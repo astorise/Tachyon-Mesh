@@ -38,7 +38,8 @@ use candle_transformers::models::with_tracing::{
 };
 
 use super::parallel::{PipelineStageExecutor, StageTransport};
-use super::tensor_parallel_llama::{TensorParallelBlock, TensorParallelCache};
+use super::tensor_parallel_llama::{shard_block_mlp, TensorParallelCache};
+use candle_transformers::models::llama::Block;
 
 /// One pipeline stage: a contiguous range of transformer blocks, plus the
 /// token embedding (stage 0 only) and/or final norm + LM head (last stage
@@ -50,7 +51,7 @@ pub(crate) struct PipelineStage {
     cfg: Config,
     layer_range: (u32, u32),
     wte: Option<Embedding>,
-    blocks: Vec<TensorParallelBlock>,
+    blocks: Vec<Block>,
     head: Option<(RmsNorm, Linear)>,
     device: Device,
     /// The dtype weights were loaded with — used to build a matching KV
@@ -82,13 +83,21 @@ impl PipelineStage {
         } else {
             None
         };
+        // Upstream blocks, with only the MLP substituted. A stage is a
+        // contiguous run of them and owns neither the embedding (unless it is
+        // the first) nor the head (unless it is the last) — the granularity
+        // `Block::load_with_block_mlp` exists for.
         let blocks = (start..=end)
             .map(|i| {
-                TensorParallelBlock::load(
-                    vb.pp(format!("model.layers.{i}")),
+                let block_vb = vb.pp(format!("model.layers.{i}"));
+                let mlp = shard_block_mlp(
+                    &block_vb,
                     cfg,
                     std::slice::from_ref(device),
-                )
+                    #[cfg(feature = "candle-cuda")]
+                    None,
+                )?;
+                Block::load_with_block_mlp(block_vb, cfg, i as usize, mlp)
             })
             .collect::<CandleResult<Vec<_>>>()?;
         let head = if is_last_stage {
@@ -147,7 +156,7 @@ impl PipelineStage {
         };
         for (offset, block) in self.blocks.iter().enumerate() {
             let block_idx = self.layer_range.0 as usize + offset;
-            x = block.forward(&x, index_pos, block_idx, cache)?;
+            x = block.forward(&x, index_pos, block_idx, cache, None)?;
         }
         if let Some((ln_f, lm_head)) = &self.head {
             let x = ln_f.forward(&x)?;

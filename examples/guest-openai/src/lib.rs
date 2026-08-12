@@ -44,9 +44,9 @@ const ROUTE_MODELS: &str = "/ai/v1/models";
 const ROUTE_CHAT_COMPLETIONS: &str = "/ai/v1/chat/completions";
 const ROUTE_EMBEDDINGS: &str = "/ai/v1/embeddings";
 
-/// Generation defaults when the request omits them. The host clamps these to its
-/// own hard caps (`HOST_MAX_NEW_TOKENS`, context window).
-const DEFAULT_MAX_TOKENS: u32 = 256;
+/// Sampling default when the request omits it, chosen so a bare request is
+/// reproducible. `max_tokens` deliberately has no guest-side default: omission
+/// is forwarded so the host applies the budget its backend advertises.
 const DEFAULT_TEMPERATURE: f32 = 0.0;
 
 struct Component;
@@ -59,6 +59,13 @@ struct ChatCompletionRequest {
     tools: Vec<serde_json::Value>,
     #[serde(default)]
     tool_choice: Option<serde_json::Value>,
+    /// Wall-clock budget for this generation. Not an OpenAI field, so it was
+    /// simply dropped: the host fell back to its own default and a client that
+    /// had asked for a shorter leash on an agentic turn waited out the long
+    /// one. Accepted here and forwarded; the host still clamps it to its
+    /// ceiling.
+    #[serde(default)]
+    max_generation_ms: Option<u64>,
     #[serde(default)]
     tool_call_parser: Option<ToolCallParser>,
     #[serde(default)]
@@ -75,6 +82,118 @@ struct ChatCompletionRequest {
     stop: Option<StopField>,
     #[serde(default)]
     stream: Option<bool>,
+    /// OpenAI gates usage reporting on a stream behind this, because the extra
+    /// final chunk breaks naive clients that assume every chunk has a choice.
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
+    /// Structured-output request. Declared here because serde drops what this
+    /// struct does not name: the host has a constrained decoder and the
+    /// upstream backend has a `response_format` translation, and neither was
+    /// reachable through the public OpenAI route because the field never
+    /// survived deserialization. A client supplying a schema got unconstrained
+    /// output and no error — the same failure the `tools` field had.
+    #[serde(default)]
+    response_format: Option<ResponseFormat>,
+}
+
+/// The subset of OpenAI's `response_format` this route acts on.
+///
+/// `{"type": "text"}` carries no constraint. The other two do: `json_schema`
+/// forwards its own `schema` — `name` and `strict` describe the request, not
+/// the grammar — and `json_object` asks for *some* valid JSON object without
+/// saying which, which is the permissive object schema rather than nothing.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ResponseFormat {
+    /// Dropping this left `json_object` indistinguishable from `text`, so a
+    /// client that asked for JSON got unconstrained prose and no error.
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    json_schema: Option<JsonSchemaFormat>,
+}
+
+impl ResponseFormat {
+    /// The schema text to constrain decoding with, or why this format cannot be
+    /// honoured.
+    ///
+    /// Every way this route refuses a format is a refusal a client can read.
+    /// The one thing it must never do is accept a format and then not apply it:
+    /// the caller asked for schema-conforming data, got prose, and has nothing
+    /// telling it the difference — so whatever it parses next treats arbitrary
+    /// text as structured.
+    ///
+    /// The `type` is checked before the schema, so a misspelling is a 400 even
+    /// when a schema rides along. Within a recognised type an explicit schema
+    /// wins, which is what lets `json_object` carry one and be honoured
+    /// precisely rather than permissively.
+    fn schema_source(&self) -> Result<Option<String>, String> {
+        let declared = self
+            .json_schema
+            .as_ref()
+            .and_then(|format| format.schema.as_ref())
+            .map(serde_json::Value::to_string);
+        match self.kind.as_deref() {
+            // The only type that constrains nothing.
+            Some("text") => Ok(None),
+            // "Any object" is the whole of what `json_object` promises, and it
+            // is expressible: the host's compiler reads a schema with no
+            // `properties` as accepting every object and nothing else.
+            // Forwarding nothing here made the mode a no-op that clients cannot
+            // detect, since the failure looks like a model that ignored the
+            // instruction.
+            Some("json_object") => Ok(Some(
+                declared.unwrap_or_else(|| r#"{"type":"object"}"#.to_owned()),
+            )),
+            Some("json_schema") => declared.map(Some).ok_or_else(|| {
+                "`response_format` of type `json_schema` must carry `json_schema.schema`".to_owned()
+            }),
+            // No `type` at all is not a format; a bare `json_schema` block is
+            // still honoured, since that is unambiguous about what was wanted.
+            None => Ok(declared),
+            // A misspelling — `json-Object`, `json_obect` — used to fall
+            // through to unconstrained inference and a 200. The caller stated a
+            // format, so answering as though it had not is the same silent
+            // no-op the branches above exist to prevent.
+            Some(other) => Err(format!(
+                "`response_format.type` `{other}` is not supported; use `text`, `json_object`, \
+                 or `json_schema`"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct JsonSchemaFormat {
+    #[serde(default)]
+    schema: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
+}
+
+/// OpenAI's `usage` object. Omitted entirely when the backend cannot count
+/// tokens — publishing zeros would be indistinguishable from a real empty
+/// generation.
+#[derive(Debug, Clone, Copy, Serialize)]
+struct Usage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
+}
+
+impl Usage {
+    fn from_host(reported: bindings::tachyon::accelerator::cpu::TokenUsage) -> Self {
+        Self {
+            prompt_tokens: reported.prompt_tokens,
+            completion_tokens: reported.completion_tokens,
+            total_tokens: reported
+                .prompt_tokens
+                .saturating_add(reported.completion_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,10 +221,59 @@ impl EmbeddingsInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatMessage {
     role: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    /// Whatever the client sent, re-serialized unchanged into the host
+    /// envelope.
+    ///
+    /// `Option<String>` here narrowed the OpenAI message shape, and the
+    /// narrowing was reachable: a standard multimodal turn whose `content` is
+    /// an array of parts — `text` plus `image_url` — failed *deserialization*,
+    /// so the request never reached the host's opaque `Vec<Value>` forwarding
+    /// and a perfectly valid request came back as HTTP 500, even when the
+    /// selected `openai:` upstream understands it.
+    ///
+    /// Kept opaque rather than modelled: the shape belongs to the provider,
+    /// and the two local runtimes already refuse structured content with a
+    /// typed invalid-request error, which is the right answer for a backend
+    /// that genuinely cannot read it.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    content: serde_json::Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<ToolCall>,
+    /// Set on a `role: "tool"` turn to associate the result with the call that
+    /// asked for it. Dropping it here would make the host's "messages are
+    /// forwarded verbatim" contract untrue for the one field an agentic loop
+    /// cannot do without: the upstream would receive a tool result tied to
+    /// nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    /// Legacy function-call name on a tool turn; some upstreams still key on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    /// The pre-`tool_calls` shape of an assistant turn that made a call.
+    ///
+    /// A client continuing a legacy conversation replays it, and with no field
+    /// to land in it was dropped: the upstream then saw a `role: "function"`
+    /// result with no request before it, and answered as though it had never
+    /// asked. Relayed opaquely, like `tool_calls`, because the provider that
+    /// still speaks this dialect is the one that knows its shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    function_call: Option<serde_json::Value>,
+    /// A provider's structured safety refusal, carried through from the host.
+    ///
+    /// OpenAI puts this on its own field precisely so a caller can tell a
+    /// refusal from an answer. Without it a refusal reached the client as
+    /// `content: null` with `finish_reason: "stop"` — indistinguishable from a
+    /// model that returned nothing, so an agent read the empty string as the
+    /// reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refusal: Option<String>,
+    /// Everything this struct does not name, carried through rather than
+    /// dropped. A provider-specific field on an inbound turn is the client's
+    /// and the upstream's business, not this route's, and serde discards what
+    /// it cannot name — so a field that mattered vanished between the client
+    /// and the server that understands it.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -113,8 +281,13 @@ impl ChatMessage {
     fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
-            content: Some(content.into()),
+            content: serde_json::Value::String(content.into()),
             tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+            function_call: None,
+            refusal: None,
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -129,6 +302,22 @@ enum ToolCallParser {
 }
 
 impl ToolCallParser {
+    /// Parse a dialect name, returning `None` for anything unrecognized.
+    ///
+    /// Deliberately not `Deserialize`: the registry row this reads from is
+    /// written by the host, and an unknown value there must not fail the row's
+    /// deserialization — that would drop the model out of `GET /ai/v1/models`
+    /// entirely over a field that is only an optimization.
+    fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "json" => Some(Self::Json),
+            "qwen" => Some(Self::Qwen),
+            "qwen_coder" => Some(Self::QwenCoder),
+            "mistral" => Some(Self::Mistral),
+            _ => None,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             ToolCallParser::Json => "json",
@@ -143,6 +332,10 @@ impl ToolCallParser {
 struct ExtraBody {
     #[serde(default)]
     tool_call_parser: Option<ToolCallParser>,
+    /// Mirrors the top-level field, for clients that keep every nonstandard
+    /// option in one place.
+    #[serde(default)]
+    max_generation_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -185,11 +378,13 @@ impl StopField {
 
 #[derive(Debug, Serialize)]
 struct ChatCompletionResponse {
-    id: &'static str,
+    id: String,
     object: &'static str,
     created: u64,
     model: String,
     choices: Vec<ChatChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -202,11 +397,13 @@ struct ChatChoice {
 /// Sent for each SSE chunk when `stream: true`.
 #[derive(Debug, Serialize)]
 struct ChatCompletionChunk {
-    id: &'static str,
+    id: String,
     object: &'static str,
     created: u64,
     model: String,
     choices: Vec<ChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -222,6 +419,65 @@ struct ChunkDelta {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<StreamToolCall>>,
+}
+
+impl ChunkDelta {
+    fn role(role: &'static str) -> Self {
+        Self {
+            role: Some(role),
+            content: None,
+            tool_calls: None,
+        }
+    }
+
+    fn content(content: String) -> Self {
+        Self {
+            role: None,
+            content: Some(content),
+            tool_calls: None,
+        }
+    }
+
+    fn tool_calls(tool_calls: Vec<StreamToolCall>) -> Self {
+        Self {
+            role: None,
+            content: None,
+            tool_calls: Some(tool_calls),
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            role: None,
+            content: None,
+            tool_calls: None,
+        }
+    }
+}
+
+/// A tool call inside a streaming delta. Same shape as the buffered [`ToolCall`]
+/// plus the `index` that identifies which call a delta belongs to — required by
+/// the OpenAI streaming format even when, as here, each call is emitted whole.
+#[derive(Debug, Serialize)]
+struct StreamToolCall {
+    index: u32,
+    id: String,
+    #[serde(rename = "type")]
+    kind: String,
+    function: ToolCallFunction,
+}
+
+impl StreamToolCall {
+    fn from_tool_call(index: u32, call: ToolCall) -> Self {
+        Self {
+            index,
+            id: call.id,
+            kind: call.kind,
+            function: call.function,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +487,86 @@ struct ModelInfo {
     engine: String,
     vram_required_mb: u64,
     status: String,
+    /// Tool-call dialect the host resolved for this checkpoint, from its
+    /// `.tachyon-model.json` sidecar or its chat template. Held as a string
+    /// rather than a `ToolCallParser` so an unrecognized value cannot fail the
+    /// row and take the model out of the listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_parser: Option<String>,
+    /// Who owns this row. `"config"` marks one the host derived from the sealed
+    /// manifest; absent means an upload or a registration owns it.
+    ///
+    /// Carried here so a round-trip through this guest preserves it. Without
+    /// the field, `serde` dropped it on deserialization and the re-serialized
+    /// row came back unmarked — so a registration silently *disowned* a
+    /// configured alias even when it did not mean to overwrite one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    /// Set on a reservation row the host writes while a hot reload swaps the
+    /// runtime out. The alias is still the manifest's — so nothing may claim it
+    /// — but no runtime is answering for it yet, and advertising it would point
+    /// clients at a model that 500s until publication catches up.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    withdrawn: bool,
+}
+
+/// Marks a registry row the host derived from the sealed manifest.
+const REGISTRY_SOURCE_CONFIG: &str = "config";
+
+/// Marker the host puts in its error when it refuses a registry write because a
+/// configured binding owns the alias. Matched rather than parsed: WIT gives the
+/// table a `result<_, string>`, so a sentinel substring is the only typed
+/// channel there is, and the alternative is reporting a 409 as a 500.
+const REGISTRY_ALIAS_TAKEN_MARKER: &str = "model-alias-claimed-by-config";
+
+impl ModelInfo {
+    fn is_config_owned(&self) -> bool {
+        self.source.as_deref() == Some(REGISTRY_SOURCE_CONFIG)
+    }
+
+    /// Strip any ownership marker a request body carried.
+    ///
+    /// Only the host writes `source: "config"`. Accepting it from a
+    /// registration would let a caller lock an alias against the upload path —
+    /// which enforces the same rule from the other side — with no manifest
+    /// entry behind the claim.
+    fn clear_ownership_marker(&mut self) {
+        self.source = None;
+    }
+}
+
+/// Whether the manifest owns this alias's row.
+///
+/// A missing or unparseable row is *not* config-owned: the guard exists to
+/// protect a marker that is present, and treating an unreadable row as owned
+/// would make a corrupt entry permanently unfixable through this route.
+fn alias_is_config_owned(alias: &str) -> bool {
+    models_table()
+        .get(alias)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ModelInfo>(&raw).ok())
+        .is_some_and(|info| info.is_config_owned())
+}
+
+/// Whether the registry holds a *reservation* row for `alias`.
+///
+/// `list_models()` filters withdrawn rows out, which is right for the listing
+/// and for resolving a qualified `engine/alias`: both go through the filtered
+/// set, so a reserved alias is absent from each. A bare name did not, because
+/// the resolver falls back to using the requested name as the alias when it
+/// matches nothing — a fallback meant for aliases the registry never knew, not
+/// for one it is deliberately holding.
+///
+/// The effect was a hole exactly the width of a reload: hidden from
+/// `GET /ai/v1/models`, still reachable by bare name, and answered by whichever
+/// runtime happened to be sealed for the route. Reading the raw row is what
+/// tells the two cases apart, since the filtered list cannot.
+fn alias_is_withdrawn(alias: &str) -> bool {
+    models_table()
+        .get(alias)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<ModelInfo>(&raw).ok())
+        .is_some_and(|info| info.withdrawn)
 }
 
 #[derive(Debug, Serialize)]
@@ -287,21 +623,81 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
 fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     // ── Registry write/list/deregister ───────────────────────────────────────
     if method.eq_ignore_ascii_case("POST") && path == ROUTE_REGISTER {
-        let info: ModelInfo = serde_json::from_slice(body)
+        let mut info: ModelInfo = serde_json::from_slice(body)
             .map_err(|e| format!("invalid model registration payload: {e}"))?;
+        // A non-dynamic configured binding is loaded eagerly at boot, so a
+        // request for its alias runs that backend whatever this table says.
+        // Letting a registration replace the row would advertise one model
+        // while another answers — for an `openai:` binding, a third-party
+        // server.
+        if alias_is_config_owned(&info.alias) {
+            return Ok(openai_error_payload(
+                409,
+                format!(
+                    "model alias `{}` is claimed by a configured binding in the sealed manifest; \
+                     register under a free alias, or declare the binding `dynamic`",
+                    info.alias
+                ),
+                "invalid_request_error",
+            ));
+        }
+        info.clear_ownership_marker();
         let value =
             serde_json::to_vec(&info).map_err(|e| format!("failed to encode model info: {e}"))?;
-        models_table()
-            .set(&info.alias, &value)
-            .map_err(|e| format!("model registry write failed: {e}"))?;
+        // The check above is a courtesy — it produces the better message — but
+        // it is not what makes this safe: it and this write are two separate
+        // host transactions, so a reload publishing the alias in between would
+        // slip past it. The host re-tests ownership inside the write and
+        // refuses with this marker, which is the answer that actually counts.
+        if let Err(error) = models_table().set(&info.alias, &value) {
+            if error.contains(REGISTRY_ALIAS_TAKEN_MARKER) {
+                return Ok(openai_error_payload(
+                    409,
+                    format!(
+                        "model alias `{}` is claimed by a configured binding in the sealed \
+                         manifest; register under a free alias, or declare the binding `dynamic`",
+                        info.alias
+                    ),
+                    "invalid_request_error",
+                ));
+            }
+            return Err(format!("model registry write failed: {error}"));
+        }
         return Ok((201, b"model registered".to_vec()));
     }
 
     if method.eq_ignore_ascii_case("DELETE") && path.starts_with(ROUTE_DEREGISTER_PREFIX) {
         let alias = path.trim_start_matches(ROUTE_DEREGISTER_PREFIX);
-        models_table()
-            .delete(alias)
-            .map_err(|e| format!("model registry delete failed: {e}"))?;
+        // Same rule on the way out. Deleting a configured row does not stop the
+        // runtime serving the alias — it only removes it from
+        // `GET /ai/v1/models`, leaving a model that answers but cannot be
+        // discovered, and which no reload short of a config change restores.
+        if alias_is_config_owned(alias) {
+            return Ok(openai_error_payload(
+                409,
+                format!(
+                    "model alias `{alias}` is claimed by a configured binding in the sealed \
+                     manifest; it is removed by editing the manifest, not by deregistering"
+                ),
+                "invalid_request_error",
+            ));
+        }
+        // Same race, same authority: the host re-tests ownership inside the
+        // delete, so an alias published between the check and here is refused
+        // there rather than silently removed.
+        if let Err(error) = models_table().delete(alias) {
+            if error.contains(REGISTRY_ALIAS_TAKEN_MARKER) {
+                return Ok(openai_error_payload(
+                    409,
+                    format!(
+                        "model alias `{alias}` is claimed by a configured binding in the sealed \
+                         manifest; it is removed by editing the manifest, not by deregistering"
+                    ),
+                    "invalid_request_error",
+                ));
+            }
+            return Err(format!("model registry delete failed: {error}"));
+        }
         return Ok((204, Vec::new()));
     }
 
@@ -337,8 +733,22 @@ fn handle_embeddings(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     }
 
     let models = list_models()?;
-    let alias = match resolve_model_alias(&request.model, &models) {
-        Some(alias) => alias,
+    let registered = resolve_registered_model(&request.model, &models);
+    let alias = match registered {
+        Some(model) => model.alias.as_str(),
+        // Same reservation rule as the chat path. `list_models()` filters a
+        // withdrawn row, so a bare embedding name fell through to this
+        // fallback and ran against whichever runtime was sealed for the route
+        // — for the length of a reload window, or indefinitely after a failed
+        // reconciliation. The chat path grew this check; embeddings resolve
+        // through the same lookup and needed it too.
+        None if !request.model.contains('/') && alias_is_withdrawn(&request.model) => {
+            return Ok(openai_error_payload(
+                404,
+                format!("model `{}` is unavailable", request.model),
+                "model_not_found",
+            ));
+        }
         None if !request.model.contains('/') => request.model.as_str(),
         None => {
             return Ok(openai_error_payload(
@@ -362,8 +772,10 @@ fn handle_embeddings(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
 
     let mut data = Vec::with_capacity(inputs.len());
     for (index, input) in inputs.into_iter().enumerate() {
-        let embedding = bindings::tachyon::accelerator::cpu::embed(model_id, &input)
-            .map_err(|e| format!("embedding failed for model `{}`: {e}", request.model))?;
+        let embedding = match bindings::tachyon::accelerator::cpu::embed(model_id, &input) {
+            Ok(embedding) => embedding,
+            Err(error) => return Ok(generation_error_payload(&request.model, error)),
+        };
         data.push(EmbeddingData {
             object: "embedding",
             embedding,
@@ -384,7 +796,7 @@ fn handle_embeddings(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
 /// Run `/ai/v1/chat/completions` against the host CPU accelerator.
 /// Routes to the streaming SSE path when `stream: true`, buffered otherwise.
 fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
-    let request: ChatCompletionRequest = serde_json::from_slice(body)
+    let mut request: ChatCompletionRequest = serde_json::from_slice(body)
         .map_err(|e| format!("invalid chat completion request: {e}"))?;
     if request.model.trim().is_empty() {
         return Err("chat completion request must name a model".to_owned());
@@ -392,21 +804,33 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     if request.messages.is_empty() {
         return Err("chat completion request must include at least one message".to_owned());
     }
+    // Checked here rather than at encode time so the refusal is a 400 the
+    // client can act on, and so it lands before a model is loaded — a request
+    // this route cannot honour should not cost a checkpoint residency.
+    if let Some(format) = request.response_format.as_ref() {
+        if let Err(detail) = format.schema_source() {
+            return Ok(openai_error_payload(400, detail, "invalid_request_error"));
+        }
+    }
 
     let models = list_models()?;
-    let alias = match resolve_model_alias(&request.model, &models) {
-        Some(alias) => alias,
-        None if !request.model.contains('/') => request.model.as_str(),
-        None => {
-            return Ok(openai_error_payload(
-                404,
-                format!("model `{}` is unavailable", request.model),
-                "model_not_found",
-            ));
-        }
+    let registered = resolve_registered_model(&request.model, &models);
+    let Some(alias) = resolve_requested_alias(&request.model, registered, || {
+        alias_is_withdrawn(&request.model)
+    }) else {
+        return Ok(openai_error_payload(
+            404,
+            format!("model `{}` is unavailable", request.model),
+            "model_not_found",
+        ));
     };
+    // Before either handler runs: every downstream use of the parser — the
+    // streaming gate, the host-side generation request, and the final parse —
+    // goes through `resolved_tool_call_parser`, so filling it in once here
+    // covers all three.
+    request.adopt_registry_parser(registered);
 
-    let model_id = match bindings::tachyon::accelerator::cpu::load_model(alias) {
+    let model_id = match bindings::tachyon::accelerator::cpu::load_model(&alias) {
         Ok(model_id) => model_id,
         Err(error) => {
             return Ok(openai_error_payload(
@@ -424,13 +848,43 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     }
 }
 
-fn resolve_model_alias<'a>(requested: &str, models: &'a [ModelInfo]) -> Option<&'a str> {
-    models
-        .iter()
-        .find(|model| {
-            model.alias == requested || format!("{}/{}", model.engine, model.alias) == requested
-        })
-        .map(|model| model.alias.as_str())
+/// Find the registry row a request's `model` names, by bare alias or by the
+/// `{engine}/{alias}` id `GET /ai/v1/models` advertises.
+/// The alias a request names, or `None` when it must be answered with a 404.
+///
+/// Three cases, and the middle one is the one that was missing:
+///
+/// * a row in the listing — the registry's own alias, whatever spelling the
+///   client used to reach it;
+/// * a bare name the registry is *holding* — reserved during a reload swap, so
+///   it is unavailable rather than unknown;
+/// * a bare name the registry has never heard of — passed through, because an
+///   alias can be loadable without having a row yet.
+///
+/// `reserved` is a closure rather than a `bool` because it reads the raw
+/// registry row through the host, and only the second case needs to ask. A
+/// request that resolved, or that used a qualified `engine/alias`, decides
+/// without the extra round trip.
+fn resolve_requested_alias(
+    requested: &str,
+    registered: Option<&ModelInfo>,
+    reserved: impl FnOnce() -> bool,
+) -> Option<String> {
+    if let Some(model) = registered {
+        return Some(model.alias.clone());
+    }
+    // A qualified name that matched nothing is simply not here: the engine
+    // prefix only exists on rows, so there is no bare-alias reading of it.
+    if requested.contains('/') {
+        return None;
+    }
+    (!reserved()).then(|| requested.to_owned())
+}
+
+fn resolve_registered_model<'a>(requested: &str, models: &'a [ModelInfo]) -> Option<&'a ModelInfo> {
+    models.iter().find(|model| {
+        model.alias == requested || format!("{}/{}", model.engine, model.alias) == requested
+    })
 }
 
 fn handle_chat_completions_buffered(
@@ -438,30 +892,79 @@ fn handle_chat_completions_buffered(
     model_id: u32,
 ) -> Result<(u16, Vec<u8>), String> {
     let generation = build_generation_request(&request)?;
-    let output = bindings::tachyon::accelerator::cpu::compute(model_id, &generation)
-        .map_err(|e| format!("inference failed for model `{}`: {e}", request.model))?;
-    let parsed = parse_assistant_output(&request, &output);
-    let finish_reason = if parsed.tool_calls.is_empty() {
-        "stop"
+    // `compute_detailed` rather than `compute`: same generation, but it also
+    // carries the token counts. Unlike a stream, a buffered response has no
+    // trailing frame to put them in, so they have to come back with the text.
+    let completed =
+        match bindings::tachyon::accelerator::cpu::compute_detailed(model_id, &generation) {
+            Ok(completed) => completed,
+            Err(error) => return Ok(generation_error_payload(&request.model, error)),
+        };
+    // Structured calls win outright: the backend received them as fields, so
+    // re-reading the text for calls could only ever guess worse.
+    // Structured calls are adopted only when the client asked for tools. An
+    // upstream that returns `tool_calls` to a request that offered none is
+    // answering a question nobody put, and surfacing them would hand a client
+    // that never opted in a `message.tool_calls` array plus a `tool_calls`
+    // finish reason — a response shape it has no code path for.
+    let parsed = if completed.tool_calls.is_empty() || !request.has_tool_intent() {
+        parse_assistant_output(&request, &completed.text)
     } else {
-        "tool_calls"
+        ParsedAssistantOutput {
+            content: completed.text.clone(),
+            tool_calls: adopt_host_tool_calls(completed.tool_calls),
+        }
     };
+    // Checked after both sources have been reconciled, so the rule covers a
+    // call the host reported as a field and one recovered from the text alike:
+    // either way it is an instruction the client has no code for.
+    if let Some(name) = request.unoffered_call(&parsed.tool_calls) {
+        return Ok(openai_error_payload(
+            502,
+            format!(
+                "model `{}` returned a call to `{name}`, which this request did not offer",
+                request.model
+            ),
+            "server_error",
+        ));
+    }
+    let finish_reason = resolve_finish_reason(
+        completed.finish_reason.as_deref(),
+        !parsed.tool_calls.is_empty(),
+    );
 
     let response = ChatCompletionResponse {
-        id: "chatcmpl-tachyon",
+        // Unconditional here, unlike the stream: a buffered response has no
+        // extra frame to break a client with, so OpenAI reports usage on it
+        // always. Still `None` when the backend could not measure — a zero
+        // `usage` claims the generation cost nothing.
+        usage: completed.usage.map(Usage::from_host),
+        id: completion_id(),
         object: "chat.completion",
-        created: 0,
+        created: unix_seconds(),
         model: request.model,
         choices: vec![ChatChoice {
             index: 0,
             message: ChatMessage {
                 role: "assistant".to_owned(),
                 content: if parsed.content.is_empty() {
-                    None
+                    serde_json::Value::Null
                 } else {
-                    Some(parsed.content)
+                    serde_json::Value::String(parsed.content)
                 },
                 tool_calls: parsed.tool_calls,
+                // Response-side only: this node answers in the modern shape,
+                // and an assistant turn never carries the other three.
+                tool_call_id: None,
+                name: None,
+                function_call: None,
+                // Carried through untouched. A refusal is the provider's, and
+                // folding it into `content` would be an agent parsing "I can't
+                // help with that" as data.
+                refusal: completed.refusal,
+                // Nothing to carry on the way out: this node composes the
+                // assistant turn itself.
+                extra: serde_json::Map::new(),
             },
             finish_reason,
         }],
@@ -493,72 +996,258 @@ fn handle_chat_completions_streaming(
         )
         .map_err(|e| format!("failed to begin streaming response: {e}"))?;
 
+    // Resolved once: every chunk of one response must carry the same id and
+    // timestamp, or a client reassembling the stream sees each delta as a
+    // separate completion.
+    let id = completion_id();
+    let created = unix_seconds();
+
     // First chunk carries the role.
     let first_chunk = ChatCompletionChunk {
-        id: "chatcmpl-tachyon",
+        usage: None,
+        id: id.clone(),
         object: "chat.completion.chunk",
-        created: 0,
+        created,
         model: request.model.clone(),
         choices: vec![ChunkChoice {
             index: 0,
-            delta: ChunkDelta {
-                role: Some("assistant"),
-                content: None,
-            },
+            delta: ChunkDelta::role("assistant"),
             finish_reason: None,
         }],
     };
     write_sse_chunk(&writer, &first_chunk)?;
 
-    let generation = build_generation_request(&request)?;
-    let token_stream = bindings::tachyon::accelerator::cpu::compute_stream(model_id, &generation)
-        .map_err(|e| {
-        format!(
-            "failed to start streaming inference for `{}`: {e}",
-            request.model
+    // Tool intent turns this into a gated stream: content flows until an opener
+    // appears, then the rest is held back for the buffered parser.
+    //
+    // The gate is always present, defaulting to the anchored `Json` opener when
+    // the request implies no parser: the host's upstream backend emits its
+    // tool-call envelope as one whole-output JSON object, and without a gate
+    // that envelope would stream out as prose before finalization could turn it
+    // into a structured call. For a response that is not a tool call the
+    // anchored gate is a passthrough — a `{` only counts at the very start.
+    // Only when the request actually offers tools. The gate exists to stop a
+    // tool call streaming out as prose before it can be turned into a
+    // structured call, and nothing can produce one when no tools were offered
+    // — while an unconditional gate trips at byte zero on any answer that
+    // starts with `{`, `[` or a fence, which is what ordinary JSON and code
+    // answers do. That withheld every fragment until generation finished,
+    // costing the streaming route exactly the time-to-first-token it exists
+    // for.
+    let mut gate = request.has_tool_intent().then(|| {
+        StreamingContentGate::new(
+            request
+                .resolved_tool_call_parser()
+                .unwrap_or(ToolCallParser::Json),
         )
-    })?;
+    });
 
+    let generation = build_generation_request(&request)?;
+    let token_stream =
+        match bindings::tachyon::accelerator::cpu::compute_stream(model_id, &generation) {
+            Ok(token_stream) => token_stream,
+            // The headers are already on the wire, so the status can no longer
+            // be changed — the failure is reported as an SSE error frame, which
+            // is what an OpenAI client reads mid-stream anyway.
+            Err(error) => {
+                write_sse_error(&writer, &request.model, error)?;
+                return Ok((200, Vec::new()));
+            }
+        };
+
+    // Tool calls the host recognised as structured data, kept aside until the
+    // stream ends: they are emitted as one `tool_calls` delta after the content,
+    // which is where an OpenAI client expects them.
+    let mut host_tool_calls = Vec::new();
     loop {
         match token_stream.next() {
-            Ok(Some(fragment)) => {
+            Ok(Some(bindings::tachyon::accelerator::cpu::StreamEvent::Content(fragment))) => {
+                let content = match gate.as_mut() {
+                    Some(gate) => gate.push(&fragment),
+                    None => Some(fragment),
+                };
+                let Some(content) = content else {
+                    continue;
+                };
                 let chunk = ChatCompletionChunk {
-                    id: "chatcmpl-tachyon",
+                    usage: None,
+                    id: id.clone(),
                     object: "chat.completion.chunk",
-                    created: 0,
+                    created,
                     model: request.model.clone(),
                     choices: vec![ChunkChoice {
                         index: 0,
-                        delta: ChunkDelta {
-                            role: None,
-                            content: Some(fragment),
-                        },
+                        delta: ChunkDelta::content(content),
                         finish_reason: None,
                     }],
                 };
                 write_sse_chunk(&writer, &chunk)?;
             }
+            Ok(Some(bindings::tachyon::accelerator::cpu::StreamEvent::ToolCall(call))) => {
+                host_tool_calls.push(call);
+            }
             Ok(None) => break,
-            Err(e) => return Err(format!("streaming inference error: {e}")),
+            Err(error) => {
+                write_sse_error(&writer, &request.model, error)?;
+                return Ok((200, Vec::new()));
+            }
         }
     }
 
-    // Final chunk signals stop.
+    // Whatever the gate held back is parsed exactly like a buffered response,
+    // so streamed and buffered requests recover the same tool calls.
+    //
+    // Structured calls win over anything parsed out of the text, for the same
+    // reason as on the buffered path: the backend received them as fields.
+    // Gated on intent, like the buffered branch. An upstream that returns
+    // structured calls to a request that offered no tools — or set
+    // `tool_choice: "none"` — is answering a question the client did not ask,
+    // and adopting them here exposed a dispatchable `tool_calls` delta the
+    // caller had explicitly forbidden. The buffered path grew this guard; the
+    // streamed one adopted unconditionally.
+    let mut tool_calls = if request.has_tool_intent() {
+        adopt_host_tool_calls(host_tool_calls)
+    } else {
+        Vec::new()
+    };
+    if let Some(gate) = gate {
+        let (whole, sent) = gate.finish();
+        let parsed = parse_assistant_output(&request, &whole);
+
+        // Everything the client has not received yet. `sent` is what actually
+        // went out, so this is also where the gate's deferred decisions get
+        // settled — the separator it dropped before a tool call comes back if
+        // the buffered parse kept it, and stays dropped if it did not.
+        //
+        // Two reconciliations, because the two cases differ.
+        //
+        // With no tool calls, the parser returned the raw text unchanged, so
+        // the exact byte cut is right. This is the case that must not trim:
+        // a response opening with whitespace trips the anchored JSON gate at
+        // its first `{`, sending nothing, and cutting the tail anywhere but 0
+        // would drop the whitespace the buffered response keeps.
+        //
+        // With tool calls, `parsed.content` is the text minus those regions,
+        // trimmed at both ends. Only its *leading* trim shifts the offset of
+        // what was sent, so the consumed length is the sent prefix minus the
+        // whitespace the parser dropped from the front. Trimming that prefix at
+        // both ends instead would hand its own trailing whitespace back as new
+        // content — three newlines where the buffered parser produces two.
+        //
+        // Which of the two applies turns on whether the *parse* is what
+        // supplies the calls, not on whether it found any. When the host
+        // already reported structured calls they win outright, so the parse is
+        // discarded whole — and its content has to be discarded with it.
+        // Keeping only its opinion of the text cut out the regions it mistook
+        // for calls, so a response carrying both a real structured call and
+        // prose that merely looks like one lost that prose, silently, on the
+        // stream but not in the buffered reply.
+        let tail = unsent_tail(
+            &whole,
+            sent,
+            &parsed,
+            /* host_supplied_calls */ !tool_calls.is_empty(),
+        );
+        if !tail.is_empty() {
+            let chunk = ChatCompletionChunk {
+                usage: None,
+                id: id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: request.model.clone(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: ChunkDelta::content(tail.to_owned()),
+                    finish_reason: None,
+                }],
+            };
+            write_sse_chunk(&writer, &chunk)?;
+        }
+
+        if tool_calls.is_empty() {
+            tool_calls = parsed.tool_calls;
+        }
+    }
+
+    // The same rule as the buffered path, on the only channel left: the status
+    // line went out with the headers, so an unusable call is reported as an
+    // error frame rather than emitted as a dispatchable delta.
+    if let Some(name) = request.unoffered_call(&tool_calls) {
+        write_sse_error(
+            &writer,
+            &request.model,
+            bindings::tachyon::accelerator::cpu::GenerationError {
+                message: format!("returned a call to `{name}`, which this request did not offer"),
+                upstream_status: Some(502),
+                invalid_request: false,
+            },
+        )?;
+        return Ok((200, Vec::new()));
+    }
+
+    // Read now rather than at the top: like `usage`, it is only known once the
+    // stream has ended, which the loop above has just observed.
+    let host_finish_reason = token_stream.finish_reason();
+    let finish_reason =
+        resolve_finish_reason(host_finish_reason.as_deref(), !tool_calls.is_empty());
+    if !tool_calls.is_empty() {
+        let deltas = tool_calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, call)| StreamToolCall::from_tool_call(index as u32, call))
+            .collect();
+        let chunk = ChatCompletionChunk {
+            usage: None,
+            id: id.clone(),
+            object: "chat.completion.chunk",
+            created,
+            model: request.model.clone(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta::tool_calls(deltas),
+                finish_reason: None,
+            }],
+        };
+        write_sse_chunk(&writer, &chunk)?;
+    }
+
+    // Final chunk signals why generation ended.
     let stop_chunk = ChatCompletionChunk {
-        id: "chatcmpl-tachyon",
+        id: id.clone(),
         object: "chat.completion.chunk",
-        created: 0,
-        model: request.model,
+        created,
+        model: request.model.clone(),
         choices: vec![ChunkChoice {
             index: 0,
-            delta: ChunkDelta {
-                role: None,
-                content: None,
-            },
-            finish_reason: Some("stop"),
+            delta: ChunkDelta::empty(),
+            finish_reason: Some(finish_reason),
         }],
+        usage: None,
     };
     write_sse_chunk(&writer, &stop_chunk)?;
+
+    // Usage rides in its own trailing chunk with no choices, which is where
+    // OpenAI puts it — and why it is gated behind `stream_options.include_usage`
+    // there: a client that assumes every chunk has a `choices[0]` breaks on it.
+    // Read only now, because the counts are not known until decoding ends.
+    if request
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage)
+    {
+        if let Some(reported) = token_stream.usage() {
+            let usage_chunk = ChatCompletionChunk {
+                id,
+                object: "chat.completion.chunk",
+                created,
+                model: request.model,
+                choices: Vec::new(),
+                usage: Some(Usage::from_host(reported)),
+            };
+            write_sse_chunk(&writer, &usage_chunk)?;
+        }
+    }
+
     writer
         .write(b"data: [DONE]\n\n")
         .map_err(|e| format!("failed to write [DONE] frame: {e}"))?;
@@ -578,6 +1267,243 @@ fn write_sse_chunk<T: serde::Serialize>(
     writer
         .write(frame.as_bytes())
         .map_err(|e| format!("failed to write SSE frame: {e}"))
+}
+
+/// Openers that mark the start of a tool call for a given parser, and whether
+/// they can only appear at the very beginning of the output.
+///
+/// `Json` is anchored: `parse_json_tool_calls` requires the *whole* output to be
+/// one JSON value, so a `{` anywhere but the start cannot begin a tool call —
+/// parsing would fail and the text stays content. The tagged parsers scan
+/// anywhere, because those models routinely emit prose and then a call.
+fn tool_call_openers(parser: ToolCallParser) -> (&'static [&'static str], bool) {
+    match parser {
+        // `[` matters as much as `{`: `tool_calls_from_value` accepts a bare
+        // top-level array of calls, so omitting it would stream the payload as
+        // content *and* emit it again as a structured call.
+        ToolCallParser::Json => (&["{", "[", "```"], true),
+        ToolCallParser::Qwen | ToolCallParser::QwenCoder => {
+            (&["<tool_call>", "<tool_calls>"], false)
+        }
+        ToolCallParser::Mistral => (&["[TOOL_CALLS]"], false),
+    }
+}
+
+/// Decides, as fragments arrive, how much of a streamed response can safely be
+/// forwarded as assistant content.
+///
+/// Buffering the whole generation before parsing would be simplest, but it
+/// destroys time-to-first-token for every request that merely *offers* tools —
+/// which, for an agentic client, is every request. So content is streamed until
+/// an opener appears; from there everything is held for the buffered parser,
+/// because the tool-call region is not content and must not leak into the
+/// client's transcript.
+///
+/// Bytes are held back near the tail so an opener split across two fragments is
+/// still matched, the same trick the host's decode loop uses for stop
+/// sequences.
+struct StreamingContentGate {
+    openers: &'static [&'static str],
+    anchored: bool,
+    hold: usize,
+    seen: String,
+    /// How far into `seen` the gate has *accounted* for content — the scan
+    /// position. Advances past whitespace it deliberately withheld.
+    emitted: usize,
+    /// How far into `seen` the gate has actually *sent* content. Never ahead of
+    /// `emitted`, and behind it exactly by the separator dropped before a tool
+    /// call. The two were one counter, which silently made "withheld" mean
+    /// "delivered": the caller's tail reconciliation then started after
+    /// whitespace nobody had received, so a response opening with whitespace
+    /// lost it, and prose *after* a call lost the separator before it.
+    sent: usize,
+    tripped: bool,
+}
+
+impl StreamingContentGate {
+    fn new(parser: ToolCallParser) -> Self {
+        let (openers, anchored) = tool_call_openers(parser);
+        let hold = openers
+            .iter()
+            .map(|opener| opener.len())
+            .max()
+            .unwrap_or(1)
+            .saturating_sub(1);
+        Self {
+            openers,
+            anchored,
+            hold,
+            seen: String::new(),
+            emitted: 0,
+            sent: 0,
+            tripped: false,
+        }
+    }
+
+    /// Absorb a fragment, returning the content safe to stream right now.
+    fn push(&mut self, fragment: &str) -> Option<String> {
+        self.seen.push_str(fragment);
+        if self.tripped {
+            return None;
+        }
+        if let Some(at) = self.find_opener() {
+            self.tripped = true;
+            // Everything before the opener is genuine content — minus the
+            // whitespace that separates it from the call. The buffered parser
+            // removes the call region and `trim()`s what is left, so emitting
+            // the newline in `Let me check.\n<tool_call>…` would leave the
+            // concatenated deltas differing from the buffered message by
+            // exactly that whitespace, and the streaming contract is that the
+            // two are equal.
+            //
+            // `emitted` still advances to the opener — the whitespace is
+            // accounted for, so nothing rescans it — but `sent` stops at what
+            // actually went out. Whether that separator is dropped or restored
+            // is not knowable yet: it is internal whitespace if prose follows
+            // the call, and a trailing edge the buffered parser trims if not.
+            // The caller decides once it has parsed the whole text.
+            let content = self.seen[self.emitted..at].trim_end().to_owned();
+            self.sent = self.emitted + content.len();
+            self.emitted = at;
+            return (!content.is_empty()).then_some(content);
+        }
+        let ceiling = floor_char_boundary(&self.seen, self.seen.len().saturating_sub(self.hold));
+        // Trailing whitespace is withheld for the same reason, before we know
+        // whether an opener follows it. Nothing is lost when none does: the
+        // buffered parse then returns the text unchanged, and the caller emits
+        // whatever it kept beyond what was streamed.
+        let safe = self.seen[..ceiling].trim_end().len();
+        if safe <= self.emitted {
+            return None;
+        }
+        let content = self.seen[self.emitted..safe].to_owned();
+        self.emitted = safe;
+        self.sent = safe;
+        Some(content)
+    }
+
+    fn find_opener(&self) -> Option<usize> {
+        if self.anchored {
+            // Anchored openers only count at the start, ignoring leading
+            // whitespace the model may have emitted first.
+            let trimmed = self.seen.trim_start();
+            let offset = self.seen.len() - trimmed.len();
+            return self
+                .openers
+                .iter()
+                .any(|opener| trimmed.starts_with(opener))
+                .then_some(offset);
+        }
+        self.openers
+            .iter()
+            .filter_map(|opener| self.seen.find(opener))
+            .min()
+    }
+
+    /// The whole generation, for the buffered parser to work on, and how much
+    /// of it the client has actually received.
+    fn finish(self) -> (String, usize) {
+        (self.seen, self.sent)
+    }
+}
+
+/// Largest index `idx` that is a char boundary of `text`. Mirrors the host's own
+/// helper; `str::floor_char_boundary` is still unstable.
+fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Adopt the tool calls the host recognised as structured data.
+///
+/// These need no parsing and no dialect guess: the backend received them as
+/// fields, not as text. That is the whole reason the accelerator interface has
+/// a `tool-call` channel — smuggled through the text channel, a call decodes
+/// only when the request happens to carry the nonstandard parser option, so a
+/// standard OpenAI client offering tools would get the raw JSON back as literal
+/// assistant prose.
+fn adopt_host_tool_calls(
+    calls: Vec<bindings::tachyon::accelerator::cpu::ToolCall>,
+) -> Vec<ToolCall> {
+    calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, call)| ToolCall {
+            // A provider that assigned no id gets one minted here, matching the
+            // parser's own scheme: the id is what a client echoes back on the
+            // tool result turn, so it cannot be left empty.
+            id: call.id.unwrap_or_else(|| format!("call_tachyon_{index}")),
+            kind: "function".to_owned(),
+            function: ToolCallFunction {
+                name: call.name,
+                arguments: call.arguments,
+            },
+        })
+        .collect()
+}
+
+/// The `finish_reason` a choice reports, given what the host said and whether
+/// any tool call was recovered.
+///
+/// `length` outranks `tool_calls`, which is the one ordering that is not
+/// obvious. A model that runs out of budget *while emitting a call* returns
+/// both a partial `tool_calls` entry and `length`; reporting `tool_calls` there
+/// tells the client the call is ready and invites it to dispatch truncated
+/// arguments — a half-written path, a half-written patch. `length` tells it the
+/// truth, and a client that checks the reason before dispatching is protected.
+/// `content_filter` outranks it for the same reason: the answer is not the
+/// model's own.
+/// The content the stream still owes, once the gate has sent `sent` bytes.
+///
+/// Two reconciliations, because the two cases differ.
+///
+/// When the parse is what supplies the calls, `parsed.content` is the text
+/// minus those regions, trimmed at both ends. Only its *leading* trim shifts
+/// the offset of what was sent, so the consumed length is the sent prefix minus
+/// the whitespace the parser dropped from the front. Trimming that prefix at
+/// both ends instead would hand its own trailing whitespace back as new content
+/// — three newlines where the buffered parser produces two.
+///
+/// Otherwise the raw text is the truth and the exact byte cut is right. That
+/// covers a response with no calls at all, and — the case this used to get
+/// wrong — one where the *host* reported structured calls. Those win outright,
+/// so the parse is discarded whole; keeping only its opinion of the text cut
+/// out the regions it mistook for calls, and a response carrying both a real
+/// structured call and prose that merely looks like one lost that prose on the
+/// stream while the buffered reply kept it.
+fn unsent_tail<'a>(
+    whole: &'a str,
+    sent: usize,
+    parsed: &'a ParsedAssistantOutput,
+    host_supplied_calls: bool,
+) -> &'a str {
+    if host_supplied_calls || parsed.tool_calls.is_empty() {
+        return whole.get(sent..).unwrap_or_default();
+    }
+    let consumed = whole.get(..sent).unwrap_or_default().trim_start().len();
+    parsed.content.get(consumed..).unwrap_or_default()
+}
+
+fn resolve_finish_reason(host_reported: Option<&str>, has_tool_calls: bool) -> &'static str {
+    match host_reported {
+        Some("length") => "length",
+        Some("content_filter") => "content_filter",
+        _ if has_tool_calls => "tool_calls",
+        // Reported by the provider but with nothing behind it. Passing it on
+        // tells the client to go read `message.tool_calls` and dispatch what it
+        // finds there, and it will find an empty array — so the turn ends with
+        // an agent waiting on a call that was never made. `stop` is the honest
+        // description of a response that carries only text.
+        Some("tool_calls") => "stop",
+        // Anything else, including an absent reason, is an ordinary completion
+        // as far as the OpenAI schema is concerned.
+        _ => "stop",
+    }
 }
 
 fn parse_assistant_output(request: &ChatCompletionRequest, output: &str) -> ParsedAssistantOutput {
@@ -606,6 +1532,100 @@ fn parse_assistant_output(request: &ChatCompletionRequest, output: &str) -> Pars
 }
 
 impl ChatCompletionRequest {
+    /// Adopt the dialect the host resolved for this model, unless the caller
+    /// named one explicitly.
+    ///
+    /// This is what makes tool calling a property of the *checkpoint* rather
+    /// than of its alias. Without it the only automatic source is
+    /// [`parser_from_model`], which matches on the alias string — so a Qwen
+    /// checkpoint registered as `local-coder` got no parser at all and emitted
+    /// its `<tool_call>` blocks as literal assistant text. For an agentic
+    /// client that reads as "the model declined to call a tool", which is
+    /// indistinguishable from success and impossible to debug from outside.
+    fn adopt_registry_parser(&mut self, model: Option<&ModelInfo>) {
+        if self.tool_call_parser.is_some()
+            || self
+                .extra_body
+                .as_ref()
+                .is_some_and(|body| body.tool_call_parser.is_some())
+        {
+            // The caller was explicit; the registry does not get to override.
+            return;
+        }
+        self.tool_call_parser = model
+            .and_then(|model| model.tool_call_parser.as_deref())
+            .and_then(ToolCallParser::from_name);
+    }
+
+    /// Whether the caller offered the model any tool to call.
+    ///
+    /// `tool_choice: "none"` is an offer withdrawn. The OpenAI schema uses it
+    /// to say "you may see the tools, do not call them", and a nonempty `tools`
+    /// list alongside it is the normal way to send that — so reading intent
+    /// from the list alone enabled the parser for exactly the request that
+    /// asked it not to. A local model's tool-shaped prose then became
+    /// dispatchable calls against a client that had ruled them out.
+    fn has_tool_intent(&self) -> bool {
+        if self.tool_choice_is_none() {
+            return false;
+        }
+        !self.tools.is_empty() || self.tool_choice.is_some()
+    }
+
+    /// The function names this request actually advertised.
+    ///
+    /// `tool_choice` contributes its own named function: a request may pin a
+    /// call without repeating the list, and `has_tool_intent` already treats
+    /// that as an offer.
+    ///
+    /// Empty means *nothing readable was offered*, which is not the same as
+    /// "no tools": a client can send entries this side cannot parse a name out
+    /// of. Validation is skipped in that case rather than refusing everything,
+    /// because a set we failed to read is not evidence about what was in it.
+    fn offered_tool_names(&self) -> Vec<&str> {
+        fn named(value: &serde_json::Value) -> Option<&str> {
+            value.get("function")?.get("name")?.as_str()
+        }
+        // A pinned choice is the *whole* set, not an addition to it. Unioning
+        // it with every advertised name meant a request pinned to `read_file`
+        // still accepted a `delete_file` call the backend invented — the
+        // opposite of what pinning asks for, and the more dangerous direction.
+        if let Some(pinned) = self.tool_choice.as_ref().and_then(|choice| named(choice)) {
+            return vec![pinned];
+        }
+        self.tools.iter().filter_map(|tool| named(tool)).collect()
+    }
+
+    /// The first call naming a function this request never offered.
+    ///
+    /// A backend answering with a call outside the advertised set is answering
+    /// a question nobody put — the same rule the intent gate applies to a
+    /// request that offered no tools at all, one entry at a time. Passing it on
+    /// hands the client a dispatchable `type: "function"` call it has no code
+    /// for, and on an `openai:` binding the backend that produced it is a
+    /// third-party server the *operator* chose, not the client.
+    fn unoffered_call<'c>(&self, calls: &'c [ToolCall]) -> Option<&'c str> {
+        let offered = self.offered_tool_names();
+        if offered.is_empty() {
+            return None;
+        }
+        calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .find(|name| !offered.contains(name))
+    }
+
+    /// Whether `tool_choice` is the literal `"none"`.
+    ///
+    /// Only the string form: `{"type":"function",…}` names a call the client
+    /// wants, and any other shape is not a withdrawal this side should infer.
+    fn tool_choice_is_none(&self) -> bool {
+        self.tool_choice
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|choice| choice == "none")
+    }
+
     fn resolved_tool_call_parser(&self) -> Option<ToolCallParser> {
         self.tool_call_parser
             .or_else(|| {
@@ -614,7 +1634,7 @@ impl ChatCompletionRequest {
                     .and_then(|body| body.tool_call_parser)
             })
             .or_else(|| parser_from_model(&self.model))
-            .filter(|_| !self.tools.is_empty() || self.tool_choice.is_some())
+            .filter(|_| self.has_tool_intent())
     }
 }
 
@@ -765,20 +1785,59 @@ fn strip_markdown_json_fence(value: &str) -> &str {
 fn build_generation_request(request: &ChatCompletionRequest) -> Result<String, String> {
     let mut payload = serde_json::json!({
         "messages": request.messages,
-        "max_new_tokens": request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         "temperature": request.temperature.unwrap_or(DEFAULT_TEMPERATURE),
     });
     let object = payload
         .as_object_mut()
         .ok_or("generation payload must be a JSON object")?;
+    // Omission is forwarded as omission. Substituting a default here would
+    // override whatever budget the *binding* advertises — an upstream binding
+    // configured for long agentic completions would silently truncate at this
+    // guest's number instead. The host applies its own default per backend.
+    if let Some(max_tokens) = request.max_tokens {
+        object.insert("max_new_tokens".to_owned(), serde_json::json!(max_tokens));
+    }
     if let Some(top_p) = request.top_p {
         object.insert("top_p".to_owned(), serde_json::json!(top_p));
     }
     if let Some(seed) = request.seed {
         object.insert("seed".to_owned(), serde_json::json!(seed));
     }
+    if let Some(budget) = request.max_generation_ms.or_else(|| {
+        request
+            .extra_body
+            .as_ref()
+            .and_then(|body| body.max_generation_ms)
+    }) {
+        object.insert("max_generation_ms".to_owned(), serde_json::json!(budget));
+    }
     if let Some(stop) = request.stop.clone() {
         object.insert("stop".to_owned(), serde_json::json!(stop.into_vec()));
+    }
+    // Carried so an `openai:` backend can ask its own provider for streamed
+    // usage. Providers emit it only when the option is present, so without this
+    // the host had nothing to read and the trailing usage chunk this client
+    // explicitly requested never arrived. Sent as the intent, not as the
+    // upstream's field: a local backend measures usage regardless, and the
+    // upstream runtime is the only place that knows whether the option is safe
+    // to forward.
+    if request
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage)
+    {
+        object.insert("include_usage".to_owned(), serde_json::json!(true));
+    }
+    // The host takes the schema as source text, which is what its grammar
+    // compiler parses. `text` is the only format that forwards nothing.
+    if let Some(schema) = request
+        .response_format
+        .as_ref()
+        .map(ResponseFormat::schema_source)
+        .transpose()?
+        .flatten()
+    {
+        object.insert("json_schema".to_owned(), serde_json::Value::String(schema));
     }
     if !request.tools.is_empty() {
         object.insert("tools".to_owned(), serde_json::json!(request.tools));
@@ -824,7 +1883,46 @@ fn list_models() -> Result<Vec<ModelInfo>, String> {
     Ok(rows
         .into_iter()
         .filter_map(|(_, v)| serde_json::from_slice::<ModelInfo>(&v).ok())
+        // A reserved alias is absent, not available. This is both the listing
+        // and the resolver, so the alias 404s for the length of the swap and
+        // comes back when the incoming binding publishes — a client's retry,
+        // rather than a row that lies about where a prompt goes.
+        .filter(|info| !info.withdrawn)
         .collect())
+}
+
+/// Seconds since the Unix epoch, or `0` when the host denies a clock.
+///
+/// OpenAI clients display `created`; it was hardcoded to `0`, which reads as
+/// January 1970 in every one of them.
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// A per-response completion id.
+///
+/// Every response used to carry the literal `chatcmpl-tachyon`, so nothing
+/// downstream — a proxy log, a client cache, a trace — could tell two
+/// completions apart. The value only has to be unique, not unguessable: it
+/// identifies a response, it does not authorize anything.
+///
+/// Built from the wall clock in nanoseconds plus a per-instance counter, so
+/// two responses collide only if the host reports the same nanosecond *and*
+/// the counter wrapped — and the counter alone keeps ids distinct within an
+/// instance even if the clock is denied and reads zero.
+fn completion_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("chatcmpl-{nanos:016x}{seq:08x}")
 }
 
 fn models_table() -> bindings::tachyon::mesh::kv_partition::Table {
@@ -855,6 +1953,69 @@ fn openai_error_payload(status: u16, message: String, kind: &'static str) -> (u1
     (status, body)
 }
 
+/// Turn a host generation failure into the OpenAI error the client should see.
+///
+/// The point of relaying the upstream's status is that the client's own
+/// behaviour depends on it: a 429 must engage its backoff, and a rejected
+/// request must not be retried at all. Reporting every provider failure as a
+/// 500 leaves it with one response — retry blindly — which is wrong for both.
+///
+/// Two classes are deliberately *not* relayed. An upstream auth failure is this
+/// node's misconfigured credential, not the caller's, and a 401 would send it
+/// chasing its own key; and an unclassified status becomes 502, because this
+/// node is the gateway and the failure is the gateway's to explain.
+///
+/// A request the *host* rejected has no upstream status to relay and is still
+/// the caller's to fix — a budget above the binding's ceiling, a prompt that
+/// cannot fit the context window. It carries `invalid_request` instead, because
+/// without it those became a retryable 500 and the client retried, forever, a
+/// request that could never succeed.
+fn generation_error_payload(
+    model: &str,
+    error: bindings::tachyon::accelerator::cpu::GenerationError,
+) -> (u16, Vec<u8>) {
+    let message = format!("inference failed for model `{model}`: {}", error.message);
+    let (status, kind) = match error.upstream_status {
+        Some(429) => (429, "rate_limit_error"),
+        // The provider rejected the request we forwarded, which for these
+        // reflects the caller's own parameters — a tool schema it will not
+        // accept, a context overflow, a conflicting field.
+        Some(400 | 409 | 413 | 422) => (400, "invalid_request_error"),
+        // Not the caller's. The upstream model name and the endpoint path both
+        // come from the binding; a client can choose the mesh alias and nothing
+        // else. Telling it `invalid_request_error` sends it looking for a
+        // mistake in a request it cannot change, while the real fault — a
+        // misconfigured `?model=` or base URL — goes unreported.
+        Some(404 | 405) => (502, "server_error"),
+        Some(status @ 502..=504) => (status, "server_error"),
+        Some(_) => (502, "server_error"),
+        None if error.invalid_request => (400, "invalid_request_error"),
+        None => (500, "server_error"),
+    };
+    openai_error_payload(status, message, kind)
+}
+
+/// Report a failure that arrived after the response headers were already
+/// flushed. The status line is spent by then, so the only honest channel left
+/// is an SSE frame carrying the same error body a buffered request would get.
+fn write_sse_error(
+    writer: &bindings::tachyon::mesh::response_body::StreamingResponse,
+    model: &str,
+    error: bindings::tachyon::accelerator::cpu::GenerationError,
+) -> Result<(), String> {
+    let (_status, body) = generation_error_payload(model, error);
+    let frame = format!(
+        "data: {}\n\n",
+        String::from_utf8(body).unwrap_or_else(|_| "{}".to_owned())
+    );
+    writer
+        .write(frame.as_bytes())
+        .map_err(|e| format!("failed to write the streaming error frame: {e}"))?;
+    writer
+        .write(b"data: [DONE]\n\n")
+        .map_err(|e| format!("failed to write [DONE] frame: {e}"))
+}
+
 fn openai_error(
     status: u16,
     message: String,
@@ -874,6 +2035,74 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The registration route rewrites the whole row, so any field this struct
+    /// does not model is erased by the round-trip. When `source` was missing,
+    /// re-registering an alias stripped the manifest's ownership marker without
+    /// anyone overwriting anything deliberately — and the upload path, which
+    /// reads exactly that marker, then treated a configured alias as free.
+    #[test]
+    fn a_registry_row_round_trip_keeps_its_ownership_marker() {
+        let stored = br#"{
+            "alias": "shared",
+            "engine": "openai",
+            "vramRequiredMb": 0,
+            "status": "available",
+            "source": "config"
+        }"#;
+
+        let info: ModelInfo = serde_json::from_slice(stored).expect("row should parse");
+        assert!(info.is_config_owned());
+
+        let rewritten = serde_json::to_vec(&info).expect("row should re-encode");
+        let reparsed: ModelInfo = serde_json::from_slice(&rewritten).expect("row should re-parse");
+        assert!(
+            reparsed.is_config_owned(),
+            "a round-trip through this guest must not disown a configured alias"
+        );
+    }
+
+    #[test]
+    fn only_the_config_marker_claims_ownership() {
+        // Absent means an upload or a registration owns the row — the common
+        // case, and the one that must stay writable.
+        assert!(!registry_model("free", None).is_config_owned());
+
+        // An unrecognised value is not ownership either. Treating anything
+        // non-empty as owned would let a stray field freeze an alias.
+        let mut odd = registry_model("odd", None);
+        odd.source = Some("upload".to_owned());
+        assert!(!odd.is_config_owned());
+
+        let mut owned = registry_model("owned", None);
+        owned.source = Some(REGISTRY_SOURCE_CONFIG.to_owned());
+        assert!(owned.is_config_owned());
+    }
+
+    /// A row this guest writes must never claim the manifest's marker: the
+    /// upload path enforces the same rule from the other side, so a
+    /// registration that could set `source: "config"` would lock an alias
+    /// against uploads with no manifest entry backing it.
+    #[test]
+    fn a_registration_cannot_claim_manifest_ownership() {
+        let mut info: ModelInfo = serde_json::from_slice(
+            br#"{"alias":"claimed","engine":"gguf","vramRequiredMb":0,
+                 "status":"available","source":"config"}"#,
+        )
+        .expect("payload should parse");
+        assert!(info.is_config_owned(), "the request body did claim it");
+
+        // What the register route does before writing.
+        info.clear_ownership_marker();
+        assert!(!info.is_config_owned());
+
+        let encoded = serde_json::to_vec(&info).expect("row should encode");
+        let value: serde_json::Value = serde_json::from_slice(&encoded).expect("row should parse");
+        assert!(
+            value.get("source").is_none(),
+            "an unowned row omits the marker entirely rather than writing a null"
+        );
+    }
+
     #[test]
     fn chat_completions_rejects_a_malformed_request() {
         // A body with neither `model` nor `messages` is rejected during request
@@ -882,24 +2111,230 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// A tool-offering request naming `model`, with nothing else set — so the
+    /// only thing that can resolve a parser is the alias heuristic or the
+    /// registry.
+    fn tool_request_named(model: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.to_owned(),
+            messages: vec![ChatMessage::text("user", "hello")],
+            tools: vec![serde_json::json!({"type": "function"})],
+            tool_choice: None,
+            max_generation_ms: None,
+            tool_call_parser: None,
+            extra_body: None,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            stop: None,
+            stream: None,
+            stream_options: None,
+            response_format: None,
+        }
+    }
+
+    /// A reserved alias is unavailable, not a free name to load.
+    ///
+    /// `list_models()` filters withdrawn rows, so a reserved alias is absent
+    /// from the listing and from `resolve_registered_model`. The bare-name
+    /// fallback then read that absence as "the registry never heard of this"
+    /// and used the name as an alias — which, for the length of a reload swap,
+    /// ran the request against whichever runtime was sealed for the route
+    /// while `GET /ai/v1/models` reported the model as gone.
+    ///
+    /// The reservation lookup is injected here because it reads the raw row
+    /// through the host; the decision it feeds is what this pins down.
     #[test]
-    fn resolves_openai_model_id_to_registry_alias() {
-        let models = vec![ModelInfo {
-            alias: "nvidia--Qwen3.6-35B-A3B-NVFP4".to_owned(),
+    fn a_reserved_bare_alias_is_unavailable_rather_than_loadable() {
+        // Reserved: hidden from the listing, held by the registry.
+        assert_eq!(
+            resolve_requested_alias("qwen-coder", None, || true),
+            None,
+            "an alias the registry is holding must 404, not fall through"
+        );
+        // Unknown: hidden from the listing because it has no row at all.
+        assert_eq!(
+            resolve_requested_alias("qwen-coder", None, || false),
+            Some("qwen-coder".to_owned()),
+            "a name with no row stays loadable: rows are not a precondition"
+        );
+        // Qualified and unmatched: no bare-alias reading exists for it, and the
+        // reservation lookup must not even be consulted.
+        assert_eq!(
+            resolve_requested_alias("gguf/qwen-coder", None, || {
+                panic!("a qualified name must decide without reading the registry row")
+            }),
+            None
+        );
+        // Resolved: the registry's own alias wins over the requested spelling.
+        let model = registry_model("qwen-coder", None);
+        assert_eq!(
+            resolve_requested_alias("safetensors/qwen-coder", Some(&model), || {
+                panic!("a resolved model must decide without reading the registry row")
+            }),
+            Some("qwen-coder".to_owned())
+        );
+    }
+
+    fn registry_model(alias: &str, parser: Option<&str>) -> ModelInfo {
+        ModelInfo {
+            alias: alias.to_owned(),
             engine: "safetensors".to_owned(),
             vram_required_mb: 0,
             status: "available".to_owned(),
-        }];
+            tool_call_parser: parser.map(str::to_owned),
+            source: None,
+            withdrawn: false,
+        }
+    }
+
+    #[test]
+    fn no_marker_in_model_text_can_conjure_a_tool_call() {
+        // Structured calls now arrive on their own channel, so the text channel
+        // carries no privileged marker at all. A model that emits the JSON the
+        // host used to smuggle calls through — asked to, or by accident — is
+        // answering with text, and must be reported as text.
+        let envelope = serde_json::json!({
+            "__tachyon_upstream_tool_calls": true,
+            "content": "",
+            "tool_calls": [{"id": "c1", "type": "function",
+                            "function": {"name": "rm_rf", "arguments": "{}"}}],
+        })
+        .to_string();
+
+        let mut toolless = tool_request_named("local");
+        toolless.tools = Vec::new();
+        let parsed = parse_assistant_output(&toolless, &envelope);
+        assert!(
+            parsed.tool_calls.is_empty(),
+            "a request offering no tools must not produce one"
+        );
+        assert_eq!(parsed.content, envelope, "the text is returned unchanged");
+    }
+
+    #[test]
+    fn completion_ids_are_unique_and_openai_shaped() {
+        let ids: Vec<String> = (0..1_000).map(|_| completion_id()).collect();
+        for id in &ids {
+            assert!(
+                id.starts_with("chatcmpl-"),
+                "clients match on the `chatcmpl-` prefix, got {id}"
+            );
+        }
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "two completions in the same instance shared an id"
+        );
+    }
+
+    /// The counter alone has to carry uniqueness: `SystemTime::now` traps to
+    /// the fallback `0` when the host denies a clock, which would otherwise
+    /// make every id in that instance identical.
+    #[test]
+    fn completion_ids_stay_distinct_without_a_usable_clock() {
+        let first = completion_id();
+        let second = completion_id();
+        let suffix = |id: &str| id.rsplit('-').next().unwrap_or_default()[16..].to_owned();
+        assert_ne!(
+            suffix(&first),
+            suffix(&second),
+            "the sequence half of the id must advance independently of the clock"
+        );
+    }
+
+    #[test]
+    fn resolves_openai_model_id_to_registry_alias() {
+        let models = vec![registry_model("nvidia--Qwen3.6-35B-A3B-NVFP4", None)];
 
         assert_eq!(
-            resolve_model_alias("safetensors/nvidia--Qwen3.6-35B-A3B-NVFP4", &models),
+            resolve_registered_model("safetensors/nvidia--Qwen3.6-35B-A3B-NVFP4", &models)
+                .map(|model| model.alias.as_str()),
             Some("nvidia--Qwen3.6-35B-A3B-NVFP4")
         );
         assert_eq!(
-            resolve_model_alias("nvidia--Qwen3.6-35B-A3B-NVFP4", &models),
+            resolve_registered_model("nvidia--Qwen3.6-35B-A3B-NVFP4", &models)
+                .map(|model| model.alias.as_str()),
             Some("nvidia--Qwen3.6-35B-A3B-NVFP4")
         );
-        assert_eq!(resolve_model_alias("unknown", &models), None);
+        assert!(resolve_registered_model("unknown", &models).is_none());
+    }
+
+    /// A registry row with an unknown dialect must not take the model out of
+    /// the listing: the field is an optimization, the row is the model's
+    /// existence.
+    #[test]
+    fn an_unknown_registry_parser_is_ignored_rather_than_fatal() {
+        let row = serde_json::json!({
+            "alias": "local-coder",
+            "engine": "gguf",
+            "vramRequiredMb": 0,
+            "status": "available",
+            "toolCallParser": "some-future-dialect",
+        });
+        let model: ModelInfo =
+            serde_json::from_value(row).expect("an unknown dialect must not fail the row");
+
+        let mut request = tool_request_named("local-coder");
+        request.adopt_registry_parser(Some(&model));
+        assert_eq!(request.resolved_tool_call_parser(), None);
+    }
+
+    /// The regression this whole seam exists for: a Qwen checkpoint whose alias
+    /// says nothing about it. Before, `parser_from_model` found no "qwen" in
+    /// `local-coder` and the model's `<tool_call>` blocks came back as prose.
+    #[test]
+    fn a_neutrally_named_model_still_gets_its_parser_from_the_registry() {
+        let mut request = tool_request_named("local-coder");
+        assert_eq!(
+            request.resolved_tool_call_parser(),
+            None,
+            "the alias heuristic cannot classify this name — that is the bug"
+        );
+
+        request.adopt_registry_parser(Some(&registry_model("local-coder", Some("qwen"))));
+        assert_eq!(
+            request.resolved_tool_call_parser(),
+            Some(ToolCallParser::Qwen)
+        );
+    }
+
+    /// Precedence: an explicit request field outranks the registry, so a client
+    /// that knows better than the checkpoint's own metadata keeps control.
+    #[test]
+    fn an_explicit_parser_outranks_the_registry() {
+        let mut request = tool_request_named("local-coder");
+        request.tool_call_parser = Some(ToolCallParser::Mistral);
+        request.adopt_registry_parser(Some(&registry_model("local-coder", Some("qwen"))));
+        assert_eq!(
+            request.resolved_tool_call_parser(),
+            Some(ToolCallParser::Mistral)
+        );
+
+        let mut via_extra_body = tool_request_named("local-coder");
+        via_extra_body.extra_body = Some(ExtraBody {
+            tool_call_parser: Some(ToolCallParser::Json),
+            max_generation_ms: None,
+        });
+        via_extra_body.adopt_registry_parser(Some(&registry_model("local-coder", Some("qwen"))));
+        assert_eq!(
+            via_extra_body.resolved_tool_call_parser(),
+            Some(ToolCallParser::Json)
+        );
+    }
+
+    /// A request that offers no tools never needs a parser, whatever the
+    /// registry says — the filter in `resolved_tool_call_parser` still applies.
+    #[test]
+    fn a_registry_parser_does_not_apply_to_a_toolless_request() {
+        let mut request = tool_request_named("local-coder");
+        request.tools = Vec::new();
+        request.adopt_registry_parser(Some(&registry_model("local-coder", Some("qwen"))));
+        assert_eq!(request.resolved_tool_call_parser(), None);
     }
 
     #[test]
@@ -914,6 +2349,7 @@ mod tests {
             ],
             tools: Vec::new(),
             tool_choice: None,
+            max_generation_ms: None,
             tool_call_parser: None,
             extra_body: None,
             max_tokens: None,
@@ -922,13 +2358,18 @@ mod tests {
             seed: None,
             stop: None,
             stream: None,
+            stream_options: None,
+            response_format: None,
         };
         let payload: serde_json::Value =
             serde_json::from_str(&build_generation_request(&request).expect("encode"))
                 .expect("valid json");
         assert_eq!(payload["messages"][0]["role"], "system");
         assert_eq!(payload["messages"][1]["content"], "hello");
-        assert_eq!(payload["max_new_tokens"], DEFAULT_MAX_TOKENS);
+        // Omitted, not defaulted: substituting a number here would override the
+        // budget the binding advertises — an upstream binding configured for
+        // long completions would silently truncate at this guest's default.
+        assert!(payload.get("max_new_tokens").is_none());
         // Optional params are omitted when unset, so the host applies its own.
         assert!(payload.get("top_p").is_none());
         assert!(payload.get("seed").is_none());
@@ -942,6 +2383,7 @@ mod tests {
             messages: vec![ChatMessage::text("user", "hi")],
             tools: Vec::new(),
             tool_choice: None,
+            max_generation_ms: None,
             tool_call_parser: None,
             extra_body: None,
             max_tokens: Some(32),
@@ -950,6 +2392,8 @@ mod tests {
             seed: Some(7),
             stop: Some(StopField::One("\n\n".to_owned())),
             stream: None,
+            stream_options: None,
+            response_format: None,
         };
         let payload: serde_json::Value =
             serde_json::from_str(&build_generation_request(&request).expect("encode"))
@@ -970,6 +2414,7 @@ mod tests {
                 "function": { "name": "get_weather" }
             })],
             tool_choice: Some(serde_json::json!("auto")),
+            max_generation_ms: None,
             tool_call_parser: None,
             extra_body: None,
             max_tokens: None,
@@ -978,6 +2423,8 @@ mod tests {
             seed: None,
             stop: None,
             stream: None,
+            stream_options: None,
+            response_format: None,
         };
         let payload: serde_json::Value =
             serde_json::from_str(&build_generation_request(&request).expect("encode"))
@@ -986,6 +2433,259 @@ mod tests {
         assert_eq!(payload["tools"][0]["function"]["name"], "get_weather");
         assert_eq!(payload["tool_choice"], "auto");
         assert_eq!(payload["tool_call_parser"], "qwen_coder");
+    }
+
+    #[test]
+    fn a_json_object_response_format_forwards_the_permissive_object_schema() {
+        // `json_object` names no schema, and forwarding nothing made it a
+        // silent no-op: the client asked for JSON and got prose, with no error
+        // anywhere to say the mode had been ignored. "Any object" is the whole
+        // of what the mode promises, and the host's compiler expresses exactly
+        // that for a schema with no declared properties.
+        let format = |body: &str| {
+            let request: ChatCompletionRequest = serde_json::from_str(body).expect("valid request");
+            let payload: serde_json::Value =
+                serde_json::from_str(&build_generation_request(&request).expect("encode"))
+                    .expect("valid json");
+            payload["json_schema"].clone()
+        };
+
+        assert_eq!(
+            format(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                    "response_format":{"type":"json_object"}}"#
+            ),
+            serde_json::json!(r#"{"type":"object"}"#)
+        );
+        // `text` is the one format that constrains nothing.
+        assert_eq!(
+            format(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                    "response_format":{"type":"text"}}"#
+            ),
+            serde_json::Value::Null
+        );
+        // An explicit schema still wins: it is the more specific statement.
+        assert_eq!(
+            format(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                    "response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"a":{"type":"integer"}}}}}}"#
+            ),
+            serde_json::json!(r#"{"properties":{"a":{"type":"integer"}},"type":"object"}"#)
+        );
+    }
+
+    /// A standard multimodal turn must survive the guest untouched.
+    ///
+    /// `content: Option<String>` narrowed the OpenAI message shape, and the
+    /// narrowing was reachable: an array of parts failed *deserialization*, so
+    /// the request never reached the host's opaque forwarding and a valid
+    /// request came back as HTTP 500 — even against an upstream that reads it.
+    #[test]
+    fn a_multimodal_message_reaches_the_host_unchanged() {
+        let body = br#"{"model":"m","messages":[{"role":"user","content":[
+            {"type":"text","text":"what is this?"},
+            {"type":"image_url","image_url":{"url":"https://example.invalid/a.png"}}
+        ],"x-provider-hint":"vision"}]}"#;
+        let request: ChatCompletionRequest =
+            serde_json::from_slice(body).expect("a multimodal turn is a valid request");
+        let payload: serde_json::Value =
+            serde_json::from_str(&build_generation_request(&request).expect("encode"))
+                .expect("valid json");
+
+        let content = &payload["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(
+            content[1]["image_url"]["url"], "https://example.invalid/a.png",
+            "the parts reach the host in the shape the client sent: {payload}"
+        );
+        // And a field this route does not model is carried rather than
+        // dropped: it is the client's and the upstream's business.
+        assert_eq!(payload["messages"][0]["x-provider-hint"], "vision");
+
+        // The ordinary string form still round-trips as a string, not as an
+        // object wrapping one.
+        let plain: ChatCompletionRequest =
+            serde_json::from_slice(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+                .expect("valid request");
+        let payload: serde_json::Value =
+            serde_json::from_str(&build_generation_request(&plain).expect("encode"))
+                .expect("valid json");
+        assert_eq!(payload["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn a_json_schema_format_without_a_schema_is_refused() {
+        // Dropping the constraint is the one outcome a caller cannot detect: it
+        // asked for schema-conforming data, got prose, and has nothing telling
+        // it the difference — so whatever it parses next treats arbitrary text
+        // as structured.
+        let (status, body) = route_request(
+            "POST",
+            ROUTE_CHAT_COMPLETIONS,
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                 "response_format":{"type":"json_schema","json_schema":{"name":"x"}}}"#,
+        )
+        .expect("a malformed format is a request error, not a host failure");
+        assert_eq!(status, 400);
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(payload["error"]["type"], "invalid_request_error");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("json_schema.schema")),
+            "the error should name the missing field: {payload}"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_response_format_type_is_refused() {
+        // A misspelling used to fall through to unconstrained inference and a
+        // 200. The caller stated a format, so answering as though it had not is
+        // the same silent no-op the missing-schema refusal exists to prevent.
+        let (status, body) = route_request(
+            "POST",
+            ROUTE_CHAT_COMPLETIONS,
+            br#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                 "response_format":{"type":"json-Object"}}"#,
+        )
+        .expect("an unsupported format is a request error, not a host failure");
+        assert_eq!(status, 400);
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(payload["error"]["type"], "invalid_request_error");
+        assert!(
+            payload["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("json-Object")),
+            "the error should quote what was sent: {payload}"
+        );
+
+        // Checked before the schema, so a misspelling is refused even when one
+        // rides along and would otherwise have been honoured.
+        let format = |body: &str| {
+            serde_json::from_str::<ResponseFormat>(body)
+                .expect("valid json")
+                .schema_source()
+        };
+        assert!(format(r#"{"type":"bogus","json_schema":{"schema":{"type":"object"}}}"#).is_err());
+        // And a recognised type still lets an explicit schema win, which is
+        // what makes `json_object` with a schema precise rather than permissive.
+        assert_eq!(
+            format(
+                r#"{"type":"json_object","json_schema":{"schema":{"type":"object","properties":{"a":{"type":"integer"}}}}}"#
+            ),
+            Ok(Some(
+                r#"{"properties":{"a":{"type":"integer"}},"type":"object"}"#.to_owned()
+            ))
+        );
+        assert_eq!(format(r#"{"type":"text"}"#), Ok(None));
+    }
+
+    #[test]
+    fn a_stream_usage_request_reaches_the_host_envelope() {
+        // Providers emit streamed usage only when the option is present, so
+        // without carrying the intent the host had nothing to read and the
+        // trailing usage chunk this client asked for never arrived.
+        let with = |body: &str| {
+            let request: ChatCompletionRequest = serde_json::from_str(body).expect("valid request");
+            let payload: serde_json::Value =
+                serde_json::from_str(&build_generation_request(&request).expect("encode"))
+                    .expect("valid json");
+            payload["include_usage"].clone()
+        };
+
+        assert_eq!(
+            with(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+                    "stream":true,"stream_options":{"include_usage":true}}"#
+            ),
+            serde_json::json!(true)
+        );
+        // Absent unless asked: the field is one an upstream may reject, and a
+        // client that never requested usage gains nothing from that risk.
+        assert_eq!(
+            with(r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#),
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn a_call_the_request_never_offered_is_not_exposed() {
+        let request =
+            |tools: serde_json::Value, choice: Option<serde_json::Value>| ChatCompletionRequest {
+                model: "qwen-coder".to_owned(),
+                messages: vec![ChatMessage::text("user", "go")],
+                tools: tools.as_array().expect("array").clone(),
+                tool_choice: choice,
+                max_generation_ms: None,
+                tool_call_parser: None,
+                extra_body: None,
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
+                seed: None,
+                stop: None,
+                stream: None,
+                stream_options: None,
+                response_format: None,
+            };
+        let call = |name: &str| ToolCall {
+            id: "call_1".to_owned(),
+            kind: "function".to_owned(),
+            function: ToolCallFunction {
+                name: name.to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        };
+        let offered = serde_json::json!([
+            {"type": "function", "function": {"name": "read_file"}}
+        ]);
+
+        assert_eq!(
+            request(offered.clone(), None).unoffered_call(&[call("read_file")]),
+            None
+        );
+        // The whole point: a backend naming something else is answering a
+        // question nobody put, and on an `openai:` binding that backend is a
+        // third-party server the operator chose, not the client.
+        assert_eq!(
+            request(offered.clone(), None).unoffered_call(&[call("rm_rf")]),
+            Some("rm_rf")
+        );
+        // A pinned `tool_choice` is an offer in its own right — a request may
+        // name a call without repeating the list.
+        assert_eq!(
+            request(
+                serde_json::json!([]),
+                Some(serde_json::json!({"type":"function","function":{"name":"pinned"}}))
+            )
+            .unoffered_call(&[call("pinned")]),
+            None
+        );
+        // And it is the *whole* set, not an addition to it. Unioning the pin
+        // with every advertised name let a request pinned to `read_file` still
+        // accept the `delete_file` call it also listed — the opposite of what
+        // pinning asks for, in the more dangerous direction.
+        let pinned = request(
+            serde_json::json!([
+                {"type": "function", "function": {"name": "read_file"}},
+                {"type": "function", "function": {"name": "delete_file"}}
+            ]),
+            Some(serde_json::json!({"type":"function","function":{"name":"read_file"}})),
+        );
+        assert_eq!(pinned.unoffered_call(&[call("read_file")]), None);
+        assert_eq!(
+            pinned.unoffered_call(&[call("delete_file")]),
+            Some("delete_file"),
+            "a listed-but-not-pinned function is not what this request asked for"
+        );
+        // Nothing readable was offered, which is not evidence about what was in
+        // the set. Refusing everything there would break a client whose tool
+        // entries this side simply cannot parse a name out of.
+        assert_eq!(
+            request(serde_json::json!([{"type": "function"}]), None).unoffered_call(&[call("any")]),
+            None
+        );
     }
 
     #[test]
@@ -1014,6 +2714,488 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].id, "call_tachyon_0");
     }
 
+    /// Drive a gate with fragments, returning what it streamed as content and
+    /// what it held back for the buffered parser.
+    fn run_gate(parser: ToolCallParser, fragments: &[&str]) -> (String, String, usize) {
+        let mut gate = StreamingContentGate::new(parser);
+        let mut streamed = String::new();
+        for fragment in fragments {
+            if let Some(content) = gate.push(fragment) {
+                streamed.push_str(&content);
+            }
+        }
+        let (whole, sent) = gate.finish();
+        (streamed, whole, sent)
+    }
+
+    #[test]
+    fn streamed_content_equals_the_buffered_message_across_a_tool_call() {
+        // The streaming contract is that concatenating the content deltas
+        // yields the buffered message. The whitespace between prose and an
+        // opener is where the two used to diverge: the buffered parser removes
+        // the call region and trims, while the gate had already streamed the
+        // newline.
+        let (streamed, whole, _emitted) = run_gate(
+            ToolCallParser::Qwen,
+            &[
+                "Let me check.",
+                "\n",
+                "<tool_call>",
+                r#"{"name":"read_file","arguments":{}}"#,
+                "</tool_call>",
+            ],
+        );
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert_eq!(
+            parsed.tool_calls.len(),
+            1,
+            "the call must still be recovered"
+        );
+        assert_eq!(
+            streamed, parsed.content,
+            "streamed content must equal the buffered message, whitespace included"
+        );
+    }
+
+    #[test]
+    fn withheld_trailing_whitespace_is_released_when_no_call_follows() {
+        // The other side of the same rule: whitespace is only *deferred*, never
+        // dropped. With no call, the buffered parse returns the text unchanged
+        // and the caller's reconciliation emits whatever the gate still held.
+        let (streamed, whole, emitted) = run_gate(
+            ToolCallParser::Qwen,
+            &[
+                "Here it is, at some length so the opener hold is not the binding constraint.",
+                "\n\n",
+            ],
+        );
+        assert!(
+            !streamed.ends_with(char::is_whitespace),
+            "trailing whitespace is withheld while an opener could still follow, got {streamed:?}"
+        );
+        assert_eq!(
+            format!("{streamed}{}", whole.get(emitted..).unwrap_or_default()),
+            whole,
+            "streamed content plus the caller's tail must reconstruct the whole generation"
+        );
+    }
+
+    #[test]
+    fn host_reported_tool_calls_need_no_parser_selection() {
+        // A standard OpenAI client offers tools and passes no parser option;
+        // the model name implies none either. Structured calls arrive on their
+        // own channel, so no dialect has to be guessed for them to survive —
+        // which is what previously decided whether a call reached the client at
+        // all or arrived as literal prose.
+        let calls = adopt_host_tool_calls(vec![bindings::tachyon::accelerator::cpu::ToolCall {
+            id: Some("c1".to_owned()),
+            name: "read_file".to_owned(),
+            arguments: r#"{"path":"a.rs"}"#.to_owned(),
+        }]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].kind, "function");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"a.rs"}"#);
+    }
+
+    #[test]
+    fn a_host_tool_call_without_an_id_is_given_one() {
+        // The id is what a client echoes back on the tool-result turn, so an
+        // empty one makes the call impossible to answer.
+        let calls = adopt_host_tool_calls(vec![bindings::tachyon::accelerator::cpu::ToolCall {
+            id: None,
+            name: "f".to_owned(),
+            arguments: "{}".to_owned(),
+        }]);
+        assert_eq!(calls[0].id, "call_tachyon_0");
+    }
+
+    #[test]
+    fn a_host_supplied_call_does_not_let_the_parser_eat_the_prose() {
+        // A response carrying a real structured call *and* prose that merely
+        // looks like one. The parse's calls are discarded — the host's win —
+        // so its opinion of the content has to be discarded with it, or the
+        // regions it mistook for calls vanish from the stream while the
+        // buffered reply keeps them.
+        let whole = "Here is some JSON: {\"name\":\"lookup\",\"arguments\":{}}";
+        let parsed = ParsedAssistantOutput {
+            content: "Here is some JSON:".to_owned(),
+            tool_calls: vec![ToolCall {
+                id: "parsed".to_owned(),
+                kind: "function".to_owned(),
+                function: ToolCallFunction {
+                    name: "lookup".to_owned(),
+                    arguments: "{}".to_owned(),
+                },
+            }],
+        };
+
+        assert_eq!(
+            unsent_tail(whole, 0, &parsed, true),
+            whole,
+            "with the host supplying the calls, the raw text is the truth"
+        );
+
+        // And when the parse *is* what supplies them, its content still wins —
+        // that is the case the offset arithmetic exists for.
+        assert_eq!(
+            unsent_tail(whole, 0, &parsed, false),
+            parsed.content,
+            "a parser-recovered call still removes its own region"
+        );
+
+        // No calls anywhere: the exact byte cut, so leading whitespace the gate
+        // held back is not trimmed away.
+        let plain = ParsedAssistantOutput {
+            content: whole.to_owned(),
+            tool_calls: Vec::new(),
+        };
+        assert_eq!(unsent_tail(whole, 5, &plain, false), &whole[5..]);
+    }
+
+    #[test]
+    fn a_legacy_function_call_survives_the_message_history() {
+        // A client continuing a pre-`tool_calls` conversation replays the
+        // assistant turn that made the call. With no field to land in it was
+        // dropped, so the upstream saw a `role: "function"` result with no
+        // request before it and answered as though it had never asked.
+        let raw = serde_json::json!({
+            "model": "coder",
+            "messages": [
+                {"role": "user", "content": "read it"},
+                {"role": "assistant", "content": null,
+                 "function_call": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}},
+                {"role": "function", "name": "read_file", "content": "fn main() {}"}
+            ]
+        });
+        let request: ChatCompletionRequest =
+            serde_json::from_value(raw).expect("a legacy history is a valid request");
+
+        let payload = build_generation_request(&request).expect("request builds");
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        let assistant = &payload["messages"][1];
+        assert_eq!(
+            assistant["function_call"]["name"], "read_file",
+            "the call the assistant made has to reach the host: {payload}"
+        );
+        // And the result stays paired with it, which is what makes the pair
+        // legible to a provider that still speaks this dialect.
+        assert_eq!(payload["messages"][2]["name"], "read_file");
+        assert_eq!(payload["messages"][2]["content"], "fn main() {}");
+    }
+
+    #[test]
+    fn a_requested_generation_budget_reaches_the_host() {
+        // Not an OpenAI field, so it used to be dropped: the host fell back to
+        // its own default and a client asking for a shorter leash waited out
+        // the long one. Accepted top level and via `extra_body`, because
+        // clients differ on where they keep nonstandard options.
+        let mut request = tool_request_named("qwen3-coder");
+        request.max_generation_ms = Some(5_000);
+        let payload = build_generation_request(&request).expect("request builds");
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(payload["max_generation_ms"], 5_000);
+
+        let mut via_extra = tool_request_named("qwen3-coder");
+        via_extra.extra_body = Some(ExtraBody {
+            tool_call_parser: None,
+            max_generation_ms: Some(7_000),
+        });
+        let payload = build_generation_request(&via_extra).expect("request builds");
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(payload["max_generation_ms"], 7_000);
+
+        // Omission stays omission, so the binding's own default still applies.
+        let payload =
+            build_generation_request(&tool_request_named("qwen3-coder")).expect("request builds");
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert!(payload.get("max_generation_ms").is_none());
+    }
+
+    #[test]
+    fn a_configured_endpoint_that_is_not_found_is_the_gateway_s_failure() {
+        // The upstream model name and the endpoint path both come from the
+        // binding. A client picks the mesh alias and nothing else, so
+        // `invalid_request_error` sends it hunting for a mistake in a request
+        // it cannot change while the real fault goes unreported.
+        let not_found = bindings::tachyon::accelerator::cpu::GenerationError {
+            message: "upstream said 404".to_owned(),
+            upstream_status: Some(404),
+            invalid_request: false,
+        };
+        let (status, _body) = generation_error_payload("coder", not_found);
+        assert_eq!(status, 502);
+
+        // A 400 really is about the forwarded parameters and stays the
+        // caller's.
+        let rejected = bindings::tachyon::accelerator::cpu::GenerationError {
+            message: "upstream said 400".to_owned(),
+            upstream_status: Some(400),
+            invalid_request: false,
+        };
+        let (status, _body) = generation_error_payload("coder", rejected);
+        assert_eq!(status, 400);
+    }
+
+    #[test]
+    fn tool_choice_none_withdraws_the_offer_the_tools_list_makes() {
+        // The schema's way of saying "you may see the tools, do not call them",
+        // and a nonempty list alongside it is how that is normally sent — so
+        // reading intent from the list alone armed the parser for exactly the
+        // request that asked it not to.
+        let mut request = tool_request_named("qwen3-coder");
+        request.tool_choice = Some(serde_json::json!("none"));
+        assert!(
+            !request.has_tool_intent(),
+            "`tool_choice: none` is an offer withdrawn, whatever the tools list says"
+        );
+        assert!(
+            request.resolved_tool_call_parser().is_none(),
+            "no parser may recover calls from prose for a request that ruled them out"
+        );
+
+        // A named function is the opposite instruction and must still arm it.
+        request.tool_choice = Some(serde_json::json!({
+            "type": "function",
+            "function": {"name": "read_file"}
+        }));
+        assert!(
+            request.has_tool_intent(),
+            "naming a function is a request for a call, not a withdrawal"
+        );
+    }
+
+    #[test]
+    fn a_truncated_tool_call_reports_length_not_tool_calls() {
+        // The dangerous case: the upstream ran out of budget mid-call, so the
+        // arguments are incomplete. Reporting `tool_calls` tells the client the
+        // call is ready to dispatch.
+        assert_eq!(resolve_finish_reason(Some("length"), true), "length");
+        assert_eq!(
+            resolve_finish_reason(Some("content_filter"), true),
+            "content_filter"
+        );
+        // A complete call still reports `tool_calls`, whether the host named it
+        // or the parser recovered it from the text.
+        assert_eq!(resolve_finish_reason(Some("stop"), true), "tool_calls");
+        assert_eq!(resolve_finish_reason(None, true), "tool_calls");
+        // Reported by the provider with nothing behind it. `has_tool_calls` is
+        // read from the same list that fills `message.tool_calls`, so `false`
+        // here means the client would be sent to an empty array and told to
+        // dispatch from it — an agent then waits on a call nobody made.
+        assert_eq!(resolve_finish_reason(Some("tool_calls"), false), "stop");
+        // And an ordinary completion is `stop`, including when nothing was
+        // reported at all.
+        assert_eq!(resolve_finish_reason(None, false), "stop");
+        assert_eq!(resolve_finish_reason(Some("length"), false), "length");
+    }
+
+    #[test]
+    fn an_upstream_status_is_relayed_rather_than_flattened_into_a_500() {
+        let rate_limited = bindings::tachyon::accelerator::cpu::GenerationError {
+            message: "upstream returned HTTP 429".to_owned(),
+            upstream_status: Some(429),
+            invalid_request: false,
+        };
+        let (status, body) = generation_error_payload("coder", rate_limited);
+        assert_eq!(status, 429, "a client's backoff depends on seeing the 429");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error body");
+        assert_eq!(payload["error"]["type"], "rate_limit_error");
+
+        // A rejected request is the caller's to fix, not to retry.
+        let (status, _) = generation_error_payload(
+            "coder",
+            bindings::tachyon::accelerator::cpu::GenerationError {
+                message: "upstream returned HTTP 400".to_owned(),
+                upstream_status: Some(400),
+                invalid_request: false,
+            },
+        );
+        assert_eq!(status, 400);
+
+        // An upstream credential failure is this node's misconfiguration, so it
+        // must not reach the caller as its own authentication problem.
+        let (status, _) = generation_error_payload(
+            "coder",
+            bindings::tachyon::accelerator::cpu::GenerationError {
+                message: "upstream returned HTTP 401".to_owned(),
+                upstream_status: Some(401),
+                invalid_request: false,
+            },
+        );
+        assert_eq!(status, 502);
+
+        // A local *host* failure has no remote status to relay and stays a 500.
+        let (status, _) = generation_error_payload(
+            "coder",
+            bindings::tachyon::accelerator::cpu::GenerationError {
+                message: "model alias `coder` is not loaded".to_owned(),
+                upstream_status: None,
+                invalid_request: false,
+            },
+        );
+        assert_eq!(status, 500);
+
+        // A local rejection of the caller's own parameters has no status
+        // either, and must not be reported as one: a 500 tells the client to
+        // retry a request that cannot succeed however many times it is sent.
+        let (status, body) = generation_error_payload(
+            "coder",
+            bindings::tachyon::accelerator::cpu::GenerationError {
+                message: "max_new_tokens 8192 exceeds the binding ceiling".to_owned(),
+                upstream_status: None,
+                invalid_request: true,
+            },
+        );
+        assert_eq!(status, 400);
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("error body");
+        assert_eq!(payload["error"]["type"], "invalid_request_error");
+    }
+
+    #[test]
+    fn streaming_gate_forwards_prose_and_withholds_a_tagged_tool_call() {
+        // The prose before the call must reach the client as it is generated —
+        // buffering everything would cost time-to-first-token on every request
+        // that merely offers tools.
+        let (streamed, whole, emitted) = run_gate(
+            ToolCallParser::Qwen,
+            &[
+                "Let me check.",
+                "\n<tool_",
+                "call>{\"name\":\"search\",\"arguments\":{}}</tool_call>",
+            ],
+        );
+        // Everything up to the opener except the whitespace separating the
+        // prose from it, which the buffered parser trims away — a streamed
+        // chunk cannot be un-sent, so it is withheld until the gate knows
+        // whether a call follows.
+        assert_eq!(streamed, "Let me check.");
+        // And `sent` counts exactly what went out — not the withheld newline.
+        // The handler decides that newline's fate once it has parsed the whole
+        // text: internal whitespace if prose follows the call, trimmed if not.
+        assert_eq!(emitted, streamed.len());
+        // The tag itself never leaks into the content stream.
+        assert!(!streamed.contains("<tool_call>"));
+        assert!(whole.contains("<tool_call>"));
+    }
+
+    #[test]
+    fn a_false_positive_json_gate_still_delivers_its_leading_whitespace() {
+        // An anchored gate trips at the first `{` even when the answer turns
+        // out to be ordinary JSON prose rather than a tool call. Nothing is
+        // streamed at that point, so `sent` must stay 0: it once advanced to
+        // the opener, and the handler then cut the tail there and dropped the
+        // leading whitespace the buffered response keeps.
+        let (streamed, whole, sent) = run_gate(ToolCallParser::Json, &["  {\"answer\"", ":1}"]);
+        assert!(streamed.is_empty(), "an anchored gate streams nothing");
+        assert_eq!(sent, 0, "nothing was sent, so nothing may be skipped");
+
+        // What the handler would emit as the tail, for a parse that found no
+        // calls: the whole text, whitespace included.
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Json);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert!(
+            parsed.tool_calls.is_empty(),
+            "`{{\"answer\":1}}` is prose, not a call"
+        );
+        let tail = whole.get(sent..).unwrap_or_default();
+        assert_eq!(
+            format!("{streamed}{tail}"),
+            parsed.content,
+            "streamed content must equal the buffered message, leading whitespace included"
+        );
+    }
+
+    #[test]
+    fn a_separator_before_a_call_is_restored_when_prose_follows_it() {
+        // The gate withholds the whitespace before an opener because the
+        // buffered parser trims it — but only when the call ends the message.
+        // With prose after the call that whitespace is *internal*, and the
+        // buffered parser keeps it, so the tail has to hand it back.
+        let (streamed, whole, sent) = run_gate(
+            ToolCallParser::Qwen,
+            &[
+                "Hi \n",
+                "<tool_call>",
+                r#"{"name":"search","arguments":{}}"#,
+                "</tool_call>",
+                "AFTER",
+            ],
+        );
+        assert_eq!(streamed, "Hi", "the separator is withheld, not sent");
+        assert_eq!(sent, 2, "`sent` counts what went out, not what was skipped");
+
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert_eq!(parsed.tool_calls.len(), 1, "the call is still recovered");
+        let consumed = whole.get(..sent).unwrap_or_default().trim_start().len();
+        let tail = parsed.content.get(consumed..).unwrap_or_default();
+        assert_eq!(
+            format!("{streamed}{tail}"),
+            parsed.content,
+            "`Hi \\nAFTER` buffered must not stream as `HiAFTER`"
+        );
+    }
+
+    #[test]
+    fn streaming_gate_matches_an_opener_split_across_fragments() {
+        // `<tool_` / `call>` arriving separately must still be caught, or the
+        // opening tag leaks into the transcript.
+        let (streamed, _, _) = run_gate(
+            ToolCallParser::Qwen,
+            &["hi ", "<tool_", "call>{\"name\":\"f\"}</tool_call>"],
+        );
+        // The space before the opener is trimmed by the buffered parser, so it
+        // is not streamed either.
+        assert_eq!(streamed, "hi");
+    }
+
+    #[test]
+    fn streaming_gate_streams_everything_when_no_tool_call_appears() {
+        let (streamed, whole, _) = run_gate(ToolCallParser::Qwen, &["all ", "plain ", "prose"]);
+        // The tail is held back until the stream ends; the handler flushes it
+        // from the parsed content afterwards.
+        assert!(whole.starts_with(&streamed));
+        assert_eq!(whole, "all plain prose");
+    }
+
+    #[test]
+    fn streaming_gate_withholds_an_anchored_json_call_entirely() {
+        // A `json` response is a tool call only when the *whole* output is one
+        // JSON value, so nothing may be streamed as content.
+        let (streamed, whole, emitted) = run_gate(
+            ToolCallParser::Json,
+            &["{\"tool_calls\":[{\"name\":", "\"search\"}]}"],
+        );
+        assert!(streamed.is_empty());
+        assert_eq!(emitted, 0);
+        assert!(whole.starts_with('{'));
+    }
+
+    #[test]
+    fn streaming_gate_does_not_anchor_on_a_brace_inside_prose() {
+        // A `{` mid-sentence cannot start a JSON tool call — the whole output
+        // would have to parse — so it must not stop content from streaming.
+        let (_, whole, _) = run_gate(ToolCallParser::Json, &["use ", "Vec<T> { .. } ", "here"]);
+        let mut gate = StreamingContentGate::new(ToolCallParser::Json);
+        gate.push(&whole);
+        assert!(!gate.tripped, "a brace inside prose must not trip the gate");
+    }
+
+    #[test]
+    fn streaming_gate_withholds_the_mistral_marker() {
+        let (streamed, _, _) = run_gate(
+            ToolCallParser::Mistral,
+            &["Checking\n", "[TOOL_CALLS] [{\"name\":\"fetch\"}]"],
+        );
+        assert_eq!(streamed, "Checking");
+    }
+
     #[test]
     fn mistral_parser_extracts_tool_calls_marker() {
         let output =
@@ -1032,6 +3214,7 @@ mod tests {
             messages: vec![ChatMessage::text("user", "hi")],
             tools: Vec::new(),
             tool_choice: None,
+            max_generation_ms: None,
             tool_call_parser: None,
             extra_body: None,
             max_tokens: None,
@@ -1040,6 +3223,8 @@ mod tests {
             seed: None,
             stop: None,
             stream: None,
+            stream_options: None,
+            response_format: None,
         };
         let parsed = parse_assistant_output(&request, r#"{"name":"search","arguments":{}}"#);
 

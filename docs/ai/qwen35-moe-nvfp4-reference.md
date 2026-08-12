@@ -43,14 +43,25 @@ selected experts, and adds the sigmoid-gated shared expert. Each expert is
 
 ## Reusable Candle inventory
 
-Candle 0.10 provides dense tensor operations, RMSNorm, Qwen 3 full-attention
+Candle provides dense tensor operations, RMSNorm, Qwen 3 full-attention
 building blocks, Qwen 3 MoE routing, fused MoE infrastructure, sampling,
-tokenization integration, and KV-cache examples. It does not provide the Qwen
-3.5 gated-delta hybrid architecture or ModelOpt mixed FP8/NVFP4 tensor mapping.
-Those remain Tachyon runtime responsibilities.
+tokenization integration, and KV-cache examples. It also provides the Qwen 3.5
+hybrid architecture itself — `candle_transformers::models::qwen3_5`, including
+`Qwen3_5GatedDeltaNet` and the recurrent gated delta rule. `qwen35_upstream.rs`
+executes on it: the local scalar reimplementation that used to sit beside it
+has been deleted, along with the parity test that compared the two. That test
+had never run — the GPU job has no checkpoint — so the equivalence was never
+demonstrated and cannot now be demonstrated that way.
 
-Production NVFP4 CUDA kernels are capability-gated to SM100 or newer. Older
-GPUs may use only bounded layer/operator fallback and must reject execution
+What remains a Tachyon responsibility is the ModelOpt mixed FP8/NVFP4 tensor
+mapping: reading the quantized-layer metadata and feeding upstream's modules
+the weights it expects.
+
+Whether the production NVFP4 CUDA kernels are reachable is `candle-nvfp4-kernels`'
+answer, not a compute capability Tachyon checks for itself. This page used to
+say SM100 or newer; candle #3831 removed that floor after establishing that
+nothing in the kernel needs FP4 tensor cores. A build that cannot reach the
+kernel may use only bounded layer/operator fallback, and must reject execution
 when configured host or accelerator memory limits would be exceeded.
 
 Sources:
@@ -75,16 +86,26 @@ fixtures.
 
 ## Fixture regeneration and qualification
 
-Run `scripts/export_qwen35_moe_fixtures.py` against a local trusted tiny model.
-The script uses `local_files_only=True` and never downloads CI artifacts. For
-the installed production checkpoint, set `TACHYON_QWEN35_MOE_NVFP4_DIR` and run
-the gated Rust profile test.
+For the installed production checkpoint, set `TACHYON_QWEN35_MOE_NVFP4_DIR` and
+run the gated tests in `qwen35_upstream.rs`. They are the only coverage the
+loader has: no synthetic checkpoint exercises it, so a run without that
+variable set skips them rather than substituting a weaker check.
+
+`scripts/export_qwen35_moe_fixtures.py` exported golden intermediate states and
+logits from a local trusted tiny model, for the scalar runtime's parity tests to
+compare against. Those tests were deleted with the runtime, so nothing reads its
+output today. The script is kept — it is the starting point for any future
+numeric validation against `transformers` — but running it currently produces a
+file no test consumes.
 
 Runtime controls:
 
-- `TACHYON_QWEN35_MAX_DENSE_OPERATOR_BYTES`: maximum dense fallback operator.
-- `TACHYON_QWEN35_WORKING_SET_BYTES`: bounded prepared-weight working set.
 - `TACHYON_MODEL_OPT_NVFP4_DIR`: generic ModelOpt parser probe.
+
+`TACHYON_QWEN35_MAX_DENSE_OPERATOR_BYTES` and `TACHYON_QWEN35_WORKING_SET_BYTES`
+bounded the scalar runtime's per-operator dequantization and its prepared-weight
+working set. Neither exists now: candle holds the weights, packed, and there is
+no working set to page. They are read by nothing, and setting them does nothing.
 
 Contract failures identify the layer, expert, projection, tensor, shape, or
 quantization assignment that must be corrected.

@@ -1,235 +1,184 @@
-use std::{ffi::c_void, ptr::NonNull};
+//! NVFP4 execution, delegated to `candle-nvfp4-kernels`.
+//!
+//! This module used to carry its own CUTLASS kernel and the build-script
+//! plumbing that compiled it (`src/ai_inference/cuda/nvfp4_cutlass.cu`, a
+//! `TACHYON_CUTLASS_INCLUDE_DIR` probe, a `tachyon_nvfp4_cuda_compiled` cfg).
+//! Candle now ships the kernel as a crate, beside the FP8, AWQ and GPTQ ones
+//! (candle #3824), so what remains here is the adapter: our capability
+//! vocabulary on one side, the upstream entry points on the other.
+//!
+//! This file is always compiled. `candle-nvfp4-kernels` comes in with
+//! `ai-inference`, with its own `cuda` feature *off*; `candle-cuda` is what
+//! turns it on. Without it `is_available()` answers `false` and every entry
+//! point reports the operator as unsupported, which is exactly what the
+//! missing CUTLASS headers used to produce — so a CPU build needs no `cfg` to
+//! stay honest, it just gets told no.
+
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, Result};
+use candle_core::{Device, Tensor};
 
-use super::{Nvfp4AcceleratorCapabilities, Nvfp4KernelKind, Nvfp4OutputDType};
+use super::Nvfp4KernelAvailability;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Nvfp4CudaLinearF32Params {
-    pub(crate) input: *const f32,
-    pub(crate) packed_weight: *const u8,
-    pub(crate) weight_scale_e4m3: *const u8,
-    pub(crate) tensor_scale: f32,
-    pub(crate) output: *mut f32,
-    pub(crate) m: i64,
-    pub(crate) n: i64,
-    pub(crate) k: i64,
-    pub(crate) stream: *mut c_void,
+/// The CUDA device every NVFP4 operator uploads to.
+///
+/// One per process rather than one per operator: `Device::new_cuda` opens a
+/// context, and a model has hundreds of operators that all want the same one.
+fn device() -> Option<&'static Device> {
+    static DEVICE: OnceLock<Option<Device>> = OnceLock::new();
+    DEVICE.get_or_init(|| Device::new_cuda(0).ok()).as_ref()
 }
 
-#[cfg(tachyon_nvfp4_cuda_compiled)]
-use std::os::raw::c_int;
-
-#[cfg(tachyon_nvfp4_cuda_compiled)]
-unsafe extern "C" {
-    fn tachyon_nvfp4_cutlass_is_available() -> c_int;
-    fn tachyon_nvfp4_cuda_dequantize_f32(
-        packed: *const u8,
-        block_scales_e4m3: *const u8,
-        tensor_scale: f32,
-        n_rows: i64,
-        n_cols: i64,
-        output: *mut f32,
-        stream: *mut c_void,
-    ) -> c_int;
-    fn tachyon_nvfp4_cuda_dequantize_bf16(
-        packed: *const u8,
-        block_scales_e4m3: *const u8,
-        tensor_scale: f32,
-        n_rows: i64,
-        n_cols: i64,
-        output: *mut u16,
-        stream: *mut c_void,
-    ) -> c_int;
-    fn tachyon_nvfp4_cutlass_linear_f32(params: Nvfp4CudaLinearF32Params) -> c_int;
-    fn tachyon_nvfp4_cutlass_linear_f32_host(
-        input: *const f32,
-        packed_weight: *const u8,
-        weight_scale_e4m3: *const u8,
-        tensor_scale: f32,
-        output: *mut f32,
-        m: i64,
-        n: i64,
-        k: i64,
-    ) -> c_int;
+/// An NVFP4 operator whose weight lives on the device.
+///
+/// The host entry points below re-upload the packed weight and its scales on
+/// every call, which for a `[rows, cols]` operator is megabytes per activation
+/// — far more traffic than the activation itself. The weight never changes, so
+/// this uploads it once at load and every later call moves only the tokens.
+pub(crate) struct Nvfp4DeviceLinear {
+    inner: candle_nvfp4_kernels::Nvfp4Linear,
+    cols: usize,
 }
 
-pub(crate) struct Nvfp4CudaBackend;
-
-impl Nvfp4CudaBackend {
-    #[cfg(tachyon_nvfp4_cuda_compiled)]
-    pub(crate) fn is_available() -> bool {
-        unsafe { tachyon_nvfp4_cutlass_is_available() == 1 }
+impl std::fmt::Debug for Nvfp4DeviceLinear {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Nvfp4DeviceLinear")
     }
+}
 
-    #[cfg(not(tachyon_nvfp4_cuda_compiled))]
-    pub(crate) fn is_available() -> bool {
-        false
-    }
-
-    pub(crate) fn capabilities() -> Nvfp4AcceleratorCapabilities {
-        if Self::is_available() {
-            Nvfp4AcceleratorCapabilities::native_fp4([
-                Nvfp4KernelKind::Dequantize,
-                Nvfp4KernelKind::Matmul,
-            ])
-        } else {
-            Nvfp4AcceleratorCapabilities::fallback_only()
+impl Clone for Nvfp4DeviceLinear {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            cols: self.cols,
         }
     }
+}
 
-    #[cfg(tachyon_nvfp4_cuda_compiled)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn launch_dequantize(
-        packed: NonNull<u8>,
-        block_scales_e4m3: NonNull<u8>,
-        tensor_scale: f32,
-        n_rows: usize,
-        n_cols: usize,
-        output: NonNull<c_void>,
-        output_dtype: Nvfp4OutputDType,
-        stream: *mut c_void,
-    ) -> Result<()> {
-        let n_rows = i64::try_from(n_rows)?;
-        let n_cols = i64::try_from(n_cols)?;
-        let status = match output_dtype {
-            Nvfp4OutputDType::F32 => unsafe {
-                tachyon_nvfp4_cuda_dequantize_f32(
-                    packed.as_ptr(),
-                    block_scales_e4m3.as_ptr(),
-                    tensor_scale,
-                    n_rows,
-                    n_cols,
-                    output.as_ptr().cast::<f32>(),
-                    stream,
-                )
-            },
-            Nvfp4OutputDType::BF16 => unsafe {
-                tachyon_nvfp4_cuda_dequantize_bf16(
-                    packed.as_ptr(),
-                    block_scales_e4m3.as_ptr(),
-                    tensor_scale,
-                    n_rows,
-                    n_cols,
-                    output.as_ptr().cast::<u16>(),
-                    stream,
-                )
-            },
-        };
-        cuda_status(status, "launch NVFP4 CUDA dequantization")
-    }
-
-    #[cfg(not(tachyon_nvfp4_cuda_compiled))]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn launch_dequantize(
-        _packed: NonNull<u8>,
-        _block_scales_e4m3: NonNull<u8>,
-        _tensor_scale: f32,
-        _n_rows: usize,
-        _n_cols: usize,
-        _output: NonNull<c_void>,
-        _output_dtype: Nvfp4OutputDType,
-        _stream: *mut c_void,
-    ) -> Result<()> {
-        Err(anyhow!(
-            "NVFP4 CUDA backend was enabled but native CUDA/CUTLASS kernels were not compiled"
-        ))
-    }
-
-    #[cfg(tachyon_nvfp4_cuda_compiled)]
-    pub(crate) unsafe fn launch_linear_f32(params: Nvfp4CudaLinearF32Params) -> Result<()> {
-        cuda_status(
-            unsafe { tachyon_nvfp4_cutlass_linear_f32(params) },
-            "launch NVFP4 CUDA/CUTLASS linear kernel",
-        )
-    }
-
-    #[cfg(not(tachyon_nvfp4_cuda_compiled))]
-    pub(crate) unsafe fn launch_linear_f32(_params: Nvfp4CudaLinearF32Params) -> Result<()> {
-        Err(anyhow!(
-            "NVFP4 CUDA backend was enabled but native CUDA/CUTLASS kernels were not compiled"
-        ))
-    }
-
-    #[cfg(tachyon_nvfp4_cuda_compiled)]
-    pub(crate) fn linear_f32_host(
-        input: &[f32],
+impl Nvfp4DeviceLinear {
+    /// Uploads one operator, or answers `None` when this build or this device
+    /// cannot execute FP4 — in which case the caller keeps the host path it
+    /// already had.
+    pub(crate) fn upload(
         packed_weight: &[u8],
         weight_scale_e4m3: &[u8],
         tensor_scale: f32,
         rows: usize,
         cols: usize,
-    ) -> Result<Vec<f32>> {
-        if input.len() != cols {
-            return Err(anyhow!(
-                "NVFP4 input has {} values, expected {cols}",
-                input.len()
-            ));
-        }
-        let mut output = vec![0.0f32; rows];
-        cuda_status(
-            unsafe {
-                tachyon_nvfp4_cutlass_linear_f32_host(
-                    input.as_ptr(),
-                    packed_weight.as_ptr(),
-                    weight_scale_e4m3.as_ptr(),
-                    tensor_scale,
-                    output.as_mut_ptr(),
-                    1,
-                    i64::try_from(rows)?,
-                    i64::try_from(cols)?,
-                )
-            },
-            "execute host-backed NVFP4 CUDA/CUTLASS linear",
-        )?;
-        Ok(output)
+    ) -> Option<Self> {
+        Self::upload_on(
+            device()?,
+            packed_weight,
+            weight_scale_e4m3,
+            tensor_scale,
+            rows,
+            cols,
+        )
     }
 
-    #[cfg(not(tachyon_nvfp4_cuda_compiled))]
-    pub(crate) fn linear_f32_host(
-        _input: &[f32],
-        _packed_weight: &[u8],
-        _weight_scale_e4m3: &[u8],
-        _tensor_scale: f32,
-        _rows: usize,
-        _cols: usize,
-    ) -> Result<Vec<f32>> {
-        Err(anyhow!(
-            "NVFP4 CUDA backend was enabled but native CUDA/CUTLASS kernels were not compiled"
-        ))
+    /// The same, onto a device the caller names — so an operator lands on the
+    /// device its activations already live on, rather than on whichever one
+    /// this process opened first.
+    pub(crate) fn upload_on(
+        device: &Device,
+        packed_weight: &[u8],
+        weight_scale_e4m3: &[u8],
+        tensor_scale: f32,
+        rows: usize,
+        cols: usize,
+    ) -> Option<Self> {
+        if !Nvfp4CudaBackend::is_available() {
+            return None;
+        }
+        let inner = candle_nvfp4_kernels::Nvfp4Linear::new(
+            packed_weight,
+            weight_scale_e4m3,
+            tensor_scale,
+            rows,
+            cols,
+            device,
+        )
+        .ok()?;
+        Some(Self { inner, cols })
+    }
+
+    /// The operator applied to a tensor already on the device.
+    ///
+    /// The entry point that costs nothing: no staging in, no staging out. A
+    /// caller whose activations are tensors should never reach for
+    /// [`Self::matmul`].
+    pub(crate) fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+        self.inner.forward(xs)
+    }
+
+    /// `tokens` host activations through the resident operator.
+    ///
+    /// For the scalar runtime, which holds its state in `Vec<f32>`: the weight
+    /// stays resident but the activations still cross the bus twice. That is
+    /// the cost of a host-side model, and it is why this exists beside
+    /// [`Self::forward`] rather than instead of it.
+    pub(crate) fn matmul(&self, inputs: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        let device = device().ok_or_else(|| anyhow!("NVFP4 CUDA device is no longer available"))?;
+        let inputs = Tensor::from_slice(inputs, (tokens, self.cols), device)
+            .map_err(|error| anyhow!("NVFP4 activation upload failed: {error}"))?;
+        self.forward(&inputs)
+            .and_then(|output| output.flatten_all()?.to_vec1::<f32>())
+            .map_err(|error| anyhow!("NVFP4 CUDA resident linear failed: {error}"))
     }
 }
 
-#[cfg(tachyon_nvfp4_cuda_compiled)]
-fn cuda_status(status: c_int, action: &str) -> Result<()> {
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(anyhow!("{action} failed with CUDA status {status}"))
-    }
-}
+pub(crate) struct Nvfp4CudaBackend;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::mem::{align_of, size_of};
-
-    #[test]
-    fn linear_params_are_ffi_stable() {
-        assert_eq!(
-            align_of::<Nvfp4CudaLinearF32Params>(),
-            align_of::<*const f32>()
-        );
-        assert!(size_of::<Nvfp4CudaLinearF32Params>() >= 72);
+impl Nvfp4CudaBackend {
+    /// Whether the NVFP4 kernel can be called from this build.
+    ///
+    /// Asked, never re-derived. Whatever the kernel requires of a device is
+    /// the kernel's to state — and it has already changed once: candle #3831
+    /// dropped the compute-capability 10.0 floor after establishing that
+    /// nothing in the kernel needs FP4 tensor cores. Any copy of that rule
+    /// kept on this side would now be wrong.
+    pub(crate) fn is_available() -> bool {
+        candle_nvfp4_kernels::is_available()
     }
 
-    #[test]
-    fn gated_cuda_capability_probe() {
-        if std::env::var("TACHYON_NVFP4_CUDA_SMOKE").as_deref() != Ok("1") {
-            return;
+    pub(crate) fn availability() -> Nvfp4KernelAvailability {
+        if Self::is_available() {
+            Nvfp4KernelAvailability::Reachable
+        } else {
+            Nvfp4KernelAvailability::Absent
         }
+    }
 
-        assert!(Nvfp4CudaBackend::is_available());
+    /// `tokens` activations through one NVFP4 operator, in a single launch.
+    ///
+    /// The last host-staging path, and the one every native call falls back to
+    /// when the operator could not be made resident. It re-sends the weight on
+    /// every call; that is the price of not holding device memory, and it is
+    /// why [`Nvfp4DeviceLinear`] exists above it.
+    ///
+    /// There is deliberately no single-activation sibling: one token is this
+    /// with `tokens = 1`, and a separate entry point is an invitation to reach
+    /// for the slow one by accident — which is exactly what the runtime used to
+    /// do, launching a kernel per token through a whole prefill.
+    pub(crate) fn linear_f32_host_batched(
+        inputs: &[f32],
+        packed_weight: &[u8],
+        weight_scale_e4m3: &[u8],
+        tensor_scale: f32,
+        rows: usize,
+        cols: usize,
+        tokens: usize,
+    ) -> Result<Vec<f32>> {
+        candle_nvfp4_kernels::linear_f32_host_batched(
+            inputs,
+            packed_weight,
+            weight_scale_e4m3,
+            tensor_scale,
+            rows,
+            cols,
+            tokens,
+        )
+        .map_err(|error| anyhow!("NVFP4 CUDA batched linear failed: {error}"))
     }
 }

@@ -1,23 +1,139 @@
-package tachyon:accelerator@1.1.0;
+package tachyon:accelerator@2.0.0;
+
+// Major, not minor, because `compute`, `embed`, `compute-stream` and
+// `token-stream.next` all changed shape: their error type became
+// `generation-error`, and `next` now yields a `stream-event` rather than a
+// string. Wasmtime resolves an import by semver *compatible* name, so shipping
+// this as 1.2.0 would have let a component built against 1.1.0 bind to it and
+// then fail instantiation with a structural type mismatch. A major bump makes
+// the break a clean unsatisfied import instead.
+//
+// The declaration stays on line 1: `check-compat` reads it with `head -n 1`.
 
 interface cpu {
-    /// A handle to an in-progress streaming generation. The caller pulls decoded
-    /// text fragments with `next` until it returns `none`, which signals that
-    /// generation is complete. Dropping the handle abandons the generation.
+    /// Token counts for one generation, in the shape OpenAI's `usage` object
+    /// reports them. Both are exact counts from the tokenizer and the decode
+    /// loop — never a re-tokenization of the output text, which would differ
+    /// from the sequence the model actually produced.
+    record token-usage {
+        prompt-tokens: u32,
+        completion-tokens: u32,
+    }
+
+    /// A failed generation.
+    ///
+    /// `upstream-status` is the HTTP status a remote provider returned, and is
+    /// present only when the failure *was* a remote response — never for a
+    /// local decode error, a transport failure, or a rejected request. A
+    /// gateway needs it to answer its own client honestly: without it every
+    /// provider failure collapses into one opaque string, so a 429 that the
+    /// client should back off from and a 400 it should fix are reported
+    /// identically, and typically as a server fault the client can only retry
+    /// blindly.
+    record generation-error {
+        message: string,
+        upstream-status: option<u16>,
+        /// The *caller's* request was rejected, before any backend ran it.
+        ///
+        /// Distinct from `upstream-status`, which says a remote provider
+        /// rejected it: a budget above the binding's ceiling, or a prompt that
+        /// cannot fit the context window, is refused locally and has no remote
+        /// status to relay. Without this flag such a failure is indistinguishable
+        /// from a host fault, so a gateway reports it as a retryable 500 and the
+        /// client retries a request that can never succeed.
+        invalid-request: bool,
+    }
+
+    /// One tool call a backend recognised as *structured* data rather than as
+    /// text inside the assistant message.
+    ///
+    /// Deliberately raw. `arguments` is the call's JSON argument object exactly
+    /// as the backend received it, and nothing here is in OpenAI's `tool_calls`
+    /// shape: the host knows what the model emitted, not what wire format its
+    /// caller speaks, and a caller that speaks a different one must not have to
+    /// undo an OpenAI encoding first.
+    record tool-call {
+        /// Provider-assigned call id, when there was one. Absent means the
+        /// caller mints its own — a local model naming a function has no id to
+        /// report, and a synthesised one must not be mistaken for the
+        /// provider's.
+        id: option<string>,
+        name: string,
+        arguments: string,
+    }
+
+    /// One item pulled off a streaming generation.
+    variant stream-event {
+        /// Decoded text for the assistant message.
+        content(string),
+        /// A tool call, complete. Tool calls arrive on this arm rather than
+        /// inside `content` so that offering tools costs nothing in
+        /// time-to-first-token: a backend that had to smuggle calls through the
+        /// text channel would have to withhold all content until it knew
+        /// whether a call was coming.
+        tool-call(tool-call),
+    }
+
+    /// A handle to an in-progress streaming generation. The caller pulls events
+    /// with `next` until it returns `none`, which signals that generation is
+    /// complete. Dropping the handle abandons the generation.
     resource token-stream {
-        /// Block until the next decoded text fragment is available. Returns
-        /// `none` once generation finishes, or an error string if it failed.
-        next: func() -> result<option<string>, string>;
+        /// Block until the next event is available. Returns `none` once
+        /// generation finishes.
+        next: func() -> result<option<stream-event>, generation-error>;
+        /// Token counts for this generation, available only after `next` has
+        /// returned `none`: the totals are not known until decoding ends, and
+        /// the last fragment has gone down the stream by then. Returns `none`
+        /// while the generation is still running, and for backends that cannot
+        /// count tokens (a mock, a vendor runner returning text over a pipe) —
+        /// so a caller omits `usage` rather than publishing zeros as if they
+        /// were measured.
+        usage: func() -> option<token-usage>;
+        /// Why generation stopped, on the same terms as `generation.finish-reason`
+        /// and with the same availability rule as `usage`: known only once
+        /// `next` has returned `none`. Without it a streamed completion that hit
+        /// the upstream's token limit is indistinguishable from one that
+        /// finished, and a caller reports `stop` for truncated code.
+        finish-reason: func() -> option<string>;
+    }
+
+    /// A completed buffered generation: the decoded text, and the token counts
+    /// when the backend could measure them.
+    record generation {
+        text: string,
+        usage: option<token-usage>,
+        /// Why generation stopped, when the backend knows: `stop`, `length`,
+        /// or whatever an upstream reported. Absent means "not reported" — a
+        /// caller then falls back to its own inference rather than being told
+        /// `stop` for an answer that was actually truncated.
+        finish-reason: option<string>,
+        /// Tool calls the backend recognised as structured data. Empty for a
+        /// backend that cannot distinguish them, in which case `text` is the
+        /// whole answer and any calls in it are the caller's to parse.
+        tool-calls: list<tool-call>,
+        /// A provider's structured safety refusal, when it sent one.
+        ///
+        /// Separate from `text` because that is the distinction it exists to
+        /// make: a refusal folded into the answer is an agent parsing "I can't
+        /// help with that" as data, and a refusal dropped entirely is
+        /// indistinguishable from a model that returned nothing. Always absent
+        /// for a local backend, which has no such concept.
+        refusal: option<string>,
     }
 
     load-model: func(name: string) -> result<u32, string>;
-    compute: func(model-id: u32, prompt: string) -> result<string, string>;
+    compute: func(model-id: u32, prompt: string) -> result<string, generation-error>;
+    /// `compute`, plus the token counts, the finish reason, and any structured
+    /// tool calls. Kept as a separate function rather than changing `compute`'s
+    /// return type, so every existing caller that only wants the text is
+    /// untouched.
+    compute-detailed: func(model-id: u32, prompt: string) -> result<generation, generation-error>;
     /// Compute a dense L2-normalized embedding for one input string with a
     /// model previously loaded by `load-model`.
-    embed: func(model-id: u32, input: string) -> result<list<f32>, string>;
+    embed: func(model-id: u32, input: string) -> result<list<f32>, generation-error>;
     /// Begin a streaming generation for a previously loaded model. The returned
-    /// `token-stream` yields decoded text fragments as the host produces them,
-    /// giving the caller real time-to-first-token instead of a buffered result.
-    /// The concatenation of every fragment equals the buffered `compute` output.
-    compute-stream: func(model-id: u32, prompt: string) -> result<token-stream, string>;
+    /// `token-stream` yields events as the host produces them, giving the caller
+    /// real time-to-first-token instead of a buffered result. The concatenation
+    /// of every `content` event equals the buffered `compute` output.
+    compute-stream: func(model-id: u32, prompt: string) -> result<token-stream, generation-error>;
 }

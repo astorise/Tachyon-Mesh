@@ -890,15 +890,19 @@ pub(crate) async fn forward_request_to_override(
     })?;
     let status = response.status();
     let response_headers = response.headers().clone();
-    let response_body = response.bytes().await.map_err(|error| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("failed to read override response body from `{destination}`: {error}"),
-        )
-    })?;
+    // Streamed through rather than read whole. `bytes()` waited for the peer to
+    // finish before this node sent anything, so a redirected SSE generation
+    // arrived as one blob at the end: time-to-first-token became total
+    // generation time, and an agentic client watching for deltas saw nothing
+    // until the answer was already complete. Mesh QoS redirects exactly the
+    // requests a node is too busy to serve, so this hit hardest when the
+    // stream mattered most.
+    //
+    // A buffered response streams just as correctly — one chunk — so this needs
+    // no branch on content type.
     let mut built = Response::builder()
         .status(status)
-        .body(Body::from(response_body))
+        .body(Body::from_stream(response.bytes_stream()))
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -987,14 +991,48 @@ pub(crate) fn requested_model_alias(
     resolve_requested_model_alias(route, body_alias)
 }
 
+/// The bare manifest alias a requested model id names, if any.
+///
+/// `GET /ai/v1/models` advertises `{engine}/{alias}` — `openai/qwen3-coder` —
+/// and `guest-openai` accepts either form, so a client that picked a model out
+/// of that listing sends the qualified id. Matching it against bare aliases
+/// alone therefore failed for exactly the clients doing the right thing, and on
+/// a multi-model route the caller fell back to the route's *first* binding:
+/// mesh QoS then watched an idle local queue while the upstream the request
+/// actually targeted was saturated.
+///
+/// The engine prefix is the part before the *first* slash, because that is
+/// where the id puts it. Taking the part after the last one instead truncated
+/// any alias that contains a slash — `gguf/Qwen/Qwen3-Coder` yielded
+/// `Qwen3-Coder`, which matches nothing, while the full string does not match
+/// either. A model named the way Hugging Face names them was therefore
+/// unreachable through the qualified id this route advertises for it.
+///
+/// The unqualified form is still tried first, so an alias that genuinely
+/// contains a slash wins before anything is stripped.
+fn model_alias_candidates(requested: &str) -> [&str; 2] {
+    let tail = requested
+        .split_once('/')
+        .map(|(_engine, alias)| alias)
+        .unwrap_or(requested);
+    [requested, tail]
+}
+
 fn resolve_requested_model_alias(route: &IntegrityRoute, alias: Option<String>) -> Option<String> {
     alias
-        .filter(|alias| {
-            route.models.is_empty()
-                || route
-                    .models
-                    .iter()
-                    .any(|binding| binding.alias.eq_ignore_ascii_case(alias))
+        .and_then(|alias| {
+            if route.models.is_empty() {
+                return Some(alias);
+            }
+            model_alias_candidates(&alias)
+                .into_iter()
+                .find_map(|candidate| {
+                    route
+                        .models
+                        .iter()
+                        .find(|binding| binding.alias.eq_ignore_ascii_case(candidate))
+                        .map(|binding| binding.alias.clone())
+                })
         })
         .or_else(|| {
             if route.models.len() == 1 {
@@ -1009,6 +1047,56 @@ fn resolve_requested_model_alias(route: &IntegrityRoute, alias: Option<String>) 
 mod requested_model_alias_tests {
     use super::*;
 
+    /// A model named the way Hugging Face names them stays reachable.
+    ///
+    /// The engine prefix is the part before the *first* slash, because that is
+    /// where `{engine}/{alias}` puts it. Stripping from the last slash instead
+    /// truncated any alias containing one, so `gguf/Qwen/Qwen3-Coder` produced
+    /// `Qwen3-Coder` — which matches nothing — while the full string matched
+    /// nothing either.
+    #[test]
+    fn a_qualified_id_keeps_the_slashes_inside_the_alias() {
+        assert_eq!(
+            model_alias_candidates("gguf/Qwen/Qwen3-Coder"),
+            ["gguf/Qwen/Qwen3-Coder", "Qwen/Qwen3-Coder"]
+        );
+        // The ordinary case is unchanged.
+        assert_eq!(
+            model_alias_candidates("gguf/coder"),
+            ["gguf/coder", "coder"]
+        );
+        // And an unqualified alias offers itself twice rather than inventing a
+        // second candidate.
+        assert_eq!(model_alias_candidates("coder"), ["coder", "coder"]);
+    }
+
+    /// The unqualified form is tried first, so an alias that really does
+    /// contain a slash wins before anything is stripped.
+    #[test]
+    fn an_alias_containing_a_slash_matches_before_any_prefix_is_removed() {
+        let route = IntegrityRoute {
+            path: "/ai".to_owned(),
+            models: vec![IntegrityModelBinding {
+                alias: "Qwen/Qwen3-Coder".to_owned(),
+                path: "/models/qwen".to_owned(),
+                device: ModelDevice::Cpu,
+                qos: RouteQos::Standard,
+                dynamic: false,
+                hardware_strategy: HardwareStrategy::default(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_requested_model_alias(&route, Some("Qwen/Qwen3-Coder".to_owned())),
+            Some("Qwen/Qwen3-Coder".to_owned())
+        );
+        assert_eq!(
+            resolve_requested_model_alias(&route, Some("gguf/Qwen/Qwen3-Coder".to_owned())),
+            Some("Qwen/Qwen3-Coder".to_owned()),
+            "the qualified id this route advertises has to resolve back to it"
+        );
+    }
+
     fn model_binding(alias: &str) -> IntegrityModelBinding {
         IntegrityModelBinding {
             alias: alias.to_owned(),
@@ -1018,6 +1106,62 @@ mod requested_model_alias_tests {
             dynamic: true,
             hardware_strategy: HardwareStrategy::default(),
         }
+    }
+
+    #[test]
+    fn an_engine_qualified_model_id_resolves_to_its_manifest_alias() {
+        // `GET /ai/v1/models` advertises `{engine}/{alias}`, so a client that
+        // picked a model out of the listing sends the qualified form. Failing
+        // to match it made a multi-model route fall back to its *first*
+        // binding, and mesh QoS then watched the wrong lane entirely.
+        let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
+        route.models = vec![model_binding("local-llama"), model_binding("qwen3-coder")];
+
+        assert_eq!(
+            resolve_requested_model_alias(&route, Some("openai/qwen3-coder".to_owned())).as_deref(),
+            Some("qwen3-coder")
+        );
+        // The bare form still works, and casing is still ignored.
+        assert_eq!(
+            resolve_requested_model_alias(&route, Some("QWEN3-Coder".to_owned())).as_deref(),
+            Some("qwen3-coder")
+        );
+        // A qualified id naming no binding stays unresolved rather than
+        // silently selecting the first one.
+        assert_eq!(
+            resolve_requested_model_alias(&route, Some("openai/not-here".to_owned())),
+            None
+        );
+    }
+
+    // `route_mesh_qos_profile` and `AcceleratorKind` only exist on an
+    // `ai-inference` build; the alias resolution above is general, so only this
+    // half of the pair is gated.
+    #[cfg(feature = "ai-inference")]
+    #[test]
+    fn the_qos_lane_follows_the_engine_qualified_model_a_client_asked_for() {
+        let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
+        let mut local = model_binding("local-llama");
+        local.device = ModelDevice::Cuda;
+        let mut upstream = model_binding("qwen3-coder");
+        upstream.path = "openai:http://127.0.0.1:8080/v1".to_owned();
+        // Non-dynamic, because that is what makes the path a destination: the
+        // broker overwrites a `dynamic` binding's path with the directory its
+        // upload landed in, so one written `openai:…` still runs locally. The
+        // shared fixture above is dynamic for the alias-resolution test, which
+        // needs no paths at all.
+        upstream.dynamic = false;
+        route.models = vec![local, upstream];
+
+        let requested =
+            resolve_requested_model_alias(&route, Some("openai/qwen3-coder".to_owned()));
+        let profile = route_mesh_qos_profile(&route, requested.as_deref())
+            .expect("a route with bindings has a profile");
+        assert_eq!(
+            profile.accelerator,
+            ai_inference::AcceleratorKind::Network,
+            "admission must watch the lane the request actually runs on, not the route's first binding"
+        );
     }
 
     #[test]
@@ -1076,8 +1220,23 @@ pub(crate) fn route_mesh_qos_profile(
                 .find(|binding| binding.alias.eq_ignore_ascii_case(alias))
         })
         .or_else(|| route.models.first())?;
+    // The lane the work actually queues on, not the device the binding
+    // declares. An `openai:` upstream runs on no local accelerator and is
+    // scheduled on `Network`; reading its declared `cpu`/`cuda` here made mesh
+    // admission watch an idle local queue while the network queue filled, so a
+    // saturated upstream never redirected a request to a healthier peer.
+    //
+    // `binding_runs_upstream` rather than the prefix: a `dynamic` binding's
+    // path is a placeholder the broker overwrites, so one written
+    // `openai:…` still runs its uploaded checkpoint locally, and calling that
+    // `Network` hid a real GPU queue from admission.
+    let accelerator = if ai_inference::binding_runs_upstream(binding) {
+        ai_inference::AcceleratorKind::Network
+    } else {
+        ai_inference::AcceleratorKind::from_model_device(&binding.device)
+    };
     Some(RouteMeshQosProfile {
-        accelerator: ai_inference::AcceleratorKind::from_model_device(&binding.device),
+        accelerator,
         qos: binding.qos,
     })
 }
@@ -2061,6 +2220,105 @@ pub(crate) async fn enforce_resource_admission(
     }))
 }
 
+/// Whether every model this route can run lives behind an `openai:` upstream.
+///
+/// Deliberately "every", not "the first": a route mixing an upstream with a
+/// local checkpoint still has something on the local device, and exempting it
+/// would let that model bypass the admission its neighbours obey. A route with
+/// no models at all is not upstream-only — it has nothing to be upstream about,
+/// and the ordinary path already ignores it.
+#[cfg(all(test, feature = "ai-inference"))]
+mod vram_admission_scope_tests {
+    use super::*;
+
+    fn route_with(paths: &[&str]) -> IntegrityRoute {
+        IntegrityRoute {
+            path: "/ai".to_owned(),
+            models: paths
+                .iter()
+                .map(|path| IntegrityModelBinding {
+                    alias: "coder".to_owned(),
+                    path: (*path).to_owned(),
+                    device: ModelDevice::Cpu,
+                    qos: RouteQos::Standard,
+                    dynamic: false,
+                    hardware_strategy: HardwareStrategy::default(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Local VRAM pressure says nothing about a route served from upstreams.
+    ///
+    /// Rejecting one with `vram-saturated` invents a failure: the provider is
+    /// healthy, the request would have succeeded, and the client is handed a
+    /// 503 naming a resource its request never touches.
+    #[test]
+    fn only_a_route_served_entirely_from_upstreams_skips_vram_admission() {
+        assert!(route_is_entirely_upstream(&route_with(&[
+            "openai:http://a.invalid/v1"
+        ])));
+        assert!(route_is_entirely_upstream(&route_with(&[
+            "openai:http://a.invalid/v1",
+            "openai:http://b.invalid/v1",
+        ])));
+
+        // One local checkpoint is enough to keep the check: exempting a mixed
+        // route would let that model bypass the admission its neighbours obey.
+        assert!(!route_is_entirely_upstream(&route_with(&[
+            "openai:http://a.invalid/v1",
+            "/models/local",
+        ])));
+        assert!(!route_is_entirely_upstream(&route_with(&["/models/local"])));
+
+        // A route with no models is not upstream-only — it has nothing to be
+        // upstream about, and the ordinary path already ignores it.
+        assert!(!route_is_entirely_upstream(&route_with(&[])));
+    }
+
+    /// A `dynamic` binding's path is a placeholder, not a destination.
+    ///
+    /// The broker overwrites it: `ensure_model_loaded` swaps it for the
+    /// directory the upload landed in, so the checkpoint runs locally on the
+    /// device the binding seals. Reading the `openai:` prefix alone therefore
+    /// exempted a route holding real VRAM from the refusal that protects it,
+    /// and pointed mesh QoS at an idle network lane while a GPU queue filled.
+    #[test]
+    fn a_dynamic_binding_is_local_however_its_path_reads() {
+        let mut route = route_with(&["openai:http://a.invalid/v1"]);
+        route.models[0].dynamic = true;
+        route.models[0].device = ModelDevice::Cuda;
+
+        assert!(
+            !route_is_entirely_upstream(&route),
+            "a dynamic binding runs its uploaded checkpoint locally, so the VRAM refusal applies"
+        );
+        assert_eq!(
+            route_mesh_qos_profile(&route, None).map(|profile| profile.accelerator),
+            Some(ai_inference::AcceleratorKind::Gpu),
+            "and it queues on the device it sealed, not on the network lane"
+        );
+
+        // The non-dynamic case is unchanged: that path *is* where requests go.
+        route.models[0].dynamic = false;
+        assert!(route_is_entirely_upstream(&route));
+        assert_eq!(
+            route_mesh_qos_profile(&route, None).map(|profile| profile.accelerator),
+            Some(ai_inference::AcceleratorKind::Network)
+        );
+    }
+}
+
+#[cfg(feature = "ai-inference")]
+fn route_is_entirely_upstream(route: &IntegrityRoute) -> bool {
+    // Not the `openai:` prefix: a `dynamic` binding carrying one still runs an
+    // uploaded checkpoint on a local device, so a route made entirely of those
+    // would have skipped the critical-VRAM refusal while holding the very VRAM
+    // the refusal exists to protect.
+    !route.models.is_empty() && route.models.iter().all(ai_inference::binding_runs_upstream)
+}
+
 /// Returns a rejection `RouteExecutionResult` when VRAM pressure is critical
 /// for routes that drive AI inference, or `None` to allow the request through.
 ///
@@ -2075,6 +2333,16 @@ pub(crate) fn enforce_vram_admission(
     state: &AppState,
     route: &IntegrityRoute,
 ) -> Option<RouteExecutionResult> {
+    // A route served entirely from upstreams holds no local VRAM, so local
+    // pressure says nothing about whether it can run. Rejecting it with
+    // `vram-saturated` invented a failure: the remote provider was healthy, the
+    // request would have succeeded, and the client got a 503 naming a resource
+    // its request never touches. Local models on the same route keep the check,
+    // which is why this asks about every binding rather than the first.
+    #[cfg(feature = "ai-inference")]
+    if route_is_entirely_upstream(route) {
+        return None;
+    }
     match state.memory_governor.vram_pressure() {
         memory_governor::MemoryPressure::Critical => {
             tracing::warn!(

@@ -327,6 +327,7 @@ fn append_chunk(uri: &str, chunk: &[u8]) -> Result<(), String> {
 
 fn commit_upload(uri: &str) -> Result<String, String> {
     ensure_dirs()?;
+    reclaim_discarded_backups();
     let upload_id = upload_id_from_uri(uri, COMMIT_PREFIX)?;
     let pending = load_pending_upload(&upload_id)?;
     if pending.bytes_received == 0 || pending.bytes_received > pending.size_bytes {
@@ -348,32 +349,347 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     // mmap, detect the on-disk format, and drop the host dispatch sidecar.
     let alias = model_alias(&pending);
     let model_dir = models_dir().join(&alias);
-    if model_dir.exists() {
-        fs::remove_dir_all(&model_dir).map_err(|error| {
+
+    // Unpack beside the live directory, never into it. An upload can still be
+    // refused after its bytes are on disk — publication rejects an alias a
+    // configured binding owns — and when that binding points at this same
+    // `models/<alias>` path, unpacking in place has already destroyed the
+    // operator's checkpoint by the time the refusal arrives. The registry row
+    // and the runtime alias survive that; the files do not, so the next load
+    // finds nothing. Staging keeps the live directory intact until the upload
+    // is accepted.
+    //
+    // Keyed by upload id so two uploads in flight cannot share a staging
+    // directory, and so a leftover from a crashed attempt belongs to a
+    // finished upload rather than blocking this one.
+    let incoming_dir = models_dir().join(format!(".incoming-{upload_id}"));
+    let backup_dir = models_dir().join(format!(".replaced-{upload_id}"));
+    let _ = fs::remove_dir_all(&incoming_dir);
+    // Held from before the first rename until after publication or rollback,
+    // so the ownership check below and the deletion it guards cannot be split
+    // by a second commit for this alias. Released on drop, including on every
+    // early return between here and the end of the function.
+    let commit_lock = AliasCommitLock::acquire(&alias, &upload_id)?;
+    reconcile_interrupted_commit(&model_dir, &backup_dir, &upload_id)?;
+    fs::create_dir_all(&incoming_dir)
+        .map_err(|error| format!("failed to create the staging model directory: {error}"))?;
+
+    let format = unpack_targz(&staging_path, &incoming_dir)
+        .and_then(|()| validate_extracted_file_manifest(&incoming_dir, &pending.files))
+        .and_then(|()| detect_format(&incoming_dir))
+        .and_then(|format| {
+            write_meta_sidecar(&incoming_dir, format, &alias, &upload_id).map(|()| format)
+        })
+        .inspect_err(|_error| {
+            // Nothing outside the staging directory has been touched yet, so a
+            // failure here costs the live checkpoint nothing.
+            let _ = fs::remove_dir_all(&incoming_dir);
+            cleanup_staging(&upload_id);
+        })?;
+
+    // The unpack above is the step that runs for minutes on a multi-gigabyte
+    // archive, and it is the reason a lock's age cannot stand in for its
+    // holder's health. Saying "still here" once it finishes keeps a slow but
+    // healthy commit from looking crashed to the next one.
+    commit_lock.refresh();
+
+    // Move the previous checkpoint aside rather than deleting it, so a refused
+    // publication can put it back exactly as it was.
+    let replaced = model_dir.exists();
+    if replaced {
+        fs::rename(&model_dir, &backup_dir).map_err(|error| {
+            let _ = fs::remove_dir_all(&incoming_dir);
+            cleanup_staging(&upload_id);
             format!(
-                "failed to replace existing model `{}`: {error}",
+                "failed to set aside the existing model `{}`: {error}",
                 model_dir.display()
             )
         })?;
     }
-    fs::create_dir_all(&model_dir)
-        .map_err(|error| format!("failed to create model directory: {error}"))?;
+    if let Err(error) = fs::rename(&incoming_dir, &model_dir) {
+        if replaced {
+            let _ = fs::rename(&backup_dir, &model_dir);
+        }
+        let _ = fs::remove_dir_all(&incoming_dir);
+        cleanup_staging(&upload_id);
+        return Err(format!(
+            "failed to install the uploaded model at `{}`: {error}",
+            model_dir.display()
+        ));
+    }
 
-    let format = unpack_targz(&staging_path, &model_dir)
-        .and_then(|()| validate_extracted_file_manifest(&model_dir, &pending.files))
-        .and_then(|()| detect_format(&model_dir))
-        .inspect_err(|_error| {
-            // The archive is unusable: drop the half-written directory and the
-            // staging slot so a retry starts clean.
+    // Published last, because this is the step that can still refuse the
+    // upload. On refusal the new files go and the previous checkpoint comes
+    // back, leaving the alias exactly as the manifest left it.
+    if let Err(error) = publish_model_uploaded(&alias, format, &model_dir, &pending.files) {
+        // Unwind only what is still ours. Two commits for the same alias can
+        // interleave: by the time this refusal arrives, a second upload may
+        // have moved our directory aside and installed its own. Removing the
+        // live directory blindly would delete a checkpoint its caller was told
+        // had installed, and dropping our backup on top would lose that one
+        // too — the sequence ends with both callers holding a failure and
+        // neither model live.
+        if installed_upload_id(&model_dir).as_deref() == Some(upload_id.as_str()) {
             let _ = fs::remove_dir_all(&model_dir);
+            if replaced {
+                let _ = fs::rename(&backup_dir, &model_dir);
+            }
             cleanup_staging(&upload_id);
-        })?;
-    write_meta_sidecar(&model_dir, format, &alias)?;
-    publish_model_uploaded(&alias, format, &model_dir, &pending.files)?;
+            return Err(error);
+        }
+        // Someone else owns the live path. Deleting is the irreversible half
+        // of a rollback and restoring is the destructive one, so do neither:
+        // leave the backup on disk and say where it is. An operator can put it
+        // back; nothing here can put it back correctly.
+        cleanup_staging(&upload_id);
+        if replaced {
+            return Err(format!(
+                "{error} (a concurrent upload now owns `{}`; this upload's previous checkpoint \
+                 was left at `{}` rather than restored over it)",
+                model_dir.display(),
+                backup_dir.display()
+            ));
+        }
+        return Err(error);
+    }
 
+    // Publication succeeded, so the backup is dead weight — and *which name it
+    // carries* is the durable record of that fact.
+    //
+    // Renamed before it is deleted, rather than deleted with a rename as the
+    // fallback. A crash in this window used to leave a `.replaced-` directory
+    // beside an already-published upload, and the retry could not tell that
+    // from a crash *before* publication: it rewound the live path to the
+    // predecessor, so a request arriving during the re-unpack could load the
+    // old files under the newly published alias, and a retry that then failed
+    // left the registry describing a checkpoint that was no longer there. The
+    // two states now have two different names.
+    //
+    // It also has to be a separate name from `.replaced-` for the older
+    // reason: the concurrent-upload path above deliberately leaves one behind
+    // for an operator to restore by hand, and a sweep that could not tell the
+    // two apart would delete exactly the one kept on purpose.
+    if replaced {
+        let discarded = models_dir().join(format!("{DISCARDED_BACKUP_PREFIX}{upload_id}"));
+        match fs::rename(&backup_dir, &discarded) {
+            Ok(()) => {
+                let _ = fs::remove_dir_all(&discarded);
+            }
+            // The rename is a single directory entry within one directory, so
+            // a failure here is unusual. Fall back to removing in place; the
+            // window it reopens is the one this rename exists to close, and
+            // leaving the directory would strand a whole checkpoint.
+            Err(_) => {
+                let _ = fs::remove_dir_all(&backup_dir);
+            }
+        }
+    }
     cleanup_staging(&upload_id);
 
     Ok(model_dir.to_string_lossy().to_string())
+}
+
+/// Directory prefix for a replaced checkpoint whose removal failed after its
+/// replacement went live. Leading dot, like the other internal names, so
+/// `validate_alias` can never let an upload claim one.
+const DISCARDED_BACKUP_PREFIX: &str = ".discarded-";
+
+/// Delete backups an earlier commit finished with but could not remove.
+///
+/// Nothing is renamed into this namespace until its upload has fully succeeded
+/// and something else owns the live path, so a sweep here cannot take a
+/// checkpoint anyone is still counting on.
+fn reclaim_discarded_backups() {
+    let Ok(entries) = fs::read_dir(models_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(DISCARDED_BACKUP_PREFIX))
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// How long a commit lock may sit untouched before a later commit takes it.
+///
+/// Generous on purpose: a commit unpacks and hashes a multi-gigabyte archive
+/// while holding this, so a limit tuned for a small upload would let a slow but
+/// healthy one be stolen from underneath itself. The only thing this bounds is
+/// how long an alias stays wedged after a crash.
+const ALIAS_LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Serializes the install / publish / rollback sequence for one alias.
+///
+/// Every step of that sequence is atomic on its own, and the sequence is not:
+/// the rollback checks that the live directory still carries this upload's id
+/// and *then* deletes it. Between those two operations a second commit for the
+/// same alias can rename ours aside and install its own — so the rollback
+/// deleted a checkpoint whose caller had been told it installed, restored a
+/// predecessor over it, and the second commit went on to publish successfully
+/// for files that no longer existed. No arrangement of individually-atomic
+/// filesystem calls closes that; only holding the alias does.
+///
+/// The lock is a file created with `create_new`, which is atomic, and released
+/// on drop — including on every `?` and every early return in the commit path.
+#[derive(Debug)]
+struct AliasCommitLock {
+    path: PathBuf,
+    /// This holder's identity, written into the file and re-checked on drop.
+    owner: String,
+}
+
+impl AliasCommitLock {
+    fn path(alias: &str) -> PathBuf {
+        models_dir().join(format!(".commit-{alias}.lock"))
+    }
+
+    /// Take the lock for `alias`, stamped with `owner`.
+    ///
+    /// The stamp is what makes both halves of this safe. Age alone is not:
+    /// nothing refreshes an mtime while a commit unpacks a multi-gigabyte
+    /// archive, so a healthy slow commit looked crashed — and the original
+    /// owner's `Drop` then deleted the *replacement's* lock, admitting a third
+    /// commit and recreating exactly the interleaving the lock exists to stop.
+    fn acquire(alias: &str, owner: &str) -> Result<Self, String> {
+        let path = Self::path(alias);
+        for _ in 0..2 {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    file.write_all(owner.as_bytes()).map_err(|error| {
+                        format!("failed to stamp the commit lock for model `{alias}`: {error}")
+                    })?;
+                    return Ok(Self {
+                        path,
+                        owner: owner.to_owned(),
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Held: by a commit still running, which is the whole point,
+                    // or by one that died, which must not wedge the alias
+                    // forever.
+                    let held_for = fs::metadata(&path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|at| std::time::SystemTime::now().duration_since(at).ok());
+                    if !held_for.is_some_and(|age| age >= ALIAS_LOCK_STALE_AFTER) {
+                        return Err(format!(
+                            "another commit for model `{alias}` is in progress; retry once it \
+                             finishes"
+                        ));
+                    }
+                    // Claimed by *moving* it aside rather than deleting it in
+                    // place: a rename within one directory is atomic, so of two
+                    // commits reclaiming the same stale lock exactly one
+                    // succeeds and the loser sees the winner's fresh lock on the
+                    // retry below.
+                    let claimed = models_dir().join(format!(".commit-{alias}.stale-{owner}"));
+                    if fs::rename(&path, &claimed).is_ok() {
+                        let _ = fs::remove_file(&claimed);
+                    }
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "failed to take the commit lock for model `{alias}`: {error}"
+                    ))
+                }
+            }
+        }
+        Err(format!(
+            "could not take the commit lock for model `{alias}`: another commit reclaimed it first"
+        ))
+    }
+
+    /// Prove the holder is still alive, at a point where the next step is long.
+    ///
+    /// The cheap half of a heartbeat: a guest is request-driven and has no
+    /// thread to tick from, but it can say "still here" at the boundaries of
+    /// the steps that actually take minutes, which is what keeps a healthy slow
+    /// commit from looking crashed.
+    fn refresh(&self) {
+        let _ = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .and_then(|mut file| file.write_all(self.owner.as_bytes()));
+    }
+
+    /// Whether this lock file is still the one this value took.
+    fn still_ours(&self) -> bool {
+        fs::read_to_string(&self.path).is_ok_and(|held| held == self.owner)
+    }
+}
+
+impl Drop for AliasCommitLock {
+    fn drop(&mut self) {
+        // Only ever our own. Deleting unconditionally meant a commit whose lock
+        // had been taken over went on to delete the successor's lock on its way
+        // out, letting a third commit in beside the second.
+        if self.still_ours() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Put the live path back the way a crashed attempt found it.
+///
+/// A commit renames twice — live checkpoint to `.replaced-{upload_id}`, then
+/// the staged upload onto the live path — and a crash between or just after
+/// them leaves a backup behind. Three states are distinguishable when a retry
+/// arrives, and each needs a different answer:
+///
+/// - **Nothing on the live path.** The crash landed between the renames. Put
+///   the backup back. This one was already handled: opening by *deleting* the
+///   backup meant a retry that was then refused had nothing to restore, and
+///   the operator's checkpoint was gone for good.
+/// - **Our own files on the live path.** The crash landed after the second
+///   rename, before publication accepted or refused them. Both directories
+///   exist, so the case above does not fire — and deleting the backup here
+///   discarded the operator's checkpoint while leaving an *unpublished* upload
+///   live. A refusal on the retry could then only roll back to the rejected
+///   upload. Our half-installed files are the disposable half: the staging
+///   archive still holds them and the retry re-unpacks them anyway, so rewind
+///   to the state the first attempt started from and let it redo the sequence.
+/// - **Somebody else's files on the live path.** What the concurrent-upload
+///   path deliberately parks for an operator, and what a crash another upload
+///   then committed over also leaves. Neither directory is safe to touch:
+///   deleting the backup loses the checkpoint it was kept for, restoring it
+///   destroys a model somebody was told had installed. Refusing names the two
+///   paths that need a decision.
+///
+/// Past this point the live directory is either whole or absent, which is what
+/// the rest of the commit assumes.
+fn reconcile_interrupted_commit(
+    model_dir: &Path,
+    backup_dir: &Path,
+    upload_id: &str,
+) -> Result<(), String> {
+    if !backup_dir.exists() {
+        return Ok(());
+    }
+    if model_dir.exists() {
+        if installed_upload_id(model_dir).as_deref() != Some(upload_id) {
+            return Err(format!(
+                "model upload `{upload_id}` cannot commit: an earlier attempt's checkpoint is \
+                 parked at `{}` while `{}` is owned by another upload; restore or remove the \
+                 parked directory before retrying",
+                backup_dir.display(),
+                model_dir.display()
+            ));
+        }
+        let _ = fs::remove_dir_all(model_dir);
+    }
+    fs::rename(backup_dir, model_dir).map_err(|error| {
+        format!(
+            "failed to restore the checkpoint an interrupted upload left in `{}`: {error}",
+            backup_dir.display()
+        )
+    })?;
+    let _ = fs::remove_dir_all(backup_dir);
+    Ok(())
 }
 
 /// The model directory / registry name: the caller-supplied alias, or the bare
@@ -616,14 +932,65 @@ fn file_starts_with_gguf_magic(path: &Path) -> bool {
 }
 
 /// Write the host dispatch sidecar declaring the detected format.
-fn write_meta_sidecar(dir: &Path, format: &str, alias: &str) -> Result<(), String> {
-    let body = serde_json::to_vec(&serde_json::json!({
+fn write_meta_sidecar(
+    dir: &Path,
+    format: &str,
+    alias: &str,
+    upload_id: &str,
+) -> Result<(), String> {
+    // Carried over from the archive's own sidecar, if it brought one. This is
+    // the documented escape hatch for a checkpoint whose chat template does not
+    // match how it was actually fine-tuned to emit calls — a Qwen Coder build
+    // whose template says `<tool_call>` while the model speaks a different
+    // dialect, say. Rewriting the sidecar from scratch threw the uploader's
+    // declaration away, and the loss is silent: tool calls simply come back as
+    // prose, which reads like the model choosing not to call anything.
+    //
+    // The *value* is relayed unvalidated — the host checks it against the
+    // dialects the guest implements and warns on anything else, and a second
+    // allowlist here would be one more place to forget a new one. Its *type* is
+    // not: the host reads this file into `ModelMeta { tool_call_parser:
+    // Option<String> }`, so a non-string fails that deserialization and takes
+    // the whole sidecar with it — `format` and `alias` included. The upload
+    // would commit, publish, and then be unloadable, which is a worse outcome
+    // than losing one optional hint.
+    //
+    // Dropped rather than refused: the sidecar is an escape hatch, and failing
+    // an otherwise valid checkpoint over a malformed optional field would trade
+    // a silent loss for a loud one nobody asked for. The host's own warning
+    // still fires for a string naming an unknown dialect.
+    let declared_parser = fs::read(dir.join(MODEL_META_JSON))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+        .and_then(|meta| meta.get("tool_call_parser").cloned())
+        .filter(|parser| parser.is_string());
+    let mut body = serde_json::json!({
         "format": format,
         "alias": alias,
-    }))
-    .map_err(|error| format!("failed to encode model metadata sidecar: {error}"))?;
+        // Who installed this directory. The host ignores unknown sidecar keys,
+        // so this costs it nothing and buys the rollback below the one fact it
+        // cannot otherwise have: whether the checkpoint sitting at the live
+        // path is still the one this upload put there.
+        "upload_id": upload_id,
+    });
+    if let (Some(parser), Some(object)) = (declared_parser, body.as_object_mut()) {
+        object.insert("tool_call_parser".to_owned(), parser);
+    }
+    let body = serde_json::to_vec(&body)
+        .map_err(|error| format!("failed to encode model metadata sidecar: {error}"))?;
     fs::write(dir.join(MODEL_META_JSON), body)
         .map_err(|error| format!("failed to write model metadata sidecar: {error}"))
+}
+
+/// The upload that installed the checkpoint at `dir`, when it says.
+///
+/// `None` covers a directory with no sidecar, an unreadable one, and one
+/// written before this key existed — all of which mean the same thing to the
+/// only caller: do not assume this directory is yours.
+fn installed_upload_id(dir: &Path) -> Option<String> {
+    let raw = fs::read(dir.join(MODEL_META_JSON)).ok()?;
+    let meta: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    meta.get("upload_id")?.as_str().map(str::to_owned)
 }
 
 /// Reject aliases that are not a single safe path component.
@@ -815,6 +1182,211 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An uploader's tool-call dialect survives the sidecar rewrite.
+    ///
+    /// It is the documented escape hatch for a checkpoint whose chat template
+    /// does not match how it was fine-tuned to emit calls, and rewriting the
+    /// sidecar from scratch threw it away. The loss is silent: calls come back
+    /// as prose, which reads exactly like a model choosing not to call
+    /// anything.
+    #[test]
+    fn an_uploaded_tool_call_parser_survives_the_sidecar_rewrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "tachyon-broker-sidecar-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("fixture dir");
+
+        // The archive brought its own declaration.
+        fs::write(
+            dir.join(MODEL_META_JSON),
+            br#"{"format":"gguf","tool_call_parser":"qwen_coder"}"#,
+        )
+        .expect("uploaded sidecar");
+
+        write_meta_sidecar(&dir, "gguf", "coder", "up-1").expect("sidecar rewrite");
+        let raw = fs::read(dir.join(MODEL_META_JSON)).expect("read back");
+        let meta: serde_json::Value = serde_json::from_slice(&raw).expect("valid JSON");
+        assert_eq!(meta["tool_call_parser"], "qwen_coder");
+        // The broker's own fields still win: they describe where the files
+        // actually landed.
+        assert_eq!(meta["alias"], "coder");
+        assert_eq!(meta["upload_id"], "up-1");
+
+        // A non-string declaration is dropped rather than relayed. The host
+        // reads this file into `ModelMeta { tool_call_parser: Option<String> }`,
+        // so relaying an object failed that deserialization and took the whole
+        // sidecar with it — `format` and `alias` included — leaving an upload
+        // that committed, published, and could not load.
+        fs::write(
+            dir.join(MODEL_META_JSON),
+            br#"{"format":"gguf","tool_call_parser":{"dialect":"qwen"}}"#,
+        )
+        .expect("uploaded sidecar");
+        write_meta_sidecar(&dir, "gguf", "coder", "up-3").expect("sidecar rewrite");
+        let raw = fs::read(dir.join(MODEL_META_JSON)).expect("read back");
+        let meta: serde_json::Value = serde_json::from_slice(&raw).expect("valid JSON");
+        assert!(
+            meta.get("tool_call_parser").is_none(),
+            "an unusable hint is worth less than a loadable checkpoint: {meta}"
+        );
+        assert_eq!(meta["format"], "gguf");
+        assert_eq!(meta["alias"], "coder");
+
+        // An archive with no declaration gets no key invented for it, so the
+        // host falls back to reading the chat template as it always did.
+        fs::remove_file(dir.join(MODEL_META_JSON)).expect("clear");
+        write_meta_sidecar(&dir, "gguf", "coder", "up-2").expect("sidecar rewrite");
+        let raw = fs::read(dir.join(MODEL_META_JSON)).expect("read back");
+        let meta: serde_json::Value = serde_json::from_slice(&raw).expect("valid JSON");
+        assert!(meta.get("tool_call_parser").is_none());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The two crash windows a retry has to tell apart.
+    #[test]
+    fn an_interrupted_commit_restores_the_checkpoint_it_displaced() {
+        let root = std::env::temp_dir().join(format!(
+            "tachyon-broker-reconcile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        let model_dir = root.join("coder");
+        let backup_dir = root.join(".replaced-up-1");
+        let plant = |dir: &Path, marker: &str, upload_id: Option<&str>| {
+            fs::create_dir_all(dir).expect("fixture dir");
+            fs::write(dir.join("weights.bin"), marker).expect("fixture file");
+            if let Some(upload_id) = upload_id {
+                fs::write(
+                    dir.join(MODEL_META_JSON),
+                    format!(r#"{{"format":"gguf","alias":"coder","upload_id":"{upload_id}"}}"#),
+                )
+                .expect("fixture sidecar");
+            }
+        };
+        let live = || fs::read_to_string(model_dir.join("weights.bin")).expect("live checkpoint");
+
+        // Crash between the renames: the checkpoint is parked and nothing is
+        // live. Deleting the backup here — which is what this used to do —
+        // left a refused retry with nothing to put back.
+        plant(&backup_dir, "operator", None);
+        reconcile_interrupted_commit(&model_dir, &backup_dir, "up-1").expect("recovers");
+        assert_eq!(live(), "operator");
+        assert!(!backup_dir.exists());
+
+        // Crash after the second rename: our own unpublished files are live
+        // *and* the checkpoint is parked. Both exist, so the case above does
+        // not fire, and deleting the backup discarded the operator's
+        // checkpoint while leaving an upload nothing had accepted.
+        plant(&backup_dir, "operator", None);
+        plant(&model_dir, "upload", Some("up-1"));
+        reconcile_interrupted_commit(&model_dir, &backup_dir, "up-1").expect("rewinds");
+        assert_eq!(
+            live(),
+            "operator",
+            "the retry must start from the state the first attempt found"
+        );
+        assert!(!backup_dir.exists());
+
+        // Someone else owns the live path. Neither directory is safe to touch,
+        // and the refusal names both so an operator can decide.
+        plant(&backup_dir, "operator", None);
+        plant(&model_dir, "other-upload", Some("up-2"));
+        let error = reconcile_interrupted_commit(&model_dir, &backup_dir, "up-1")
+            .expect_err("a live directory owned by another upload is not ours to move");
+        assert!(error.contains(".replaced-up-1"), "{error}");
+        assert_eq!(live(), "other-upload");
+        assert!(
+            backup_dir.exists(),
+            "the parked checkpoint is left for an operator"
+        );
+
+        // Nothing parked is the ordinary case and must stay a no-op.
+        fs::remove_dir_all(&backup_dir).expect("clear");
+        reconcile_interrupted_commit(&model_dir, &backup_dir, "up-1").expect("no-op");
+        assert_eq!(live(), "other-upload");
+
+        // A crash *after* publication is a different state, and it has a
+        // different name: the commit renames the backup into the discarded
+        // namespace before deleting it, so a retry that finds no `.replaced-`
+        // directory leaves the published checkpoint alone. Rewinding it would
+        // let a request load the predecessor under the newly published alias.
+        let discarded = root.join(format!("{DISCARDED_BACKUP_PREFIX}up-1"));
+        plant(&discarded, "operator", None);
+        plant(&model_dir, "published", Some("up-1"));
+        reconcile_interrupted_commit(&model_dir, &backup_dir, "up-1")
+            .expect("a discarded backup is not a pending rollback");
+        assert_eq!(
+            live(),
+            "published",
+            "a published upload must survive a retry"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two commits for one alias must not interleave.
+    ///
+    /// Every filesystem step in the install sequence is atomic on its own, and
+    /// the sequence is not: the rollback checks the live directory still
+    /// carries this upload's id and *then* deletes it. A second commit landing
+    /// between those two operations had its published checkpoint deleted by
+    /// the first one's rollback.
+    #[test]
+    fn a_commit_lock_excludes_a_second_commit_for_the_same_alias() {
+        let root = std::env::temp_dir().join(format!(
+            "tachyon-broker-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("fixture dir");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("enter fixture");
+        fs::create_dir_all(models_dir()).expect("models dir");
+
+        let held = AliasCommitLock::acquire("coder", "up-1").expect("a free alias locks");
+        let denied = AliasCommitLock::acquire("coder", "up-2")
+            .expect_err("a second commit for the same alias must wait, not interleave");
+        assert!(denied.contains("in progress"), "{denied}");
+
+        // A different alias is unaffected: the lock is per alias, not global.
+        let other =
+            AliasCommitLock::acquire("embedder", "up-3").expect("an unrelated alias is free");
+        drop(other);
+
+        // Released on drop, including on the early returns the commit path is
+        // full of.
+        drop(held);
+        let held = AliasCommitLock::acquire("coder", "up-4")
+            .expect("the alias frees when the commit ends");
+
+        // A holder whose lock was taken over must not delete its successor's.
+        // Simulating the takeover: the file now carries somebody else's stamp.
+        fs::write(AliasCommitLock::path("coder"), b"up-5").expect("successor stamp");
+        assert!(!held.still_ours());
+        drop(held);
+        assert_eq!(
+            fs::read_to_string(AliasCommitLock::path("coder")).expect("successor's lock survives"),
+            "up-5",
+            "a superseded holder must not unlock the alias on its way out"
+        );
+        fs::remove_file(AliasCommitLock::path("coder")).expect("clear");
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn model_upload_accepts_large_local_chunks() {

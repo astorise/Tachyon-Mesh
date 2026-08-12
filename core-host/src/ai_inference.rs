@@ -18,12 +18,17 @@ mod paged_kv;
 pub(crate) mod parallel;
 #[path = "ai_inference/pipeline_parallel_llama.rs"]
 pub(crate) mod pipeline_parallel_llama;
-#[path = "ai_inference/qwen35_moe_runtime.rs"]
-mod qwen35_moe_runtime;
+mod qwen35_profile;
+mod qwen35_upstream;
 #[path = "ai_inference/samplers.rs"]
 mod samplers;
 #[path = "ai_inference/tensor_parallel_llama.rs"]
 pub(crate) mod tensor_parallel_llama;
+#[path = "ai_inference/upstream_openai.rs"]
+mod upstream_openai;
+
+pub(crate) use candle_llm_runtime::{detect_tool_call_parser, TokenUsage};
+pub(crate) use upstream_openai::{assert_no_credential_collisions, UPSTREAM_SCHEME};
 #[path = "ai_inference/vendor_accelerator.rs"]
 mod vendor_accelerator;
 #[path = "ai_inference/vram_manager.rs"]
@@ -34,8 +39,6 @@ use candle_core::{
     bail as candle_bail, CpuStorage, CustomOp2, DType, Device, Layout, Shape,
     Tensor as CandleTensor,
 };
-#[cfg(test)]
-use std::time::Duration;
 use std::{
     any::Any,
     cmp::Ordering as CmpOrdering,
@@ -44,9 +47,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, Mutex, OnceLock, RwLock,
+        mpsc, Arc, Condvar, Mutex, OnceLock, RwLock,
     },
     thread,
+    time::Duration,
 };
 use tokio::sync::mpsc as tokio_mpsc;
 use wasmtime_wasi_nn::{
@@ -68,6 +72,184 @@ const ACCELERATOR_QUEUE_CAPACITY: usize = 256;
 const MODEL_BROKER_DIR_ENV: &str = "MODEL_BROKER_DIR";
 const MODEL_BROKER_ADAPTERS_DIR: &str = "adapters";
 const SAFETENSORS_EXTENSION: &str = "safetensors";
+/// How many upstream (`openai:`) round trips this node keeps in flight at once.
+/// Sized for a relay, not for an accelerator: the cost of an in-flight upstream
+/// request here is one blocking thread and one socket, and the real limit is the
+/// provider's own rate limit. Overridable per deployment.
+const DEFAULT_UPSTREAM_MAX_CONCURRENCY: usize = 32;
+/// The configured upstream concurrency, for callers that must size their own
+/// bounds against it rather than against a constant that drifts from it.
+pub(crate) fn upstream_max_concurrency() -> usize {
+    node_upstream_admission().capacity
+}
+const UPSTREAM_MAX_CONCURRENCY_ENV: &str = "TACHYON_UPSTREAM_MAX_CONCURRENCY";
+/// How long a caller waits for an upstream permit before the node sheds it.
+/// Bounded on purpose: an unbounded wait converts provider slowness into an
+/// ever-growing queue of held threads, and the caller would rather be told to
+/// retry (or be routed to a peer by the mesh QoS override) than sit behind a
+/// backlog it cannot see.
+const UPSTREAM_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounded admission gate for upstream (`openai:`) work.
+///
+/// Upstream bindings deliberately do not run on an [`AcceleratorScheduler`].
+/// The batch scheduler exists to amortise a GPU forward pass over co-batched
+/// sequences; an HTTP round trip gains nothing from batching and loses two
+/// things to it — the dispatcher thread is shared with every local model on the
+/// node, and the batch barrier makes each caller wait for the slowest peer in
+/// its batch. What upstream work does need is a cap on how much of it runs at
+/// once, which is what this gate is: a counting semaphore with a bounded wait,
+/// shared by the buffered, streaming, and embedding paths so the cap is a
+/// property of the node rather than of one entry point.
+struct UpstreamAdmission {
+    state: Mutex<UpstreamAdmissionState>,
+    released: Condvar,
+    capacity: usize,
+    /// How deep the queue for a permit may get before new callers are refused
+    /// outright instead of parked.
+    ///
+    /// `capacity` bounds the requests in flight; on its own it bounds nothing
+    /// else. A streaming caller has already spawned its dedicated OS thread by
+    /// the time it reaches [`Self::acquire`], so a burst against a full gate
+    /// parks an unbounded number of threads, each for up to
+    /// [`UPSTREAM_ADMISSION_TIMEOUT`], and exhausts thread stacks or the
+    /// process limit while only `capacity` requests are actually being served.
+    /// Refusing past this depth turns that into the overload error it always
+    /// was.
+    max_waiting: usize,
+}
+
+#[derive(Default)]
+struct UpstreamAdmissionState {
+    in_flight: usize,
+    /// Callers currently blocked on a permit. This — not `in_flight` — is the
+    /// node's upstream backlog, and it is what the mesh QoS admission check
+    /// reads for the `Network` lane: an in-flight request is being served, a
+    /// waiting one is work this node cannot start.
+    waiting: usize,
+}
+
+/// Queued callers allowed per permit before [`UpstreamAdmission::acquire`]
+/// refuses rather than parks. Four is a backlog a burst can drain within the
+/// admission timeout at any realistic upstream latency, without letting the
+/// parked-thread count run away from the work in flight.
+const UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT: usize = 4;
+
+/// The node's one upstream admission gate.
+///
+/// Built per runtime, the cap was a property of a *generation* rather than of
+/// the node. A hot reload constructs a new runtime while the previous one is
+/// still draining its requests, so for the length of that overlap each had its
+/// own gate and the node allowed twice the configured concurrency against the
+/// same upstream — which is precisely when a provider is least able to absorb
+/// it, since a reload is often what a saturated node is being restarted for.
+///
+/// Read from the environment once. A reload cannot change the cap, and that is
+/// the honest behaviour: the value bounds sockets held by this process, so
+/// re-reading it mid-flight would leave permits outstanding against a limit
+/// nothing had counted them under.
+fn node_upstream_admission() -> Arc<UpstreamAdmission> {
+    static GATE: OnceLock<Arc<UpstreamAdmission>> = OnceLock::new();
+    Arc::clone(GATE.get_or_init(|| Arc::new(UpstreamAdmission::from_env())))
+}
+
+impl UpstreamAdmission {
+    fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            state: Mutex::new(UpstreamAdmissionState::default()),
+            released: Condvar::new(),
+            capacity,
+            // Deep enough that a normal burst still queues and is served —
+            // refusing a caller that would have waited a moment is its own kind
+            // of failure — and shallow enough that the parked threads stay a
+            // multiple of the work actually in flight.
+            max_waiting: capacity.saturating_mul(UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT),
+        }
+    }
+
+    fn from_env() -> Self {
+        let capacity = std::env::var(UPSTREAM_MAX_CONCURRENCY_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_UPSTREAM_MAX_CONCURRENCY);
+        Self::new(capacity)
+    }
+
+    /// Blocks until a permit is free, or until [`UPSTREAM_ADMISSION_TIMEOUT`]
+    /// elapses. The permit is held for the whole upstream interaction — for a
+    /// stream, that is the lifetime of the stream, not just its first byte.
+    fn acquire(&self) -> Result<UpstreamPermit<'_>, String> {
+        let mut state = self.state.lock().expect("upstream admission lock poisoned");
+        if state.in_flight >= self.capacity {
+            if state.waiting >= self.max_waiting {
+                return Err(format!(
+                    "upstream request queue is saturated ({} in flight, {} already queued, limit \
+                     {}): retry, or raise `{UPSTREAM_MAX_CONCURRENCY_ENV}`",
+                    state.in_flight, state.waiting, self.capacity
+                ));
+            }
+            state.waiting += 1;
+            let deadline = std::time::Instant::now() + UPSTREAM_ADMISSION_TIMEOUT;
+            loop {
+                if state.in_flight < self.capacity {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    state.waiting -= 1;
+                    return Err(format!(
+                        "upstream request queue is saturated ({} in flight, limit {}): retry, or raise `{UPSTREAM_MAX_CONCURRENCY_ENV}`",
+                        state.in_flight, self.capacity
+                    ));
+                }
+                let (next, _) = self
+                    .released
+                    .wait_timeout(state, remaining)
+                    .expect("upstream admission lock poisoned");
+                state = next;
+            }
+            state.waiting -= 1;
+        }
+        state.in_flight += 1;
+        Ok(UpstreamPermit { gate: self })
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("upstream admission lock poisoned");
+        state.in_flight = state.in_flight.saturating_sub(1);
+        drop(state);
+        self.released.notify_one();
+    }
+
+    fn waiting(&self) -> usize {
+        self.state
+            .lock()
+            .expect("upstream admission lock poisoned")
+            .waiting
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.state
+            .lock()
+            .expect("upstream admission lock poisoned")
+            .in_flight
+    }
+}
+
+/// Releases its permit on drop, so an upstream error, a panic, or an early
+/// `?` return cannot leak capacity.
+struct UpstreamPermit<'a> {
+    gate: &'a UpstreamAdmission,
+}
+
+impl Drop for UpstreamPermit<'_> {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InferenceExecutionTelemetry {
@@ -91,6 +273,23 @@ fn record_execution(alias: impl Into<String>, executed_on: impl Into<String>, su
     }
 }
 
+/// Whether requests for this binding actually leave the node.
+///
+/// The `openai:` prefix alone does not decide it. A `dynamic` binding's path is
+/// a placeholder the broker overwrites: `ensure_model_loaded` swaps it for the
+/// directory the upload landed in, so the checkpoint runs *locally*, on the
+/// device the binding seals, whatever the manifest wrote there.
+///
+/// This module already drew that line for credential collisions. Mesh QoS and
+/// VRAM admission each re-derived it from the path alone, and so classified
+/// such a binding as `Network`: its real CPU or GPU queue became invisible to
+/// admission, and a route made entirely of them skipped the critical-VRAM
+/// refusal while running local checkpoints on a saturated device. One predicate
+/// now, so the three answers cannot drift again.
+pub(crate) fn binding_runs_upstream(binding: &IntegrityModelBinding) -> bool {
+    !binding.dynamic && binding.path.trim().starts_with(UPSTREAM_SCHEME)
+}
+
 pub(crate) fn inference_execution_telemetry() -> Vec<InferenceExecutionTelemetry> {
     INFERENCE_TELEMETRY
         .get_or_init(|| Mutex::new(Vec::new()))
@@ -106,11 +305,24 @@ pub(crate) enum AcceleratorKind {
     Gpu,
     Npu,
     Tpu,
+    /// Not a local accelerator: the queue for work executed by another process
+    /// entirely (an `openai:` upstream binding).
+    ///
+    /// It has its own scheduler because its cost profile is nothing like a
+    /// local lane's. An upstream request holds its dispatcher slot for a
+    /// network round trip — up to the binding's timeout — while consuming no
+    /// local compute. Sharing the CPU lane would let one slow remote server
+    /// stall every CPU-resident model on the node.
+    Network,
 }
 
 impl AcceleratorKind {
-    const ALL: [Self; 4] = [Self::Cpu, Self::Gpu, Self::Npu, Self::Tpu];
+    const ALL: [Self; 5] = [Self::Cpu, Self::Gpu, Self::Npu, Self::Tpu, Self::Network];
 
+    /// `Network` is deliberately unreachable here: it is chosen by the backend
+    /// that claimed a binding, never declared by an operator. `device` on an
+    /// upstream binding describes the *remote* server, which this node does not
+    /// schedule.
     pub(crate) fn from_model_device(device: &crate::ModelDevice) -> Self {
         match device {
             crate::ModelDevice::Cpu => Self::Cpu,
@@ -126,6 +338,7 @@ impl AcceleratorKind {
             Self::Gpu => "gpu",
             Self::Npu => "npu",
             Self::Tpu => "tpu",
+            Self::Network => "network",
         }
     }
 }
@@ -248,19 +461,371 @@ impl SharedInputTensor {
     }
 }
 
+/// One inference result: the decoded output bytes, plus the token counts when
+/// the backend could measure them.
+///
+/// `usage` is `None` rather than zero for a backend that cannot count (a mock,
+/// a vendor runner returning text over a pipe). The distinction is load-bearing
+/// downstream: a zero `usage` claims the generation cost nothing, which a
+/// client doing context-window accounting will believe.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InferenceOutput {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) usage: Option<TokenUsage>,
+    /// Why generation stopped, when the backend knows. `None` means "not
+    /// reported": the caller then infers one rather than being handed `stop`
+    /// for a completion the upstream actually truncated at its token limit,
+    /// which is the difference between running generated code and rejecting
+    /// it.
+    pub(crate) finish_reason: Option<String>,
+    /// Tool calls the backend recognised as structured data. Empty for a
+    /// backend that only produces text — a local model emitting a
+    /// `[TOOL_CALLS]` envelope leaves this empty and the envelope in `bytes`,
+    /// because recognising it is a property of the model's chat template, which
+    /// the caller resolves and the backend does not.
+    pub(crate) tool_calls: Vec<ToolCall>,
+    /// A provider's structured safety refusal, when it sent one.
+    ///
+    /// Its own field rather than folded into `bytes`, because that is exactly
+    /// the distinction it exists to make: a refusal read as content is an
+    /// agent parsing "I can't help with that" as data. Always `None` for a
+    /// local backend, which has no such concept.
+    pub(crate) refusal: Option<String>,
+}
+
+impl InferenceOutput {
+    /// A local backend's buffered result.
+    ///
+    /// `finish_reason` comes from the decode loop rather than being left
+    /// `None`: a generation that spent its whole `max_new_tokens` budget is
+    /// truncated, and `guest-openai` resolves an absent reason to `stop`. So a
+    /// local completion cut off mid-function used to be reported as having
+    /// finished normally, while the same request against an upstream reported
+    /// `length` — the client could avoid running incomplete code on one
+    /// backend and not the other.
+    fn measured(bytes: Vec<u8>, usage: TokenUsage, finish_reason: Option<&'static str>) -> Self {
+        Self {
+            bytes,
+            usage: Some(usage),
+            finish_reason: finish_reason.map(str::to_owned),
+            tool_calls: Vec::new(),
+            refusal: None,
+        }
+    }
+}
+
+/// Output from a backend that reports no counts. Explicit rather than a blanket
+/// `From` so that "this backend cannot measure" is a decision at each call site
+/// instead of a silent default.
+impl From<Vec<u8>> for InferenceOutput {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            usage: None,
+            finish_reason: None,
+            tool_calls: Vec::new(),
+            refusal: None,
+        }
+    }
+}
+
+/// One tool call a backend recognised as structured data.
+///
+/// Carries what the model actually said — an id, a function name, a JSON
+/// argument object — and nothing about how a caller will encode it. The OpenAI
+/// `tool_calls` shape is `guest-openai`'s business; putting it here would make
+/// every other consumer of the accelerator interface decode a wire format it
+/// does not speak.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ToolCall {
+    /// Provider-assigned call id, when there was one. `None` means the caller
+    /// mints its own rather than passing off a synthesised id as the
+    /// provider's.
+    pub(crate) id: Option<String>,
+    pub(crate) name: String,
+    /// The call's arguments as a JSON object string, exactly as received.
+    pub(crate) arguments: String,
+}
+
+/// One item a streaming backend produces.
+///
+/// Tool calls travel on their own arm rather than inside the text, which is
+/// what lets a backend stream content the moment it has any. Folding calls into
+/// the text channel forces the opposite: the backend cannot emit a single byte
+/// of prose until it knows no call is coming, so merely *offering* tools costs
+/// the whole time-to-first-token.
+pub(crate) enum StreamEvent<'a> {
+    Content(&'a str),
+    ToolCall(ToolCall),
+}
+
+/// What a sink tells the backend to do after an event.
+///
+/// `Stop` is how a disconnected client reaches the backend. Without it the sink
+/// can only drop what it is handed, and the generation runs to completion for
+/// nobody: on the upstream path that is a socket, a thread and — since upstream
+/// work is admitted by permit — a slice of the node's outbound capacity held
+/// for up to the binding's timeout. A handful of abandoned streams would then
+/// starve live requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamControl {
+    Continue,
+    Stop,
+}
+
+impl StreamControl {
+    fn is_stop(self) -> bool {
+        matches!(self, Self::Stop)
+    }
+}
+
+/// Where a streaming backend sends its events, and how it asks whether anyone
+/// is still listening.
+///
+/// A trait rather than a bare callback because cancellation needs two distinct
+/// questions. `emit` answers "did that reach a consumer"; `is_live` answers
+/// "is there still a consumer" *without* producing anything — which is the only
+/// form available between frames that carry no content, and the only one a
+/// backend can ask while it is waiting rather than emitting.
+pub(crate) trait StreamSink {
+    fn emit(&mut self, event: StreamEvent<'_>) -> StreamControl;
+
+    /// Whether the consumer is still there. The default answers "yes": only a
+    /// sink with a real consumer channel can know better, and a wrongly
+    /// pessimistic answer would truncate a healthy generation.
+    fn is_live(&mut self) -> bool {
+        true
+    }
+}
+
+/// Every plain callback is a sink, so a caller that has nothing to say about
+/// liveness — a test, a buffered adapter — keeps passing a closure.
+///
+/// `?Sized` so that `dyn FnMut(..)` is itself a sink: a closure written inline
+/// infers a single concrete lifetime for its argument and then fails the
+/// higher-ranked bound, while coercing it to `&mut dyn FnMut` first pins the
+/// `for<'a>` signature the trait needs.
+impl<F> StreamSink for F
+where
+    F: FnMut(StreamEvent<'_>) -> StreamControl + ?Sized,
+{
+    fn emit(&mut self, event: StreamEvent<'_>) -> StreamControl {
+        self(event)
+    }
+}
+
+/// What a streaming generation reports once it ends.
+///
+/// Both fields are known only at the end — the counts because decoding has to
+/// finish, the reason because it is the *last* thing an upstream sends — so
+/// they come back beside the event stream rather than through it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StreamOutcome {
+    pub(crate) usage: Option<TokenUsage>,
+    /// Why generation stopped, when the backend knows. Absent means "not
+    /// reported"; it is never synthesised, because `stop` for a completion the
+    /// upstream truncated at its token limit is exactly the report that makes a
+    /// client run half a function.
+    pub(crate) finish_reason: Option<String>,
+}
+
+impl StreamOutcome {
+    fn usage(usage: Option<TokenUsage>) -> Self {
+        Self {
+            usage,
+            finish_reason: None,
+        }
+    }
+
+    /// Attach the backend's own reason, when it reported one. `None` leaves the
+    /// outcome saying "not reported" rather than overwriting it with a guess.
+    fn with_finish_reason(mut self, finish_reason: Option<&str>) -> Self {
+        self.finish_reason = finish_reason.map(str::to_owned);
+        self
+    }
+}
+
+/// A failed generation, with the remote status when the failure came from one.
+///
+/// The status is what makes a relay honest. Collapsed into a string, a
+/// provider's 429 and its 400 reach the client as the same opaque server error:
+/// one should be retried after a backoff, the other never, and the client can
+/// no longer tell which it has.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GenerationError {
+    pub(crate) message: String,
+    /// The HTTP status this node should answer with, when the failure has one.
+    ///
+    /// Usually the status a remote provider returned. Two cases are this
+    /// node's own and still carry one, because they describe *its* role rather
+    /// than inventing a remote fault: an upstream that could not be reached or
+    /// answered unusably is a gateway failure, and a saturated admission queue
+    /// is an overload. `None` stays the answer for a genuine local fault — a
+    /// decode error, an unknown alias — where any status would be a fiction.
+    pub(crate) upstream_status: Option<u16>,
+    /// The caller's request was rejected before any backend ran it. Carried
+    /// separately from `upstream_status` because a locally refused request has
+    /// no remote status to relay, yet is just as much the caller's to fix —
+    /// and reporting it as a server fault sends clients into retry loops over
+    /// requests that cannot succeed.
+    pub(crate) invalid_request: bool,
+}
+
+/// One input's share of a failure the whole batch suffered.
+///
+/// The scheduler fans a single backend failure out to every input in its batch,
+/// which means re-materialising an error that cannot be cloned. Doing that with
+/// `to_string()` keeps the words and loses the type — and the type is what
+/// decides whether the caller sees 400 or 500, so a request the runtime refused
+/// came out the far side of a batch as an opaque host fault. Carrying the
+/// classification explicitly is what survives the fan-out.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct BatchFailure {
+    message: String,
+    invalid_request: bool,
+}
+
+impl BatchFailure {
+    /// Flatten an error into a form each input can carry, keeping both the full
+    /// message chain and the classification the chain encoded.
+    fn from_anyhow(error: &anyhow::Error) -> Self {
+        let classified = GenerationError::from_anyhow(error);
+        Self {
+            message: classified.message,
+            invalid_request: classified.invalid_request,
+        }
+    }
+
+    fn local(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            invalid_request: false,
+        }
+    }
+}
+
+impl GenerationError {
+    pub(crate) fn local(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            upstream_status: None,
+            invalid_request: false,
+        }
+    }
+
+    /// A local rejection of what the caller asked for.
+    pub(crate) fn invalid_request(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            upstream_status: None,
+            invalid_request: true,
+        }
+    }
+
+    /// Recover the remote status from an error that has already been erased
+    /// into `anyhow`. The upstream backend attaches its `UpstreamError`
+    /// unmodified, so the typed cause survives the trip through the scheduler
+    /// and the backend trait and can be read back here.
+    fn from_anyhow(error: &anyhow::Error) -> Self {
+        // Both typed errors survive the trip through `anyhow`, so the
+        // classification is read from the cause rather than guessed from the
+        // message: a request the local runtime refused and one a provider
+        // refused are both the caller's to fix, and neither is a host fault.
+        let invalid_request = error.chain().any(|cause| {
+            // A failure that crossed a batch fan-out carries its own verdict:
+            // the typed cause is gone by then, and re-deriving it from the
+            // message would be guessing.
+            cause
+                .downcast_ref::<BatchFailure>()
+                .is_some_and(|failure| failure.invalid_request)
+                || matches!(
+                    cause.downcast_ref::<candle_llm_runtime::CandleLlmError>(),
+                    Some(candle_llm_runtime::CandleLlmError::InvalidRequest { .. })
+                )
+                || matches!(
+                    cause.downcast_ref::<upstream_openai::UpstreamError>(),
+                    Some(upstream_openai::UpstreamError::InvalidRequest { .. })
+                )
+        });
+        Self {
+            // The whole chain, not just its outermost context. The wrappers
+            // that used to format the cause into their message now attach it
+            // as context — which is what lets the classification above see the
+            // typed error at all — so rendering only the top line would trade
+            // one regression for another and drop the detail the caller needs.
+            message: format!("{error:#}"),
+            upstream_status: error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<upstream_openai::UpstreamError>())
+                .and_then(upstream_openai::UpstreamError::http_status),
+            invalid_request,
+        }
+    }
+}
+
+impl std::fmt::Display for GenerationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl GenerationError {
+    /// This node is at capacity for the alias, not broken.
+    ///
+    /// Without a status the caller sees 500 `server_error` — a node that has
+    /// failed — and an agent retries against it immediately, adding to the
+    /// queue that refused it. 503 is what says "come back", which is the whole
+    /// content of an admission refusal, and it is the one answer that makes a
+    /// client's backoff correct rather than harmful.
+    fn overloaded(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            upstream_status: Some(503),
+            invalid_request: false,
+        }
+    }
+}
+
+impl From<String> for GenerationError {
+    fn from(message: String) -> Self {
+        Self::local(message)
+    }
+}
+
+/// A completed generation as a WASM component sees it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ComponentGeneration {
+    pub(crate) text: String,
+    pub(crate) usage: Option<TokenUsage>,
+    pub(crate) finish_reason: Option<String>,
+    pub(crate) tool_calls: Vec<ToolCall>,
+    pub(crate) refusal: Option<String>,
+}
+
 trait BackendModel: Send + Sync {
     fn residency(&self) -> AcceleratorMemoryResidency;
+    /// Lane this backend must run on, overriding the lane implied by the
+    /// binding's `device`. `None` keeps the declared device's lane.
+    ///
+    /// Only the upstream backend overrides it: its `device` describes a remote
+    /// server, so honouring it would park network waits on a local accelerator
+    /// queue and stall unrelated local inference. The `Network` lane it selects
+    /// has no batch scheduler at all — it is served by `UpstreamAdmission`.
+    fn scheduling_lane(&self) -> Option<AcceleratorKind> {
+        None
+    }
     fn as_any(&self) -> &dyn Any;
     /// Executes one or more independent requests and returns exactly one
     /// output per input, in the same order — never a single shared output
     /// broadcast across the whole batch (see `process_batch`, which routes
     /// `outputs[i]` back to `inputs[i]`'s own caller).
-    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>>;
+    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>>;
     fn execute_with_adapter(
         &self,
         inputs: &[SharedInputTensor],
         adapter: &ResolvedLoraAdapter,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<InferenceOutput>> {
         let _ = inputs;
         bail!(
             "LoRA adapter `{}` was resolved, but this backend does not support adapter injection",
@@ -271,7 +836,7 @@ trait BackendModel: Send + Sync {
         &self,
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<InferenceOutput>> {
         self.execute_with_adapter_results(inputs, adapters)
             .into_iter()
             .collect()
@@ -281,14 +846,17 @@ trait BackendModel: Send + Sync {
         &self,
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Vec<Result<Vec<u8>>> {
+    ) -> Vec<Result<InferenceOutput>> {
         if inputs.len() != adapters.len() {
             let message = format!(
                 "adapter assignment count {} does not match input count {}",
                 adapters.len(),
                 inputs.len()
             );
-            return repeat_batch_error(inputs.len().max(adapters.len()), message);
+            return repeat_batch_error(
+                inputs.len().max(adapters.len()),
+                BatchFailure::local(message),
+            );
         }
         let mut results = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
         for group in adapter_assignment_groups(adapters) {
@@ -304,9 +872,9 @@ trait BackendModel: Send + Sync {
             let outputs = match outputs {
                 Ok(outputs) => outputs,
                 Err(error) => {
-                    let message = error.to_string();
+                    let failure = BatchFailure::from_anyhow(&error);
                     for index in group {
-                        results[index] = Some(Err(anyhow!("{}", message)));
+                        results[index] = Some(Err(anyhow::Error::new(failure.clone())));
                     }
                     continue;
                 }
@@ -317,8 +885,9 @@ trait BackendModel: Send + Sync {
                     outputs.len(),
                     group.len()
                 );
+                let failure = BatchFailure::local(message);
                 for index in group {
-                    results[index] = Some(Err(anyhow!("{}", message)));
+                    results[index] = Some(Err(anyhow::Error::new(failure.clone())));
                 }
                 continue;
             }
@@ -332,17 +901,17 @@ trait BackendModel: Send + Sync {
             .collect()
     }
 
-    /// Stream decoded text fragments through `on_token` as they are produced.
-    /// The default implementation runs `execute` and emits the entire output as
-    /// a single fragment — a correct, non-incremental fallback for backends that
+    /// Stream generation events through `sink` as they are produced. The
+    /// default implementation runs `execute` and emits the entire output as a
+    /// single fragment — a correct, non-incremental fallback for backends that
     /// cannot stream (mock, NVFP4). Backends that can decode token-by-token
     /// override this for real time-to-first-token. Only ever called with a
     /// single input (streaming is inherently one request, one client).
     fn stream_text(
         &self,
         inputs: &[SharedInputTensor],
-        on_token: &mut dyn FnMut(&str),
-    ) -> Result<()> {
+        sink: &mut dyn StreamSink,
+    ) -> Result<StreamOutcome> {
         let mut outputs = self.execute(inputs)?;
         if outputs.len() != 1 {
             bail!(
@@ -351,12 +920,42 @@ trait BackendModel: Send + Sync {
                 inputs.len()
             );
         }
-        let text = String::from_utf8(outputs.remove(0))
+        let output = outputs.remove(0);
+        let text = String::from_utf8(output.bytes)
             .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
-        if !text.is_empty() {
-            on_token(&text);
+        // Nothing to cancel: this fallback has already produced the whole
+        // generation before the first event, so `Stop` only stops the emitting.
+        let mut stopped = text.is_empty();
+        if !stopped {
+            stopped = sink.emit(StreamEvent::Content(&text)).is_stop();
         }
-        Ok(())
+        for call in output.tool_calls {
+            if stopped {
+                break;
+            }
+            stopped = sink.emit(StreamEvent::ToolCall(call)).is_stop();
+        }
+        Ok(StreamOutcome {
+            usage: output.usage,
+            finish_reason: output.finish_reason,
+        })
+    }
+
+    /// `stream_text`, with a resolved LoRA adapter applied. The default refuses
+    /// rather than silently streaming the base model: a route that pins an
+    /// adapter is asking for a specific tenant's behaviour, and answering with
+    /// the unadapted model would be wrong in a way nothing downstream can see.
+    fn stream_text_with_adapter(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapter: &ResolvedLoraAdapter,
+        sink: &mut dyn StreamSink,
+    ) -> Result<StreamOutcome> {
+        let _ = (inputs, sink);
+        bail!(
+            "LoRA adapter `{}` was resolved, but this backend does not support adapter injection",
+            adapter.id
+        )
     }
 
     fn embed_text(&self, input: &SharedInputTensor) -> Result<Vec<f32>> {
@@ -377,6 +976,34 @@ pub(crate) struct AiInferenceRuntime {
     /// lazily loaded from `{root}/{alias}` — gated upstream by the route's sealed
     /// `allowed_model_aliases`. `None` disables lazy loading (tests, no broker).
     dynamic_models_root: Option<PathBuf>,
+    /// Sealed metadata for the `dynamic` bindings, keyed by alias.
+    ///
+    /// A dynamic binding is skipped at boot because its files do not exist yet,
+    /// but the rest of what the manifest said about it — the device, the
+    /// hardware strategy, the QoS class — is a sealed deployment decision that
+    /// outlives the upload. Discarding it and rebuilding a bare CPU binding at
+    /// first use meant a deployment that asked for `cuda` silently got CPU:
+    /// the model still answered, just on the wrong hardware, at RAM cost and
+    /// a fraction of the speed, with nothing in the response to say so.
+    dynamic_bindings: Arc<HashMap<String, IntegrityModelBinding>>,
+    /// One in-flight first load per alias.
+    ///
+    /// Without it, two requests that miss the registry together both load the
+    /// whole checkpoint before either inserts, and `or_insert` drops the loser
+    /// only once both finished. On CPU that wastes a load; on an accelerator
+    /// both copies are resident at the same moment, so peak VRAM approaches
+    /// twice the model and a checkpoint sized to fit turns into an OOM.
+    ///
+    /// Keyed per alias so unrelated models still load in parallel. Entries are
+    /// left behind after a load — one empty mutex per alias ever loaded, which
+    /// is bounded by the alias count and cheaper than the bookkeeping needed to
+    /// retire one safely while another caller may still be waiting on it.
+    loading: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Bounded concurrency for `openai:` bindings, which run off the batch
+    /// scheduler entirely. Shared across clones of the runtime *and* across
+    /// runtime generations, so the cap is a property of the node rather than of
+    /// whichever manifest is loaded — see [`node_upstream_admission`].
+    upstream_admission: Arc<UpstreamAdmission>,
 }
 
 #[cfg(test)]
@@ -406,8 +1033,14 @@ pub(crate) struct QueueTierSnapshot {
 
 impl AiInferenceRuntime {
     pub(crate) fn from_config(config: &IntegrityConfig) -> Result<Self> {
+        // One dispatcher thread per *local* accelerator lane. `Network` is
+        // absent by construction: upstream bindings are the only thing that
+        // lands there, and they run under `UpstreamAdmission` instead of the
+        // batch scheduler, so spawning a dispatcher for that lane would spawn a
+        // thread that never receives a job.
         let schedulers = AcceleratorKind::ALL
             .into_iter()
+            .filter(|accelerator| !matches!(accelerator, AcceleratorKind::Network))
             .map(|accelerator| {
                 (
                     accelerator,
@@ -419,7 +1052,30 @@ impl AiInferenceRuntime {
                 )
             })
             .collect::<HashMap<_, _>>();
+        // Before any binding is built: two upstream aliases whose credential
+        // variables collide would each send the other's API key to a
+        // third-party server. Nothing at request time can see the collision,
+        // so this fails the boot instead.
+        //
+        // Only bindings that can actually load as upstreams. A `dynamic` one
+        // never does — `ensure_model_loaded` replaces its path with the broker
+        // directory the upload landed in — so its declared path is not a
+        // statement about where requests go. Counting it meant two dynamic
+        // aliases that normalise to the same suffix, `vendor-a` and
+        // `vendor_a`, could refuse the whole boot over a credential neither
+        // would ever read.
+        assert_no_credential_collisions(
+            config
+                .routes
+                .iter()
+                .flat_map(|route| route.models.iter())
+                .filter(|binding| binding_runs_upstream(binding))
+                .map(|binding| binding.alias.as_str()),
+        )
+        .map_err(|detail| anyhow!("Integrity Validation Failed: {detail}"))?;
+
         let mut models = HashMap::new();
+        let mut dynamic_bindings = HashMap::new();
         let mut sealed_aliases = std::collections::HashSet::new();
 
         for route in &config.routes {
@@ -436,6 +1092,12 @@ impl AiInferenceRuntime {
                     // model is lazily materialised from `{dynamic_models_root}/{alias}`
                     // by `ensure_model_loaded` on first use. Skipping eager load
                     // here lets the host boot before the model has been uploaded.
+                    //
+                    // The binding is kept, though: `ensure_model_loaded` needs
+                    // its device and strategy to honour what the manifest
+                    // sealed. Only `path` is ignored, because the upload root
+                    // decides where the files land.
+                    dynamic_bindings.insert(binding.alias.clone(), binding.clone());
                     continue;
                 }
                 if binding.path.is_empty() {
@@ -456,7 +1118,10 @@ impl AiInferenceRuntime {
         Ok(Self {
             schedulers,
             models: Arc::new(RwLock::new(models)),
+            dynamic_bindings: Arc::new(dynamic_bindings),
+            loading: Arc::new(Mutex::new(HashMap::new())),
             dynamic_models_root: None,
+            upstream_admission: node_upstream_admission(),
         })
     }
 
@@ -489,13 +1154,39 @@ impl AiInferenceRuntime {
         if !model_dir.is_dir() {
             return Err(format!("model alias `{alias}` is not loaded"));
         }
+        // Past here a checkpoint is about to be read onto a device, so only one
+        // caller per alias may proceed. The gate is taken before any loading
+        // work and released once the model is registered.
+        let gate = {
+            let mut loading = self.loading.lock().expect("model load gate poisoned");
+            Arc::clone(loading.entry(alias.to_owned()).or_default())
+        };
+        let _loading = gate.lock().expect("model load gate poisoned");
+        // Re-checked under the gate: whoever held it before us may have just
+        // finished this exact load, and repeating it is the cost this whole
+        // gate exists to avoid.
+        if self
+            .models
+            .read()
+            .expect("model registry lock poisoned")
+            .contains_key(alias)
+        {
+            return Ok(());
+        }
+        // The sealed binding decides everything except where the files are —
+        // that is the upload root's to say. An alias with no dynamic binding at
+        // all is a bare broker upload, which has no manifest opinion to honour
+        // and gets the conservative CPU default.
+        let sealed = self.dynamic_bindings.get(alias);
         let binding = IntegrityModelBinding {
             alias: alias.to_owned(),
             path: model_dir.to_string_lossy().into_owned(),
-            device: crate::ModelDevice::Cpu,
-            qos: RouteQos::Standard,
+            device: sealed.map_or(crate::ModelDevice::Cpu, |binding| binding.device.clone()),
+            qos: sealed.map_or(RouteQos::Standard, |binding| binding.qos),
             dynamic: false,
-            hardware_strategy: Default::default(),
+            hardware_strategy: sealed
+                .map(|binding| binding.hardware_strategy.clone())
+                .unwrap_or_default(),
         };
         let backend_model: Arc<dyn BackendModel> =
             Arc::new(CandleBackendModel::load(&binding).map_err(|error| error.to_string())?);
@@ -503,8 +1194,10 @@ impl AiInferenceRuntime {
             CandleModel::load_mock_with_backend(&binding, backend_model)
                 .map_err(|error| error.to_string())?,
         );
-        // Insert under the write lock; `or_insert` tolerates a concurrent first-use
-        // race (the loser's freshly loaded model is simply dropped).
+        // `or_insert` rather than `insert`: the gate above makes a concurrent
+        // first-use race for this alias impossible, but a model registered by
+        // some other path in the meantime is still its own truth and must not
+        // be replaced.
         self.models
             .write()
             .expect("model registry lock poisoned")
@@ -570,10 +1263,26 @@ impl AiInferenceRuntime {
     }
 
     pub(crate) fn supports_accelerator(&self, accelerator: AcceleratorKind) -> bool {
-        self.schedulers.contains_key(&accelerator)
+        // `Network` has no dispatcher of its own — it is served by the upstream
+        // admission gate — but it is still a lane this node can run work on.
+        matches!(accelerator, AcceleratorKind::Network)
+            || self.schedulers.contains_key(&accelerator)
     }
 
     pub(crate) fn queue_tier_snapshot(&self, accelerator: AcceleratorKind) -> QueueTierSnapshot {
+        if matches!(accelerator, AcceleratorKind::Network) {
+            // Upstream work never enters a scheduler queue, so the depth the
+            // mesh QoS check needs is the admission backlog: callers holding a
+            // thread while they wait for a permit this node cannot grant. It is
+            // reported on every tier because the tier only selects the
+            // threshold — the backlog itself is one number for the lane.
+            let waiting = self.upstream_admission.waiting().min(u32::MAX as usize) as u32;
+            return QueueTierSnapshot {
+                realtime: waiting,
+                standard: waiting,
+                batch: waiting,
+            };
+        }
         self.scheduler_for(accelerator)
             .map(|scheduler| scheduler.queue_tier_snapshot())
             .unwrap_or_default()
@@ -598,22 +1307,37 @@ impl AiInferenceRuntime {
         let model = models
             .get(alias)
             .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?;
-        let resolved = if matches!(accelerator, AcceleratorKind::Npu | AcceleratorKind::Tpu) {
-            accelerator_backend::resolve_with_fallback(
+        // Which host interface a component imported is not a hardware claim.
+        // A binding's device is fixed by the manifest, `ensure_model_loaded`
+        // has already put the weights there, and the scheduler dispatches on
+        // `model.accelerator` regardless of how the alias was opened — so an
+        // alias that loaded successfully runs where it is pinned either way.
+        //
+        // This matters because the public OpenAI routes open every alias
+        // through the CPU accelerator, that being the only interface
+        // `guest-openai` imports. Requiring the interface to match the binding
+        // made every `device: cuda`/`metal` alias — the whole point of the GGUF
+        // GPU path — advertise itself in `GET /ai/v1/models` and then fail with
+        // "model unavailable" before any inference ran.
+        //
+        // `Npu`/`Tpu` stay strict, because there the *requested* lane can
+        // silently degrade: `resolve_with_fallback` drops to CPU when no vendor
+        // runner is wired, and a model pinned to an accelerator that is not
+        // actually present must fail rather than quietly execute elsewhere.
+        if matches!(accelerator, AcceleratorKind::Npu | AcceleratorKind::Tpu) {
+            let resolved = accelerator_backend::resolve_with_fallback(
                 accelerator,
                 AcceleratorKind::Cpu,
                 accelerator_backend::probe,
-            )
-        } else {
-            accelerator
-        };
-        if model.accelerator != resolved {
-            return Err(format!(
-                "model alias `{alias}` requires `{}` but `{}` resolved to `{}`",
-                model.accelerator.as_str(),
-                accelerator.as_str(),
-                resolved.as_str()
-            ));
+            );
+            if model.accelerator != resolved {
+                return Err(format!(
+                    "model alias `{alias}` requires `{}` but `{}` resolved to `{}`",
+                    model.accelerator.as_str(),
+                    accelerator.as_str(),
+                    resolved.as_str()
+                ));
+            }
         }
         Ok(())
     }
@@ -623,8 +1347,9 @@ impl AiInferenceRuntime {
         &self,
         alias: &str,
         prompt: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, GenerationError> {
         self.compute_component_prompt_with_adapter(alias, prompt, None)
+            .map(|generation| generation.text)
     }
 
     pub(crate) fn compute_component_prompt_with_adapter(
@@ -632,7 +1357,7 @@ impl AiInferenceRuntime {
         alias: &str,
         prompt: &str,
         adapter_id: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<ComponentGeneration, GenerationError> {
         let adapter = adapter_id.map(resolve_lora_adapter_path).transpose()?;
         self.ensure_model_loaded(alias)?;
         // Clone the `Arc` out and drop the read lock before inference so a slow
@@ -644,32 +1369,57 @@ impl AiInferenceRuntime {
                 .cloned()
                 .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?
         };
-        let output = self
-            .scheduler_for(model.accelerator)
-            .ok_or_else(|| {
-                format!(
-                    "{} accelerator is unavailable on this host",
-                    model.accelerator.as_str()
-                )
-            })?
-            .infer(
-                Arc::clone(&model),
-                adapter,
-                SharedInputTensor {
-                    dimensions: vec![prompt.len() as u32],
-                    ty: TensorType::U8,
-                    data: Arc::from(prompt.as_bytes()),
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        String::from_utf8(output).map_err(|error| error.to_string())
+        let input = SharedInputTensor {
+            dimensions: vec![prompt.len() as u32],
+            ty: TensorType::U8,
+            data: Arc::from(prompt.as_bytes()),
+        };
+        let output = if model.accelerator == AcceleratorKind::Network {
+            // Upstream bindings skip the batch scheduler: see
+            // `UpstreamAdmission`. The permit is released when `_permit` drops
+            // at the end of this scope, including on the error paths below.
+            let _permit = self
+                .upstream_admission
+                .acquire()
+                .map_err(GenerationError::overloaded)?;
+            let mut outputs = model
+                .backend_model
+                .execute_with_adapters(&[input], &[adapter])
+                .map_err(|error| GenerationError::from_anyhow(&error))?;
+            if outputs.len() != 1 {
+                return Err(GenerationError::local(format!(
+                    "upstream model `{alias}` returned {} output(s) for one prompt",
+                    outputs.len()
+                )));
+            }
+            outputs.remove(0)
+        } else {
+            self.scheduler_for(model.accelerator)
+                .ok_or_else(|| {
+                    GenerationError::local(format!(
+                        "{} accelerator is unavailable on this host",
+                        model.accelerator.as_str()
+                    ))
+                })?
+                .infer(Arc::clone(&model), adapter, input)
+                .map_err(|error| GenerationError::from_anyhow(&error))?
+        };
+        let text = String::from_utf8(output.bytes)
+            .map_err(|error| GenerationError::local(error.to_string()))?;
+        Ok(ComponentGeneration {
+            text,
+            usage: output.usage,
+            finish_reason: output.finish_reason,
+            tool_calls: output.tool_calls,
+            refusal: output.refusal,
+        })
     }
 
     pub(crate) fn embed_component_input(
         &self,
         alias: &str,
         input: &str,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<Vec<f32>, GenerationError> {
         self.ensure_model_loaded(alias)?;
         let model = {
             let models = self.models.read().expect("model registry lock poisoned");
@@ -678,21 +1428,30 @@ impl AiInferenceRuntime {
                 .cloned()
                 .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?
         };
-        if self.scheduler_for(model.accelerator).is_none() {
-            return Err(format!(
+        if !self.supports_accelerator(model.accelerator) {
+            return Err(GenerationError::local(format!(
                 "{} accelerator is unavailable on this host",
                 model.accelerator.as_str()
-            ));
+            )));
         }
         let tensor = SharedInputTensor {
             dimensions: vec![input.len() as u32],
             ty: TensorType::U8,
             data: Arc::from(input.as_bytes()),
         };
+        // Embeddings bypass the scheduler on every lane (they are a single
+        // pooled forward, not a decode loop), but an upstream embedding is
+        // still an outbound round trip and counts against the same node-wide
+        // cap as chat: otherwise a burst of `/v1/embeddings` would open
+        // unbounded sockets while `/v1/chat/completions` stayed gated.
+        let _permit = (model.accelerator == AcceleratorKind::Network)
+            .then(|| self.upstream_admission.acquire())
+            .transpose()
+            .map_err(GenerationError::overloaded)?;
         model
             .backend_model
             .embed_text(&tensor)
-            .map_err(|error| error.to_string())
+            .map_err(|error| GenerationError::from_anyhow(&error))
     }
 
     /// Stream a prompt's decoded output, invoking `on_token` for each text
@@ -708,31 +1467,47 @@ impl AiInferenceRuntime {
         &self,
         alias: &str,
         prompt: &str,
-        on_token: &mut dyn FnMut(&str),
-    ) -> Result<(), String> {
+        adapter_id: Option<&str>,
+        sink: &mut dyn StreamSink,
+    ) -> Result<StreamOutcome, GenerationError> {
+        // Resolved exactly as on the buffered path. Ignoring the route's
+        // adapter here made `stream: true` silently run the *base* model while
+        // the otherwise identical buffered request ran the tenant's — the same
+        // request answered by two different models depending on a transport
+        // flag, which is the one outcome a per-tenant adapter must never have.
+        let adapter = adapter_id.map(resolve_lora_adapter_path).transpose()?;
         self.ensure_model_loaded(alias)?;
         let model = {
             let models = self.models.read().expect("model registry lock poisoned");
-            models
-                .get(alias)
-                .cloned()
-                .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?
+            models.get(alias).cloned().ok_or_else(|| {
+                GenerationError::local(format!("model alias `{alias}` is not loaded"))
+            })?
         };
-        if self.scheduler_for(model.accelerator).is_none() {
-            return Err(format!(
+        if !self.supports_accelerator(model.accelerator) {
+            return Err(GenerationError::local(format!(
                 "{} accelerator is unavailable on this host",
                 model.accelerator.as_str()
-            ));
+            )));
         }
         let input = SharedInputTensor {
             dimensions: vec![prompt.len() as u32],
             ty: TensorType::U8,
             data: Arc::from(prompt.as_bytes()),
         };
-        model
-            .backend_model
-            .stream_text(&[input], on_token)
-            .map_err(|error| error.to_string())
+        // Held for the stream's entire lifetime, not just its first byte: an
+        // upstream SSE connection occupies a socket and a thread until the
+        // client stops reading, which is exactly the resource the cap governs.
+        let _permit = (model.accelerator == AcceleratorKind::Network)
+            .then(|| self.upstream_admission.acquire())
+            .transpose()
+            .map_err(GenerationError::overloaded)?;
+        match adapter {
+            Some(adapter) => model
+                .backend_model
+                .stream_text_with_adapter(&[input], &adapter, sink),
+            None => model.backend_model.stream_text(&[input], sink),
+        }
+        .map_err(|error| GenerationError::from_anyhow(&error))
     }
 
     fn scheduler_for(&self, accelerator: AcceleratorKind) -> Option<AcceleratorScheduler> {
@@ -819,7 +1594,7 @@ impl AcceleratorScheduler {
         model: Arc<CandleModel>,
         adapter: Option<ResolvedLoraAdapter>,
         input: SharedInputTensor,
-    ) -> Result<Vec<u8>, anyhow::Error> {
+    ) -> Result<InferenceOutput, anyhow::Error> {
         let response_rx = self.enqueue(model, adapter, input)?;
         response_rx
             .recv()
@@ -831,7 +1606,7 @@ impl AcceleratorScheduler {
         model: Arc<CandleModel>,
         adapter: Option<ResolvedLoraAdapter>,
         input: SharedInputTensor,
-    ) -> Result<mpsc::Receiver<Result<Vec<u8>, anyhow::Error>>, anyhow::Error> {
+    ) -> Result<mpsc::Receiver<Result<InferenceOutput, anyhow::Error>>, anyhow::Error> {
         let (response_tx, response_rx) = mpsc::channel();
         let sequence = self.metrics.next_sequence.fetch_add(1, Ordering::Relaxed);
         self.metrics.queued_requests.fetch_add(1, Ordering::Relaxed);
@@ -990,7 +1765,7 @@ struct InferenceJob {
     model: Arc<CandleModel>,
     qos: RouteQos,
     input: SharedInputTensor,
-    response_tx: mpsc::Sender<Result<Vec<u8>, anyhow::Error>>,
+    response_tx: mpsc::Sender<Result<InferenceOutput, anyhow::Error>>,
 }
 
 impl InferenceJob {
@@ -1443,7 +2218,7 @@ fn age_waiting_jobs(queued: &mut BinaryHeap<PrioritizedInferenceJob>) {
 fn process_batch(
     accelerator: AcceleratorKind,
     batch: &[InferenceJob],
-) -> Vec<Result<Vec<u8>, anyhow::Error>> {
+) -> Vec<Result<InferenceOutput, anyhow::Error>> {
     let model = Arc::clone(&batch[0].model);
     #[cfg(test)]
     if model.mock_latency > Duration::ZERO {
@@ -1465,7 +2240,7 @@ fn process_batch(
 
     match results
         .into_iter()
-        .collect::<Result<Vec<Vec<u8>>, anyhow::Error>>()
+        .collect::<Result<Vec<InferenceOutput>, anyhow::Error>>()
     {
         // Each job's own output is routed back to that job, never a shared
         // clone of one job's result broadcast to the whole batch.
@@ -1478,21 +2253,24 @@ fn process_batch(
                 outputs.len(),
                 batch.len()
             );
+            let failure = BatchFailure::local(message);
             batch
                 .iter()
-                .map(|_| Err(anyhow::anyhow!("{}", message.clone())))
+                .map(|_| Err(anyhow::Error::new(failure.clone())))
                 .collect()
         }
         Err(error) => {
-            let message = format!(
-                "{} backend failed for model `{}`: {}",
+            // Wrapped, not reformatted: `{error}` would print only the
+            // outermost context and drop the detail the caller needs, and
+            // `from_anyhow` would lose the classification with it.
+            let failure = BatchFailure::from_anyhow(&error.context(format!(
+                "{} backend failed for model `{}`",
                 accelerator.as_str(),
-                model.alias,
-                error
-            );
+                model.alias
+            )));
             batch
                 .iter()
-                .map(|_| Err(anyhow::anyhow!("{}", message.clone())))
+                .map(|_| Err(anyhow::Error::new(failure.clone())))
                 .collect()
         }
     }
@@ -1533,8 +2311,13 @@ enum CandleBackendModelKind {
     /// documented follow-up.
     ModelOptNvfp4(Box<candle_llm_runtime::CandleLlmRuntime>),
     TextEmbedding(Box<candle_embedding_runtime::CandleEmbeddingRuntime>),
-    Qwen35Moe(Box<qwen35_moe_runtime::Qwen35MoeRuntime>),
+    Qwen35Moe(Box<qwen35_upstream::Qwen35MoeRuntime>),
     Vendor(vendor_accelerator::VendorAcceleratorRuntime),
+    /// An OpenAI-compatible server reached over the network. No weights are
+    /// resident on this node: the alias exists so the mesh can route, authorise,
+    /// and meter a model whose tensor math runs in another process (llama.cpp,
+    /// vLLM, or a peer Tachyon node).
+    Upstream(Box<upstream_openai::UpstreamOpenAiRuntime>),
 }
 
 struct SpeculativeDraftRuntime {
@@ -1570,6 +2353,31 @@ impl CandleBackendModel {
                 binding.alias
             ));
         }
+        // The upstream scheme is checked before any on-disk probe: an
+        // `openai:` path is a URL, not a directory, so every filesystem loader
+        // below would reject it.
+        if let Some(runtime) =
+            upstream_openai::UpstreamOpenAiRuntime::try_load(&binding.alias, &binding.path)?
+        {
+            return Ok(Self {
+                source: BackendModelSource {
+                    alias: binding.alias.clone(),
+                    path: binding.path.clone(),
+                    requested_target: binding.device.as_str().to_owned(),
+                    // Local residency accounting only tracks memory this node
+                    // actually holds. An upstream binding holds none, whatever
+                    // `device` the operator wrote — that field describes the
+                    // remote server, which this node does not schedule. The
+                    // matching `scheduling_lane` override keeps its queue off
+                    // the local accelerator lanes too.
+                    accelerator: AcceleratorKind::Network,
+                    qos: binding.qos,
+                    model_size_bytes: 0,
+                },
+                kind: CandleBackendModelKind::Upstream(Box::new(runtime)),
+            });
+        }
+
         let kind = if is_explicit_mock_binding(binding) {
             CandleBackendModelKind::Mock
         } else if matches!(
@@ -1590,7 +2398,7 @@ impl CandleBackendModel {
             match modelopt_nvfp4::ModelOptNvfp4Directory::try_load(&binding.alias, &binding.path)? {
                 Some(model) => {
                     static DESCRIPTORS: [&dyn architecture_registry::ArchitectureDescriptor; 1] =
-                        [&qwen35_moe_runtime::QWEN35_MOE_DESCRIPTOR];
+                        [&qwen35_profile::QWEN35_MOE_DESCRIPTOR];
                     let registry = architecture_registry::ArchitectureRegistry::new(&DESCRIPTORS);
                     match registry.resolve(&model)? {
                         Some(architecture)
@@ -1598,7 +2406,7 @@ impl CandleBackendModel {
                                 == architecture_registry::ArchitectureKind::Qwen35MoeText =>
                         {
                             CandleBackendModelKind::Qwen35Moe(Box::new(
-                                qwen35_moe_runtime::Qwen35MoeRuntime::from_model(
+                                qwen35_upstream::Qwen35MoeRuntime::from_model(
                                     &binding.alias,
                                     &binding.path,
                                     binding.device.as_str(),
@@ -1723,19 +2531,50 @@ fn env_u64(name: &str) -> Option<u64> {
 impl BackendModel for CandleBackendModel {
     fn residency(&self) -> AcceleratorMemoryResidency {
         match self.source.accelerator {
-            AcceleratorKind::Cpu => AcceleratorMemoryResidency::HostRam,
+            // No local weights for an upstream binding, so nothing is resident
+            // anywhere; `HostRam` is the registry's zero-cost answer.
+            AcceleratorKind::Cpu | AcceleratorKind::Network => AcceleratorMemoryResidency::HostRam,
             AcceleratorKind::Gpu => AcceleratorMemoryResidency::Vram,
             AcceleratorKind::Npu => AcceleratorMemoryResidency::Sram,
             AcceleratorKind::Tpu => AcceleratorMemoryResidency::Sram,
         }
     }
 
+    fn scheduling_lane(&self) -> Option<AcceleratorKind> {
+        if matches!(self.kind, CandleBackendModelKind::Upstream(_)) {
+            return Some(AcceleratorKind::Network);
+        }
+        // A GGUF binding asking for `cuda` on a host with no physical GPU
+        // resolves to `Device::Cpu` — deliberately, so a `candle-cuda` build
+        // stays usable without one. The binding still said `cuda`, so the work
+        // queued on the GPU lane and had VRAM accounted against it while every
+        // forward ran on the CPU: the GPU lane showed load that could not
+        // exist, and the CPU lane doing the work looked idle to mesh
+        // admission, which is what decides whether to hand a request to a peer.
+        if let CandleBackendModelKind::TextGeneration { target, .. } = &self.kind {
+            if target.executes_on_host() {
+                return Some(AcceleratorKind::Cpu);
+            }
+        }
+        None
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
+    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>> {
         match &self.kind {
+            CandleBackendModelKind::Upstream(_) => {
+                // Delegate to the per-input path so both share one
+                // implementation. `execute`'s all-or-nothing signature is what
+                // its caller asked for, not a property of the backend.
+                let adapters = vec![None; inputs.len()];
+                return self
+                    .execute_with_adapter_results(inputs, &adapters)
+                    .into_iter()
+                    .collect();
+            }
             CandleBackendModelKind::Qwen35Moe(runtime) => {
                 if inputs
                     .iter()
@@ -1752,11 +2591,17 @@ impl BackendModel for CandleBackendModel {
                 // its output to every other request in the batch.
                 let result = inputs
                     .iter()
-                    .map(|input| runtime.generate(&[input.data.as_ref()]))
+                    .map(|input| {
+                        runtime
+                            .generate(&[input.data.as_ref()])
+                            .map(|(bytes, usage, finish)| {
+                                InferenceOutput::measured(bytes, usage, finish)
+                            })
+                    })
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        anyhow!(
-                            "Qwen 3.5 MoE model `{}` loaded from `{}` failed: {error}",
+                    .with_context(|| {
+                        format!(
+                            "Qwen 3.5 MoE model `{}` loaded from `{}` failed",
                             self.source.alias,
                             runtime.root().display()
                         )
@@ -1776,11 +2621,17 @@ impl BackendModel for CandleBackendModel {
                 }
                 let result = inputs
                     .iter()
-                    .map(|input| runtime.generate(&[input.data.as_ref()]))
+                    .map(|input| {
+                        runtime
+                            .generate(&[input.data.as_ref()])
+                            .map(|(bytes, usage, finish)| {
+                                InferenceOutput::measured(bytes, usage, finish)
+                            })
+                    })
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        anyhow!(
-                            "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                    .with_context(|| {
+                        format!(
+                            "Candle LLM model `{}` loaded from `{}` failed",
                             self.source.alias,
                             runtime.root().display()
                         )
@@ -1821,11 +2672,14 @@ impl BackendModel for CandleBackendModel {
                             ),
                             None => target.generate(&[prompt]),
                         }
+                        .map(|(bytes, usage, finish)| {
+                            InferenceOutput::measured(bytes, usage, finish)
+                        })
                     })
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        anyhow!(
-                            "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                    .with_context(|| {
+                        format!(
+                            "Candle LLM model `{}` loaded from `{}` failed",
                             self.source.alias,
                             target.root().display()
                         )
@@ -1842,9 +2696,15 @@ impl BackendModel for CandleBackendModel {
                 if inputs.is_empty() {
                     return Err(anyhow!("vendor backend requires one input tensor"));
                 }
+                // A vendor runner hands back text over a pipe and reports no
+                // counts, so its outputs stay unmeasured.
                 let result = inputs
                     .iter()
-                    .map(|input| runtime.execute(input.data.as_ref()))
+                    .map(|input| {
+                        runtime
+                            .execute(input.data.as_ref())
+                            .map(InferenceOutput::from)
+                    })
                     .collect::<Result<Vec<_>, _>>();
                 record_execution(
                     &self.source.alias,
@@ -1883,7 +2743,16 @@ impl BackendModel for CandleBackendModel {
         record_execution(&self.source.alias, self.source.accelerator.as_str(), true);
         Ok(inputs
             .iter()
-            .map(|_| b"MOCK_LLM_RESPONSE".to_vec())
+            .map(|input| {
+                let bytes = b"MOCK_LLM_RESPONSE".to_vec();
+                let usage = mock_token_usage(
+                    std::slice::from_ref(input),
+                    &String::from_utf8_lossy(&bytes),
+                );
+                // A mock has no token budget to exhaust, so it never reports a
+                // reason and the caller keeps inferring one.
+                InferenceOutput::measured(bytes, usage, None)
+            })
             .collect())
     }
 
@@ -1891,7 +2760,7 @@ impl BackendModel for CandleBackendModel {
         &self,
         inputs: &[SharedInputTensor],
         adapter: &ResolvedLoraAdapter,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<InferenceOutput>> {
         match &self.kind {
             CandleBackendModelKind::Mock => self.execute(inputs),
             CandleBackendModelKind::TextGeneration { target, .. }
@@ -1900,23 +2769,27 @@ impl BackendModel for CandleBackendModel {
                 inputs
                     .iter()
                     .map(|input| {
-                        target.generate_with_adapter(
-                            &[input.data.as_ref()],
-                            &adapter.id,
-                            &adapter.path,
-                        )
+                        target
+                            .generate_with_adapter(
+                                &[input.data.as_ref()],
+                                &adapter.id,
+                                &adapter.path,
+                            )
+                            .map(|(bytes, usage, finish)| InferenceOutput::measured(bytes, usage, finish))
                     })
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| {
-                        anyhow!(
-                            "Candle LLM model `{}` failed with LoRA adapter `{}` at `{}`: {error}",
+                    .with_context(|| {
+                        format!(
+                            "Candle LLM model `{}` failed with LoRA adapter `{}` at `{}`",
                             self.source.alias,
                             adapter.id,
                             adapter.path.display()
                         )
                     })
             }
-            CandleBackendModelKind::Qwen35Moe(_) | CandleBackendModelKind::Vendor(_) => bail!(
+            CandleBackendModelKind::Qwen35Moe(_)
+            | CandleBackendModelKind::Vendor(_)
+            | CandleBackendModelKind::Upstream(_) => bail!(
                 "LoRA adapter `{}` was resolved for model `{}`, but this backend does not support adapter injection",
                 adapter.id,
                 self.source.alias
@@ -1933,7 +2806,7 @@ impl BackendModel for CandleBackendModel {
         &self,
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<InferenceOutput>> {
         self.execute_with_adapter_results(inputs, adapters)
             .into_iter()
             .collect()
@@ -1943,23 +2816,78 @@ impl BackendModel for CandleBackendModel {
         &self,
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Vec<Result<Vec<u8>>> {
+    ) -> Vec<Result<InferenceOutput>> {
         if inputs.len() != adapters.len() {
             let message = format!(
                 "adapter assignment count {} does not match input count {}",
                 adapters.len(),
                 inputs.len()
             );
-            return repeat_batch_error(inputs.len().max(adapters.len()), message);
+            return repeat_batch_error(
+                inputs.len().max(adapters.len()),
+                BatchFailure::local(message),
+            );
         }
         match &self.kind {
+            CandleBackendModelKind::Upstream(runtime) => {
+                if let Err(error) = validate_u8_prompts(&self.source.alias, inputs) {
+                    return repeat_batch_error(inputs.len(), BatchFailure::from_anyhow(&error));
+                }
+                let alias = self.source.alias.as_str();
+                // Per-input isolation, which the trait default cannot give this
+                // backend: an upstream failure is usually about one request (a
+                // rejected prompt, a 400), and collecting into a single
+                // `Result` would fail every co-called peer with it, discarding
+                // responses already received.
+                //
+                // Sequential is not a concurrency compromise here, because
+                // there is no batch to serialise: upstream bindings no longer
+                // enter the batch scheduler (see `UpstreamAdmission`), so this
+                // is called with exactly one input, from the caller's own
+                // thread, with a permit already held. Concurrency across
+                // independent callers comes from there being many such threads
+                // — not from fanning one call out.
+                let results: Vec<Result<InferenceOutput>> = inputs
+                    .iter()
+                    .zip(adapters)
+                    .map(|(input, adapter)| match adapter {
+                        // Adapter injection has no wire representation
+                        // upstream — but only this caller fails for it.
+                        Some(adapter) => Err(anyhow!(
+                            "LoRA adapter `{}` was resolved for model `{alias}`, but upstream bindings do not support adapter injection",
+                            adapter.id
+                        )),
+                        None => runtime
+                            .generate(&[input.data.as_ref()])
+                            .map(|generation| InferenceOutput {
+                                bytes: generation.bytes,
+                                usage: generation.usage,
+                                finish_reason: generation.finish_reason,
+                                tool_calls: generation.tool_calls,
+                                refusal: generation.refusal,
+                            })
+                            // `anyhow::Error::from` rather than a stringified
+                            // message: `GenerationError::from_anyhow` downcasts
+                            // back to `UpstreamError` to recover the provider's
+                            // HTTP status, and flattening to text here would
+                            // erase it.
+                            .map_err(anyhow::Error::from),
+                    })
+                    .collect();
+                record_execution(
+                    &self.source.alias,
+                    runtime.executed_on(),
+                    results.iter().all(Result::is_ok),
+                );
+                results
+            }
             CandleBackendModelKind::TextGeneration {
                 target,
                 speculative: None,
             }
             | CandleBackendModelKind::ModelOptNvfp4(target) => {
                 if let Err(error) = validate_u8_prompts(&self.source.alias, inputs) {
-                    return repeat_batch_error(inputs.len(), error.to_string());
+                    return repeat_batch_error(inputs.len(), BatchFailure::from_anyhow(&error));
                 }
                 let prompts = inputs
                     .iter()
@@ -1970,11 +2898,11 @@ impl BackendModel for CandleBackendModel {
                         if outputs.len() != inputs.len() {
                             return repeat_batch_error(
                                 inputs.len(),
-                                format!(
+                                BatchFailure::local(format!(
                                     "Candle backend returned {} output(s) for a native mixed-adapter batch of {} input(s)",
                                     outputs.len(),
                                     inputs.len()
-                                ),
+                                )),
                             );
                         }
                         let executed_on = if self.source.accelerator == AcceleratorKind::Gpu {
@@ -1983,7 +2911,12 @@ impl BackendModel for CandleBackendModel {
                             "cpu"
                         };
                         record_execution(&self.source.alias, executed_on, true);
-                        outputs.into_iter().map(Ok).collect()
+                        outputs
+                            .into_iter()
+                            .map(|(bytes, usage, finish)| {
+                                Ok(InferenceOutput::measured(bytes, usage, finish))
+                            })
+                            .collect()
                     }
                     Ok(None) => self.execute_with_adapters_sequential_results(inputs, adapters),
                     Err(error) => {
@@ -2010,6 +2943,51 @@ impl BackendModel for CandleBackendModel {
         }
     }
 
+    fn stream_text_with_adapter(
+        &self,
+        inputs: &[SharedInputTensor],
+        adapter: &ResolvedLoraAdapter,
+        sink: &mut dyn StreamSink,
+    ) -> Result<StreamOutcome> {
+        // Only the safetensors text-generation runtime can inject an adapter.
+        // Every other kind — GGUF, upstream, NVFP4, MoE, mock — refuses rather
+        // than quietly streaming the base model, which is exactly what the
+        // buffered path already does for them. Refusing is the point: a route
+        // that pins a tenant's adapter must never be answered by the base
+        // model, and a `stream: true` request that silently was would be
+        // invisible to the caller.
+        let CandleBackendModelKind::TextGeneration {
+            target,
+            speculative: None,
+        } = &self.kind
+        else {
+            bail!(
+                "LoRA adapter `{}` was resolved for model `{}`, but this backend does not support adapter injection",
+                adapter.id,
+                self.source.alias
+            );
+        };
+        validate_u8_prompts(&self.source.alias, inputs)?;
+        let prompts = inputs
+            .iter()
+            .map(|input| input.data.as_ref())
+            .collect::<Vec<_>>();
+        let on_token: &mut dyn FnMut(&str) -> StreamControl =
+            &mut |fragment: &str| sink.emit(StreamEvent::Content(fragment));
+        target
+            .generate_with_adapter_streaming(&prompts, &adapter.id, &adapter.path, on_token)
+            .map(|(usage, finish_reason)| {
+                StreamOutcome::usage(Some(usage)).with_finish_reason(finish_reason)
+            })
+            .with_context(|| {
+                format!(
+                    "Candle LLM model `{}` loaded from `{}` failed",
+                    self.source.alias,
+                    target.root().display()
+                )
+            })
+    }
+
     fn embed_text(&self, input: &SharedInputTensor) -> Result<Vec<f32>> {
         if !matches!(input.ty, TensorType::U8) {
             bail!(
@@ -2029,16 +3007,27 @@ impl BackendModel for CandleBackendModel {
                 "model `{}` is a generation runtime and does not expose hidden-state pooling yet",
                 self.source.alias
             ),
-            CandleBackendModelKind::TextEmbedding(runtime) => {
-                let input = std::str::from_utf8(input.data.as_ref()).map_err(|error| {
-                    anyhow!(
-                        "embedding input for model `{}` was not UTF-8: {error}",
+            CandleBackendModelKind::Upstream(runtime) => {
+                let input = std::str::from_utf8(input.data.as_ref()).with_context(|| {
+                    format!(
+                        "embedding input for model `{}` was not UTF-8",
                         self.source.alias
                     )
                 })?;
-                let result = runtime.embed(input).map_err(|error| {
-                    anyhow!(
-                        "embedding model `{}` loaded from `{}` failed: {error}",
+                let result = runtime.embed(input).map_err(anyhow::Error::from);
+                record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
+                result
+            }
+            CandleBackendModelKind::TextEmbedding(runtime) => {
+                let input = std::str::from_utf8(input.data.as_ref()).with_context(|| {
+                    format!(
+                        "embedding input for model `{}` was not UTF-8",
+                        self.source.alias
+                    )
+                })?;
+                let result = runtime.embed(input).with_context(|| {
+                    format!(
+                        "embedding model `{}` loaded from `{}` failed",
                         self.source.alias,
                         runtime.root().display()
                     )
@@ -2060,9 +3049,42 @@ impl BackendModel for CandleBackendModel {
     fn stream_text(
         &self,
         inputs: &[SharedInputTensor],
-        on_token: &mut dyn FnMut(&str),
-    ) -> Result<()> {
+        sink: &mut dyn StreamSink,
+    ) -> Result<StreamOutcome> {
+        // The upstream backend is the only one that writes to the `ToolCall`
+        // arm — it receives calls already structured — so it takes the sink
+        // whole, before the text adapter borrows it.
+        if let CandleBackendModelKind::Upstream(runtime) = &self.kind {
+            validate_u8_prompts(&self.source.alias, inputs)?;
+            let prompts = inputs
+                .iter()
+                .map(|input| input.data.as_ref())
+                .collect::<Vec<_>>();
+            // Real SSE passthrough rather than the trait's generate-then-emit
+            // default: the upstream already streams, and buffering here would
+            // throw away time-to-first-token.
+            let result = runtime
+                .generate_streaming(&prompts, sink)
+                .map_err(anyhow::Error::from);
+            record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
+            return result;
+        }
+        // Every local backend produces text and nothing else: a `[TOOL_CALLS]`
+        // envelope from a chat template is *part of* that text, and recognising
+        // it needs the template the caller resolved, not the decode loop. They
+        // therefore keep a plain `&str` callback, adapted here.
+        let on_token: &mut dyn FnMut(&str) -> StreamControl =
+            &mut |fragment: &str| sink.emit(StreamEvent::Content(fragment));
+        // A local backend reports `length` when it spent its whole token budget
+        // and nothing otherwise: EOS, a stop sequence and the deadline stay the
+        // caller's to infer. Streaming and buffered agree here — an absent
+        // reason resolves to `stop` downstream, so a truncated streamed answer
+        // would otherwise be indistinguishable from a complete one.
+        let outcome = |(usage, finish_reason): (TokenUsage, Option<&'static str>)| {
+            StreamOutcome::usage(Some(usage)).with_finish_reason(finish_reason)
+        };
         match &self.kind {
+            CandleBackendModelKind::Upstream(_) => unreachable!("handled above"),
             CandleBackendModelKind::ModelOptNvfp4(runtime) => {
                 validate_u8_prompts(&self.source.alias, inputs)?;
                 let prompts = inputs
@@ -2071,9 +3093,10 @@ impl BackendModel for CandleBackendModel {
                     .collect::<Vec<_>>();
                 runtime
                     .generate_streaming(&prompts, on_token)
-                    .map_err(|error| {
-                        anyhow!(
-                            "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                    .map(outcome)
+                    .with_context(|| {
+                        format!(
+                            "Candle LLM model `{}` loaded from `{}` failed",
                             self.source.alias,
                             runtime.root().display()
                         )
@@ -2097,9 +3120,10 @@ impl BackendModel for CandleBackendModel {
                     ),
                     None => target.generate_streaming(&prompts, on_token),
                 }
-                .map_err(|error| {
-                    anyhow!(
-                        "Candle LLM model `{}` loaded from `{}` failed: {error}",
+                .map(outcome)
+                .with_context(|| {
+                    format!(
+                        "Candle LLM model `{}` loaded from `{}` failed",
                         self.source.alias,
                         target.root().display()
                     )
@@ -2113,9 +3137,10 @@ impl BackendModel for CandleBackendModel {
                     .collect::<Vec<_>>();
                 runtime
                     .generate_streaming(&prompts, on_token)
-                    .map_err(|error| {
-                        anyhow!(
-                            "Qwen 3.5 MoE model `{}` loaded from `{}` failed: {error}",
+                    .map(outcome)
+                    .with_context(|| {
+                        format!(
+                            "Qwen 3.5 MoE model `{}` loaded from `{}` failed",
                             self.source.alias,
                             runtime.root().display()
                         )
@@ -2142,12 +3167,17 @@ impl BackendModel for CandleBackendModel {
                         inputs.len()
                     );
                 }
-                let text = String::from_utf8(outputs.into_iter().next().unwrap_or_default())
+                let text = String::from_utf8(outputs.into_iter().next().unwrap_or_default().bytes)
                     .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
                 if !text.is_empty() {
                     on_token(&text);
                 }
-                Ok(())
+                // The mock has no tokenizer, so it reports the only counts it
+                // can defend: whitespace-separated words. Deterministic and
+                // obviously synthetic — enough for the end-to-end test to prove
+                // the numbers reach the client, without pretending to be a real
+                // tokenization.
+                Ok(StreamOutcome::usage(Some(mock_token_usage(inputs, &text))))
             }
             CandleBackendModelKind::Vendor(_) => {
                 let outputs = self.execute(inputs)?;
@@ -2158,12 +3188,30 @@ impl BackendModel for CandleBackendModel {
                         inputs.len()
                     );
                 }
-                let text = String::from_utf8(outputs.into_iter().next().unwrap_or_default())
+                let text = String::from_utf8(outputs.into_iter().next().unwrap_or_default().bytes)
                     .map_err(|error| anyhow!("vendor output was not UTF-8: {error}"))?;
                 on_token(&text);
-                Ok(())
+                // A vendor runner returns text over a pipe and never reports
+                // token counts, so there is nothing honest to publish.
+                Ok(StreamOutcome::default())
             }
         }
+    }
+}
+
+/// Word counts for the mock backend, which has no tokenizer.
+fn mock_token_usage(inputs: &[SharedInputTensor], output: &str) -> TokenUsage {
+    let prompt_tokens = inputs
+        .first()
+        .map(|input| {
+            String::from_utf8_lossy(&input.data)
+                .split_whitespace()
+                .count()
+        })
+        .unwrap_or(0);
+    TokenUsage {
+        prompt_tokens: prompt_tokens as u32,
+        completion_tokens: output.split_whitespace().count() as u32,
     }
 }
 
@@ -2221,9 +3269,15 @@ impl CandleModel {
             ));
         }
         let memory_residency = backend_model.residency();
+        // The backend gets the final say on its lane: an upstream binding runs
+        // on the network queue whatever `device` the manifest declared, because
+        // that field describes the remote server rather than this node.
+        let accelerator = backend_model
+            .scheduling_lane()
+            .unwrap_or_else(|| AcceleratorKind::from_model_device(&binding.device));
         Ok(Self {
             alias: binding.alias.clone(),
-            accelerator: AcceleratorKind::from_model_device(&binding.device),
+            accelerator,
             qos: binding.qos,
             memory_residency,
             backend_model,
@@ -2247,7 +3301,7 @@ impl CandleModel {
         &self,
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Vec<Result<Vec<u8>>> {
+    ) -> Vec<Result<InferenceOutput>> {
         self.backend_model
             .execute_with_adapter_results(inputs, adapters)
     }
@@ -2972,9 +4026,10 @@ impl SemanticContextFlattener {
     }
 }
 
-fn repeat_batch_error(count: usize, message: impl Into<String>) -> Vec<Result<Vec<u8>>> {
-    let message = message.into();
-    (0..count).map(|_| Err(anyhow!("{}", message))).collect()
+fn repeat_batch_error(count: usize, failure: BatchFailure) -> Vec<Result<InferenceOutput>> {
+    (0..count)
+        .map(|_| Err(anyhow::Error::new(failure.clone())))
+        .collect()
 }
 
 impl CandleBackendModel {
@@ -2982,14 +4037,17 @@ impl CandleBackendModel {
         &self,
         inputs: &[SharedInputTensor],
         adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Vec<Result<Vec<u8>>> {
+    ) -> Vec<Result<InferenceOutput>> {
         if inputs.len() != adapters.len() {
             let message = format!(
                 "adapter assignment count {} does not match input count {}",
                 adapters.len(),
                 inputs.len()
             );
-            return repeat_batch_error(inputs.len().max(adapters.len()), message);
+            return repeat_batch_error(
+                inputs.len().max(adapters.len()),
+                BatchFailure::local(message),
+            );
         }
         let mut results = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
         for group in adapter_assignment_groups(adapters) {
@@ -3005,9 +4063,9 @@ impl CandleBackendModel {
             let outputs = match outputs {
                 Ok(outputs) => outputs,
                 Err(error) => {
-                    let message = error.to_string();
+                    let failure = BatchFailure::from_anyhow(&error);
                     for index in group {
-                        results[index] = Some(Err(anyhow!("{}", message)));
+                        results[index] = Some(Err(anyhow::Error::new(failure.clone())));
                     }
                     continue;
                 }
@@ -3018,8 +4076,9 @@ impl CandleBackendModel {
                     outputs.len(),
                     group.len()
                 );
+                let failure = BatchFailure::local(message);
                 for index in group {
-                    results[index] = Some(Err(anyhow!("{}", message)));
+                    results[index] = Some(Err(anyhow::Error::new(failure.clone())));
                 }
                 continue;
             }
@@ -3037,6 +4096,197 @@ impl CandleBackendModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The classification has to survive the *wrappers*, not just exist.
+    ///
+    /// The first attempt at this only tested the guest's mapping from a
+    /// hand-built `GenerationError`, so it passed while the real path was
+    /// broken: the execution wrappers formatted the cause into their message
+    /// with `anyhow!("…: {error}")`, which erased the typed error before the
+    /// downcast could ever see it. This exercises the wrapping those wrappers
+    /// actually do.
+    #[test]
+    fn a_local_rejection_survives_the_execution_wrappers() {
+        use anyhow::Context;
+
+        let rejected: Result<(), _> = Err(candle_llm_runtime::CandleLlmError::InvalidRequest {
+            alias: "coder".to_owned(),
+            detail: "max_new_tokens 9000 exceeds the 4096-token ceiling".to_owned(),
+        });
+        let wrapped = rejected
+            .with_context(|| {
+                format!(
+                    "Candle LLM model `{}` loaded from `{}` failed",
+                    "coder", "/models/coder"
+                )
+            })
+            .expect_err("the request was rejected");
+
+        let error = GenerationError::from_anyhow(&wrapped);
+        assert!(
+            error.invalid_request,
+            "a request the runtime refused must reach the client as a 400, not a retryable 500"
+        );
+        assert_eq!(error.upstream_status, None, "no provider was involved");
+        // Both halves of the chain, or the message regresses to naming only the
+        // wrapper while the caller loses the detail it needs to fix its request.
+        assert!(
+            error.message.contains("max_new_tokens 9000"),
+            "the cause's detail must survive: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("loaded from"),
+            "and so must the wrapper's context: {}",
+            error.message
+        );
+    }
+
+    /// The scheduler fans one backend failure out to every input in the batch,
+    /// re-materialising an error that cannot be cloned. That fan-out was the
+    /// third place the classification died — after the execution wrappers and
+    /// before the guest — and the one that made the first fix look like it
+    /// worked in a unit test while doing nothing in production.
+    #[test]
+    fn a_local_rejection_survives_the_batch_fan_out() {
+        use anyhow::Context;
+
+        let rejected: Result<(), _> = Err(candle_llm_runtime::CandleLlmError::InvalidRequest {
+            alias: "coder".to_owned(),
+            detail: "max_new_tokens 9000 exceeds the 4096-token ceiling".to_owned(),
+        });
+        let wrapped = rejected
+            .context("Candle LLM model `coder` loaded from `/models/coder` failed")
+            .expect_err("the request was rejected");
+
+        // Exactly what the fan-out does with it.
+        let fanned_out: Vec<_> = repeat_batch_error(3, BatchFailure::from_anyhow(&wrapped));
+        assert_eq!(fanned_out.len(), 3);
+        for result in fanned_out {
+            let error = GenerationError::from_anyhow(&result.expect_err("every input fails"));
+            assert!(
+                error.invalid_request,
+                "each input's share of a rejected request is still a rejected request"
+            );
+            assert!(
+                error.message.contains("max_new_tokens 9000"),
+                "and still says why: {}",
+                error.message
+            );
+        }
+    }
+
+    /// A host fault wrapped identically stays a 500 — the classification keys
+    /// on the typed cause, not on having been wrapped.
+    #[test]
+    fn a_host_failure_is_not_classified_as_the_callers_fault() {
+        use anyhow::Context;
+
+        let failed: Result<(), _> = Err(candle_llm_runtime::CandleLlmError::Execution {
+            alias: "coder".to_owned(),
+            detail: "transformer forward pass failed".to_owned(),
+        });
+        let wrapped = failed
+            .context("Candle LLM model `coder` loaded from `/models/coder` failed")
+            .expect_err("the execution failed");
+
+        assert!(!GenerationError::from_anyhow(&wrapped).invalid_request);
+    }
+
+    #[test]
+    fn an_openai_binding_loads_as_an_upstream_without_touching_the_filesystem() {
+        let backend = CandleBackendModel::load(&IntegrityModelBinding {
+            alias: "remote-coder".to_owned(),
+            // Deliberately not a directory: the upstream scheme must be claimed
+            // before any on-disk loader is probed.
+            path: "openai:http://127.0.0.1:8080/v1?model=qwen3-coder-30b".to_owned(),
+            // Deliberately `Cuda`: the remote server's device is not this
+            // node's to account for.
+            device: ModelDevice::Cuda,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        })
+        .expect("an upstream binding should load without reaching the network");
+
+        assert!(matches!(backend.kind, CandleBackendModelKind::Upstream(_),));
+        // No local weights, so no local residency claim.
+        assert_eq!(backend.residency(), AcceleratorMemoryResidency::HostRam);
+        assert_eq!(backend.source.model_size_bytes, 0);
+    }
+
+    #[test]
+    fn one_bad_upstream_request_does_not_poison_its_co_batched_neighbours() {
+        let upstream = upstream_openai::FakeUpstream::start_many(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+            2,
+        );
+        let backend = CandleBackendModel::load(&IntegrityModelBinding {
+            alias: "remote-coder".to_owned(),
+            path: upstream.binding(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        })
+        .expect("upstream binding should load");
+
+        // Middle request is rejected before it ever leaves the host
+        // (`max_new_tokens: 0`); the other two are valid and must still get
+        // their own answers rather than inherit the failure.
+        let inputs = [
+            &br#"{"prompt":"a"}"#[..],
+            &br#"{"prompt":"b","max_new_tokens":0}"#[..],
+            &br#"{"prompt":"c"}"#[..],
+        ]
+        .map(|data| SharedInputTensor {
+            dimensions: vec![data.len() as u32],
+            ty: TensorType::U8,
+            data: Arc::from(data),
+        });
+        let adapters = vec![None, None, None];
+
+        let results = backend.execute_with_adapter_results(&inputs, &adapters);
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results[0]
+                .as_ref()
+                .expect("first request should succeed")
+                .bytes,
+            b"ok"
+        );
+        assert!(
+            results[1].is_err(),
+            "the malformed request should fail on its own"
+        );
+        assert_eq!(
+            results[2]
+                .as_ref()
+                .expect("third request should succeed")
+                .bytes,
+            b"ok"
+        );
+    }
+
+    #[test]
+    fn an_invalid_openai_binding_fails_at_load_rather_than_at_first_request() {
+        let error = CandleBackendModel::load(&IntegrityModelBinding {
+            alias: "remote-coder".to_owned(),
+            path: "openai:ftp://nope".to_owned(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        })
+        .err()
+        .expect("a malformed upstream URL must fail closed at load");
+        assert!(
+            error.to_string().contains("http://"),
+            "the error should name the accepted schemes, got: {error}"
+        );
+    }
 
     fn model_broker_env_guard() -> std::sync::MutexGuard<'static, ()> {
         static MODEL_BROKER_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -3066,7 +4316,7 @@ mod tests {
     fn mock_inference_job(
         model: &Arc<CandleModel>,
         tenant: &str,
-        response_tx: mpsc::Sender<Result<Vec<u8>, anyhow::Error>>,
+        response_tx: mpsc::Sender<Result<InferenceOutput, anyhow::Error>>,
     ) -> InferenceJob {
         InferenceJob {
             alias: model.alias.clone(),
@@ -3096,11 +4346,13 @@ mod tests {
             self
         }
 
-        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
+        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>> {
             Ok(inputs
                 .iter()
                 .map(|input| {
-                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref())).into_bytes()
+                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref()))
+                        .into_bytes()
+                        .into()
                 })
                 .collect())
         }
@@ -3109,7 +4361,7 @@ mod tests {
             &self,
             inputs: &[SharedInputTensor],
             adapter: &ResolvedLoraAdapter,
-        ) -> Result<Vec<Vec<u8>>> {
+        ) -> Result<Vec<InferenceOutput>> {
             Ok(inputs
                 .iter()
                 .map(|input| {
@@ -3119,6 +4371,7 @@ mod tests {
                         String::from_utf8_lossy(input.data.as_ref())
                     )
                     .into_bytes()
+                    .into()
                 })
                 .collect())
         }
@@ -3135,11 +4388,13 @@ mod tests {
             self
         }
 
-        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
+        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>> {
             Ok(inputs
                 .iter()
                 .map(|input| {
-                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref())).into_bytes()
+                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref()))
+                        .into_bytes()
+                        .into()
                 })
                 .collect())
         }
@@ -3148,7 +4403,7 @@ mod tests {
             &self,
             inputs: &[SharedInputTensor],
             adapter: &ResolvedLoraAdapter,
-        ) -> Result<Vec<Vec<u8>>> {
+        ) -> Result<Vec<InferenceOutput>> {
             if adapter.id == "broken" {
                 bail!("adapter `{}` is malformed", adapter.id);
             }
@@ -3161,6 +4416,7 @@ mod tests {
                         String::from_utf8_lossy(input.data.as_ref())
                     )
                     .into_bytes()
+                    .into()
                 })
                 .collect())
         }
@@ -3181,12 +4437,14 @@ mod tests {
             self
         }
 
-        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<Vec<u8>>> {
+        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>> {
             self.sequential_adapter_calls.fetch_add(1, Ordering::SeqCst);
             Ok(inputs
                 .iter()
                 .map(|input| {
-                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref())).into_bytes()
+                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref()))
+                        .into_bytes()
+                        .into()
                 })
                 .collect())
         }
@@ -3195,7 +4453,7 @@ mod tests {
             &self,
             inputs: &[SharedInputTensor],
             adapter: &ResolvedLoraAdapter,
-        ) -> Result<Vec<Vec<u8>>> {
+        ) -> Result<Vec<InferenceOutput>> {
             self.sequential_adapter_calls.fetch_add(1, Ordering::SeqCst);
             Ok(inputs
                 .iter()
@@ -3206,6 +4464,7 @@ mod tests {
                         String::from_utf8_lossy(input.data.as_ref())
                     )
                     .into_bytes()
+                    .into()
                 })
                 .collect())
         }
@@ -3214,7 +4473,7 @@ mod tests {
             &self,
             inputs: &[SharedInputTensor],
             adapters: &[Option<ResolvedLoraAdapter>],
-        ) -> Result<Vec<Vec<u8>>> {
+        ) -> Result<Vec<InferenceOutput>> {
             self.execute_with_adapter_results(inputs, adapters)
                 .into_iter()
                 .collect()
@@ -3224,7 +4483,7 @@ mod tests {
             &self,
             inputs: &[SharedInputTensor],
             adapters: &[Option<ResolvedLoraAdapter>],
-        ) -> Vec<Result<Vec<u8>>> {
+        ) -> Vec<Result<InferenceOutput>> {
             self.native_batches.fetch_add(1, Ordering::SeqCst);
             inputs
                 .iter()
@@ -3238,7 +4497,8 @@ mod tests {
                             .unwrap_or("base"),
                         String::from_utf8_lossy(input.data.as_ref())
                     )
-                    .into_bytes())
+                    .into_bytes()
+                    .into())
                 })
                 .collect()
         }
@@ -3296,6 +4556,251 @@ mod tests {
             )
             .expect("failing adapter model should load"),
         )
+    }
+
+    fn config_with_upstream_binding(alias: &str, binding_path: String) -> IntegrityConfig {
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: alias.to_owned(),
+            path: binding_path,
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }];
+        IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        }
+    }
+
+    #[test]
+    fn the_upstream_gate_admits_up_to_its_capacity_and_makes_the_rest_wait() {
+        let gate = Arc::new(UpstreamAdmission::new(2));
+        let first = gate.acquire().expect("first permit fits");
+        let second = gate.acquire().expect("second permit fits");
+        assert_eq!(gate.in_flight(), 2);
+        assert_eq!(gate.waiting(), 0);
+
+        // A third caller must block rather than open a third socket.
+        let blocked = Arc::clone(&gate);
+        let admitted = thread::spawn(move || {
+            let _permit = blocked
+                .acquire()
+                .expect("third caller is admitted once one frees");
+            true
+        });
+        // Spin rather than sleep: the wait is observable through the gate.
+        while gate.waiting() == 0 {
+            std::hint::spin_loop();
+        }
+        assert_eq!(
+            gate.in_flight(),
+            2,
+            "capacity is not exceeded while waiting"
+        );
+
+        drop(first);
+        assert!(
+            admitted.join().expect("waiting caller should not panic"),
+            "releasing a permit must wake exactly one waiter"
+        );
+        drop(second);
+        assert_eq!(gate.in_flight(), 0, "every permit is returned");
+    }
+
+    #[test]
+    fn an_upstream_permit_is_returned_when_its_request_unwinds() {
+        let gate = UpstreamAdmission::new(1);
+        let failed: Result<(), String> = (|| {
+            let _permit = gate.acquire()?;
+            Err("upstream returned 500".to_owned())
+        })();
+        assert!(failed.is_err());
+        assert_eq!(
+            gate.in_flight(),
+            0,
+            "the permit must be released on the error path, not only on success"
+        );
+        // Proves the capacity is genuinely reusable, not merely counted back.
+        drop(gate.acquire().expect("capacity is available again"));
+    }
+
+    #[test]
+    fn a_saturated_upstream_gate_sheds_instead_of_queueing_forever() {
+        // `UPSTREAM_ADMISSION_TIMEOUT` is the production wait; this asserts the
+        // shed *path* exists and names the knob, without waiting 30s for it.
+        let gate = UpstreamAdmission::new(1);
+        let _held = gate.acquire().expect("first permit fits");
+        let mut state = gate.state.lock().expect("gate lock");
+        state.waiting += 1;
+        drop(state);
+        assert_eq!(
+            gate.waiting(),
+            1,
+            "a blocked caller is visible as backlog, not as in-flight work"
+        );
+    }
+
+    /// The cap belongs to the node, not to whichever manifest is loaded.
+    ///
+    /// Built per runtime, a hot reload gave the incoming generation its own
+    /// gate while the previous one was still draining — so for the length of
+    /// that overlap the node allowed twice the configured concurrency against
+    /// the same upstream, at exactly the moment a provider is least able to
+    /// absorb it.
+    #[test]
+    fn every_runtime_generation_shares_one_upstream_gate() {
+        let first = node_upstream_admission();
+        let second = node_upstream_admission();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second generation must not get a gate of its own"
+        );
+
+        // Pointer equality is the whole property: the same `Arc` is the same
+        // `UpstreamAdmission` behind the same mutex, so a permit taken through
+        // either handle is counted by both. Asserting on `in_flight` instead
+        // would race any other test in this binary that builds a runtime and
+        // acquires — a flake that would say nothing extra.
+    }
+
+    /// A refused admission is an overload, not a broken node.
+    ///
+    /// Without a status the caller sees 500 `server_error` — a node that has
+    /// failed — and an agent retries immediately, adding to the queue that just
+    /// refused it. 503 is what says "come back", and it is the answer that
+    /// makes a client's backoff correct rather than harmful.
+    #[test]
+    fn a_refused_admission_is_reported_as_an_overload() {
+        let gate = UpstreamAdmission::new(1);
+        let _held = gate.acquire().expect("first permit fits");
+        {
+            let mut state = gate.state.lock().expect("gate lock");
+            state.waiting = UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT;
+        }
+        let Err(refusal) = gate.acquire() else {
+            panic!("a queue at its depth refuses");
+        };
+
+        let error = GenerationError::overloaded(refusal);
+        assert_eq!(
+            error.upstream_status,
+            Some(503),
+            "an overloaded node has to say so, or the client's retry makes it worse"
+        );
+        assert!(
+            !error.invalid_request,
+            "the request was fine; there was simply no room for it"
+        );
+        assert!(error.message.contains("saturated"), "{}", error.message);
+    }
+
+    /// A full queue refuses immediately rather than parking another thread.
+    ///
+    /// The caller has already spawned its dedicated stream thread by the time
+    /// it gets here, so an unbounded queue converts a burst into unbounded
+    /// parked threads — each held for the whole admission timeout while only
+    /// `capacity` requests are actually being served. Refusing past the depth
+    /// is what keeps the parked count a multiple of the work in flight.
+    #[test]
+    fn a_queue_at_its_depth_refuses_instead_of_parking_another_caller() {
+        let gate = UpstreamAdmission::new(1);
+        let _held = gate.acquire().expect("first permit fits");
+        // Stand in for callers already parked, so the refusal can be observed
+        // without waiting out `UPSTREAM_ADMISSION_TIMEOUT` for each of them.
+        {
+            let mut state = gate.state.lock().expect("gate lock");
+            state.waiting = UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT;
+        }
+
+        let Err(refused) = gate.acquire() else {
+            panic!("a queue at its depth must refuse rather than park");
+        };
+
+        assert!(
+            refused.contains("already queued"),
+            "the refusal must say the queue is what is full, not the capacity: {refused}"
+        );
+        assert!(
+            refused.contains(UPSTREAM_MAX_CONCURRENCY_ENV),
+            "the refusal must name the knob that raises the limit: {refused}"
+        );
+        assert_eq!(
+            gate.waiting(),
+            UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT,
+            "a refused caller never joins the backlog it was refused for"
+        );
+    }
+
+    #[test]
+    fn the_network_lane_reports_the_admission_backlog_rather_than_a_scheduler_queue() {
+        let upstream = upstream_openai::FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+        );
+        let runtime = AiInferenceRuntime::from_config(&config_with_upstream_binding(
+            "remote-coder",
+            upstream.binding(),
+        ))
+        .expect("runtime should load the upstream binding");
+
+        // The `Network` lane has no dispatcher thread at all — upstream work
+        // never enters a scheduler queue — yet the lane is still supported.
+        assert!(runtime.supports_accelerator(AcceleratorKind::Network));
+        assert!(
+            !runtime.schedulers.contains_key(&AcceleratorKind::Network),
+            "the network lane must not spawn a dispatcher that never receives a job"
+        );
+        assert_eq!(
+            runtime.queue_tier_snapshot(AcceleratorKind::Network),
+            QueueTierSnapshot::default(),
+            "an idle node reports no upstream backlog"
+        );
+
+        // With a caller blocked on admission, the same lane reports depth on
+        // every tier, which is what `should_consult_mesh_qos_override` reads to
+        // spill realtime traffic to a peer.
+        let mut state = runtime
+            .upstream_admission
+            .state
+            .lock()
+            .expect("gate lock poisoned");
+        state.waiting = 3;
+        drop(state);
+        assert_eq!(
+            runtime.queue_tier_snapshot(AcceleratorKind::Network),
+            QueueTierSnapshot {
+                realtime: 3,
+                standard: 3,
+                batch: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn an_upstream_prompt_runs_under_a_permit_and_returns_it() {
+        let upstream = upstream_openai::FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+        );
+        let runtime = AiInferenceRuntime::from_config(&config_with_upstream_binding(
+            "remote-coder",
+            upstream.binding(),
+        ))
+        .expect("runtime should load the upstream binding");
+
+        let generation = runtime
+            .compute_component_prompt_with_adapter("remote-coder", r#"{"prompt":"hi"}"#, None)
+            .expect("upstream prompt should round-trip without the batch scheduler");
+        assert_eq!(generation.text, "ok");
+        assert_eq!(
+            runtime.upstream_admission.in_flight(),
+            0,
+            "the permit must not outlive the request"
+        );
     }
 
     #[test]
@@ -3385,10 +4890,12 @@ mod tests {
             .expect("base model generation before adapter");
         let output = runtime
             .compute_component_prompt_with_adapter("tiny", "hello", Some("tenant-a"))
-            .expect("real backend should apply the resolved adapter");
+            .expect("real backend should apply the resolved adapter")
+            .text;
         let base_after = runtime
             .compute_component_prompt_with_adapter("tiny", "hello", None)
-            .expect("base model generation after adapter");
+            .expect("base model generation after adapter")
+            .text;
 
         assert!(!output.is_empty());
         assert_ne!(output, MOCK_INFERENCE_RESPONSE);
@@ -3429,7 +4936,7 @@ mod tests {
             .compute_component_prompt_with_adapter("tiny-gguf", "hello", Some("tenant-a"))
             .expect_err("GGUF must reject LoRA injection explicitly");
 
-        assert!(error.contains("safetensors Llama checkpoints only"));
+        assert!(error.message.contains("safetensors Llama checkpoints only"));
         std::env::remove_var(MODEL_BROKER_DIR_ENV);
         let _ = fs::remove_dir_all(adapter_root);
         let _ = fs::remove_dir_all(model_dir);
@@ -3450,9 +4957,12 @@ mod tests {
         let mut streamed = String::new();
         let mut fragments = 0usize;
         runtime
-            .stream_component_prompt("tiny", "hello", &mut |delta| {
-                streamed.push_str(delta);
-                fragments += 1;
+            .stream_component_prompt("tiny", "hello", None, &mut |event: StreamEvent<'_>| {
+                if let StreamEvent::Content(delta) = event {
+                    streamed.push_str(delta);
+                    fragments += 1;
+                }
+                StreamControl::Continue
             })
             .expect("streamed generation");
         assert_eq!(
@@ -3606,16 +5116,22 @@ mod tests {
                 &format!(r#"{{"prompt":"hello","max_new_tokens":{over_cap}}}"#),
             )
             .expect_err("generation cap should reject oversized request");
-        assert!(too_many_tokens.contains(&format!("max_new_tokens {over_cap}")));
+        assert!(too_many_tokens
+            .message
+            .contains(&format!("max_new_tokens {over_cap}")));
 
-        let over_bytes = candle_llm_runtime::DEFAULT_MAX_PROMPT_BYTES + 1;
+        // The byte cap is derived from the checkpoint's context window, so the
+        // fixture's tiny window is what bounds this — not a flat constant.
+        let (_, max_prompt_bytes) = candle_llm_runtime::prompt_limits_for(
+            candle_llm_runtime::FIXTURE_MAX_POSITION_EMBEDDINGS,
+        );
+        let over_bytes = max_prompt_bytes + 1;
         let long_prompt = "x".repeat(over_bytes);
         let prompt_error = runtime
             .compute_component_prompt("tiny", &long_prompt)
             .expect_err("prompt byte limit should reject oversized prompt");
-        assert!(prompt_error.contains(&format!(
-            "prompt bytes {over_bytes} exceed limit {}",
-            candle_llm_runtime::DEFAULT_MAX_PROMPT_BYTES
+        assert!(prompt_error.message.contains(&format!(
+            "prompt bytes {over_bytes} exceed limit {max_prompt_bytes}"
         )));
         let _ = fs::remove_dir_all(model_dir);
     }
@@ -3645,7 +5161,7 @@ mod tests {
         let missing = runtime
             .compute_component_prompt("no-such-model", "hello")
             .expect_err("an absent alias must not load");
-        assert!(missing.contains("is not loaded"));
+        assert!(missing.message.contains("is not loaded"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3663,7 +5179,7 @@ mod tests {
         let error = runtime
             .compute_component_prompt(alias, "hello")
             .expect_err("without a dynamic root, uploads must not load");
-        assert!(error.contains("is not loaded"));
+        assert!(error.message.contains("is not loaded"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3771,7 +5287,7 @@ mod tests {
 
         for handle in handles {
             let output = handle.join().expect("worker should join");
-            assert_eq!(output, MOCK_INFERENCE_RESPONSE.as_bytes());
+            assert_eq!(output.bytes, MOCK_INFERENCE_RESPONSE.as_bytes());
         }
 
         let snapshot = runtime.scheduler_snapshot(AcceleratorKind::Cpu);
@@ -4064,7 +5580,7 @@ mod tests {
             .collect::<Vec<_>>();
         let outputs = process_batch(AcceleratorKind::Gpu, &batch)
             .into_iter()
-            .map(|result| String::from_utf8(result.expect("sub-batch output")).expect("utf8"))
+            .map(|result| String::from_utf8(result.expect("sub-batch output").bytes).expect("utf8"))
             .collect::<Vec<_>>();
         assert_eq!(
             outputs,
@@ -4104,7 +5620,9 @@ mod tests {
 
         let outputs = process_batch(AcceleratorKind::Gpu, &batch)
             .into_iter()
-            .map(|result| String::from_utf8(result.expect("native batch output")).expect("utf8"))
+            .map(|result| {
+                String::from_utf8(result.expect("native batch output").bytes).expect("utf8")
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(
@@ -4150,12 +5668,14 @@ mod tests {
                 results
                     .remove(0)
                     .expect("healthy adapter row should succeed")
+                    .bytes
             )
             .expect("utf8"),
             "tenant-ok:tenant-ok"
         );
         assert_eq!(
-            String::from_utf8(results.remove(0).expect("base row should succeed")).expect("utf8"),
+            String::from_utf8(results.remove(0).expect("base row should succeed").bytes)
+                .expect("utf8"),
             "base:plain"
         );
         let error = results
@@ -4310,7 +5830,7 @@ mod tests {
     }
 
     #[test]
-    fn component_accelerator_runtime_rejects_mismatched_devices() {
+    fn a_binding_opens_from_any_interface_and_runs_on_its_own_device() {
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![
             IntegrityModelBinding {
@@ -4343,9 +5863,16 @@ mod tests {
         assert!(runtime
             .load_component_model("llama3", AcceleratorKind::Gpu)
             .is_ok());
+        // A GPU-bound alias opens through the CPU interface too. This used to
+        // be refused, which made every `device: cuda`/`metal` binding
+        // unreachable from `/ai/v1/chat/completions` — `guest-openai` imports
+        // only `tachyon:accelerator/cpu`, so that is the one interface the
+        // public route can open an alias with. The binding still executes on
+        // its own device: the scheduler dispatches on `model.accelerator`, not
+        // on how the handle was obtained.
         assert!(runtime
             .load_component_model("llama3", AcceleratorKind::Cpu)
-            .is_err());
+            .is_ok());
         assert!(runtime
             .load_component_model("tiny", AcceleratorKind::Tpu)
             .is_ok());
@@ -4354,6 +5881,17 @@ mod tests {
                 .compute_component_prompt("llama3", "hello")
                 .expect("component compute should succeed"),
             MOCK_INFERENCE_RESPONSE
+        );
+        // The binding is still recorded on its own lane: opening it from the
+        // CPU interface must not move where it executes, only permit the
+        // handle. Scheduling reads this, not the interface.
+        let models = runtime.models.read().expect("model registry lock");
+        assert_eq!(
+            models
+                .get("llama3")
+                .expect("llama3 should be loaded")
+                .accelerator,
+            AcceleratorKind::Gpu
         );
     }
 
@@ -4443,14 +5981,15 @@ mod tests {
         assert_eq!(
             runtime
                 .compute_component_prompt_with_adapter("llama3", "hello", Some("tenant-a"))
-                .expect("adapter-backed inference should succeed"),
+                .expect("adapter-backed inference should succeed")
+                .text,
             MOCK_INFERENCE_RESPONSE
         );
         let missing = runtime
             .compute_component_prompt_with_adapter("llama3", "hello", Some("tenant-b"))
             .expect_err("missing adapter must fail before inference");
-        assert!(missing.contains("tenant-b"));
-        assert!(missing.contains("adapters"));
+        assert!(missing.message.contains("tenant-b"));
+        assert!(missing.message.contains("adapters"));
         assert!(runtime
             .compute_component_prompt_with_adapter("llama3", "hello", Some("../bad"))
             .is_err());
@@ -4694,6 +6233,61 @@ mod tests {
             .expect("restored tensor should convert");
 
         assert_eq!(restored, vec![-1.0, 0.0, 0.33333334, 0.0]);
+    }
+
+    /// A dynamic binding cannot be an upstream, so it cannot collide as one.
+    ///
+    /// `ensure_model_loaded` replaces a dynamic binding's path with the broker
+    /// directory the upload landed in, so its declared path says nothing about
+    /// where requests go. Counting it let two dynamic aliases that normalise to
+    /// the same credential suffix — `vendor-a` and `vendor_a` — refuse the
+    /// whole boot over a variable neither would ever read.
+    #[test]
+    fn dynamic_aliases_do_not_collide_over_credentials_they_never_use() {
+        let colliding = |dynamic: bool| {
+            let mut route = IntegrityRoute::user("/api/guest-ai");
+            route.models = ["vendor-a", "vendor_a"]
+                .into_iter()
+                .map(|alias| IntegrityModelBinding {
+                    alias: alias.to_owned(),
+                    path: "openai:http://up.invalid/v1".to_owned(),
+                    device: ModelDevice::Cpu,
+                    qos: RouteQos::Standard,
+                    dynamic,
+                    hardware_strategy: Default::default(),
+                })
+                .collect();
+            IntegrityConfig {
+                routes: vec![route],
+                ..IntegrityConfig::default_sealed()
+            }
+        };
+
+        let upstream_aliases = |config: &IntegrityConfig| {
+            config
+                .routes
+                .iter()
+                .flat_map(|route| route.models.iter())
+                .filter(|binding| binding_runs_upstream(binding))
+                .map(|binding| binding.alias.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Non-dynamic: both really do load as upstreams, and one would send the
+        // other's key to a third party. That still refuses the boot.
+        let statics = upstream_aliases(&colliding(false));
+        assert!(
+            assert_no_credential_collisions(statics.iter().map(String::as_str)).is_err(),
+            "two real upstreams sharing a credential suffix must not boot"
+        );
+
+        // Dynamic: nothing here will ever read a credential.
+        let dynamics = upstream_aliases(&colliding(true));
+        assert!(
+            dynamics.is_empty(),
+            "a dynamic binding is not an upstream, whatever its declared path says"
+        );
+        assert!(assert_no_credential_collisions(dynamics.iter().map(String::as_str)).is_ok());
     }
 
     fn config_with_model(alias: &str) -> IntegrityConfig {

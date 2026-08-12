@@ -129,6 +129,21 @@ pub(crate) struct ComponentHostState {
     pub(crate) ai_runtime: Option<Arc<ai_inference::AiInferenceRuntime>>,
     #[cfg(feature = "ai-inference")]
     pub(crate) allowed_model_aliases: BTreeSet<String>,
+    /// Aliases this component may *see* in the registry, as opposed to the ones
+    /// this route may execute.
+    ///
+    /// The two differ because a dedicated listing route seals no bindings at
+    /// all: `/ai/v1/models` lists, `/ai/v1/chat/completions` executes, and both
+    /// are served by the same component. Scoping the read by the executing set
+    /// emptied the public listing outright — every row filtered, on a node with
+    /// models loaded and answering.
+    ///
+    /// Widened to the component, not to the node: the union over every route
+    /// that targets a module this route targets. Execution stays sealed per
+    /// route through `allowed_model_aliases`, so a wider view buys no wider
+    /// reach.
+    #[cfg(feature = "ai-inference")]
+    pub(crate) listable_model_aliases: BTreeSet<String>,
     #[cfg(feature = "ai-inference")]
     pub(crate) adapter_id: Option<String>,
     #[cfg(feature = "ai-inference")]

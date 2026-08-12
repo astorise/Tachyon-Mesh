@@ -157,8 +157,12 @@ string SHALL be normalised to a list.
 
 ### Requirement: Chat completion tool calling post-processing
 
-`guest-openai` SHALL support OpenAI-compatible tool calling for buffered chat
-completion responses as user-space post-processing of generated assistant text.
+`guest-openai` SHALL support OpenAI-compatible tool calling for both buffered
+and streamed chat completion responses, as user-space post-processing of
+generated assistant text. On the streaming path it SHALL forward content as it
+arrives until a tool-call opener appears, rather than buffering every generation
+that merely offers tools, and SHALL then emit the recovered calls as
+`delta.tool_calls` with `finish_reason: "tool_calls"`.
 When a request provides `tools` or `tool_choice`, it SHALL select a configurable
 tool-call parser from `tool_call_parser`, `extra_body.tool_call_parser`, or a
 model-name heuristic for `qwen_coder`, `qwen`, and `mistral`. Supported parser

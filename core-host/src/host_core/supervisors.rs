@@ -688,6 +688,8 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
         Arc::clone(&state.storage_broker),
     )?;
     let previous_runtime = state.runtime.load_full();
+    #[cfg(feature = "ai-inference")]
+    let previous_runtime_config = previous_runtime.config.clone();
     let draining_since = Instant::now();
     previous_runtime.mark_draining(draining_since);
     state
@@ -698,6 +700,25 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
             runtime: previous_runtime,
             draining_since,
         });
+
+    // Before the swap, withdraw every configured row the incoming runtime will
+    // not serve identically. Publication has to happen *after* the swap (see
+    // below), which leaves a window where the registry still describes the old
+    // runtime while the new one is answering — and an alias whose engine
+    // changed would be advertised as `gguf/<alias>` while requests executed an
+    // `openai:` upstream, the same "the listing lies about where a prompt goes"
+    // failure the ownership rule exists to prevent.
+    //
+    // Withdrawing first turns that into a transient *absence* instead: the
+    // alias 404s for the length of the swap and comes back correctly labelled.
+    // A missing row is a client's retry; a wrong one is a prompt sent somewhere
+    // it did not choose.
+    #[cfg(feature = "ai-inference")]
+    crate::system_storage::withdraw_changed_model_bindings(
+        &state.core_store,
+        &previous_runtime_config,
+        &runtime.config,
+    );
 
     state
         .background_workers
@@ -714,6 +735,17 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
         .await;
     let runtime = Arc::new(runtime);
     state.runtime.store(Arc::clone(&runtime));
+    // After the swap, not before. `replace_with` above waits for every old
+    // worker to stop, and throughout that interval the still-active runtime is
+    // the previous one — so publishing first advertised aliases it could not
+    // load, and withdrew engine-qualified ids it was still serving. A client
+    // choosing from `GET /ai/v1/models` in that window got transient 404s from
+    // an otherwise successful reload.
+    //
+    // Best-effort, like the boot-time publication: the reload itself must not
+    // fail on a registry write.
+    #[cfg(feature = "ai-inference")]
+    publish_configured_model_bindings_with_retry(&state.core_store, &runtime.config).await;
     state
         .host_identity
         .clear_route_token_cache()
@@ -730,6 +762,51 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
         "Hot reload successful"
     );
     Ok(())
+}
+
+/// Publish the incoming config's registry rows, retrying while any transaction
+/// fails.
+///
+/// The withdrawal before the swap leaves a config-owned reservation on every
+/// alias it touched, and this publication is what lifts them. One best-effort
+/// attempt meant a single failed transaction left the alias hidden from
+/// `GET /ai/v1/models` and refused to uploads — with no periodic
+/// reconciliation anywhere, that state lasted until somebody reloaded again.
+///
+/// Bounded, not indefinite: a store that is still failing after these attempts
+/// is not going to be fixed by a loop here, and the reload itself must not hang
+/// on the registry. The last failure is reported at `error` so the gap is
+/// visible rather than inferred from a 404.
+#[cfg(feature = "ai-inference")]
+async fn publish_configured_model_bindings_with_retry(
+    core_store: &store::CoreStore,
+    config: &crate::IntegrityConfig,
+) {
+    /// Enough to ride out a contended transaction; short enough that a reload
+    /// does not visibly stall on a store that is genuinely down.
+    const ATTEMPTS: usize = 3;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
+    for attempt in 1..=ATTEMPTS {
+        let failures = crate::system_storage::publish_configured_model_bindings(core_store, config);
+        if failures == 0 {
+            return;
+        }
+        if attempt < ATTEMPTS {
+            tracing::warn!(
+                failures,
+                attempt,
+                "model registry publication left rows unwritten after a reload; retrying"
+            );
+            tokio::time::sleep(BACKOFF).await;
+        } else {
+            tracing::error!(
+                failures,
+                "model registry publication still failing after {ATTEMPTS} attempts; aliases \
+                 withdrawn for this reload stay hidden and refused to uploads until the next one"
+            );
+        }
+    }
 }
 
 pub(crate) fn secure_cache_bootstrap(

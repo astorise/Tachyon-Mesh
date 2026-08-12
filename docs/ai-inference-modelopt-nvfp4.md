@@ -32,43 +32,59 @@ Production limits are configured in bytes:
 
 - `TACHYON_NVFP4_MAX_HOST_RAM_BYTES`
 - `TACHYON_NVFP4_MAX_ACCELERATOR_BYTES`
-- `TACHYON_NVFP4_NATIVE_REQUIRED=1` to reject fallback
 
-## Native Kernel Requirements
+## Which path runs
 
-Native NVFP4 execution is capability-gated. A backend must report:
+Two things decide it, and neither is a probe of the device.
 
-- FP4-capable accelerator hardware
-- Runtime availability for the accelerator stack
-- Compiled NVFP4 dequant and matmul kernels
+The route says where the work happens. A `cpu` route is the dense path by
+definition — unpacking is the only thing a host has to multiply — so it needs
+no permission. A `gpu` route is a claim that the accelerator does the work, and
+a build that cannot make good on it fails to load rather than serving the same
+tokens off the wrong device.
 
-Without all three, Tachyon selects the BF16/F32 fallback when allowed by memory limits, or returns an unsupported native-execution error when native execution is required.
+Whether the kernel is reachable is candle's answer, not ours: it is whatever
+`candle-nvfp4-kernels` reports. Tachyon used to keep its own model of this — an
+FP4-hardware flag, a runtime-availability flag, a set of compiled kernel kinds —
+and candle #3831 made the first of them false in practice by removing the
+compute-capability floor the kernel never needed. Hardware requirements belong
+to the kernel that has them; anything mirrored here goes stale the next time
+upstream moves.
 
-## CUDA/CUTLASS Build
+`TACHYON_QWEN35_DEQUANTIZED_FALLBACK=1` turns a refused GPU route back into the
+dense path. It costs eight times the packed memory, it is a development tool
+rather than a deployment mode, and it is the only switch involved.
 
-The concrete native backend is behind the `nvfp4-cuda` feature. Standard builds do not require CUDA, NVCC, or CUTLASS. CI and `--all-features` builds may enable `nvfp4-cuda` without native inputs; in that case Tachyon compiles the Rust capability layer and reports native NVFP4 CUDA kernels unavailable.
+## Building the native path
 
-To compile the native backend, set:
+There is no NVFP4 feature to enable. `candle-nvfp4-kernels` comes in with
+`ai-inference`, and on a plain build it compiles as pure Rust — no CUDA, no
+NVCC, no CUTLASS — and reports itself unavailable. `candle-cuda` is what turns
+on its `cuda` feature, and that is the build that needs a toolchain.
 
-- `TACHYON_NVFP4_CUDA_HOME`, `CUDA_HOME`, or `CUDA_PATH`: CUDA toolkit root
-- `TACHYON_CUTLASS_INCLUDE_DIR`: CUTLASS include directory
-- `TACHYON_NVFP4_CUDA_ARCH`: optional NVCC architecture, default `sm_100a`
-- `TACHYON_NVCC`: optional explicit `nvcc` path
+This used to be a repository-owned kernel with its own build script, driven by
+`TACHYON_NVFP4_CUDA_HOME`, `TACHYON_CUTLASS_INCLUDE_DIR` and `TACHYON_NVCC`.
+Candle owns the kernel now (candle #3824); those variables are read by nothing
+and setting them does nothing — `TACHYON_NVFP4_CUDA_ARCH` included. The kernel
+crate's build script hands architecture selection to `cudaforge`, which reads
+the device itself and picks the `a` variant where the family has one. CI used
+to derive that value from `nvidia-smi` and export it; nothing ever read it.
 
-Example:
+```bash
+# CPU host: compiles, reports the kernel unavailable, exercises the fallback.
+cargo test -p core-host --features ai-inference modelopt_nvfp4
 
-```powershell
-$env:CUDA_PATH='C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0'
-$env:TACHYON_CUTLASS_INCLUDE_DIR='C:\src\cutlass\include'
-$env:TACHYON_NVFP4_CUDA_ARCH='sm_120'
-cargo test -p core-host --features "ai-inference nvfp4-cuda" modelopt_nvfp4
+# CUDA host: compiles the kernel and runs it.
+cargo test -p core-host --features candle-cuda nvfp4_cuda
 ```
 
-The native source provides CUDA entrypoints for NVFP4 dequantization and an initial linear matmul kernel that consumes ModelOpt packed FP4 weights and FP8 E4M3 scales. CUTLASS headers are required to compile the native kernels so future block-scaled Tensor Core kernels can use the same ABI boundary.
-
-The Qwen runtime selects the native packed path once per loaded model. Each
-request records `executed_on` as one of `gpu_native_fp4`, `gpu_fallback`, or
-`cpu_fallback`. WASI-NN ONNX execution records `gpu_onnx` or `cpu`. The bounded
+The Qwen runtime selects the operator once per loaded model, and records
+`executed_on` as `gpu_native_fp4` on a CUDA route or `cpu_packed_fp4` on the
+host. The host value is not a fallback: candle #3857 gave NVFP4 a packed CPU
+operator, so the weight stays at the checkpoint's own footprint and is decoded
+per row during the forward pass rather than expanded eightfold at load. The
+`gpu_fallback` and `cpu_fallback` values are gone with the scalar runtime that
+produced them. WASI-NN ONNX execution records `gpu_onnx` or `cpu`. The bounded
 in-process telemetry log is available through
 `ai_inference::inference_execution_telemetry()` for admin/metrics consumers.
 
@@ -79,6 +95,13 @@ never fall through to `MOCK_LLM_RESPONSE`. Checkpoints matching
 `qwen3.5-moe-text-modelopt-0.44-v1` execute through the hybrid Qwen 3.5 runtime.
 Other architectures return an actionable compatibility error.
 
-The Qwen runtime pages only the current layer, selected routed experts, shared
-expert, and required attention state. See
+Execution is candle's: `qwen35_upstream.rs` translates the validated config,
+hands upstream a projection factory built on `quantized_nvfp4::auto_linear`,
+and runs the decode loop. Nothing pages weights any more — that was the scalar
+runtime's answer to a checkpoint it had to dequantize operator by operator, and
+it went with it.
+
+One consequence is worth knowing before deploying: upstream's model owns the KV
+cache and every linear-attention layer's recurrent state, so requests to one
+alias are serialized. See
 [`ai/qwen35-moe-nvfp4-reference.md`](ai/qwen35-moe-nvfp4-reference.md).

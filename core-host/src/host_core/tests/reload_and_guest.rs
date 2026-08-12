@@ -483,6 +483,14 @@ fn execute_guest_persists_volume_data_for_component_guest() {
 #[cfg(feature = "ai-inference")]
 #[tokio::test]
 async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
+    // Every host-side way this can fail — a linker mismatch, a component that
+    // will not instantiate, a trap — answers 500 with no headers and no body,
+    // and says why only through `tracing`. Without a subscriber the assertion
+    // below reports the bare status and nothing that explains it.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_test_writer()
+        .try_init();
     let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
     route.models = vec![IntegrityModelBinding {
         alias: "llama3".to_owned(),
@@ -512,7 +520,16 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
 
     let messages = serde_json::json!([{"role": "user", "content": "ping"}]);
 
-    // Helper: run execute_streaming_guest, return (status, headers, body_string).
+    // Helper: run execute_streaming_guest, return (worker, headers, body chunks).
+    //
+    // The worker handle is returned rather than detached, and every call site
+    // joins it once its stream is drained. Draining to EOF only proves the
+    // sender was dropped — the worker is still inside `execute_streaming_guest`
+    // for a moment after that, tearing down a wasmtime store. A detached worker
+    // therefore outlives the test, and under a one-process-per-test runner the
+    // process starts exiting while a guest instance is still being torn down on
+    // another thread. That is the standing explanation for this test reporting
+    // itself as passed and then killing its run process with SIGABRT.
     let run_streaming = |body_json: serde_json::Value, seed: u8| {
         let route_c = route.clone();
         let engine_c = engine.clone();
@@ -524,7 +541,7 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
         );
         let (htx, hrx) = tokio::sync::oneshot::channel::<(StatusCode, GuestHttpFields)>();
         let (ctx, crx) = tokio::sync::mpsc::channel::<Bytes>(64);
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             execute_streaming_guest(
                 &engine_c,
                 &route_c,
@@ -535,14 +552,14 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
                 &test_guest_execution_context(config_c, seed),
             );
         });
-        (hrx, crx)
+        (worker, hrx, crx)
     };
 
     // ── Buffered reference: no `stream` field → fallback path sends JSON body ──
     // The streaming execution path is used for both calls; the buffered case
     // uses the channel-based fallback (guest returns normally without calling
     // get-streaming-response).
-    let (hrx_ref, mut crx_ref) = run_streaming(
+    let (ref_worker, hrx_ref, mut crx_ref) = run_streaming(
         serde_json::json!({"model": "llama3", "messages": messages}),
         91,
     );
@@ -551,6 +568,9 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     while let Some(chunk) = crx_ref.recv().await {
         ref_body_bytes.extend_from_slice(&chunk);
     }
+    ref_worker
+        .join()
+        .expect("the buffered worker should finish");
     assert_eq!(
         ref_status,
         StatusCode::OK,
@@ -564,8 +584,31 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
         .expect("buffered reference must have content")
         .to_owned();
 
+    // Unlike a stream, a buffered response has no extra frame to break a naive
+    // client with, so usage is unconditional here — OpenAI reports it the same
+    // way. The counts come back beside the text through `compute-detailed`.
+    let buffered_usage = &ref_json["usage"];
+    assert!(
+        !buffered_usage.is_null(),
+        "a buffered response must report usage: {ref_json}"
+    );
+    let buffered_prompt_tokens = buffered_usage["prompt_tokens"]
+        .as_u64()
+        .expect("prompt_tokens");
+    let buffered_completion_tokens = buffered_usage["completion_tokens"]
+        .as_u64()
+        .expect("completion_tokens");
+    assert!(
+        buffered_prompt_tokens > 0 && buffered_completion_tokens > 0,
+        "buffered usage must be measured, not defaulted: {buffered_usage}"
+    );
+    assert_eq!(
+        buffered_usage["total_tokens"].as_u64(),
+        Some(buffered_prompt_tokens + buffered_completion_tokens)
+    );
+
     // ── Streaming call: stream: true → SSE path ──────────────────────────
-    let (hrx_s, mut crx_s) = run_streaming(
+    let (stream_worker, hrx_s, mut crx_s) = run_streaming(
         serde_json::json!({"model": "llama3", "messages": messages, "stream": true}),
         92,
     );
@@ -584,6 +627,9 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     while let Some(chunk) = crx_s.recv().await {
         sse_body.push_str(&String::from_utf8_lossy(&chunk));
     }
+    stream_worker
+        .join()
+        .expect("the streaming worker should finish");
 
     assert!(
         sse_body.contains("data: [DONE]"),
@@ -606,4 +652,118 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
         delta_content, buffered_content,
         "concatenated SSE deltas must equal the buffered response content"
     );
+
+    // ── Usage is opt-in, exactly as it is on OpenAI ──────────────────────
+    // Without `stream_options.include_usage`, no chunk may carry a `usage`
+    // object: an extra trailing chunk with an empty `choices` array breaks
+    // clients that index `choices[0]` unconditionally, which is why OpenAI
+    // gates it too.
+    for frame in sse_data_frames(&sse_body) {
+        assert!(
+            frame.get("usage").is_none_or(Value::is_null),
+            "an unrequested stream must not carry usage: {frame}"
+        );
+    }
+
+    // ── With it: one trailing chunk, no choices, real counts ─────────────
+    let (usage_worker, hrx_u, mut crx_u) = run_streaming(
+        serde_json::json!({
+            "model": "llama3",
+            "messages": messages,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        }),
+        93,
+    );
+    let (usage_status, _) = hrx_u.await.expect("usage stream headers should arrive");
+    assert_eq!(usage_status, StatusCode::OK);
+    let mut usage_body = String::new();
+    while let Some(chunk) = crx_u.recv().await {
+        usage_body.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    usage_worker
+        .join()
+        .expect("the usage-stream worker should finish");
+
+    let frames = sse_data_frames(&usage_body);
+    let carrying_usage: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame.get("usage").is_some_and(|usage| !usage.is_null()))
+        .collect();
+    assert_eq!(
+        carrying_usage.len(),
+        1,
+        "exactly one chunk carries usage\n{usage_body}"
+    );
+
+    let usage_frame = carrying_usage[0];
+    assert!(
+        usage_frame["choices"]
+            .as_array()
+            .is_some_and(|choices| choices.is_empty()),
+        "the usage chunk must carry no choices: {usage_frame}"
+    );
+    // It must also be the last chunk before `[DONE]`, or a client that stops
+    // reading at `finish_reason` never sees it.
+    assert!(
+        std::ptr::eq(usage_frame, frames.last().expect("at least one frame")),
+        "usage must be the final chunk before [DONE]\n{usage_body}"
+    );
+
+    // Counts crossed the whole boundary: decode loop → host channel → WIT
+    // resource → guest → SSE. The mock backend reports word counts, so these
+    // are synthetic but non-zero and internally consistent.
+    let usage = &usage_frame["usage"];
+    assert_eq!(
+        usage, buffered_usage,
+        "the same prompt must cost the same whether streamed or buffered"
+    );
+    let prompt_tokens = usage["prompt_tokens"].as_u64().expect("prompt_tokens");
+    let completion_tokens = usage["completion_tokens"]
+        .as_u64()
+        .expect("completion_tokens");
+    assert!(
+        prompt_tokens > 0,
+        "prompt_tokens must be measured, not defaulted: {usage}"
+    );
+    assert!(
+        completion_tokens > 0,
+        "completion_tokens must be measured, not defaulted: {usage}"
+    );
+    assert_eq!(
+        usage["total_tokens"].as_u64(),
+        Some(prompt_tokens + completion_tokens),
+        "total_tokens must be the sum: {usage}"
+    );
+
+    // Every id in one stream must agree — the usage chunk included, since it is
+    // built after the loop and could easily have picked up a fresh one.
+    let ids: Vec<&str> = frames
+        .iter()
+        .filter_map(|frame| frame["id"].as_str())
+        .collect();
+    assert!(!ids.is_empty());
+    assert!(
+        ids.windows(2).all(|pair| pair[0] == pair[1]),
+        "all chunks of one response must share an id, got {ids:?}"
+    );
+    assert!(
+        ids[0].starts_with("chatcmpl-") && ids[0] != "chatcmpl-tachyon",
+        "the completion id must be per-response, got {}",
+        ids[0]
+    );
+}
+
+/// Parse every `data:` frame of an SSE body except the `[DONE]` sentinel.
+#[cfg(feature = "ai-inference")]
+fn sse_data_frames(body: &str) -> Vec<Value> {
+    body.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .map(|payload| {
+            serde_json::from_str(payload).unwrap_or_else(|error| {
+                panic!("SSE frame must be JSON ({error}): {payload}");
+            })
+        })
+        .collect()
 }

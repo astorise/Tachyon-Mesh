@@ -9,7 +9,7 @@ package tachyon:openai@1.1.0;
 /// component.
 world openai-faas-guest {
     import tachyon:mesh/kv-partition@1.1.0;
-    import tachyon:accelerator/cpu@1.1.0;
+    import tachyon:accelerator/cpu@2.0.0;
     import tachyon:mesh/response-body@1.1.0;
     export tachyon:mesh/handler@1.1.0;
 }

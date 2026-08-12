@@ -34,6 +34,13 @@ The Qwen 3.5 MoE backend SHALL execute the declared ordered sequence of
 linear-attention and full-attention decoder layers with the required gated
 projections and position encoding.
 
+These requirements describe what the backend does, not who implements it, and
+that has changed: `candle_transformers::models::qwen3_5` executes them now, and
+the local scalar reimplementation that used to has been deleted. Tachyon
+supplies the validated configuration and the ModelOpt projection factory. What
+follows is still binding — it is what a compatible checkpoint is entitled to —
+but a failure against it is now upstream's to fix, not this repository's.
+
 #### Scenario: Hybrid layer schedule is preserved
 
 - **WHEN** the configuration declares a mixture of linear-attention and
@@ -97,6 +104,24 @@ buffered generation, and incremental streaming contracts.
 
 - **WHEN** a request supplies image content to the text-only backend
 - **THEN** the runtime rejects it with an explicit unsupported-modality error
+
+### Requirement: Decodes on one alias MUST NOT observe each other's state
+
+The executing model owns the KV cache and every linear-attention layer's
+recurrent state, so the backend SHALL serialize decodes per loaded alias and
+SHALL reset that state before each one. This is a narrowing: the deleted scalar
+runtime held decode state in a local and served an alias concurrently.
+
+#### Scenario: A decode starts from a clean state
+
+- **WHEN** two requests are served in sequence by one loaded alias
+- **THEN** the second is decoded as though the first had not run
+- **AND** repeating one deterministic request returns the same text each time
+
+#### Scenario: Concurrent requests do not interleave
+
+- **WHEN** requests arrive for one alias while a decode is in flight
+- **THEN** they wait rather than advancing the in-flight decode's state
 
 ### Requirement: Compatibility profile MUST be extensible and fail closed
 

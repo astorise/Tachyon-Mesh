@@ -44,7 +44,10 @@ impl AcceleratorAvailability {
 /// vendor runner probe.
 pub(crate) fn probe(backend: AcceleratorKind) -> AcceleratorAvailability {
     let status = match backend {
-        AcceleratorKind::Cpu => AvailabilityStatus::Available,
+        // The network lane needs no local hardware: its "device" is another
+        // process, and whether that process is reachable is a per-request
+        // outcome rather than a host capability.
+        AcceleratorKind::Cpu | AcceleratorKind::Network => AvailabilityStatus::Available,
         AcceleratorKind::Gpu => {
             if super::parallel::discover_cluster_topology().devices.len() > 1 {
                 AvailabilityStatus::Available

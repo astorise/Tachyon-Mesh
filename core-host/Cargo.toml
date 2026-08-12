@@ -20,12 +20,26 @@ admin-plane = []
 # Candle + TurboQuant + ONNX inference — pure Rust, musl-compatible.
 # candle-onnx executes .onnx models; wasmtime-wasi-nn (no ORT) provides the
 # WASI-NN guest interface backed by our CandleOnnxBackend.
+# The two candle kernel crates are in here rather than behind features of their
+# own, because neither is a hardware switch. Built without their `cuda` feature
+# they are pure Rust, compile with no toolkit — no nvcc, no CUTLASS — and report
+# themselves unavailable, which is exactly what a CPU host should hear. The
+# `nvfp4-cuda` and `candle-flashinfer` features that used to carry them decided
+# only whether the crates were linked, and having separate names for "is the
+# code present" and "can this device run it" is what let the second question go
+# on being answered in the wrong place. `candle-cuda` turns on both crates' own
+# `cuda` features; that is the one switch that needs a toolchain.
+#
+# `candle-transformers/flashinfer-kernels` rides along for the same reason: it
+# compiles upstream's FlashInfer decode seam, which without CUDA is a reference
+# implementation, not a device requirement.
 ai-inference = [
     "dep:candle-core", "dep:candle-nn", "dep:candle-onnx", "dep:candle-transformers",
+    "dep:candle-nvfp4-kernels", "dep:candle-flashinfer-kernels",
+    "candle-transformers/flashinfer-kernels",
     "dep:lru", "dep:minijinja", "dep:minijinja-contrib", "dep:parallel-topology", "dep:prost",
     "dep:tokenizers", "dep:turboquant-sys", "dep:wasmtime-wasi-nn",
 ]
-candle-flashinfer = ["ai-inference", "dep:candle-flashinfer-kernels", "candle-transformers/flashinfer-kernels"]
 ebpf-loader = ["dep:aya"]
 # `experimental` gates unwired v1.1 stubs (QUIC safetensors replication, predictive
 # VRAM helpers, BaaS scratch tables) so they are excluded from the default build but
@@ -37,10 +51,14 @@ mtls = []
 candle-cuda = [
     "ai-inference",
     "candle-core/cuda",
-    "candle-flashinfer-kernels?/cuda",
+    "candle-flashinfer-kernels/cuda",
     "candle-nn/lora-cuda",
     "candle-onnx/cuda",
     "candle-transformers/cuda",
+    # `auto_linear` only reaches the fused device-resident NVFP4 operator when
+    # this is on; without it, upstream's chooser silently picks the packed CPU
+    # path even on a CUDA device.
+    "candle-transformers/nvfp4-cuda",
     # Compiles in candle-transformers' paged-attention call site (the
     # cache.set_paged_kv/paged_kv seam added for hardware_strategy.paged_attention);
     # gated behind this feature because it pulls in the CUDA-only
@@ -48,18 +66,27 @@ candle-cuda = [
     # replicated attention; single-device Llama only takes the paged path when
     # the host attaches a PagedKvCache via cache.set_paged_kv.
     "candle-transformers/flash-attn",
+    "candle-nvfp4-kernels/cuda",
     "dep:candle-flash-attn",
     "dep:cudarc",
     "dep:nvml-wrapper",
 ]
-# `nvfp4-cuda` stays CPU-buildable (no `candle-core/cuda`) so it remains in the
-# standard non-CUDA feature matrix. The candle CUDA backend is activated by the
-# separate `candle-cuda` feature (which enables `candle-core/cuda` et al.) and is
-# what the parallel dispatch, multi-GPU enumeration, and tensor-parallel
-# all-reduce gate on (`#[cfg(feature = "candle-cuda")]`); it is exercised by the
-# dedicated `cuda-quality` CI job. The default build stays CUDA-free
-# (`default = ["ring"]`) and reproducible without a CUDA toolchain.
-nvfp4-cuda = ["ai-inference"]
+# Apple GPU execution for quantized GGUF checkpoints. Deliberately narrower than
+# `candle-cuda`: it activates candle's Metal backend and nothing else, because
+# the CUDA-only extras that feature pulls in (flash-attn, paged attention,
+# cudarc, NVML) have no Metal counterpart here. Only the GGUF loader resolves a
+# Metal device — safetensors families still build against `Device::Cpu`, so
+# enabling this does not silently move them.
+#
+# Mutually exclusive with `candle-cuda` in practice: candle can compile both
+# backends, but a host would then have two GPU paths competing for the same
+# non-`cpu` binding, and `resolve_gguf_device` deliberately picks CUDA first.
+candle-metal = [
+    "ai-inference",
+    "candle-core/metal",
+    "candle-nn/metal",
+    "candle-transformers/metal",
+]
 rate-limit = ["dep:governor", "dep:forwarded-header-value"]
 resiliency = ["dep:tower"]
 ring = ["tokio-rustls/ring", "tokio-rustls/tls12"]
@@ -77,15 +104,16 @@ arc-swap = "1.7"
 axum = "0.8"
 blake3 = "1.5"
 bytes = "1.5"
-candle-core = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true }
-candle-flash-attn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true }
-candle-flashinfer-kernels = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true, default-features = false }
-candle-nn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true }
-candle-onnx = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true }
+candle-core = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-26", version = "0.11.0", optional = true }
+candle-flash-attn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-26", version = "0.11.0", optional = true }
+candle-nvfp4-kernels = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-26", version = "0.11.0", optional = true, default-features = false }
+candle-flashinfer-kernels = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-26", version = "0.11.0", optional = true, default-features = false }
+candle-nn = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-26", version = "0.11.0", optional = true }
+candle-onnx = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-26", version = "0.11.0", optional = true }
 # Standard transformer architectures (Llama family) for running real, uploaded
 # checkpoints. Weights are mmapped from the model directory at runtime — never
 # compiled into the Tachyon artifact.
-candle-transformers = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-13", version = "0.11.0", optional = true, default-features = false }
+candle-transformers = { git = "https://github.com/astorise/candle", tag = "tachyon-v0.11.0-26", version = "0.11.0", optional = true, default-features = false }
 parallel-topology = { path = "../crates/parallel-topology", optional = true }
 # Same cudarc version `candle-core`'s CUDA backend already vendors (see
 # Cargo.lock), so this reuses one NCCL binding instead of introducing a
@@ -125,7 +153,14 @@ prometheus = "0.14"
 prost = { version = "0.14", optional = true }
 quinn = { version = "0.11.9", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rand = "0.10"
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+# `stream` is what lets a redirected SSE response stay a stream: without it the
+# mesh's peer forward can only read a body whole, which turns a redirected
+# token stream into one blob delivered at the end.
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "rustls",
+    "stream",
+] }
 redb = "4.0"
 semver = "1.0"
 schemars = "1"
@@ -138,7 +173,13 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
 tokio-stream = { version = "0.1", optional = true }
-tokenizers = { version = "0.23.0", optional = true, default-features = false, features = ["fancy-regex"] }
+# Pinned to the same major line the candle fork's workspace uses (0.22). Sharing
+# one `tokenizers` crate version is a hard requirement, not a preference:
+# `candle_transformers::generation::IncrementalDecoder::new` takes a
+# `&tokenizers::Tokenizer`, and a 0.23 copy of that type is a *different* type to
+# the compiler. Bumping this ahead of the fork silently splits the dependency
+# graph in two and breaks the detokenizer seam.
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["fancy-regex"] }
 tower = { version = "0.5", optional = true, features = ["retry", "timeout", "util"] }
 tracing = "0.1"
 utoipa = { version = "5", features = ["axum_extras"] }
@@ -147,9 +188,9 @@ system-faas-enrollment = { path = "../systems/system-faas-enrollment" }
 system-faas-microvm-runner = { path = "../systems/system-faas-microvm-runner" }
 turboquant-sys = { path = "../turboquant-sys", optional = true }
 uuid = { version = "1", features = ["v4"] }
-wasmtime = { version = "46.0.1", features = ["component-model"] }
-wasmtime-wasi = { version = "46.0.1", features = ["p1"] }
-wasmtime-wasi-nn = { version = "46.0.1", optional = true, default-features = false }
+wasmtime = { version = "46.0.2", features = ["component-model"] }
+wasmtime-wasi = { version = "46.0.2", features = ["p1"] }
+wasmtime-wasi-nn = { version = "46.0.2", optional = true, default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.14.0", optional = true }

@@ -290,8 +290,661 @@ The AI inference runtime SHALL execute supported local Candle text-generation mo
 - **THEN** the runtime validates the request against configured prompt and generation limits
 - **AND** returns UTF-8 generated text bytes through the existing inference response path
 
+### Requirement: Prompt limits MUST derive from the checkpoint's context window
+
+The runtime SHALL compute a binding's prompt token and byte budgets from the
+checkpoint's declared context window rather than from flat constants, so a
+long-context model is not held to a short-context model's ceiling.
+
+The token budget SHALL reserve generation headroom, so a prompt that passes
+validation can never leave the decode loop with no positions left. The byte
+budget is a pre-tokenization memory guard, not the semantic limit, and SHALL
+therefore be bounded below by the flat cap it replaces and above by an absolute
+ceiling.
+
+#### Scenario: A long-context checkpoint accepts a long prompt
+
+- **WHEN** a checkpoint declares a context window well above the previous flat
+  cap
+- **THEN** its prompt token and byte budgets scale with that window
+
+#### Scenario: Generation headroom is always reserved
+
+- **WHEN** prompt limits are derived for any context window large enough to
+  afford it
+- **THEN** the prompt budget plus the host's maximum generation fits inside the
+  window
+
+#### Scenario: A small context window is never exceeded, nor tightened
+
+- **WHEN** a checkpoint's context window is too small to afford the reservation
+  or the token floor
+- **THEN** the prompt token budget does not exceed the window
+- **AND** the byte budget is never lower than the flat cap this derivation
+  replaced
+
+#### Scenario: The byte budget is capped for very long contexts
+
+- **WHEN** a checkpoint declares a context window of millions of tokens
+- **THEN** the byte budget is clamped to an absolute ceiling
+
+#### Scenario: An unstated generation budget is clamped, not refused
+
+- **WHEN** a request names no `max_new_tokens` and the default plus the prompt
+  would exceed the context window
+- **THEN** the default is clamped to the remaining headroom, because a caller
+  that named no budget has no expectation to violate
+- **AND** a caller that *did* name one gets a request error naming what would
+  fit, rather than a silently truncated answer
+- **AND** every local runtime applies this rule, so raising the shared default
+  cannot turn a prompt one backend accepts into a hard failure on another
+
+### Requirement: Configured model bindings MUST be discoverable
+
+Model bindings declared in the manifest SHALL be published to the model registry
+so they appear in `GET /ai/v1/models`. Until now the registry was written only
+by the upload flow, so an `openai:` upstream — which has no upload — could never
+appear in a client's model list.
+
+Publishing SHALL be idempotent across restarts. It SHALL NOT overwrite a
+registry row for an alias no configured binding names. Where a **non-dynamic**
+binding does name the alias, the configured row SHALL win even over an uploaded
+one: that binding is loaded eagerly at boot and is what a request for the alias
+actually executes, so a row describing anything else would send a client's
+prompt somewhere it did not choose.
+
+#### Scenario: A configured binding appears in the model list
+
+- **WHEN** the host boots with a manifest declaring a non-dynamic model binding
+- **THEN** a registry row is published for it with an engine label matching its
+  binding kind
+- **AND** the row uses the casing `guest-openai`'s reader expects
+
+#### Scenario: An uploaded row for an unclaimed alias is left untouched
+
+- **WHEN** a registry row exists for an alias no configured binding names
+- **THEN** publishing configured bindings leaves it untouched, and the sweep
+  never removes it
+
+#### Scenario: A non-dynamic binding owns the row for the alias it executes
+
+- **WHEN** an uploaded row and a non-dynamic configured binding share an alias
+- **THEN** the row is replaced by one describing the configured binding, because
+  the runtime loaded it eagerly and every request for that alias runs it
+- **AND** the collision is logged, since the uploaded checkpoint's own figures
+  are lost
+
+#### Scenario: A later upload cannot take a configured alias
+
+- **WHEN** an upload commits for an alias a configured binding already owns,
+  after reconciliation has run
+- **THEN** the upload is rejected rather than overwriting the row, because the
+  runtime would keep executing the configured backend whatever the listing said
+- **AND** the rejection names the alias, so the operator learns it is taken
+- **AND** the rule holds on every path that writes an uploaded row, not only
+  the storage-proxy one
+
+#### Scenario: The registration route cannot take or disown a configured alias
+
+- **WHEN** `POST /internal/guest-openai/register` names an alias whose row the
+  manifest owns
+- **THEN** the registration is refused with `409`, naming the alias and the way
+  out, because the runtime keeps executing the configured backend regardless
+- **AND** deregistering such an alias is refused on the same terms: removing the
+  row would leave a model that answers but cannot be discovered
+- **AND** a registration for a *free* alias never writes the ownership marker,
+  whatever the request body claims — only the host marks a row as
+  manifest-derived
+- **AND** a row that passes through this route keeps a marker it already had, so
+  registering does not silently disown a configured alias
+- **AND** the ownership test and the write are one transaction on the host side,
+  not a guest-side read followed by a write: a reload publishing the alias
+  between the two would otherwise be overwritten, leaving the registry
+  advertising a registration while the configured backend answers
+- **AND** the rule binds every component reaching the registry table, through
+  any of `set`, `delete` or `batch-set`, not only the component that remembers
+  to ask first
+- **AND** a refused `batch-set` applies none of its entries: the ownership test
+  happens inside the batch's own transaction, so the interface keeps the
+  atomicity it promises rather than leaving a half-applied batch behind
+
+#### Scenario: A declared format outranks the files beside it
+
+- **WHEN** a model directory's sidecar declares a format and the directory also
+  holds a checkpoint of a different one
+- **THEN** the registry's engine label follows the sidecar, matching the loader
+
+#### Scenario: Format probing follows the loader's own order
+
+- **WHEN** a directory carries no sidecar and holds both an ONNX checkpoint and
+  a leftover checkpoint of another format
+- **THEN** the engine label is the one the loader's probe order would select,
+  because the label is half the public `{engine}/{alias}` id
+
+#### Scenario: Dynamic bindings are left to the upload flow
+
+- **WHEN** a binding is marked `dynamic`
+- **THEN** no configured-binding row is published for it
+- **AND** the rest of what the manifest sealed for it — device, hardware
+  strategy, QoS class — is retained and applied when the upload is lazily
+  loaded, because only `path` is the upload's to decide
+- **AND** an alias with no dynamic binding at all is a bare upload, which has no
+  manifest opinion to honour and loads on CPU
+
+#### Scenario: A reload withdraws the rows its own bindings no longer back
+
+- **WHEN** a configuration reload removes a non-dynamic binding, or changes the
+  path an alias resolves to
+- **THEN** the config-owned row for the alias it no longer backs is deleted
+  before the new runtime is installed, so the listing never advertises a model
+  the node has stopped serving
+- **AND** withdrawal is confined to rows the configuration itself owns: an
+  uploaded row is never removed by a reload, whatever the outgoing manifest said
+- **AND** ownership is re-read inside the transaction, so a row that became
+  upload-owned between the comparison and the write survives
+- **AND** an alias the *incoming* configuration still owns is reserved rather
+  than released: the row stays config-owned, so no upload can claim it during
+  the swap, and is marked withdrawn, so the alias is not advertised until
+  publication replaces it
+- **AND** an alias the incoming configuration no longer owns is released
+  outright, because nothing will republish it and a reservation would block the
+  alias permanently
+
+### Requirement: A rejected upload MUST leave nothing behind
+
+An upload that fails after its files are on disk SHALL remove them. A model
+directory that survives a rejected upload is not inert: it is a checkpoint the
+operator never accepted, occupying the alias's path and consuming the node's
+disk, and the next probe of that directory would treat it as real.
+
+#### Scenario: An upload rejected at publication removes its own files
+
+- **WHEN** an upload's sidecar write or registry publication fails — including a
+  rejection because a configured binding owns the alias
+- **THEN** the model directory and its staging area are removed
+- **AND** the original error is what the caller sees, not a cleanup failure
+
+#### Scenario: A rejected upload never destroys the checkpoint it would replace
+
+- **WHEN** an upload targets an alias whose configured binding points at the same
+  broker-managed directory, and publication then refuses it
+- **THEN** the previous checkpoint is still on disk and unchanged, because the
+  archive was unpacked beside the live directory rather than into it and the
+  previous one was moved aside rather than deleted
+- **AND** the alias keeps serving what the manifest declared: a refused upload
+  leaves the registry row, the runtime alias, and the files consistent with each
+  other
+
+### Requirement: A local generation MUST report an exhausted token budget
+
+A backend that stops because it reached the request's `max_new_tokens` SHALL
+report `length`. An absent finish reason resolves to `stop` downstream, so a
+truncated local completion would otherwise be described as having finished
+normally — and the upstream path already reports `length`, which made the
+honesty of the answer depend on which backend served the alias.
+
+#### Scenario: A budget-exhausted local generation reports `length`
+
+- **WHEN** a local Candle, ModelOpt or Qwen 3.5 MoE generation produces its full
+  `max_new_tokens` without reaching EOS or a stop sequence
+- **THEN** the finish reason is `length`, on both the buffered and streaming
+  paths, and the two agree
+- **AND** a batch-native decode evaluates this per row, since rows share a step
+  count but not a budget
+
+#### Scenario: Every other stopping condition stays unreported
+
+- **WHEN** a local generation ends on EOS, a stop sequence, or the deadline
+- **THEN** no finish reason is reported, and the caller keeps its own inference
+- **AND** a generation refused before decoding, and a mock binding, report
+  nothing — neither had a budget to exhaust
+
+### Requirement: Tool calls MUST be recovered on the streaming path
+
+`guest-openai` SHALL recover tool calls when streaming, emitting
+`delta.tool_calls` and `finish_reason: "tool_calls"`, not only for buffered
+completions. It SHALL NOT buy that by buffering every generation: content SHALL
+stream until a tool-call opener appears.
+
+#### Scenario: Prose streams and the tool-call region does not
+
+- **WHEN** a streamed generation emits text and then a tool call
+- **THEN** the text is forwarded as content deltas as it arrives
+- **AND** the tool-call region is withheld and returned as `delta.tool_calls`
+- **AND** the choice's `finish_reason` is `tool_calls`
+
+#### Scenario: An opener split across fragments is still matched
+
+- **WHEN** a tool-call opener spans two streamed fragments
+- **THEN** it is detected and no part of it is forwarded as content
+
+#### Scenario: Streamed content equals the buffered message
+
+- **WHEN** a generation emits prose, then whitespace, then a tool-call opener
+- **THEN** the whitespace is withheld, so concatenating the content deltas
+  yields exactly the message the buffered path would have returned
+- **AND** when no opener follows, the withheld whitespace is released rather
+  than dropped
+- **AND** withheld bytes are tracked apart from bytes actually sent, so the
+  reconciliation resumes from what the client received: a response opening with
+  whitespace that trips an anchored parser keeps that whitespace, and a
+  separator before a call is restored when prose follows the call and dropped
+  when nothing does
+
+#### Scenario: An anchored parser does not trip on prose
+
+- **WHEN** the active parser only recognises a tool call spanning the whole
+  output, and the generation merely contains that opener character mid-text
+- **THEN** content keeps streaming
+
+### Requirement: Generation MUST be bounded by wall-clock time
+
+A token budget cannot bound how long a request occupies a scheduler slot:
+throughput spans more than an order of magnitude across model size,
+quantization and device, and varies as much between two models on one device as
+between devices. The runtime SHALL therefore carry a wall-clock deadline per
+generation, defaulted per binding, overridable per request, and clamped to a
+host maximum.
+
+#### Scenario: An expired deadline stops generation without erroring
+
+- **WHEN** a generation's deadline elapses before its token budget
+- **THEN** decoding stops and the text generated so far is returned
+- **AND** the request is not reported as an error
+- **AND** this holds for expiry during *prefill* too, in every prefill: a prompt
+  that outlasts the deadline before producing a token returns the empty answer,
+  which is the text produced so far, rather than failing the request
+
+#### Scenario: A deadline beyond the work changes nothing
+
+- **WHEN** a request sets a deadline far larger than the generation needs
+- **THEN** its output is identical to the same request without one
+
+#### Scenario: An out-of-range deadline is rejected
+
+- **WHEN** a request sets a deadline of zero or beyond the host maximum
+- **THEN** the request is rejected with an error naming the field
+
+#### Scenario: Each batched row stops at its own deadline
+
+- **WHEN** batched rows carry different deadlines
+- **THEN** each row is retired at its own, and rows with time left keep decoding
+- **AND** the batch's shared prefill is abandoned only once *every* row is out
+  of time, because a prefill forward pass cannot be run for some rows and not
+  others
+
+### Requirement: GGUF loading MUST dispatch by architecture
+
+The GGUF loader SHALL select a quantized backend from the checkpoint's
+`general.architecture`, not assume Llama, and SHALL read architecture-prefixed
+metadata keys. A family without a verified quantized loader SHALL be rejected at
+validation rather than at load.
+
+#### Scenario: A non-Llama GGUF family loads
+
+- **WHEN** a GGUF checkpoint declares a family with a verified quantized loader
+  (Qwen2, Qwen3, Qwen3-MoE, Gemma, GLM4, LFM2, Phi2, Phi3)
+- **THEN** the runtime constructs that family's backend
+- **AND** reads its context length from that family's metadata namespace
+
+#### Scenario: A family reaches the loader it is advertised for
+
+- **WHEN** a GGUF checkpoint declares any architecture the quantized loader can
+  build
+- **THEN** the host's architecture gate accepts it rather than refusing it as
+  unrecognized before the loader runs
+
+#### Scenario: A family without a quantized loader is refused
+
+- **WHEN** a GGUF checkpoint declares a family the runtime has no quantized
+  backend for
+- **THEN** format validation rejects it before any weights are read
+
+### Requirement: GGUF checkpoints MUST be executable on Metal
+
+The runtime SHALL support Apple GPU execution for GGUF bindings behind a
+dedicated build feature, tracked separately from CUDA so a Metal binding cannot
+accept a CUDA-only optimization.
+
+#### Scenario: A Metal binding runs the block types Metal can execute
+
+- **GIVEN** a host built with the Metal feature
+- **WHEN** a GGUF binding declares `metal`
+- **THEN** the runtime resolves a Metal device
+- **AND** applies the same per-device block-type check it applies to CUDA,
+  because Metal's matmul coverage is partial: it has mat-vec kernels for
+  `Q8_1`/`Q8K` but neither the mat-mat kernel used for prefill nor `get_rows`,
+  so a checkpoint stored in those types is unusable there
+
+#### Scenario: A Metal request on a build without the feature is refused
+
+- **WHEN** a GGUF binding declares `metal` on a host built without it
+- **THEN** the runtime returns a typed error naming the missing build feature
+
+#### Scenario: A device the loader cannot reach is refused
+
+- **WHEN** a GGUF binding declares a device that is neither `cpu`, `cuda` nor
+  `metal`
+- **THEN** the runtime rejects it rather than falling through to another device
+
+### Requirement: Decode loops MUST detokenize incrementally
+
+Every decode step needs the text generated so far, for stop-sequence matching
+and for the streaming delta. The runtime SHALL obtain it without re-decoding the
+whole token sequence on each step, which is quadratic in the generated length.
+
+Because a BPE/SentencePiece decode is not the concatenation of its tokens'
+decodes, the incremental result SHALL be identical to what decoding the whole
+sequence would produce, and the runtime SHALL verify rather than assume the
+conditions under which it advances its decode window.
+
+#### Scenario: Incremental text matches a whole-sequence decode
+
+- **WHEN** a decode loop generates any number of tokens
+- **THEN** the text it exposes at every step equals the whole-sequence decode of
+  the tokens generated so far
+
+#### Scenario: A character split across tokens is not corrupted
+
+- **WHEN** a multi-byte character spans several generated tokens
+- **THEN** the runtime replaces the provisional text once the character
+  completes, rather than appending each token's partial decode
+
+#### Scenario: The re-decoded window stays bounded
+
+- **WHEN** a generation runs well past the window budget
+- **THEN** the window is re-anchored so per-step decode cost does not grow with
+  the generated length
+- **AND** re-anchoring happens only when the shorter decode is verifiably a
+  suffix of the current window, so a tokenizer that offers no clean split
+  degrades to whole-sequence behaviour instead of corrupting output
+
+### Requirement: GGUF checkpoints MUST execute on CUDA when the binding asks for it
+
+The quantized GGUF loader SHALL upload weights to the device its binding
+requests, not unconditionally to the host. On a `candle-cuda` build, a
+single-device Llama GGUF binding whose `device` is not `cpu` SHALL load onto a
+real CUDA device through the pinned fork's quantized CUDA kernels, and its
+decode loop SHALL build input tensors on that same device. A `cpu` binding
+SHALL keep the existing host-side quantized path unchanged.
+
+Because only a subset of GGML block types has a CUDA quantized-matmul kernel,
+the loader SHALL validate every tensor's block type *before* uploading any
+weights, so an unrunnable checkpoint fails at load rather than at first decode
+with VRAM already claimed.
+
+#### Scenario: A K-quant GGUF binding runs on the GPU
+
+- **GIVEN** a host built with the `candle-cuda` feature
+- **WHEN** a `single`-distribution Llama GGUF binding declares a non-`cpu` device
+- **AND** every tensor uses a block type with a CUDA quantized-matmul kernel
+- **THEN** the runtime loads the quantized weights onto a CUDA device
+- **AND** prefill and decode build their input tensors on that device
+
+#### Scenario: A block type without a CUDA kernel is refused before load
+
+- **GIVEN** the binding's device resolves to a real CUDA device
+- **WHEN** a GGUF checkpoint contains a tensor whose block type has no CUDA
+  quantized-matmul kernel
+- **THEN** the runtime returns a typed unsupported-model error naming the tensor
+  and its block type
+- **AND** no weights are uploaded to the device
+
+#### Scenario: The block-type rule does not apply to the CPU fallback
+
+- **GIVEN** a host built with the `candle-cuda` feature but no physical GPU
+- **WHEN** a non-`cpu` GGUF binding resolves to the `Device::Cpu` fallback
+- **THEN** the runtime loads it regardless of its block types, because no CUDA
+  kernel will execute
+
+#### Scenario: Attention optimizations are refused for GGUF
+
+- **WHEN** a GGUF binding requests `paged_attention`, `cuda_graph_decode`, or
+  `flashinfer_attention`
+- **THEN** the runtime returns a typed unsupported-model error
+- **AND** it does not accept the flag while running ordinary quantized attention
+
+#### Scenario: A CUDA-less build refuses a GPU GGUF binding
+
+- **GIVEN** a host built without the `candle-cuda` feature
+- **WHEN** a GGUF binding declares a non-`cpu` device
+- **THEN** the runtime returns a typed error naming the missing build feature
+- **AND** it does not silently load the checkpoint on the host
+
+#### Scenario: A CPU GGUF binding is unaffected by the block-type rule
+
+- **WHEN** a GGUF binding declares `cpu`
+- **THEN** the runtime loads it on the host regardless of its block types
+
+### Requirement: OpenAI-compatible upstreams MUST be bindable as mesh models
+
+The AI inference runtime SHALL support model bindings whose `path` uses the
+`openai:<base-url>` scheme, forwarding generation to an external
+OpenAI-compatible server (llama.cpp, vLLM, or a peer node) instead of executing
+locally. The upstream model name SHALL default to the binding alias and be
+overridable with a `model` query parameter; a `timeout_ms` query parameter SHALL
+bound each request. Credentials SHALL NOT be carried in the binding: the runtime
+SHALL read a bearer token from `TACHYON_UPSTREAM_API_KEY_<ALIAS>`, falling back
+to `TACHYON_UPSTREAM_API_KEY`.
+
+An upstream binding holds no local weights, so it SHALL report no local
+accelerator residency regardless of the `device` its binding declares.
+
+#### Scenario: An upstream binding is claimed before any filesystem probe
+
+- **WHEN** a model binding's `path` starts with `openai:`
+- **THEN** the runtime claims it as an upstream binding
+- **AND** it does not probe the ModelOpt/NVFP4, embedding, or Candle LLM loaders
+- **AND** loading performs no network I/O, so an unreachable upstream does not
+  block host startup
+
+#### Scenario: A host generation request is translated to chat completions
+
+- **WHEN** a request reaches an upstream binding as a JSON generation request
+- **THEN** the runtime POSTs `<base-url>/chat/completions` with the request's
+  `messages` (or its `prompt` as a single user turn), mapping `max_new_tokens`
+  to `max_tokens` and forwarding `temperature`, `top_p`, `seed`, and `stop`
+- **AND** a `json_schema` is forwarded as an OpenAI `response_format`
+- **AND** the assistant message content is returned as the generated text bytes
+
+#### Scenario: Tool schemas reach the upstream
+
+- **WHEN** a request reaching an upstream binding carries `tools` or
+  `tool_choice`
+- **THEN** they are forwarded verbatim, so the upstream applies its own
+  tool-aware chat template
+- **AND** an explicitly empty `tools` array is omitted rather than sent
+
+#### Scenario: A tool call is a successful generation, not a malformed response
+
+- **WHEN** an upstream returns `choices[0].message.tool_calls` with
+  `content: null`
+- **THEN** the runtime returns the calls on the generation's structured
+  `tool-calls` channel, never re-encoded into the generated text
+- **AND** it does not report the response as malformed for lacking a content
+  string
+- **AND** a call whose `function.name` is absent or blank fails the whole
+  response rather than being silently dropped
+- **AND** a `tool_calls` payload that is present but not an array fails the
+  response on the streaming path as well as the buffered one, rather than
+  reading as an absent one
+
+#### Scenario: Streamed tool-call fragments are reassembled
+
+- **WHEN** an upstream streams `delta.tool_calls` fragments carrying a function
+  name and its arguments in pieces
+- **THEN** the runtime reassembles them by fragment index and emits each
+  assembled call as a `stream-event::tool-call`
+- **AND** a stream carrying no tool calls emits no tool-call event
+
+#### Scenario: Offering tools does not withhold streamed content
+
+- **WHEN** a streaming request that offered `tools` produces content deltas
+  followed by tool-call fragments
+- **THEN** each content delta is emitted as it arrives, not accumulated until
+  the stream ends
+- **AND** the tool calls arrive on the structured channel beside that content
+
+#### Scenario: Streaming passes the upstream's own SSE deltas through
+
+- **WHEN** a streaming request reaches an upstream binding
+- **THEN** the runtime requests `stream: true` and emits one token per SSE
+  content delta as it arrives, terminating on `[DONE]`
+- **AND** it does not buffer the whole generation first
+
+#### Scenario: An upstream failure surfaces instead of becoming output
+
+- **WHEN** the upstream returns a non-success HTTP status or an unusable body
+- **THEN** the runtime returns a typed error carrying the endpoint, status, and
+  a bounded excerpt of the upstream's own explanation
+- **AND** the failing response body is never returned as generated text
+- **AND** the remote HTTP status reaches the component as
+  `generation-error.upstream-status`, while a local failure leaves it absent
+
+### Requirement: A route's LoRA adapter applies to streaming as it does to buffering
+A streaming generation SHALL resolve and apply the same adapter a buffered
+generation would for that route, and SHALL fail where the buffered path fails.
+
+#### Scenario: Streaming does not silently answer from the base model
+- **WHEN** a route pins an adapter and the client sets `stream: true`
+- **THEN** the adapter is applied, or the request fails exactly as the buffered
+  request would — never answered by the unadapted model
+
+### Requirement: Upstream work SHALL be admitted by a bounded gate, not the batch scheduler
+`openai:` bindings run on the `Network` lane, which SHALL have no batch
+scheduler. Every upstream path — buffered generation, streaming, and embeddings
+— SHALL acquire a permit from one node-wide gate whose capacity defaults to 32
+and is overridable with `TACHYON_UPSTREAM_MAX_CONCURRENCY`. The permit SHALL be
+held for the whole interaction and released on every exit path, including
+errors. A caller that cannot be admitted within the bounded wait SHALL be
+refused rather than queued indefinitely.
+
+#### Scenario: Concurrency is capped without a dispatcher
+
+- **WHEN** more upstream requests arrive than the gate's capacity
+- **THEN** the excess callers block until a permit frees, and the in-flight
+  count never exceeds the capacity
+- **AND** no `Network` dispatcher thread is spawned
+
+#### Scenario: A permit survives a failed request
+
+- **WHEN** an upstream request fails after acquiring a permit
+- **THEN** the permit is released and the capacity is immediately reusable
+
+#### Scenario: Speculative decoding stops for a departed client
+
+- **WHEN** a streaming client disconnects while a speculative draft is running
+- **THEN** the decode loop stops at its next check rather than continuing draft
+  and target forward passes
+
+#### Scenario: A stream carrying no content still notices a departed client
+
+- **WHEN** a streaming client disconnects and the upstream sends only frames
+  that produce no event — a role-only opening, a usage frame, a keep-alive
+- **THEN** the backend still observes the departure and abandons the response,
+  rather than running to completion because nothing was emitted to fail on
+
+#### Scenario: An abandoned stream releases its permit at once
+
+- **WHEN** a streaming client disconnects and the component drops its
+  `token-stream`
+- **THEN** the backend is told to stop and abandons the upstream response
+  instead of draining it to its terminator
+- **AND** the permit is released without waiting for the binding's timeout
+
+#### Scenario: A stream that never registered still cancels its producer
+
+- **WHEN** registering the `token-stream` resource fails, as when a guest has
+  exhausted its resource table
+- **THEN** the producer is cancelled on that path too, because the WIT `drop`
+  hook runs only for a stream that registered successfully
+- **AND** a generation thread parked on the queue's byte budget is woken rather
+  than left waiting on a condvar a closed channel cannot signal, which would
+  hold its thread and its admission permit until the request timed out
+
+#### Scenario: The network lane reports its admission backlog
+
+- **WHEN** the mesh QoS admission check reads the `Network` lane's queue depth
+- **THEN** it receives the number of callers waiting for a permit, not the
+  number in flight
+- **AND** an idle node reports zero on every tier
+
+#### Scenario: A generation budget is always bounded and always sent
+
+- **WHEN** a request reaching an upstream binding carries `max_new_tokens`
+  outside the binding's `1..=max_new_tokens` range
+- **THEN** the runtime rejects it before any round trip
+- **AND** when the field is absent the binding's budget is sent, so the
+  upstream's own default never governs the generation budget
+
+#### Scenario: An upstream binding carries its own generation ceiling
+
+The upstream ceiling SHALL be independent of the native runtime's
+`HOST_MAX_NEW_TOKENS`, because the two bound different resources: the native cap
+bounds this host's decode loop and local VRAM, while an upstream generation
+spends the remote server's resources and costs this node one open connection.
+
+- **WHEN** a binding path sets `max_new_tokens`
+- **THEN** that value becomes the binding's default and ceiling
+- **AND** it is itself rejected when outside `1..=UPSTREAM_MAX_NEW_TOKENS`
+
+#### Scenario: One failing request does not fail its co-batched neighbours
+
+- **WHEN** a batch of independent requests reaches one upstream binding and some
+  of them fail
+- **THEN** each caller receives its own result
+- **AND** a failure is not propagated to requests that succeeded
+
+#### Scenario: Independent upstream requests are dispatched concurrently
+
+- **WHEN** a batch of independent requests reaches one upstream binding
+- **THEN** their network round trips run concurrently
+- **AND** a caller does not wait for the sum of the preceding requests' upstream
+  latencies
+
+#### Scenario: A truncated stream is not reported as a completed generation
+
+- **WHEN** an upstream stream ends without its `[DONE]` sentinel
+- **THEN** the runtime returns a typed malformed-response error
+- **AND** the request is not recorded as a successful execution
+
+#### Scenario: Every upstream read is bounded
+
+- **WHEN** an upstream returns an oversized response body, error body, stream, or
+  individual SSE frame
+- **THEN** the runtime bounds the read itself rather than only truncating the
+  result afterwards
+
+#### Scenario: A present-but-malformed field is an error, not an absent one
+
+- **WHEN** an upstream response carries a field whose shape it does not permit —
+  a non-array `choices` on a streamed frame, a non-string `message.content`
+  beside valid `tool_calls`
+- **THEN** the runtime returns a typed malformed-response error naming the shape
+- **AND** it SHALL NOT read the value as absent, which would drop part of the
+  answer and let the stream finish reporting an ordinary `stop`
+- **AND** the same rule applies to a frame's `delta`: a present non-object is an
+  error, while an absent one is the ordinary shape of a frame that only reports
+  `finish_reason`
+- **AND** genuinely absent or `null` values keep their meaning: a usage-only
+  frame carries no `choices`, and a tool-call message carries no content
+
+#### Scenario: Embedding components must narrow to finite f32
+
+- **WHEN** an upstream embedding contains a value that does not narrow to a
+  finite `f32`
+- **THEN** the runtime returns a typed malformed-response error instead of
+  returning an infinity
+
+#### Scenario: An invalid upstream URL fails at load
+
+- **WHEN** an `openai:` binding's remainder is not an `http://` or `https://`
+  URL with a host, or carries an unknown query parameter
+- **THEN** model initialization fails with a typed binding error
+- **AND** inference for that alias is not registered
+
 ### Requirement: Non-mock model bindings MUST NOT fall back to mock output
-The AI inference runtime SHALL classify model bindings as explicit mock, ModelOpt/NVFP4, supported Candle LLM, ONNX/WASI-NN, or unsupported, and SHALL NOT return `MOCK_LLM_RESPONSE` for any non-mock binding.
+The AI inference runtime SHALL classify model bindings as explicit mock, upstream OpenAI-compatible, ModelOpt/NVFP4, supported Candle LLM, ONNX/WASI-NN, or unsupported, and SHALL NOT return `MOCK_LLM_RESPONSE` for any non-mock binding.
 
 #### Scenario: Unsupported safetensors directory fails before registration
 - **WHEN** a model binding points at a safetensors directory that is neither ModelOpt/NVFP4 nor a supported Candle LLM
@@ -460,17 +1113,76 @@ that could begin a stop match until a further token confirms it is safe to emit.
 
 ### Requirement: The accelerator exposes a streaming compute primitive
 The `tachyon:accelerator/cpu` interface SHALL provide a `compute-stream`
-function returning a `token-stream` resource whose `next` yields decoded text
-fragments until it returns `none` (generation complete). The streaming path
-SHALL enforce the same sealed-alias scope and accelerator-handle checks as the
-buffered `compute`, and the new function SHALL be additive so existing guests
-are unaffected.
+function returning a `token-stream` resource whose `next` yields `stream-event`
+values — decoded text on `content`, structured calls on `tool-call` — until it
+returns `none` (generation complete). The streaming path SHALL enforce the same
+sealed-alias scope and accelerator-handle checks as the buffered `compute`.
 
 #### Scenario: Streaming a sealed model
 - **GIVEN** a guest holding an accelerator handle for a sealed model alias
 - **WHEN** it calls `compute-stream` and pulls with `next`
 - **THEN** the host yields decoded fragments as they are produced
 - **AND** `next` returns `none` once generation completes
+
+### Requirement: A streaming generation reports why it stopped
+`token-stream` SHALL expose the generation's finish reason on the same terms as
+its token counts: available only after `next` has returned `none`, and absent
+rather than synthesised when the backend did not report one. A component SHALL
+give `length` and `content_filter` precedence over `tool_calls`.
+
+#### Scenario: A truncated stream does not report `stop`
+- **WHEN** an upstream ends a streamed generation with `finish_reason: "length"`
+- **THEN** that reason reaches the component and the choice reports `length`
+
+#### Scenario: A tool call truncated at the token limit reports `length`
+- **WHEN** a generation returns both a tool call and a `length` finish reason
+- **THEN** the choice reports `length`, not `tool_calls`, so the client is not
+  invited to dispatch incomplete arguments
+
+#### Scenario: An answer that ends on its budget's last token is not truncated
+- **WHEN** a local generation emits EOS, or matches a stop sequence, on exactly
+  the `max_new_tokens`-th token
+- **THEN** the reason is absent and the client resolves it to `stop`, because
+  the model ended the answer itself
+- **AND** the token count alone SHALL NOT decide this: the two coincide at the
+  boundary, and reporting `length` there marks a complete answer as truncated
+
+### Requirement: The accelerator carries tool calls and failures as typed data
+`tachyon:accelerator/cpu` SHALL carry structured tool calls as a `tool-call`
+record (optional provider id, function name, JSON argument string) on both the
+buffered `generation` and the streaming `stream-event`, in the backend's own
+terms rather than in any caller's wire format. Generation functions SHALL fail
+with a `generation-error` carrying a message and, when the failure was a remote
+HTTP response, that response's status.
+
+#### Scenario: A structured call needs no parser selection
+- **WHEN** a backend reports a tool call on the structured channel
+- **THEN** the component uses it directly, whatever tool-call dialect the
+  request implies or the model name suggests
+- **AND** a call the host reported structurally takes precedence over anything
+  parsed out of the generated text
+
+#### Scenario: No marker in generated text can conjure a tool call
+- **WHEN** a model emits text that resembles a tool-call payload but the backend
+  reported no structured call
+- **THEN** the text is returned as assistant content, subject only to the
+  request's own tool-call parser
+
+#### Scenario: An upstream status reaches the client as itself
+- **WHEN** a component receives a `generation-error` carrying an upstream status
+- **THEN** a 429 is relayed as 429 so the client's backoff engages, and a
+  rejected request is relayed as 400 so it is not retried
+- **AND** an upstream authentication failure is reported as 502, because it is
+  this node's misconfiguration rather than the caller's
+- **AND** a failure with no upstream status stays a 500, unless the error marks
+  the *request* invalid — a budget above the binding's ceiling, a prompt that
+  cannot fit the context window — which is reported as 400
+  `invalid_request_error`, because a local rejection is still the caller's to
+  fix and a 500 sends it retrying a request that can never succeed
+- **AND** that classification SHALL survive the path the error actually takes —
+  the execution wrappers that add context, and the scheduler's fan-out of one
+  failure to every input in a batch — since an error flattened to its message
+  along the way arrives indistinguishable from a host fault
 
 #### Scenario: Streaming respects the scope gate
 - **WHEN** a guest calls `compute-stream` for a handle it does not hold, or for
@@ -631,14 +1343,19 @@ The `cuda-quality` CI job (or an equivalent job on the same GPU-equipped self-ho
 - **THEN** it uses multiple NCCL ranks on that single device (loopback communicator initialization) rather than requiring a second physical GPU
 - **AND** the test is skipped, not failed, on a `candle-cuda` build executed on a host reporting zero CUDA devices
 
-### Requirement: The `nvfp4-cuda` and `candle-cuda` Cargo features MUST be documented as independent
-Inline documentation describing the relationship between the `nvfp4-cuda` and `candle-cuda` Cargo features SHALL accurately reflect that they are separate, sibling features — enabling one does not enable the other — matching `core-host/Cargo.toml`'s actual feature graph.
+### Requirement: `candle-cuda` MUST be documented as the single CUDA switch
+Inline documentation describing what enables CUDA execution SHALL name
+`candle-cuda` as the only Cargo feature involved, matching
+`core-host/Cargo.toml`'s actual feature graph. The `nvfp4-cuda` feature that
+once sat beside it has been folded into `ai-inference`, because it decided
+only whether the kernel crate was linked — never what a device could do — and
+two names for those two questions is what let the second be answered locally.
 
-#### Scenario: The topology-discovery comment accurately describes feature independence
+#### Scenario: The topology-discovery comment names one feature
 - **GIVEN** a reader inspects the comment above `discover_cluster_topology`'s CUDA-enumeration loop in `core-host/src/ai_inference/parallel.rs`
 - **WHEN** they read the comment to understand what enables multi-GPU enumeration
-- **THEN** the comment states that the `candle-cuda` feature, not `nvfp4-cuda`, is required
-- **AND** the comment does not claim `nvfp4-cuda` pulls in or implies `candle-cuda`
+- **THEN** the comment states that the `candle-cuda` feature is required
+- **AND** the comment does not refer to a separate NVFP4 Cargo feature
 
 ### Requirement: Route-scoped dynamic model bindings
 
@@ -830,10 +1547,11 @@ cache's per-step reallocation is fundamentally incompatible with CUDA
 graph replay, so `cuda_graph_decode` without `paged_attention` SHALL
 continue to fail closed with a typed error naming that dependency, not
 just naming the missing `CudaGraph` wiring. `flashinfer_attention` SHALL
-be enabled only for a Llama-family checkpoint on a CUDA device when the
-`candle-flashinfer` build feature and decode-attention dispatch are available.
-Every other architecture, non-CUDA device, or build without that feature SHALL
-fail closed with a typed error. Prefill (multi-token) forward passes SHALL
+be enabled only for a Safetensors Llama-family checkpoint on a CUDA device.
+There SHALL be no separate build feature in that condition: the FlashInfer
+decode seam is compiled by `ai-inference`, and `candle-cuda` is the single
+switch that gives it a device. Every other architecture or non-CUDA device
+SHALL fail closed with a typed error. Prefill (multi-token) forward passes SHALL
 continue to use the existing attention path because
 `flashinfer_decode_attention` is decode-only.
 
@@ -890,10 +1608,11 @@ continue to use the existing attention path because
 - **THEN** loading fails with a typed `UnsupportedModel` error naming the unsupported combination
 - **AND** the runtime does not silently pick one attention path over the other
 
-#### Scenario: FlashInfer remains an optional dependency
-- **WHEN** `core-host` is built without the `candle-flashinfer` feature
-- **THEN** the FlashInfer-style Candle crate remains unlinked
-- **AND** default and CPU-only AI inference builds are unchanged
+#### Scenario: The FlashInfer crate needs no CUDA to build
+- **WHEN** `core-host` is built with `ai-inference` and no CUDA toolchain
+- **THEN** the FlashInfer-style Candle crate is linked and compiles as pure Rust
+- **AND** `flashinfer_attention` still fails closed, because the rejection
+  turns on the absence of a CUDA device rather than on a Cargo feature
 
 ### Requirement: The runtime MUST validate a parallel plan against discovered hardware before loading weights
 Before constructing any parallel engine, the runtime SHALL validate the requested plan against the cluster's discovered hardware topology (device count, interconnect class, per-shard VRAM) and SHALL abort the load with a typed topology error — loading no weights — when the plan cannot be satisfied. This hardware-aware check is in addition to the structural plan validation already performed by the config API.
