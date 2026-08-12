@@ -221,8 +221,22 @@ impl EmbeddingsInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChatMessage {
     role: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    /// Whatever the client sent, re-serialized unchanged into the host
+    /// envelope.
+    ///
+    /// `Option<String>` here narrowed the OpenAI message shape, and the
+    /// narrowing was reachable: a standard multimodal turn whose `content` is
+    /// an array of parts — `text` plus `image_url` — failed *deserialization*,
+    /// so the request never reached the host's opaque `Vec<Value>` forwarding
+    /// and a perfectly valid request came back as HTTP 500, even when the
+    /// selected `openai:` upstream understands it.
+    ///
+    /// Kept opaque rather than modelled: the shape belongs to the provider,
+    /// and the two local runtimes already refuse structured content with a
+    /// typed invalid-request error, which is the right answer for a backend
+    /// that genuinely cannot read it.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    content: serde_json::Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<ToolCall>,
     /// Set on a `role: "tool"` turn to associate the result with the call that
@@ -253,6 +267,13 @@ struct ChatMessage {
     /// reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refusal: Option<String>,
+    /// Everything this struct does not name, carried through rather than
+    /// dropped. A provider-specific field on an inbound turn is the client's
+    /// and the upstream's business, not this route's, and serde discards what
+    /// it cannot name — so a field that mattered vanished between the client
+    /// and the server that understands it.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -260,12 +281,13 @@ impl ChatMessage {
     fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
-            content: Some(content.into()),
+            content: serde_json::Value::String(content.into()),
             tool_calls: Vec::new(),
             tool_call_id: None,
             name: None,
             function_call: None,
             refusal: None,
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -926,9 +948,9 @@ fn handle_chat_completions_buffered(
             message: ChatMessage {
                 role: "assistant".to_owned(),
                 content: if parsed.content.is_empty() {
-                    None
+                    serde_json::Value::Null
                 } else {
-                    Some(parsed.content)
+                    serde_json::Value::String(parsed.content)
                 },
                 tool_calls: parsed.tool_calls,
                 // Response-side only: this node answers in the modern shape,
@@ -940,6 +962,9 @@ fn handle_chat_completions_buffered(
                 // folding it into `content` would be an agent parsing "I can't
                 // help with that" as data.
                 refusal: completed.refusal,
+                // Nothing to carry on the way out: this node composes the
+                // assistant turn itself.
+                extra: serde_json::Map::new(),
             },
             finish_reason,
         }],
@@ -2448,6 +2473,45 @@ mod tests {
             ),
             serde_json::json!(r#"{"properties":{"a":{"type":"integer"}},"type":"object"}"#)
         );
+    }
+
+    /// A standard multimodal turn must survive the guest untouched.
+    ///
+    /// `content: Option<String>` narrowed the OpenAI message shape, and the
+    /// narrowing was reachable: an array of parts failed *deserialization*, so
+    /// the request never reached the host's opaque forwarding and a valid
+    /// request came back as HTTP 500 — even against an upstream that reads it.
+    #[test]
+    fn a_multimodal_message_reaches_the_host_unchanged() {
+        let body = br#"{"model":"m","messages":[{"role":"user","content":[
+            {"type":"text","text":"what is this?"},
+            {"type":"image_url","image_url":{"url":"https://example.invalid/a.png"}}
+        ],"x-provider-hint":"vision"}]}"#;
+        let request: ChatCompletionRequest =
+            serde_json::from_slice(body).expect("a multimodal turn is a valid request");
+        let payload: serde_json::Value =
+            serde_json::from_str(&build_generation_request(&request).expect("encode"))
+                .expect("valid json");
+
+        let content = &payload["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(
+            content[1]["image_url"]["url"], "https://example.invalid/a.png",
+            "the parts reach the host in the shape the client sent: {payload}"
+        );
+        // And a field this route does not model is carried rather than
+        // dropped: it is the client's and the upstream's business.
+        assert_eq!(payload["messages"][0]["x-provider-hint"], "vision");
+
+        // The ordinary string form still round-trips as a string, not as an
+        // object wrapping one.
+        let plain: ChatCompletionRequest =
+            serde_json::from_slice(br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)
+                .expect("valid request");
+        let payload: serde_json::Value =
+            serde_json::from_str(&build_generation_request(&plain).expect("encode"))
+                .expect("valid json");
+        assert_eq!(payload["messages"][0]["content"], "hi");
     }
 
     #[test]
