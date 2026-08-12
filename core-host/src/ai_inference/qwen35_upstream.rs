@@ -137,6 +137,17 @@ pub(crate) struct Qwen35MoeRuntime {
     tokenizer: Tokenizer,
     chat_template: Option<ChatTemplate>,
     executed_on: &'static str,
+    /// The device the weights were actually loaded onto.
+    ///
+    /// Kept rather than re-derived. It used to be reconstructed per request
+    /// from the telemetry label — `Device::new_cuda(0)` for one string, CPU for
+    /// everything else — which is wrong twice over: candle distinguishes CUDA
+    /// devices by *instance*, not by ordinal, so a freshly constructed one
+    /// fails the same-device check against the model's tensors inside
+    /// `forward`; and adding a second GPU label made a CUDA-loaded fallback
+    /// fall through to the CPU arm. A label describes what happened; it is not
+    /// a handle to the thing that happened on.
+    device: Device,
     /// See the module docs: upstream's model owns the state a decode advances,
     /// so one decode at a time per loaded alias.
     model: Mutex<ModelForCausalLM>,
@@ -221,6 +232,7 @@ impl Qwen35MoeRuntime {
             tokenizer,
             chat_template,
             executed_on,
+            device,
             model: Mutex::new(model),
         })
     }
@@ -305,7 +317,9 @@ impl Qwen35MoeRuntime {
         model.clear_kv_cache();
 
         let prompt_ids = encoded.get_ids();
-        let device = self.device_of(&model);
+        // The very device the weights live on. Cloning a candle `Device` clones
+        // the handle, not the context.
+        let device = self.device.clone();
         let mut logits: Option<Tensor> = None;
         for (chunk_index, chunk) in prompt_ids.chunks(PREFILL_CHUNK_TOKENS).enumerate() {
             let position = chunk_index * PREFILL_CHUNK_TOKENS;
@@ -407,6 +421,15 @@ impl Qwen35MoeRuntime {
                 finish = criteria.finish_reason(token, text, false);
                 break;
             }
+            // The budget's last token needs no successor. Feeding it through a
+            // 40-layer mixture produced logits the loop then discarded — a
+            // whole decode pass, holding the serialized model and its scheduler
+            // lane, and able to push the request past its own deadline after
+            // the answer the caller asked for was already complete. At
+            // `max_new_tokens: 1` it was half the work of the request.
+            if step + 1 == max_new_tokens {
+                break;
+            }
             let input = Tensor::new(&[token][..], &device)?.unsqueeze(0)?;
             logits = model.forward(&input, encoded.len() + step)?;
         }
@@ -429,19 +452,6 @@ impl Qwen35MoeRuntime {
             None => (generated.len() >= max_new_tokens).then_some("length"),
         };
         Ok((usage, finish_reason))
-    }
-
-    /// The device the loaded weights live on.
-    ///
-    /// Read back from the model rather than stored beside it, so the tensors a
-    /// decode builds cannot end up on a different device from the ones it
-    /// multiplies.
-    fn device_of(&self, model: &ModelForCausalLM) -> Device {
-        let _ = model;
-        match self.executed_on {
-            "gpu_native_fp4" => Device::new_cuda(0).unwrap_or(Device::Cpu),
-            _ => Device::Cpu,
-        }
     }
 
     fn parse_request(&self, bytes: &[u8]) -> Result<ParsedRequest> {
