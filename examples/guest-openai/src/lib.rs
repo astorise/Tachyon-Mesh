@@ -1561,11 +1561,14 @@ impl ChatCompletionRequest {
         fn named(value: &serde_json::Value) -> Option<&str> {
             value.get("function")?.get("name")?.as_str()
         }
-        let mut names: Vec<&str> = self.tools.iter().filter_map(|tool| named(tool)).collect();
-        if let Some(chosen) = self.tool_choice.as_ref().and_then(|choice| named(choice)) {
-            names.push(chosen);
+        // A pinned choice is the *whole* set, not an addition to it. Unioning
+        // it with every advertised name meant a request pinned to `read_file`
+        // still accepted a `delete_file` call the backend invented — the
+        // opposite of what pinning asks for, and the more dangerous direction.
+        if let Some(pinned) = self.tool_choice.as_ref().and_then(|choice| named(choice)) {
+            return vec![pinned];
         }
-        names
+        self.tools.iter().filter_map(|tool| named(tool)).collect()
     }
 
     /// The first call naming a function this request never offered.
@@ -2594,6 +2597,23 @@ mod tests {
             )
             .unoffered_call(&[call("pinned")]),
             None
+        );
+        // And it is the *whole* set, not an addition to it. Unioning the pin
+        // with every advertised name let a request pinned to `read_file` still
+        // accept the `delete_file` call it also listed — the opposite of what
+        // pinning asks for, in the more dangerous direction.
+        let pinned = request(
+            serde_json::json!([
+                {"type": "function", "function": {"name": "read_file"}},
+                {"type": "function", "function": {"name": "delete_file"}}
+            ]),
+            Some(serde_json::json!({"type":"function","function":{"name":"read_file"}})),
+        );
+        assert_eq!(pinned.unoffered_call(&[call("read_file")]), None);
+        assert_eq!(
+            pinned.unoffered_call(&[call("delete_file")]),
+            Some("delete_file"),
+            "a listed-but-not-pinned function is not what this request asked for"
         );
         // Nothing readable was offered, which is not evidence about what was in
         // the set. Refusing everything there would break a client whose tool

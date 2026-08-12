@@ -445,6 +445,7 @@ impl ComponentHostState {
                     sender: &sender,
                     consumer_alive: &generation_alive,
                     budget: &generation_budget,
+                    reported_stall: false,
                 };
                 match ai_runtime.stream_component_prompt(
                     &alias,
@@ -1857,24 +1858,64 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
+        // The model registry is one table for the whole node, but a component
+        // may only see the aliases its own routes seal — and
+        // `load_accelerator_model` enforces exactly that for execution.
+        // Handing the full table back made `GET /ai/v1/models` advertise
+        // models belonging to other components, which a client can see,
+        // select, and then be refused for, with nothing in the listing to say
+        // why.
+        //
+        // `limit` and `offset` count *scoped* rows, which is the only sequence
+        // the caller can observe. Letting the store apply them first and
+        // filtering afterwards looked equivalent and was not: on a table past
+        // one page, a component whose aliases sort late received an empty list
+        // while its models sat registered and executable a page further in.
+        // The store's own reconciliation pages beyond 10 000 rows, so that size
+        // is reachable rather than theoretical.
+        #[cfg(feature = "ai-inference")]
+        if res.table_name == crate::system_storage::AI_MODELS_REGISTRY_TABLE {
+            /// Raw rows per store read while collecting a scoped page.
+            const SCAN_PAGE: u32 = 10_000;
+
+            let mut scoped = Vec::new();
+            let mut skipped = 0u32;
+            let mut scanned = 0u32;
+            loop {
+                let page = res
+                    .core_store
+                    .kv_partition_get_range(
+                        &res.table_name,
+                        &start_key,
+                        &end_key,
+                        SCAN_PAGE,
+                        scanned,
+                    )
+                    .map_err(|e| format!("{e:#}"))?;
+                let read = page.len() as u32;
+                for row in page {
+                    if !self.listable_model_aliases.contains(&row.0) {
+                        continue;
+                    }
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+                    scoped.push(row);
+                    if scoped.len() as u32 >= limit {
+                        return Ok(scoped);
+                    }
+                }
+                if read < SCAN_PAGE {
+                    return Ok(scoped);
+                }
+                scanned = scanned.saturating_add(read);
+            }
+        }
         let rows = res
             .core_store
             .kv_partition_get_range(&res.table_name, &start_key, &end_key, limit, offset)
             .map_err(|e| format!("{e:#}"))?;
-        // The model registry is one table for the whole node, but a route may
-        // only execute the aliases its own manifest entry seals — and
-        // `load_accelerator_model` enforces exactly that. Handing the full
-        // table back made `GET /ai/v1/models` advertise models belonging to
-        // other routes, which a client can see, select, and then be refused
-        // for, with nothing in the listing to say why. Reading it through the
-        // same set the execution check uses keeps the two answers consistent.
-        //
-        // The limit bounds the rows read, not the rows returned, as it does for
-        // any filtered view. The listing asks for one large page, so this costs
-        // it nothing.
-        #[cfg(feature = "ai-inference")]
-        let rows =
-            scope_registry_rows_to_route(&res.table_name, rows, &self.listable_model_aliases);
         Ok(rows)
     }
 
@@ -2168,6 +2209,12 @@ const STREAM_CHANNEL_CAPACITY: usize = 64;
 #[cfg(feature = "ai-inference")]
 const STREAM_QUEUE_BUDGET_BYTES: usize = 256 * 1024;
 
+/// How often a producer re-checks for a free channel slot while the consumer is
+/// behind. Short enough that a resuming client is served promptly, long enough
+/// that a stalled one costs almost nothing.
+#[cfg(feature = "ai-inference")]
+const STREAM_SLOT_POLL: Duration = Duration::from_millis(25);
+
 /// How long a producer waits for the consumer to drain before treating it as
 /// gone.
 ///
@@ -2276,6 +2323,20 @@ impl StreamQueueBudget {
         self.state.lock().is_ok_and(|state| state.stalled)
     }
 
+    /// Declare a stall observed somewhere other than the byte budget.
+    ///
+    /// The channel's slot count is the other way a producer can be held: 64
+    /// slots fill long before 256 KiB of ordinary token fragments do, so a
+    /// blocking `send` parked without the byte budget ever being consulted.
+    /// Recording it here keeps one answer to "why did this stream stop".
+    fn consumer_stalled(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.consumer_gone = true;
+            state.stalled = true;
+        }
+        self.drained.notify_all();
+    }
+
     /// Wake a producer blocked on a budget nobody will drain again.
     fn consumer_gone(&self) {
         if let Ok(mut state) = self.state.lock() {
@@ -2297,6 +2358,8 @@ struct GuestStreamSink<'a> {
     >,
     consumer_alive: &'a Arc<std::sync::atomic::AtomicBool>,
     budget: &'a Arc<StreamQueueBudget>,
+    /// Whether the stall has already been reported down the channel.
+    reported_stall: bool,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -2317,20 +2380,30 @@ impl ai_inference::StreamSink for GuestStreamSink<'_> {
             // merely paused was handed a truncated answer under a clean `stop`,
             // with nothing to distinguish it from a complete one.
             //
-            // Best effort: if the consumer has since gone too, the send fails
-            // and there is nobody left to tell, which is the other case
-            // already handled below.
             if self.budget.stalled() {
-                let _ = self.sender.send(Err(ai_inference::GenerationError::local(
-                    "the client stopped reading this stream for longer than the backpressure \
-                     limit allows, so generation was cancelled",
-                )));
+                self.report_stall();
             }
             return ai_inference::StreamControl::Stop;
         }
-        match self.sender.send(Ok(payload)) {
-            Ok(()) => ai_inference::StreamControl::Continue,
-            Err(_) => {
+        // Timed, not blocking. The byte budget is only one of the two ways a
+        // producer can be held: the channel's 64 slots fill long before 256 KiB
+        // of ordinary token fragments do, so this used to park forever on the
+        // common case — holding the model, the route permit and the upstream
+        // admission permit — while the stall limit added just above never came
+        // near being consulted.
+        match Self::send_before(
+            self.sender,
+            Ok(payload),
+            Instant::now() + STREAM_BACKPRESSURE_STALL_LIMIT,
+        ) {
+            SlotSend::Sent => ai_inference::StreamControl::Continue,
+            SlotSend::Stalled => {
+                self.budget.release(charged);
+                self.budget.consumer_stalled();
+                self.report_stall();
+                ai_inference::StreamControl::Stop
+            }
+            SlotSend::Disconnected => {
                 // Nothing was queued, so the reservation must not outlive the
                 // failure — otherwise a later send would wait on bytes that
                 // will never be drained.
@@ -2344,6 +2417,73 @@ impl ai_inference::StreamSink for GuestStreamSink<'_> {
         self.consumer_alive
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+#[cfg(feature = "ai-inference")]
+impl GuestStreamSink<'_> {
+    /// Tell a client that is still there why its stream stopped.
+    ///
+    /// Timed rather than blocking, and for the same reason the event send is:
+    /// the channel may be exactly what filled. A slot frees the moment the
+    /// client resumes reading, which is precisely when there is somebody to
+    /// tell; if it never resumes, the send times out or disconnects and there
+    /// was nobody to tell anyway.
+    ///
+    /// Sent once. After the first stall every later `reserve` refuses
+    /// immediately, and repeating the error would only fill the channel the
+    /// client is trying to drain.
+    fn report_stall(&mut self) {
+        if std::mem::replace(&mut self.reported_stall, true) {
+            return;
+        }
+        let _ = Self::send_before(
+            self.sender,
+            Err(ai_inference::GenerationError::local(
+                "the client stopped reading this stream for longer than the backpressure limit \
+                 allows, so generation was cancelled",
+            )),
+            Instant::now() + STREAM_BACKPRESSURE_STALL_LIMIT,
+        );
+    }
+
+    /// `SyncSender::send`, bounded by a deadline.
+    ///
+    /// std's `send_timeout` is still unstable for a `SyncSender`, and `try_send`
+    /// hands the payload back on a full channel, so the wait is spelled out:
+    /// poll for a slot until the deadline. Only ever entered when the channel
+    /// is already full — a consumer keeping up never sleeps here.
+    fn send_before(
+        sender: &std::sync::mpsc::SyncSender<
+            std::result::Result<StreamPayload, ai_inference::GenerationError>,
+        >,
+        mut payload: std::result::Result<StreamPayload, ai_inference::GenerationError>,
+        deadline: Instant,
+    ) -> SlotSend {
+        loop {
+            match sender.try_send(payload) {
+                Ok(()) => return SlotSend::Sent,
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    return SlotSend::Disconnected
+                }
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    if Instant::now() >= deadline {
+                        return SlotSend::Stalled;
+                    }
+                    payload = returned;
+                    std::thread::sleep(STREAM_SLOT_POLL);
+                }
+            }
+        }
+    }
+}
+
+/// How a bounded send ended.
+#[cfg(feature = "ai-inference")]
+enum SlotSend {
+    Sent,
+    /// The channel stayed full for the whole stall limit.
+    Stalled,
+    Disconnected,
 }
 
 /// One item the generation thread pushes down the stream channel. The owned

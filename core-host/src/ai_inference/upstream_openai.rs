@@ -621,13 +621,38 @@ impl UpstreamOpenAiRuntime {
         let Some(endpoint) = UpstreamEndpoint::parse(alias, path)? else {
             return Ok(None);
         };
-        // `reqwest::blocking` spins its own runtime on a private thread. That is
-        // safe here because inference executes on the scheduler's dedicated OS
-        // thread (`AcceleratorScheduler::new`'s `tachyon-*-dispatcher`), never
-        // inside a tokio worker.
-        let client = reqwest::blocking::Client::builder()
-            .timeout(endpoint.timeout)
-            .build()
+        // Built on a thread of its own, because `reqwest::blocking`'s builder
+        // *panics* when called from inside a tokio runtime — and this runs at
+        // manifest-load time, not at request time. An earlier comment here
+        // claimed the opposite, reasoning from where inference executes (the
+        // scheduler's dedicated OS thread) rather than from where loading does:
+        // `serve_host` is `async`, and it calls `build_runtime_state`
+        // synchronously, so any manifest carrying an `openai:` binding took the
+        // host down during boot.
+        //
+        // A thread per upstream binding, once, at load. The alternative —
+        // building lazily on first use — would move a TLS or resolver failure
+        // from boot to an arbitrary later request, which is the wrong end to
+        // discover it.
+        let timeout = endpoint.timeout;
+        let client = std::thread::Builder::new()
+            .name("tachyon-upstream-client-build".to_owned())
+            .spawn(move || {
+                reqwest::blocking::Client::builder()
+                    .timeout(timeout)
+                    .build()
+            })
+            .map_err(|error| UpstreamError::InvalidBinding {
+                alias: alias.to_owned(),
+                detail: format!(
+                    "could not start a thread to build the upstream HTTP client: {error}"
+                ),
+            })?
+            .join()
+            .map_err(|_| UpstreamError::InvalidBinding {
+                alias: alias.to_owned(),
+                detail: "the thread building the upstream HTTP client panicked".to_owned(),
+            })?
             .map_err(|error| UpstreamError::InvalidBinding {
                 alias: alias.to_owned(),
                 detail: format!("could not build the upstream HTTP client: {error}"),

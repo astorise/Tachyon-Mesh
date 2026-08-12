@@ -442,22 +442,36 @@ fn commit_upload(uri: &str) -> Result<String, String> {
         return Err(error);
     }
 
-    // The upload is live, so the backup is dead weight. A failed removal used
-    // to be dropped here, and nothing ever came back for it: the directory is
-    // keyed by an upload id no later commit knows, so one busy file or one
-    // transient error stranded a whole previous checkpoint — once per update,
-    // on a volume sized for the models rather than for their history.
+    // Publication succeeded, so the backup is dead weight — and *which name it
+    // carries* is the durable record of that fact.
     //
-    // Renaming into the swept namespace is the recovery, and it has to be a
-    // separate name rather than a re-try of `.replaced-`: the concurrent-upload
-    // path above *deliberately* leaves a `.replaced-` directory behind for an
-    // operator to restore by hand, and a sweep that could not tell the two
-    // apart would delete exactly the one that was kept on purpose.
-    if fs::remove_dir_all(&backup_dir).is_err() && backup_dir.exists() {
-        let _ = fs::rename(
-            &backup_dir,
-            models_dir().join(format!("{DISCARDED_BACKUP_PREFIX}{upload_id}")),
-        );
+    // Renamed before it is deleted, rather than deleted with a rename as the
+    // fallback. A crash in this window used to leave a `.replaced-` directory
+    // beside an already-published upload, and the retry could not tell that
+    // from a crash *before* publication: it rewound the live path to the
+    // predecessor, so a request arriving during the re-unpack could load the
+    // old files under the newly published alias, and a retry that then failed
+    // left the registry describing a checkpoint that was no longer there. The
+    // two states now have two different names.
+    //
+    // It also has to be a separate name from `.replaced-` for the older
+    // reason: the concurrent-upload path above deliberately leaves one behind
+    // for an operator to restore by hand, and a sweep that could not tell the
+    // two apart would delete exactly the one kept on purpose.
+    if replaced {
+        let discarded = models_dir().join(format!("{DISCARDED_BACKUP_PREFIX}{upload_id}"));
+        match fs::rename(&backup_dir, &discarded) {
+            Ok(()) => {
+                let _ = fs::remove_dir_all(&discarded);
+            }
+            // The rename is a single directory entry within one directory, so
+            // a failure here is unusual. Fall back to removing in place; the
+            // window it reopens is the one this rename exists to close, and
+            // leaving the directory would strand a whole checkpoint.
+            Err(_) => {
+                let _ = fs::remove_dir_all(&backup_dir);
+            }
+        }
     }
     cleanup_staging(&upload_id);
 
@@ -1169,6 +1183,22 @@ mod tests {
         fs::remove_dir_all(&backup_dir).expect("clear");
         reconcile_interrupted_commit(&model_dir, &backup_dir, "up-1").expect("no-op");
         assert_eq!(live(), "other-upload");
+
+        // A crash *after* publication is a different state, and it has a
+        // different name: the commit renames the backup into the discarded
+        // namespace before deleting it, so a retry that finds no `.replaced-`
+        // directory leaves the published checkpoint alone. Rewinding it would
+        // let a request load the predecessor under the newly published alias.
+        let discarded = root.join(format!("{DISCARDED_BACKUP_PREFIX}up-1"));
+        plant(&discarded, "operator", None);
+        plant(&model_dir, "published", Some("up-1"));
+        reconcile_interrupted_commit(&model_dir, &backup_dir, "up-1")
+            .expect("a discarded backup is not a pending rollback");
+        assert_eq!(
+            live(),
+            "published",
+            "a published upload must survive a retry"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
