@@ -921,6 +921,8 @@ pub(crate) async fn handle_streaming_http_request(
 
     let (headers_tx, headers_rx) = tokio::sync::oneshot::channel::<(StatusCode, GuestHttpFields)>();
     let (chunks_tx, chunks_rx) = tokio::sync::mpsc::channel::<Bytes>(32);
+    let consumer_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let guest_consumer_alive = Arc::clone(&consumer_alive);
 
     std::thread::Builder::new()
         .name(format!("tachyon-streaming-{}", route.path))
@@ -956,6 +958,7 @@ pub(crate) async fn handle_streaming_http_request(
                 request,
                 headers_tx,
                 chunks_tx,
+                guest_consumer_alive,
                 &execution,
             );
         })
@@ -979,6 +982,7 @@ pub(crate) async fn handle_streaming_http_request(
     let body = GuestStreamingBody {
         receiver: chunks_rx,
         _completion_guard: Some(active_request_guard.into_response_guard()),
+        consumer_alive,
     };
 
     let mut response = Response::builder()

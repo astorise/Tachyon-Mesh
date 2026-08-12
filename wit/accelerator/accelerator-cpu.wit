@@ -33,6 +33,9 @@ interface cpu {
     record generation-error {
         message: string,
         upstream-status: option<u16>,
+        /// Stable host classification: `invalid-request`, `transport`, or
+        /// `malformed-response`; absent for ordinary local failures.
+        class: option<string>,
     }
 
     /// One tool call a backend recognised as *structured* data rather than as
@@ -57,6 +60,10 @@ interface cpu {
     variant stream-event {
         /// Decoded text for the assistant message.
         content(string),
+        /// A provider safety refusal. This is distinct from assistant content
+        /// in the OpenAI stream protocol and must not be silently flattened
+        /// into an empty successful completion.
+        refusal(string),
         /// A tool call, complete. Tool calls arrive on this arm rather than
         /// inside `content` so that offering tools costs nothing in
         /// time-to-first-token: a backend that had to smuggle calls through the
@@ -92,6 +99,8 @@ interface cpu {
     /// when the backend could measure them.
     record generation {
         text: string,
+        /// A provider safety refusal, distinct from assistant content.
+        refusal: option<string>,
         usage: option<token-usage>,
         /// Why generation stopped, when the backend knows: `stop`, `length`,
         /// or whatever an upstream reported. Absent means "not reported" — a

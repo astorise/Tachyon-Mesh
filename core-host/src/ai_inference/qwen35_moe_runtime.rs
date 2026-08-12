@@ -449,8 +449,8 @@ struct GenerationRequest {
     prompt: Option<String>,
     #[serde(default)]
     messages: Option<Vec<IncomingChatTurn>>,
-    #[serde(default = "default_max_new_tokens")]
-    max_new_tokens: usize,
+    #[serde(default)]
+    max_new_tokens: Option<usize>,
     #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
@@ -596,7 +596,7 @@ impl Qwen35MoeRuntime {
         if prompts.len() != 1 {
             bail!("Qwen 3.5 MoE runtime currently accepts exactly one prompt per decode");
         }
-        let request = self.parse_request(prompts[0])?;
+        let mut request = self.parse_request(prompts[0])?;
         let encoded = self
             .tokenizer
             .encode(request.prompt.clone(), true)
@@ -604,7 +604,14 @@ impl Qwen35MoeRuntime {
         if encoded.is_empty() {
             bail!("Qwen prompt encoded to zero tokens");
         }
-        if encoded.len() + request.max_new_tokens > self.config.max_position_embeddings {
+        let headroom = self
+            .config
+            .max_position_embeddings
+            .saturating_sub(encoded.len());
+        if request.defaulted_max_new_tokens {
+            request.max_new_tokens = request.max_new_tokens.min(headroom);
+        }
+        if request.max_new_tokens == 0 || request.max_new_tokens > headroom {
             bail!(
                 "prompt and generation length exceed context limit {}",
                 self.config.max_position_embeddings
@@ -636,6 +643,7 @@ impl Qwen35MoeRuntime {
         let mut generated = Vec::<u32>::new();
         let mut emitted = 0usize;
         let mut abandoned = false;
+        let mut budget_exhausted = false;
         // Incremental, like every other production decode loop. Re-decoding the
         // whole sequence after each token is quadratic in the generation
         // length, and the stop check needs the decoded text on every step — so
@@ -648,6 +656,7 @@ impl Qwen35MoeRuntime {
             // does, rather than failing: freeing the scheduler slot is the
             // point, and a partial answer beats an error.
             if Instant::now() >= request.deadline {
+                budget_exhausted = true;
                 break;
             }
             // Same reasoning for a consumer that went away: finishing an
@@ -658,6 +667,7 @@ impl Qwen35MoeRuntime {
             let tensor = Tensor::from_vec(logits, self.config.vocab_size, &Device::Cpu)?;
             let token = processor.sample(&tensor)?;
             if token == self.config.eos_token_id {
+                generated.push(token);
                 break;
             }
             generated.push(token);
@@ -675,7 +685,14 @@ impl Qwen35MoeRuntime {
                 abandoned = on_token(&text[emitted..safe_end]).is_stop();
                 emitted = safe_end;
             }
+            if abandoned {
+                break;
+            }
             if stop.is_some() {
+                break;
+            }
+            if step + 1 == request.max_new_tokens {
+                budget_exhausted = true;
                 break;
             }
             logits = self.forward_token(token, encoded.len() + step, &mut state)?;
@@ -687,7 +704,7 @@ impl Qwen35MoeRuntime {
         // Same rule as the generic Candle runtime: only budget exhaustion is
         // named, because that is the case an absent reason would misreport as
         // a clean `stop` — and this backend serves the same `/ai/v1` clients.
-        let finish_reason = (generated.len() >= request.max_new_tokens).then_some("length");
+        let finish_reason = budget_exhausted.then_some("length");
         Ok((usage, finish_reason))
     }
 
@@ -703,7 +720,7 @@ impl Qwen35MoeRuntime {
             GenerationRequest {
                 prompt: Some(raw.to_owned()),
                 messages: None,
-                max_new_tokens: default_max_new_tokens(),
+                max_new_tokens: None,
                 temperature: None,
                 top_p: None,
                 seed: None,
@@ -711,7 +728,11 @@ impl Qwen35MoeRuntime {
                 max_generation_ms: None,
             }
         };
-        if request.max_new_tokens == 0 || request.max_new_tokens > HOST_MAX_NEW_TOKENS {
+        let defaulted_max_new_tokens = request.max_new_tokens.is_none();
+        let max_new_tokens = request
+            .max_new_tokens
+            .unwrap_or_else(default_max_new_tokens);
+        if max_new_tokens == 0 || max_new_tokens > HOST_MAX_NEW_TOKENS {
             bail!("max_new_tokens must be between 1 and {HOST_MAX_NEW_TOKENS}");
         }
         // Same bounds and same default as the Candle runtime, so a caller sees
@@ -771,7 +792,8 @@ impl Qwen35MoeRuntime {
         };
         Ok(ParsedRequest {
             prompt,
-            max_new_tokens: request.max_new_tokens,
+            max_new_tokens,
+            defaulted_max_new_tokens,
             temperature: request.temperature,
             top_p: request.top_p,
             seed: request.seed,
@@ -956,6 +978,7 @@ fn env_u64(name: &str) -> Option<u64> {
 struct ParsedRequest {
     prompt: String,
     max_new_tokens: usize,
+    defaulted_max_new_tokens: bool,
     temperature: Option<f32>,
     top_p: Option<f32>,
     seed: Option<u64>,

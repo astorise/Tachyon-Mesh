@@ -6,11 +6,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use http_body_util::BodyExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
 };
 use wasmtime::{component::Linker as ComponentLinker, Engine, Store};
 use wasmtime_wasi::{
@@ -20,6 +20,14 @@ use wasmtime_wasi::{
 const ASSET_URI_PREFIX: &str = "tachyon://sha256:";
 const REGISTRY_MODULE_NAME: &str = "system-faas-registry";
 const MODEL_BROKER_MODULE_NAME: &str = "system-faas-model-broker";
+const MODEL_BROKER_COMMIT_PREFIX: &str = "/admin/models/commit/";
+
+/// The broker guest is instantiated per request, so serialization for a live
+/// model-directory swap must live in the host process rather than in guest
+/// statics. Keys are aliases; the fallback key deliberately serializes unknown
+/// metadata rather than allowing an unsafe concurrent swap.
+static MODEL_COMMIT_LOCKS: OnceLock<Mutex<std::collections::BTreeMap<String, Arc<Mutex<()>>>>> =
+    OnceLock::new();
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -41,12 +49,56 @@ struct StorageComponentState {
 }
 
 const AI_MODELS_REGISTRY_TABLE: &str = "ai-models-registry";
+/// Upload-owned rows displaced by a non-dynamic manifest binding. A configured
+/// alias executes the manifest backend while present, but the upload remains
+/// on disk and must become discoverable again when that ownership ends.
+const AI_MODELS_SHADOWED_UPLOADS_TABLE: &str = "ai-models-shadowed-uploads";
 
 struct ComponentRequest {
     method: String,
     uri: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct BrokerPendingUpload {
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    files: Vec<BrokerUploadFile>,
+}
+
+#[derive(Deserialize)]
+struct BrokerUploadFile {
+    sha256: String,
+}
+
+fn model_commit_lock(root_dir: &Path, uri: &str) -> Arc<Mutex<()>> {
+    let upload_id = uri
+        .split_once('?')
+        .map_or(uri, |(path, _)| path)
+        .strip_prefix(MODEL_BROKER_COMMIT_PREFIX);
+    let alias = upload_id
+        .and_then(|id| fs::read(root_dir.join("model-uploads").join(format!("{id}.json"))).ok())
+        .and_then(|raw| serde_json::from_slice::<BrokerPendingUpload>(&raw).ok())
+        .map(|pending| {
+            pending.alias.unwrap_or_else(|| {
+                pending
+                    .files
+                    .first()
+                    .map(|file| file.sha256.trim_start_matches("sha256:").to_owned())
+                    .unwrap_or_else(|| "unknown-model".to_owned())
+            })
+        })
+        .unwrap_or_else(|| "unknown-model".to_owned());
+    let locks = MODEL_COMMIT_LOCKS.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    locks
+        .lock()
+        .expect("model commit lock registry poisoned")
+        .entry(alias)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 struct ComponentResponse {
@@ -156,8 +208,19 @@ async fn proxy_request_to_component(
         }
     };
     let root_dir = working_dir(&manifest_path);
+    let commit_lock = (module_name == MODEL_BROKER_MODULE_NAME
+        && component_request.method.eq_ignore_ascii_case("POST")
+        && component_request
+            .uri
+            .starts_with(MODEL_BROKER_COMMIT_PREFIX))
+    .then(|| model_commit_lock(&root_dir, &component_request.uri));
 
     match tokio::task::spawn_blocking(move || {
+        // Keep the guard across guest instantiation and the full component call:
+        // the guest owns the directory swap and registry publication.
+        let _commit_guard = commit_lock
+            .as_ref()
+            .map(|lock| lock.lock().expect("model commit lock poisoned"));
         invoke_storage_component(
             &engine,
             module_name,
@@ -566,6 +629,20 @@ pub(crate) fn publish_configured_model_bindings(
             // The write is still a single transaction: a read followed by a
             // write would let an upload land in between and be reported as the
             // winner when it is not.
+            if let Ok(Some(upload_row)) =
+                core_store.kv_partition_get(AI_MODELS_REGISTRY_TABLE, &binding.alias)
+            {
+                if !row_is_config_owned(Some(&upload_row)) {
+                    if let Err(error) = core_store.kv_partition_set(
+                        AI_MODELS_SHADOWED_UPLOADS_TABLE,
+                        &binding.alias,
+                        &upload_row,
+                    ) {
+                        tracing::warn!(alias = %binding.alias, "failed to preserve upload registry row hidden by configured binding: {error:#}");
+                        continue;
+                    }
+                }
+            }
             if let Err(error) = core_store.kv_partition_update(
                 AI_MODELS_REGISTRY_TABLE,
                 &binding.alias,
@@ -590,12 +667,27 @@ pub(crate) fn publish_configured_model_bindings(
     // Drop configured rows whose binding is gone, or a removed alias would stay
     // listed in `GET /ai/v1/models` forever. Upload-owned rows are never swept:
     // their model is still on disk and reachable.
-    for alias in config_owned_aliases(core_store) {
+    let owned_aliases = match config_owned_aliases(core_store) {
+        Ok(aliases) => aliases,
+        Err(error) => {
+            tracing::warn!(
+                "failed to scan configured model bindings before registry sweep: {error:#}"
+            );
+            return;
+        }
+    };
+    for alias in owned_aliases {
         if configured.contains(alias.as_str()) {
             continue;
         }
         // Same race: an upload may have replaced this row since the scan, so
         // ownership is re-checked inside the deleting transaction.
+        let hidden_upload = core_store
+            .kv_partition_get(AI_MODELS_SHADOWED_UPLOADS_TABLE, &alias)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%alias, "failed to read upload row hidden by configured binding: {error:#}");
+                None
+            });
         if let Err(error) =
             core_store.kv_partition_update(AI_MODELS_REGISTRY_TABLE, &alias, |current| {
                 if row_is_config_owned(current) {
@@ -611,6 +703,17 @@ pub(crate) fn publish_configured_model_bindings(
             );
         } else {
             tracing::info!(%alias, "dropped a configured model binding that left the manifest");
+            if let Some(upload_row) = hidden_upload {
+                if let Err(error) =
+                    core_store.kv_partition_set(AI_MODELS_REGISTRY_TABLE, &alias, &upload_row)
+                {
+                    tracing::warn!(%alias, "failed to restore upload registry row after configured binding withdrawal: {error:#}");
+                } else if let Err(error) =
+                    core_store.kv_partition_delete(AI_MODELS_SHADOWED_UPLOADS_TABLE, &alias)
+                {
+                    tracing::warn!(%alias, "failed to clear restored upload registry row backup: {error:#}");
+                }
+            }
         }
     }
 }
@@ -703,10 +806,13 @@ pub(crate) fn withdraw_changed_model_bindings(
     };
     let incoming = publishable(incoming);
 
-    for (alias, path) in publishable(previous) {
-        // Same alias, same path — the row it would publish is byte-identical,
-        // so leaving it in place keeps the model listed across the reload.
-        if incoming.get(&alias).is_some_and(|next| *next == path) {
+    for (alias, _path) in publishable(previous) {
+        // An alias that remains configured must keep its ownership marker
+        // throughout the swap. Removing it creates a window in which an upload
+        // can claim the alias and modify the configured checkpoint before the
+        // replacement row is published. The post-swap publisher refreshes the
+        // path and engine; withdrawal is only for aliases no longer configured.
+        if incoming.contains_key(&alias) {
             continue;
         }
         // Ownership is re-read inside the transaction: an upload that landed
@@ -730,7 +836,7 @@ pub(crate) fn withdraw_changed_model_bindings(
 
 /// Every alias in the registry whose row this publisher owns.
 #[cfg(feature = "ai-inference")]
-fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Vec<String> {
+fn config_owned_aliases(core_store: &crate::store::CoreStore) -> anyhow::Result<Vec<String>> {
     /// Rows per read. The page size is a transaction-size bound, not a limit
     /// on how much of the table this sweep covers.
     const PAGE: u32 = 10_000;
@@ -741,9 +847,13 @@ fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Vec<String> {
         // A single page used to be the whole sweep, so once the table grew
         // past it — uploaded rows count too — any configured alias beyond that
         // page stayed advertised forever after leaving the manifest.
-        let page = core_store
-            .kv_partition_get_range(AI_MODELS_REGISTRY_TABLE, "", "\u{10ffff}", PAGE, offset)
-            .unwrap_or_default();
+        let page = core_store.kv_partition_get_range(
+            AI_MODELS_REGISTRY_TABLE,
+            "",
+            "\u{10ffff}",
+            PAGE,
+            offset,
+        )?;
         let read = page.len() as u32;
         owned.extend(page.into_iter().filter_map(|(alias, raw)| {
             let row = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
@@ -751,7 +861,7 @@ fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Vec<String> {
                 .then_some(alias)
         }));
         if read < PAGE {
-            return owned;
+            return Ok(owned);
         }
         offset = offset.saturating_add(read);
     }
@@ -1276,7 +1386,7 @@ mod configured_binding_registry_tests {
     }
 
     #[test]
-    fn a_reload_withdraws_only_the_bindings_that_change() {
+    fn a_reload_withdraws_only_the_bindings_that_leave_configured_ownership() {
         let (store, dir) = temp_store();
         let previous = config_with(vec![
             binding("unchanged", "openai:http://127.0.0.1:8080/v1", false),
@@ -1287,8 +1397,8 @@ mod configured_binding_registry_tests {
 
         let incoming = config_with(vec![
             binding("unchanged", "openai:http://127.0.0.1:8080/v1", false),
-            // Same alias, different backend: advertising the old engine while
-            // the new one answers is the failure this withdrawal prevents.
+            // Same alias, different backend: it must retain its configured
+            // ownership marker until the publisher refreshes its registry row.
             binding("re-pointed", "/models/re-pointed", false),
         ]);
         withdraw_changed_model_bindings(&store, &previous, &incoming);
@@ -1303,7 +1413,10 @@ mod configured_binding_registry_tests {
             present("unchanged"),
             "an identical binding keeps its row, so an unrelated reload costs no availability"
         );
-        assert!(!present("re-pointed"), "a changed binding is withdrawn");
+        assert!(
+            present("re-pointed"),
+            "a re-pointed binding keeps ownership until its replacement row is published"
+        );
         assert!(!present("removed"), "a removed binding is withdrawn");
         let _ = fs::remove_dir_all(dir);
     }

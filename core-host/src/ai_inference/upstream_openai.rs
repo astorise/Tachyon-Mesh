@@ -94,6 +94,7 @@ pub(crate) enum UpstreamError {
         alias: String,
         endpoint: String,
         detail: String,
+        timed_out: bool,
     },
     #[error("upstream `{alias}` at `{endpoint}` returned HTTP {status}: {body}")]
     Status {
@@ -425,6 +426,7 @@ struct HostGenerationRequest {
 #[derive(Debug)]
 pub(crate) struct UpstreamGeneration {
     pub(crate) bytes: Vec<u8>,
+    pub(crate) refusal: Option<String>,
     pub(crate) usage: Option<TokenUsage>,
     pub(crate) finish_reason: Option<String>,
     pub(crate) tool_calls: Vec<ToolCall>,
@@ -445,7 +447,7 @@ pub(crate) struct UpstreamOpenAiRuntime {
     /// arrived, and the request held its admission permit meanwhile. Owning the
     /// runtime lets the read loop wrap each poll in a timeout and ask the sink
     /// whether anyone is still listening.
-    runtime: tokio::runtime::Runtime,
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
 /// How long the stream reader waits on the socket before checking whether the
@@ -459,6 +461,12 @@ pub(crate) struct UpstreamOpenAiRuntime {
 const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 impl UpstreamOpenAiRuntime {
+    fn runtime(&self) -> &tokio::runtime::Runtime {
+        self.runtime
+            .as_ref()
+            .expect("upstream runtime is available until the backend is dropped")
+    }
+
     /// Claim a binding whose `path` uses the `openai:` scheme.
     ///
     /// `Ok(None)` means "not mine" — the caller keeps probing the on-disk
@@ -495,7 +503,7 @@ impl UpstreamOpenAiRuntime {
             api_key: api_key_for(alias),
             endpoint,
             client,
-            runtime,
+            runtime: Some(runtime),
         }))
     }
 
@@ -669,6 +677,7 @@ impl UpstreamOpenAiRuntime {
                 alias: self.alias.clone(),
                 endpoint: url.clone(),
                 detail: error.to_string(),
+                timed_out: error.is_timeout(),
             })?;
 
         let status = response.status();
@@ -702,9 +711,14 @@ impl UpstreamOpenAiRuntime {
     /// rather than as zeros.
     fn read_usage(payload: &Value) -> Option<TokenUsage> {
         let usage = payload.get("usage").filter(|usage| !usage.is_null())?;
-        let field = |name: &str| usage.get(name).and_then(Value::as_u64).unwrap_or(0) as u32;
-        let prompt_tokens = field("prompt_tokens");
-        let completion_tokens = field("completion_tokens");
+        let field = |name: &str| {
+            usage
+                .get(name)
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+        };
+        let prompt_tokens = field("prompt_tokens")?;
+        let completion_tokens = field("completion_tokens")?;
         if prompt_tokens == 0 && completion_tokens == 0 {
             return None;
         }
@@ -725,7 +739,7 @@ impl UpstreamOpenAiRuntime {
             });
         };
         let (body, timeout) = self.chat_body(prompt, false)?;
-        let payload: Value = self.runtime.block_on(async {
+        let payload: Value = self.runtime().block_on(async {
             let mut response = self.post("/chat/completions", &body, timeout).await?;
             read_json(&self.alias, &mut response).await
         })?;
@@ -751,6 +765,10 @@ impl UpstreamOpenAiRuntime {
                 detail: "response has no `choices[0].message` object".to_owned(),
             })?;
         let content = message.get("content").and_then(Value::as_str);
+        let refusal = message
+            .get("refusal")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
 
         // A tool call carries `content: null`, so requiring a content string
         // would turn every successful tool call into a malformed-response
@@ -764,12 +782,32 @@ impl UpstreamOpenAiRuntime {
         {
             return Ok(UpstreamGeneration {
                 bytes: content.unwrap_or_default().as_bytes().to_vec(),
+                refusal,
                 usage,
                 finish_reason,
                 tool_calls: tool_calls_from_value(&self.alias, tool_calls)?,
             });
         }
 
+        if finish_reason.as_deref() == Some("tool_calls") {
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: "upstream reported `finish_reason: tool_calls` without a tool call"
+                    .to_owned(),
+            });
+        }
+
+        if refusal.is_some()
+            || (content.is_none() && finish_reason.as_deref() == Some("content_filter"))
+        {
+            return Ok(UpstreamGeneration {
+                bytes: Vec::new(),
+                refusal,
+                usage,
+                finish_reason,
+                tool_calls: Vec::new(),
+            });
+        }
         let text = content.ok_or_else(|| UpstreamError::MalformedResponse {
             alias: self.alias.clone(),
             detail: "response has no `choices[0].message.content` string and no `tool_calls`"
@@ -777,6 +815,7 @@ impl UpstreamOpenAiRuntime {
         })?;
         Ok(UpstreamGeneration {
             bytes: text.as_bytes().to_vec(),
+            refusal,
             usage,
             finish_reason,
             tool_calls: Vec::new(),
@@ -810,7 +849,7 @@ impl UpstreamOpenAiRuntime {
         // The whole read runs inside one `block_on`, so the sink is borrowed
         // across await points on a single thread — which is exactly why the
         // runtime is current-thread. Nothing here needs to be `Send`.
-        self.runtime
+        self.runtime()
             .block_on(self.stream_response(body, timeout, sink))
     }
 
@@ -828,6 +867,7 @@ impl UpstreamOpenAiRuntime {
         let mut saw_done = false;
         let mut usage = None;
         let mut finish_reason = None;
+        let mut saw_choice = false;
         // Set when the sink asks to stop — the client went away. The read loop
         // then abandons the upstream response instead of draining it to
         // `[DONE]`, which is what releases the socket, the thread and the
@@ -846,7 +886,7 @@ impl UpstreamOpenAiRuntime {
             // The interval is not a deadline. Exceeding it is the normal case
             // for a model still thinking, and only the binding's timeout ends
             // the request.
-            let line = match reader.next_line(&mut response).await {
+            let payload = match reader.next_event(&mut response).await {
                 Ok(Some(line)) => line,
                 Ok(None) => break,
                 Err(SseReadError::Idle) => {
@@ -872,17 +912,20 @@ impl UpstreamOpenAiRuntime {
                         ),
                     })
                 }
-                Err(SseReadError::Transport(detail)) => {
+                Err(SseReadError::Transport { detail, timed_out }) => {
                     return Err(UpstreamError::Transport {
                         alias: self.alias.clone(),
                         endpoint: self.endpoint.url("/chat/completions"),
                         detail: format!("failed to read the upstream stream: {detail}"),
+                        timed_out,
                     })
                 }
-            };
-            let Some(payload) = line.trim().strip_prefix("data:") else {
-                // Blank separator lines and SSE comments carry no delta.
-                continue;
+                Err(SseReadError::InvalidUtf8(detail)) => {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail,
+                    });
+                }
             };
             let payload = payload.trim();
             if payload == "[DONE]" {
@@ -932,6 +975,7 @@ impl UpstreamOpenAiRuntime {
                 .get("choices")
                 .and_then(Value::as_array)
                 .and_then(|choices| choices.first());
+            saw_choice |= choice.is_some();
             // Sent on the last content-bearing frame, before `[DONE]`. Keeping
             // it is what lets the caller tell a completion that finished from
             // one the upstream truncated at its own token limit.
@@ -965,6 +1009,24 @@ impl UpstreamOpenAiRuntime {
                         alias: self.alias.clone(),
                         detail: format!(
                             "streamed `choices[0].delta.content` is {}, expected a string",
+                            json_type_name(other)
+                        ),
+                    })
+                }
+            }
+            match delta.get("refusal") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(refusal)) => {
+                    if !refusal.is_empty() && sink.emit(StreamEvent::Refusal(refusal)).is_stop() {
+                        abandoned = true;
+                        break;
+                    }
+                }
+                Some(other) => {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "streamed `choices[0].delta.refusal` is {}, expected a string",
                             json_type_name(other)
                         ),
                     })
@@ -1005,17 +1067,35 @@ impl UpstreamOpenAiRuntime {
             }
         }
 
+        if !saw_done && !abandoned {
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: "upstream stream ended before the `[DONE]` sentinel".to_owned(),
+            });
+        }
+        if saw_done && !saw_choice {
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: "upstream SSE stream completed without a choice".to_owned(),
+            });
+        }
+
         if !abandoned {
-            for call in
-                streamed_tool_calls
-                    .finish()
-                    .map_err(|detail| UpstreamError::MalformedResponse {
-                        alias: self.alias.clone(),
-                        detail,
-                    })?
-            {
+            let calls = streamed_tool_calls.finish().map_err(|detail| {
+                UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail,
+                }
+            })?;
+            if finish_reason.as_deref() == Some("tool_calls") && calls.is_empty() {
+                return Err(UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail: "upstream reported `finish_reason: tool_calls` without a tool call"
+                        .to_owned(),
+                });
+            }
+            for call in calls {
                 if sink.emit(StreamEvent::ToolCall(call)).is_stop() {
-                    abandoned = true;
                     break;
                 }
             }
@@ -1029,12 +1109,6 @@ impl UpstreamOpenAiRuntime {
         // An abandoned stream is exempt: nobody is left to receive the answer,
         // so stopping short is the intended outcome rather than a truncation to
         // report.
-        if !saw_done && !abandoned {
-            return Err(UpstreamError::MalformedResponse {
-                alias: self.alias.clone(),
-                detail: "upstream stream ended before the `[DONE]` sentinel".to_owned(),
-            });
-        }
         // Absence stays absence: an upstream that volunteers no usage frame
         // has told us nothing, and zeros would read to the client as a
         // generation that cost nothing.
@@ -1047,7 +1121,7 @@ impl UpstreamOpenAiRuntime {
     /// Forward a single embedding request to the upstream `/embeddings` route.
     pub(crate) fn embed(&self, input: &str) -> Result<Vec<f32>, UpstreamError> {
         let body = json!({"model": self.endpoint.model, "input": input});
-        let payload: Value = self.runtime.block_on(async {
+        let payload: Value = self.runtime().block_on(async {
             let mut response = self
                 .post("/embeddings", &body, self.endpoint.timeout)
                 .await?;
@@ -1112,6 +1186,17 @@ impl UpstreamOpenAiRuntime {
             detail,
         })?;
         Ok(vector)
+    }
+}
+
+impl Drop for UpstreamOpenAiRuntime {
+    fn drop(&mut self) {
+        // Reload reaping happens from Tokio tasks. Dropping a Runtime there
+        // panics because its shutdown may block; consume it with Tokio's
+        // non-blocking shutdown instead.
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 
@@ -1391,7 +1476,11 @@ enum SseReadError {
     Idle,
     FrameTooLarge,
     StreamTooLarge,
-    Transport(String),
+    Transport {
+        detail: String,
+        timed_out: bool,
+    },
+    InvalidUtf8(String),
 }
 
 /// Line framing over an async response body.
@@ -1405,7 +1494,6 @@ enum SseReadError {
 /// never sends a newline would otherwise grow the buffer without limit;
 /// `MAX_STREAM_BYTES` bounds the whole response, because a stream that never
 /// ends would otherwise run forever.
-#[derive(Default)]
 struct SseReader {
     /// Bytes received but not yet consumed as a complete line.
     buffered: Vec<u8>,
@@ -1414,9 +1502,59 @@ struct SseReader {
     /// Set once the body is exhausted, so a trailing line with no newline is
     /// still delivered exactly once.
     eof: bool,
+    /// `data:` fields collected for the current SSE event. SSE joins multiple
+    /// fields with a newline and dispatches only at the blank separator.
+    event_data: String,
+    /// The UTF-8 BOM is permitted only at the beginning of a text stream.
+    first_line: bool,
+}
+
+impl Default for SseReader {
+    fn default() -> Self {
+        Self {
+            buffered: Vec::new(),
+            consumed: 0,
+            eof: false,
+            event_data: String::new(),
+            first_line: true,
+        }
+    }
 }
 
 impl SseReader {
+    async fn next_event(
+        &mut self,
+        response: &mut reqwest::Response,
+    ) -> Result<Option<String>, SseReadError> {
+        loop {
+            match self.next_line(response).await? {
+                Some(line) if line.is_empty() || line == "\r" => {
+                    if !self.event_data.is_empty() {
+                        return Ok(Some(std::mem::take(&mut self.event_data)));
+                    }
+                }
+                Some(mut line) => {
+                    if self.first_line {
+                        self.first_line = false;
+                        line = line.strip_prefix('\u{feff}').unwrap_or(&line).to_owned();
+                    }
+                    if let Some(data) = line.trim_end_matches('\r').strip_prefix("data:") {
+                        if !self.event_data.is_empty() {
+                            self.event_data.push('\n');
+                        }
+                        self.event_data
+                            .push_str(data.strip_prefix(' ').unwrap_or(data));
+                        if self.event_data.len() > MAX_SSE_FRAME_BYTES {
+                            return Err(SseReadError::FrameTooLarge);
+                        }
+                    }
+                }
+                None if self.event_data.is_empty() => return Ok(None),
+                None => return Ok(Some(std::mem::take(&mut self.event_data))),
+            }
+        }
+    }
+
     /// The next complete line, or `Ok(None)` at end of stream.
     ///
     /// `Err(Idle)` means only that nothing arrived within the poll interval.
@@ -1440,7 +1578,12 @@ impl SseReader {
                     self.eof = true;
                     continue;
                 }
-                Ok(Err(error)) => return Err(SseReadError::Transport(error.to_string())),
+                Ok(Err(error)) => {
+                    return Err(SseReadError::Transport {
+                        detail: error.to_string(),
+                        timed_out: error.is_timeout(),
+                    })
+                }
             };
             self.consumed = self.consumed.saturating_add(chunk.len() as u64);
             if self.consumed > MAX_STREAM_BYTES {
@@ -1452,7 +1595,11 @@ impl SseReader {
 
     /// Split one line out of the buffer, if a whole one is there.
     fn take_line(&mut self) -> Result<Option<String>, SseReadError> {
-        let Some(end) = self.buffered.iter().position(|byte| *byte == b'\n') else {
+        let Some(end) = self
+            .buffered
+            .iter()
+            .position(|byte| matches!(*byte, b'\n' | b'\r'))
+        else {
             // No newline yet. The buffer is a partial line, so it is bounded by
             // the frame cap rather than by the stream cap — several concurrent
             // streams each holding a near-`MAX_STREAM_BYTES` partial line is
@@ -1464,16 +1611,29 @@ impl SseReader {
                 // A final line the upstream never terminated. Delivered once,
                 // then the buffer is empty and the next call reports EOF.
                 let line = std::mem::take(&mut self.buffered);
-                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+                return String::from_utf8(line).map(Some).map_err(|error| {
+                    SseReadError::InvalidUtf8(format!("SSE frame is not UTF-8: {error}"))
+                });
             }
             return Ok(None);
         };
+        // A CR at the current buffer boundary may be the first half of CRLF.
+        // Wait for one more byte so the following LF is not mistaken for a
+        // separate blank event separator. At EOF it is definitively bare CR.
+        if self.buffered[end] == b'\r' && end + 1 == self.buffered.len() && !self.eof {
+            return Ok(None);
+        }
         if end > MAX_SSE_FRAME_BYTES {
             return Err(SseReadError::FrameTooLarge);
         }
         let mut line: Vec<u8> = self.buffered.drain(..=end).collect();
-        line.pop();
-        Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+        let terminator = line.pop();
+        if terminator == Some(b'\r') && self.buffered.first() == Some(&b'\n') {
+            self.buffered.remove(0);
+        }
+        String::from_utf8(line)
+            .map(Some)
+            .map_err(|error| SseReadError::InvalidUtf8(format!("SSE frame is not UTF-8: {error}")))
     }
 }
 
@@ -1648,14 +1808,16 @@ impl FakeUpstream {
             let _ = stream.flush();
             // Hold the connection open without sending a single chunk.
             std::thread::sleep(hold);
-            // Then close the stream the way a real upstream does: a `[DONE]`
-            // sentinel, then the terminating chunk. Both matter — a truncated
-            // body surfaces as a transport error and a missing sentinel as a
-            // malformed one, and either would mask what the test measures,
-            // which is *when* the reader gave up rather than how it failed.
-            let sentinel = "data: [DONE]\n\n";
-            let _ = stream
-                .write_all(format!("{:x}\r\n{sentinel}\r\n0\r\n\r\n", sentinel.len()).as_bytes());
+            // Then finish with a valid terminal choice followed by `[DONE]`.
+            // The silent period is what these tests measure; a malformed empty
+            // completion would instead exercise stream validation.
+            let completion = concat!(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let _ = stream.write_all(
+                format!("{:x}\r\n{completion}\r\n0\r\n\r\n", completion.len()).as_bytes(),
+            );
             let _ = stream.flush();
         });
 
@@ -1688,6 +1850,7 @@ mod tests {
     #[derive(Default)]
     struct CapturedStream {
         content: Vec<String>,
+        refusals: Vec<String>,
         tool_calls: Vec<ToolCall>,
     }
 
@@ -1696,6 +1859,7 @@ mod tests {
             move |event| {
                 match event {
                     StreamEvent::Content(text) => self.content.push(text.to_owned()),
+                    StreamEvent::Refusal(text) => self.refusals.push(text.to_owned()),
                     StreamEvent::ToolCall(call) => self.tool_calls.push(call),
                 }
                 StreamControl::Continue
@@ -1711,6 +1875,7 @@ mod tests {
             move |event| {
                 match event {
                     StreamEvent::Content(text) => self.content.push(text.to_owned()),
+                    StreamEvent::Refusal(text) => self.refusals.push(text.to_owned()),
                     StreamEvent::ToolCall(call) => self.tool_calls.push(call),
                 }
                 if self.content.len() >= after {

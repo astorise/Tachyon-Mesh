@@ -154,6 +154,8 @@ impl ComponentHostState {
             accelerator_models: HashMap::new(),
             #[cfg(feature = "ai-inference")]
             next_accelerator_model_id: 1,
+            #[cfg(feature = "ai-inference")]
+            streaming_consumer_alive: None,
             streaming_body: None,
         })
     }
@@ -201,6 +203,7 @@ impl ComponentHostState {
             let gpu = runtime.queue_tier_snapshot(ai_inference::AcceleratorKind::Gpu);
             let npu = runtime.queue_tier_snapshot(ai_inference::AcceleratorKind::Npu);
             let tpu = runtime.queue_tier_snapshot(ai_inference::AcceleratorKind::Tpu);
+            let network = runtime.queue_tier_snapshot(ai_inference::AcceleratorKind::Network);
             AcceleratorQueueLoads {
                 cpu_rt_load: cpu.realtime,
                 cpu_standard_load: cpu.standard,
@@ -214,6 +217,9 @@ impl ComponentHostState {
                 tpu_rt_load: tpu.realtime,
                 tpu_standard_load: tpu.standard,
                 tpu_batch_load: tpu.batch,
+                network_rt_load: network.realtime,
+                network_standard_load: network.standard,
+                network_batch_load: network.batch,
             }
         }
 
@@ -422,7 +428,11 @@ impl ComponentHostState {
         // already reports a departed consumer, but only when there is something
         // to send; this is the same answer available *between* sends, which is
         // what a backend needs while it is waiting on a slow upstream.
-        let consumer_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let consumer_alive = self
+            .streaming_consumer_alive
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(true)));
         let generation_alive = Arc::clone(&consumer_alive);
         let budget = Arc::new(StreamQueueBudget::default());
         let generation_budget = Arc::clone(&budget);
@@ -498,6 +508,9 @@ pub(crate) struct ControlPlaneSnapshot {
     pub(crate) tpu_rt_load: u32,
     pub(crate) tpu_standard_load: u32,
     pub(crate) tpu_batch_load: u32,
+    pub(crate) network_rt_load: u32,
+    pub(crate) network_standard_load: u32,
+    pub(crate) network_batch_load: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -514,6 +527,9 @@ pub(crate) struct AcceleratorQueueLoads {
     pub(crate) tpu_rt_load: u32,
     pub(crate) tpu_standard_load: u32,
     pub(crate) tpu_batch_load: u32,
+    pub(crate) network_rt_load: u32,
+    pub(crate) network_standard_load: u32,
+    pub(crate) network_batch_load: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -593,6 +609,9 @@ pub(crate) fn control_plane_snapshot(
         tpu_rt_load: queue_loads.tpu_rt_load,
         tpu_standard_load: queue_loads.tpu_standard_load,
         tpu_batch_load: queue_loads.tpu_batch_load,
+        network_rt_load: queue_loads.network_rt_load,
+        network_standard_load: queue_loads.network_standard_load,
+        network_batch_load: queue_loads.network_batch_load,
     }
 }
 
@@ -1791,6 +1810,43 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
             .map_err(|e| format!("{e:#}"))
     }
 
+    fn compare_and_set(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::kv_partition::Table,
+        >,
+        key: String,
+        expected: Option<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> std::result::Result<bool, String> {
+        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
+        res.core_store
+            .kv_partition_compare_and_set(&res.table_name, &key, expected.as_deref(), &value)
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    fn compare_and_delete(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::kv_partition::Table,
+        >,
+        key: String,
+        expected: Vec<u8>,
+    ) -> std::result::Result<bool, String> {
+        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
+        res.core_store
+            .kv_partition_compare_and_delete(&res.table_name, &key, &expected)
+            .map_err(|e| format!("{e:#}"))
+    }
+
     fn delete(
         &mut self,
         self_: wasmtime::component::Resource<
@@ -1927,6 +1983,43 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
             .map_err(|e| format!("{e:#}"))
     }
 
+    fn compare_and_set(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            control_plane_component_bindings::tachyon::mesh::kv_partition::Table,
+        >,
+        key: String,
+        expected: Option<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> std::result::Result<bool, String> {
+        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
+        res.core_store
+            .kv_partition_compare_and_set(&res.table_name, &key, expected.as_deref(), &value)
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    fn compare_and_delete(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            control_plane_component_bindings::tachyon::mesh::kv_partition::Table,
+        >,
+        key: String,
+        expected: Vec<u8>,
+    ) -> std::result::Result<bool, String> {
+        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
+        res.core_store
+            .kv_partition_compare_and_delete(&res.table_name, &key, &expected)
+            .map_err(|e| format!("{e:#}"))
+    }
+
     fn delete(
         &mut self,
         self_: wasmtime::component::Resource<
@@ -2013,6 +2106,7 @@ fn wit_generation_error(error: ai_inference::GenerationError) -> WitGenerationEr
     WitGenerationError {
         message: error.message,
         upstream_status: error.upstream_status,
+        class: error.class,
     }
 }
 
@@ -2134,6 +2228,7 @@ impl ai_inference::StreamSink for GuestStreamSink<'_> {
     fn emit(&mut self, event: ai_inference::StreamEvent<'_>) -> ai_inference::StreamControl {
         let payload = match event {
             ai_inference::StreamEvent::Content(text) => StreamPayload::Content(text.to_owned()),
+            ai_inference::StreamEvent::Refusal(text) => StreamPayload::Refusal(text.to_owned()),
             ai_inference::StreamEvent::ToolCall(call) => StreamPayload::ToolCall(call),
         };
         // Charged before the send and refunded when the guest takes the event,
@@ -2167,6 +2262,7 @@ impl ai_inference::StreamSink for GuestStreamSink<'_> {
 #[cfg(feature = "ai-inference")]
 enum StreamPayload {
     Content(String),
+    Refusal(String),
     ToolCall(ai_inference::ToolCall),
 }
 
@@ -2177,7 +2273,7 @@ impl StreamPayload {
     /// scales with the model's output and the only part worth bounding.
     fn queued_bytes(&self) -> usize {
         match self {
-            Self::Content(text) => text.len(),
+            Self::Content(text) | Self::Refusal(text) => text.len(),
             Self::ToolCall(call) => {
                 call.name.len() + call.arguments.len() + call.id.as_ref().map_or(0, String::len)
             }
@@ -2247,6 +2343,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
         Ok(
             accelerator_component_bindings::tachyon::accelerator::cpu::Generation {
                 text: generation.text,
+                refusal: generation.refusal,
                 finish_reason: generation.finish_reason,
                 usage: generation.usage.map(|usage| {
                     accelerator_component_bindings::tachyon::accelerator::cpu::TokenUsage {
@@ -2339,6 +2436,11 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
         match received {
             Ok(Ok(StreamPayload::Content(text))) => Ok(Some(
                 accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Content(
+                    text,
+                ),
+            )),
+            Ok(Ok(StreamPayload::Refusal(text))) => Ok(Some(
+                accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Refusal(
                     text,
                 ),
             )),
@@ -2566,6 +2668,9 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
             tpu_rt_load: control_plane.tpu_rt_load,
             tpu_standard_load: control_plane.tpu_standard_load,
             tpu_batch_load: control_plane.tpu_batch_load,
+            network_rt_load: control_plane.network_rt_load,
+            network_standard_load: control_plane.network_standard_load,
+            network_batch_load: control_plane.network_batch_load,
             hot_models,
             dropped_events,
             last_status,
@@ -2613,6 +2718,9 @@ impl control_plane_component_bindings::tachyon::mesh::telemetry_reader::Host
             tpu_rt_load: snapshot.tpu_rt_load,
             tpu_standard_load: snapshot.tpu_standard_load,
             tpu_batch_load: snapshot.tpu_batch_load,
+            network_rt_load: snapshot.network_rt_load,
+            network_standard_load: snapshot.network_standard_load,
+            network_batch_load: snapshot.network_batch_load,
             hot_models: snapshot.hot_models,
             dropped_events: snapshot.dropped_events,
             last_status: snapshot.last_status,
@@ -2658,6 +2766,9 @@ impl background_component_bindings::tachyon::mesh::telemetry_reader::Host for Co
             tpu_rt_load: snapshot.tpu_rt_load,
             tpu_standard_load: snapshot.tpu_standard_load,
             tpu_batch_load: snapshot.tpu_batch_load,
+            network_rt_load: snapshot.network_rt_load,
+            network_standard_load: snapshot.network_standard_load,
+            network_batch_load: snapshot.network_batch_load,
             hot_models: snapshot.hot_models,
             dropped_events: snapshot.dropped_events,
             last_status: snapshot.last_status,
@@ -3570,6 +3681,8 @@ impl component_bindings::tachyon::mesh::response_body::Host for ComponentHostSta
         let resource = HostStreamingResponseResource {
             headers_tx: Some(slot.headers_tx),
             chunk_tx: slot.chunk_tx,
+            #[cfg(feature = "ai-inference")]
+            consumer_alive: Arc::clone(&slot.consumer_alive),
         };
         let owned = self
             .table

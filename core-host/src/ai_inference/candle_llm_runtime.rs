@@ -553,10 +553,10 @@ struct TokenSink<'a> {
     /// Latched rather than re-read because the answer cannot un-become "nobody
     /// is listening", and the decode loops check it beside the deadline.
     stopped: bool,
-    /// The request's `max_new_tokens`, recorded by whichever entry point parsed
-    /// it. Present so the sink can tell a generation that *ran out of budget*
-    /// from one that finished — see [`TokenSink::finish_reason`].
-    token_budget: Option<usize>,
+    /// Set by a decode loop only when it exits by exhausting the token budget.
+    /// Token counts alone are insufficient because EOS may be sampled on the
+    /// final permitted token.
+    budget_exhausted: bool,
 }
 
 impl<'a> TokenSink<'a> {
@@ -566,16 +566,12 @@ impl<'a> TokenSink<'a> {
             completion_tokens: 0,
             prompt_tokens: 0,
             stopped: false,
-            token_budget: None,
+            budget_exhausted: false,
         }
     }
 
     fn record_prompt_tokens(&mut self, tokens: usize) {
         self.prompt_tokens = tokens;
-    }
-
-    fn record_token_budget(&mut self, budget: usize) {
-        self.token_budget = Some(budget);
     }
 
     /// Why decoding stopped, when this sink can tell.
@@ -593,9 +589,7 @@ impl<'a> TokenSink<'a> {
     /// so the same request was answered honestly or not depending on which
     /// backend served the alias.
     fn finish_reason(&self) -> Option<&'static str> {
-        self.token_budget
-            .filter(|budget| self.completion_tokens >= *budget)
-            .map(|_| "length")
+        self.budget_exhausted.then_some("length")
     }
 
     fn usage(&self) -> TokenUsage {
@@ -622,6 +616,10 @@ impl<'a> TokenSink<'a> {
     /// Record one token appended to the generated sequence.
     fn record_token(&mut self) {
         self.completion_tokens += 1;
+    }
+
+    fn mark_length_truncated(&mut self) {
+        self.budget_exhausted = true;
     }
 }
 
@@ -1787,7 +1785,7 @@ pub(crate) fn detect_tool_call_parser(root: &Path) -> Option<&'static str> {
     // dialect outright, so those are checked before the generic JSON case.
     if source.contains("[TOOL_CALLS]") {
         Some("mistral")
-    } else if source.contains("<tool_call>") {
+    } else if source.contains("<tool_call>") || source.contains("<tool_calls>") {
         Some("qwen")
     } else if source.contains("tools") {
         // Tool-aware, but with no tag convention: the call is rendered as a
@@ -3189,7 +3187,6 @@ impl CandleLlmRuntime {
             });
         }
         sink.record_prompt_tokens(prompt_ids.len());
-        sink.record_token_budget(request.max_new_tokens);
 
         let LoadedModel::Safetensors {
             backend,
@@ -3383,7 +3380,6 @@ impl CandleLlmRuntime {
             });
         }
         sink.record_prompt_tokens(prompt_ids.len());
-        sink.record_token_budget(request.max_new_tokens);
 
         self.decode(&prompt_ids, request, sink)
     }
@@ -3420,7 +3416,6 @@ impl CandleLlmRuntime {
             });
         }
         sink.record_prompt_tokens(prompt_ids.len());
-        sink.record_token_budget(request.max_new_tokens);
 
         let draft_tokens = draft_tokens.max(1);
         let mut context_ids = prompt_ids.clone();
@@ -3494,6 +3489,11 @@ impl CandleLlmRuntime {
         }
 
         let text = decoder.text();
+        if generated.len() >= request.max_new_tokens
+            || (Instant::now() >= request.deadline && !sink.stopped())
+        {
+            sink.mark_length_truncated();
+        }
         let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
         emit_delta(sink, text, &mut emitted, end);
         Ok(())
@@ -3961,6 +3961,8 @@ impl CandleLlmRuntime {
         // vocabulary copy nor the context resolution is paid `batch` times.
         let mut decoders = vec![IncrementalDecoder::from_tokenizer(&self.tokenizer); batch];
         let mut done = vec![false; batch];
+        let mut naturally_stopped = vec![false; batch];
+        let mut deadline_exhausted = vec![false; batch];
         let mut next_tokens = vec![0u32; batch];
         let max_new_tokens = requests
             .iter()
@@ -3980,6 +3982,7 @@ impl CandleLlmRuntime {
                 // remaining rows keep their shared forward pass.
                 if Instant::now() >= requests[row].deadline {
                     done[row] = true;
+                    deadline_exhausted[row] = true;
                     continue;
                 }
                 let row_logits = logits.get(row).map_err(|error| {
@@ -4013,6 +4016,7 @@ impl CandleLlmRuntime {
                     || find_earliest_stop(decoders[row].text(), &requests[row].stop).is_some()
                 {
                     done[row] = true;
+                    naturally_stopped[row] = true;
                 }
             }
 
@@ -4049,7 +4053,8 @@ impl CandleLlmRuntime {
         decoders
             .iter()
             .zip(requests)
-            .map(|(decoder, request)| {
+            .enumerate()
+            .map(|(row, (decoder, request))| {
                 let text = decoder.text();
                 let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
                 let completion_tokens = decoder.tokens().len();
@@ -4064,8 +4069,9 @@ impl CandleLlmRuntime {
                 // Per row, not per batch: rows share a step count but not a
                 // budget, so one row can be truncated while its neighbours
                 // finished cleanly.
-                let finish_reason =
-                    (completion_tokens >= request.max_new_tokens).then_some("length");
+                let finish_reason = (deadline_exhausted[row]
+                    || (!naturally_stopped[row] && completion_tokens >= request.max_new_tokens))
+                    .then_some("length");
                 Ok((text.as_bytes()[..end].to_vec(), usage, finish_reason))
             })
             .collect()
@@ -4157,6 +4163,7 @@ impl CandleLlmRuntime {
             // worth more to the caller than a failure, and the point is to free
             // the scheduler slot.
             if Instant::now() >= request.deadline {
+                sink.mark_length_truncated();
                 break;
             }
             // Nobody left to read it. Same reasoning as the deadline: the slot
@@ -4175,6 +4182,9 @@ impl CandleLlmRuntime {
             index_pos += 1;
         }
         // Token budget exhausted: flush the held-back tail, trimming any stop.
+        if sink.completion_tokens >= request.max_new_tokens {
+            sink.mark_length_truncated();
+        }
         let text = decoder.text();
         let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
         emit_delta(sink, text, &mut emitted, end);
@@ -6495,8 +6505,6 @@ mod tests {
     fn a_local_generation_that_spends_its_budget_reports_length() {
         let mut emit = |_: &str| StreamControl::Continue;
         let mut sink = TokenSink::new(&mut emit);
-        sink.record_token_budget(4);
-
         sink.completion_tokens = 3;
         assert_eq!(
             sink.finish_reason(),
@@ -6506,6 +6514,7 @@ mod tests {
         );
 
         sink.completion_tokens = 4;
+        sink.mark_length_truncated();
         assert_eq!(sink.finish_reason(), Some("length"));
     }
 

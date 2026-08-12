@@ -85,6 +85,15 @@ const UPSTREAM_MAX_CONCURRENCY_ENV: &str = "TACHYON_UPSTREAM_MAX_CONCURRENCY";
 /// backlog it cannot see.
 const UPSTREAM_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Host-process admission state. Runtime generations are replaced during a hot
+/// reload, but an upstream socket owned by a draining generation still consumes
+/// the same node-level capacity as one owned by the incoming generation.
+static HOST_UPSTREAM_ADMISSION: OnceLock<Arc<UpstreamAdmission>> = OnceLock::new();
+
+fn host_upstream_admission() -> Arc<UpstreamAdmission> {
+    Arc::clone(HOST_UPSTREAM_ADMISSION.get_or_init(|| Arc::new(UpstreamAdmission::from_env())))
+}
+
 /// Bounded admission gate for upstream (`openai:`) work.
 ///
 /// Upstream bindings deliberately do not run on an [`AcceleratorScheduler`].
@@ -100,6 +109,7 @@ struct UpstreamAdmission {
     state: Mutex<UpstreamAdmissionState>,
     released: Condvar,
     capacity: usize,
+    max_waiters: usize,
 }
 
 #[derive(Default)]
@@ -112,12 +122,37 @@ struct UpstreamAdmissionState {
     waiting: usize,
 }
 
+/// A locally generated, but retryable, capacity rejection.  Keeping this as a
+/// type until it reaches `GenerationError` prevents admission shedding from
+/// being flattened into an indistinguishable internal error.
+#[derive(Debug)]
+enum UpstreamAdmissionError {
+    QueueFull { waiting: usize, limit: usize },
+    TimedOut { in_flight: usize, limit: usize },
+}
+
+impl std::fmt::Display for UpstreamAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull { waiting, limit } => write!(
+                f,
+                "upstream request queue is full ({waiting} waiting, limit {limit})"
+            ),
+            Self::TimedOut { in_flight, limit } => write!(
+                f,
+                "upstream request queue is saturated ({in_flight} in flight, limit {limit}): retry, or raise `{UPSTREAM_MAX_CONCURRENCY_ENV}`"
+            ),
+        }
+    }
+}
+
 impl UpstreamAdmission {
     fn new(capacity: usize) -> Self {
         Self {
             state: Mutex::new(UpstreamAdmissionState::default()),
             released: Condvar::new(),
             capacity: capacity.max(1),
+            max_waiters: capacity.max(1),
         }
     }
 
@@ -133,9 +168,15 @@ impl UpstreamAdmission {
     /// Blocks until a permit is free, or until [`UPSTREAM_ADMISSION_TIMEOUT`]
     /// elapses. The permit is held for the whole upstream interaction — for a
     /// stream, that is the lifetime of the stream, not just its first byte.
-    fn acquire(&self) -> Result<UpstreamPermit<'_>, String> {
+    fn acquire(&self) -> std::result::Result<UpstreamPermit<'_>, UpstreamAdmissionError> {
         let mut state = self.state.lock().expect("upstream admission lock poisoned");
         if state.in_flight >= self.capacity {
+            if state.waiting >= self.max_waiters {
+                return Err(UpstreamAdmissionError::QueueFull {
+                    waiting: state.waiting,
+                    limit: self.max_waiters,
+                });
+            }
             state.waiting += 1;
             let deadline = std::time::Instant::now() + UPSTREAM_ADMISSION_TIMEOUT;
             loop {
@@ -145,10 +186,10 @@ impl UpstreamAdmission {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
                     state.waiting -= 1;
-                    return Err(format!(
-                        "upstream request queue is saturated ({} in flight, limit {}): retry, or raise `{UPSTREAM_MAX_CONCURRENCY_ENV}`",
-                        state.in_flight, self.capacity
-                    ));
+                    return Err(UpstreamAdmissionError::TimedOut {
+                        in_flight: state.in_flight,
+                        limit: self.capacity,
+                    });
                 }
                 let (next, _) = self
                     .released
@@ -400,6 +441,7 @@ impl SharedInputTensor {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InferenceOutput {
     pub(crate) bytes: Vec<u8>,
+    pub(crate) refusal: Option<String>,
     pub(crate) usage: Option<TokenUsage>,
     /// Why generation stopped, when the backend knows. `None` means "not
     /// reported": the caller then infers one rather than being handed `stop`
@@ -428,6 +470,7 @@ impl InferenceOutput {
     fn measured(bytes: Vec<u8>, usage: TokenUsage, finish_reason: Option<&'static str>) -> Self {
         Self {
             bytes,
+            refusal: None,
             usage: Some(usage),
             finish_reason: finish_reason.map(str::to_owned),
             tool_calls: Vec::new(),
@@ -442,6 +485,7 @@ impl From<Vec<u8>> for InferenceOutput {
     fn from(bytes: Vec<u8>) -> Self {
         Self {
             bytes,
+            refusal: None,
             usage: None,
             finish_reason: None,
             tool_calls: Vec::new(),
@@ -476,6 +520,7 @@ pub(crate) struct ToolCall {
 /// the whole time-to-first-token.
 pub(crate) enum StreamEvent<'a> {
     Content(&'a str),
+    Refusal(&'a str),
     ToolCall(ToolCall),
 }
 
@@ -578,6 +623,7 @@ pub(crate) struct GenerationError {
     /// a decode error, an unknown alias, a rejected request — because inventing
     /// a status for those would misreport a local fault as a remote one.
     pub(crate) upstream_status: Option<u16>,
+    pub(crate) class: Option<String>,
 }
 
 impl GenerationError {
@@ -585,6 +631,7 @@ impl GenerationError {
         Self {
             message: message.into(),
             upstream_status: None,
+            class: None,
         }
     }
 
@@ -593,12 +640,40 @@ impl GenerationError {
     /// unmodified, so the typed cause survives the trip through the scheduler
     /// and the backend trait and can be read back here.
     fn from_anyhow(error: &anyhow::Error) -> Self {
+        let upstream = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<upstream_openai::UpstreamError>());
         Self {
             message: error.to_string(),
-            upstream_status: error
-                .chain()
-                .find_map(|cause| cause.downcast_ref::<upstream_openai::UpstreamError>())
-                .and_then(upstream_openai::UpstreamError::http_status),
+            upstream_status: upstream.and_then(upstream_openai::UpstreamError::http_status),
+            class: upstream
+                .and_then(|error| match error {
+                    upstream_openai::UpstreamError::InvalidRequest { .. } => {
+                        Some("invalid-request")
+                    }
+                    upstream_openai::UpstreamError::Transport {
+                        timed_out: true, ..
+                    } => Some("timeout"),
+                    upstream_openai::UpstreamError::Transport { .. } => Some("transport"),
+                    upstream_openai::UpstreamError::MalformedResponse { .. } => {
+                        Some("malformed-response")
+                    }
+                    _ => None,
+                })
+                .map(str::to_owned),
+        }
+    }
+}
+
+impl From<UpstreamAdmissionError> for GenerationError {
+    fn from(error: UpstreamAdmissionError) -> Self {
+        Self {
+            message: error.to_string(),
+            // This is a local response status, not an upstream provider
+            // status; the existing OpenAI payload mapper deliberately uses
+            // this field for both so clients receive a retryable 429.
+            upstream_status: Some(429),
+            class: Some("upstream-admission".to_owned()),
         }
     }
 }
@@ -619,6 +694,7 @@ impl From<String> for GenerationError {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ComponentGeneration {
     pub(crate) text: String,
+    pub(crate) refusal: Option<String>,
     pub(crate) usage: Option<TokenUsage>,
     pub(crate) finish_reason: Option<String>,
     pub(crate) tool_calls: Vec<ToolCall>,
@@ -794,8 +870,8 @@ pub(crate) struct AiInferenceRuntime {
     /// `allowed_model_aliases`. `None` disables lazy loading (tests, no broker).
     dynamic_models_root: Option<PathBuf>,
     /// Bounded concurrency for `openai:` bindings, which run off the batch
-    /// scheduler entirely. Shared across clones of the runtime so the cap is a
-    /// node-wide property.
+    /// scheduler entirely. The Arc is sourced from host-process state so it is
+    /// also shared by draining and replacement runtime generations.
     upstream_admission: Arc<UpstreamAdmission>,
 }
 
@@ -897,7 +973,7 @@ impl AiInferenceRuntime {
             schedulers,
             models: Arc::new(RwLock::new(models)),
             dynamic_models_root: None,
-            upstream_admission: Arc::new(UpstreamAdmission::from_env()),
+            upstream_admission: host_upstream_admission(),
         })
     }
 
@@ -1153,6 +1229,7 @@ impl AiInferenceRuntime {
             .map_err(|error| GenerationError::local(error.to_string()))?;
         Ok(ComponentGeneration {
             text,
+            refusal: output.refusal,
             usage: output.usage,
             finish_reason: output.finish_reason,
             tool_calls: output.tool_calls,
@@ -2582,6 +2659,7 @@ impl BackendModel for CandleBackendModel {
                             .generate(&[input.data.as_ref()])
                             .map(|generation| InferenceOutput {
                                 bytes: generation.bytes,
+                                refusal: generation.refusal,
                                 usage: generation.usage,
                                 finish_reason: generation.finish_reason,
                                 tool_calls: generation.tool_calls,
@@ -2669,31 +2747,29 @@ impl BackendModel for CandleBackendModel {
         adapter: &ResolvedLoraAdapter,
         sink: &mut dyn StreamSink,
     ) -> Result<StreamOutcome> {
-        // Only the safetensors text-generation runtime can inject an adapter.
-        // Every other kind — GGUF, upstream, NVFP4, MoE, mock — refuses rather
-        // than quietly streaming the base model, which is exactly what the
-        // buffered path already does for them. Refusing is the point: a route
-        // that pins a tenant's adapter must never be answered by the base
-        // model, and a `stream: true` request that silently was would be
-        // invisible to the caller.
-        let CandleBackendModelKind::TextGeneration {
-            target,
-            speculative: None,
-        } = &self.kind
-        else {
-            bail!(
+        if matches!(self.kind, CandleBackendModelKind::Mock) {
+            return self.stream_text(inputs, sink);
+        }
+        let target = match &self.kind {
+            CandleBackendModelKind::TextGeneration { target, .. }
+            | CandleBackendModelKind::ModelOptNvfp4(target) => target,
+            _ => bail!(
                 "LoRA adapter `{}` was resolved for model `{}`, but this backend does not support adapter injection",
-                adapter.id,
-                self.source.alias
-            );
+                adapter.id, self.source.alias
+            ),
         };
         validate_u8_prompts(&self.source.alias, inputs)?;
         let prompts = inputs
             .iter()
             .map(|input| input.data.as_ref())
             .collect::<Vec<_>>();
-        let on_token: &mut dyn FnMut(&str) -> StreamControl =
-            &mut |fragment: &str| sink.emit(StreamEvent::Content(fragment));
+        let on_token: &mut dyn FnMut(&str) -> StreamControl = &mut |fragment: &str| {
+            if sink.is_live() {
+                sink.emit(StreamEvent::Content(fragment))
+            } else {
+                StreamControl::Stop
+            }
+        };
         target
             .generate_with_adapter_streaming(&prompts, &adapter.id, &adapter.path, on_token)
             .map(|(usage, finish_reason)| {
@@ -2771,6 +2847,9 @@ impl BackendModel for CandleBackendModel {
         inputs: &[SharedInputTensor],
         sink: &mut dyn StreamSink,
     ) -> Result<StreamOutcome> {
+        if !sink.is_live() {
+            return Ok(StreamOutcome::default());
+        }
         // The upstream backend is the only one that writes to the `ToolCall`
         // arm — it receives calls already structured — so it takes the sink
         // whole, before the text adapter borrows it.
@@ -4232,7 +4311,7 @@ mod tests {
     fn an_upstream_permit_is_returned_when_its_request_unwinds() {
         let gate = UpstreamAdmission::new(1);
         let failed: Result<(), String> = (|| {
-            let _permit = gate.acquire()?;
+            let _permit = gate.acquire().map_err(|error| error.to_string())?;
             Err("upstream returned 500".to_owned())
         })();
         assert!(failed.is_err());

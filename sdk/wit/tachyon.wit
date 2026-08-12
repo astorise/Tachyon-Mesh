@@ -222,6 +222,8 @@ interface kv-partition {
         constructor(name: string);
         get: func(key: string) -> result<list<u8>, string>;
         set: func(key: string, value: list<u8>) -> result<_, string>;
+        compare-and-set: func(key: string, expected: option<list<u8>>, value: list<u8>) -> result<bool, string>;
+        compare-and-delete: func(key: string, expected: list<u8>) -> result<bool, string>;
         delete: func(key: string) -> result<_, string>;
         batch-set: func(entries: list<tuple<string, list<u8>>>) -> result<_, string>;
         get-range: func(

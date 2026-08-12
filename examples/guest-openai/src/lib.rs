@@ -136,6 +136,8 @@ struct ChatMessage {
     role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tool_calls: Vec<ToolCall>,
     /// Set on a `role: "tool"` turn to associate the result with the call that
@@ -156,6 +158,7 @@ impl ChatMessage {
         Self {
             role: role.into(),
             content: Some(content.into()),
+            refusal: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
             name: None,
@@ -287,6 +290,8 @@ struct ChunkDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    refusal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<StreamToolCall>>,
 }
 
@@ -295,6 +300,7 @@ impl ChunkDelta {
         Self {
             role: Some(role),
             content: None,
+            refusal: None,
             tool_calls: None,
         }
     }
@@ -303,6 +309,7 @@ impl ChunkDelta {
         Self {
             role: None,
             content: Some(content),
+            refusal: None,
             tool_calls: None,
         }
     }
@@ -311,6 +318,7 @@ impl ChunkDelta {
         Self {
             role: None,
             content: None,
+            refusal: None,
             tool_calls: Some(tool_calls),
         }
     }
@@ -319,6 +327,16 @@ impl ChunkDelta {
         Self {
             role: None,
             content: None,
+            refusal: None,
+            tool_calls: None,
+        }
+    }
+
+    fn refusal(refusal: String) -> Self {
+        Self {
+            role: None,
+            content: None,
+            refusal: Some(refusal),
             tool_calls: None,
         }
     }
@@ -395,14 +413,6 @@ impl ModelInfo {
 /// A missing or unparseable row is *not* config-owned: the guard exists to
 /// protect a marker that is present, and treating an unreadable row as owned
 /// would make a corrupt entry permanently unfixable through this route.
-fn alias_is_config_owned(alias: &str) -> bool {
-    models_table()
-        .get(alias)
-        .ok()
-        .and_then(|raw| serde_json::from_slice::<ModelInfo>(&raw).ok())
-        .is_some_and(|info| info.is_config_owned())
-}
-
 #[derive(Debug, Serialize)]
 struct OpenAiModel {
     id: String,
@@ -464,23 +474,27 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
         // Letting a registration replace the row would advertise one model
         // while another answers — for an `openai:` binding, a third-party
         // server.
-        if alias_is_config_owned(&info.alias) {
-            return Ok(openai_error_payload(
-                409,
-                format!(
-                    "model alias `{}` is claimed by a configured binding in the sealed manifest; \
-                     register under a free alias, or declare the binding `dynamic`",
-                    info.alias
-                ),
-                "invalid_request_error",
-            ));
-        }
         info.clear_ownership_marker();
         let value =
             serde_json::to_vec(&info).map_err(|e| format!("failed to encode model info: {e}"))?;
-        models_table()
-            .set(&info.alias, &value)
-            .map_err(|e| format!("model registry write failed: {e}"))?;
+        let table = models_table();
+        loop {
+            let previous = table.get(&info.alias).ok();
+            if previous
+                .as_deref()
+                .and_then(|raw| serde_json::from_slice::<ModelInfo>(raw).ok())
+                .is_some_and(|row| row.is_config_owned())
+            {
+                return Ok(openai_error_payload(409, format!(
+                    "model alias `{}` is claimed by a configured binding in the sealed manifest; register under a free alias, or declare the binding `dynamic`", info.alias), "invalid_request_error"));
+            }
+            if table
+                .compare_and_set(&info.alias, previous.as_deref(), &value)
+                .map_err(|e| format!("model registry write failed: {e}"))?
+            {
+                break;
+            }
+        }
         return Ok((201, b"model registered".to_vec()));
     }
 
@@ -490,19 +504,29 @@ fn route_request(method: &str, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>)
         // runtime serving the alias — it only removes it from
         // `GET /ai/v1/models`, leaving a model that answers but cannot be
         // discovered, and which no reload short of a config change restores.
-        if alias_is_config_owned(alias) {
-            return Ok(openai_error_payload(
-                409,
-                format!(
-                    "model alias `{alias}` is claimed by a configured binding in the sealed \
-                     manifest; it is removed by editing the manifest, not by deregistering"
-                ),
-                "invalid_request_error",
-            ));
+        let table = models_table();
+        while let Some(previous) = table.get(alias).map(Some).or_else(|error| {
+            if error == format!("key `{alias}` not found") {
+                Ok(None)
+            } else {
+                Err(format!("model registry delete failed: {error}"))
+            }
+        })? {
+            if serde_json::from_slice::<ModelInfo>(&previous)
+                .ok()
+                .is_some_and(|row| row.is_config_owned())
+            {
+                return Ok(openai_error_payload(409, format!(
+                    "model alias `{alias}` is claimed by a configured binding in the sealed manifest; it is removed by editing the manifest, not by deregistering"
+                ), "invalid_request_error"));
+            }
+            if table
+                .compare_and_delete(alias, &previous)
+                .map_err(|e| format!("model registry delete failed: {e}"))?
+            {
+                break;
+            }
         }
-        models_table()
-            .delete(alias)
-            .map_err(|e| format!("model registry delete failed: {e}"))?;
         return Ok((204, Vec::new()));
     }
 
@@ -689,6 +713,7 @@ fn handle_chat_completions_buffered(
                 } else {
                     Some(parsed.content)
                 },
+                refusal: completed.refusal,
                 tool_calls: parsed.tool_calls,
                 // Response-side only: an assistant turn never carries these.
                 tool_call_id: None,
@@ -811,6 +836,21 @@ fn handle_chat_completions_streaming(
                 };
                 write_sse_chunk(&writer, &chunk)?;
             }
+            Ok(Some(bindings::tachyon::accelerator::cpu::StreamEvent::Refusal(refusal))) => {
+                let chunk = ChatCompletionChunk {
+                    usage: None,
+                    id: id.clone(),
+                    object: "chat.completion.chunk",
+                    created,
+                    model: request.model.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: ChunkDelta::refusal(refusal),
+                        finish_reason: None,
+                    }],
+                };
+                write_sse_chunk(&writer, &chunk)?;
+            }
             Ok(Some(bindings::tachyon::accelerator::cpu::StreamEvent::ToolCall(call))) => {
                 host_tool_calls.push(call);
             }
@@ -829,8 +869,15 @@ fn handle_chat_completions_streaming(
     // reason as on the buffered path: the backend received them as fields.
     let mut tool_calls = adopt_host_tool_calls(host_tool_calls);
     if let Some(gate) = gate {
-        let (whole, streamed) = gate.finish();
-        let parsed = parse_assistant_output(&request, &whole);
+        let (held, separator, post_separator, tripped) = gate.finish();
+        let parsed = if tool_calls.is_empty() {
+            parse_assistant_output(&request, &held)
+        } else {
+            ParsedAssistantOutput {
+                content: held.clone(),
+                tool_calls: Vec::new(),
+            }
+        };
 
         // Content the gate held back that turned out not to be part of a tool
         // call — text the model emitted *after* the call, typically.
@@ -853,19 +900,12 @@ fn handle_chat_completions_streaming(
         // trimmed too. Matching by prefix rather than by offset is what keeps
         // this safe: no match means no tail is emitted, and duplicating text in
         // the transcript is worse than omitting a trailing fragment.
-        let tail = if parsed.tool_calls.is_empty() {
-            parsed.content.get(streamed..).unwrap_or_default()
+        let tail = if tripped && !parsed.content.is_empty() {
+            format!("{separator}{post_separator}{}", parsed.content)
+        } else if parsed.tool_calls.is_empty() {
+            parsed.content.clone()
         } else {
-            // `parsed.content` is the text minus the tool-call regions, trimmed
-            // at both ends. Only its *leading* trim shifts the offset of what
-            // was already streamed, so the consumed length is the streamed
-            // prefix minus the whitespace the parser dropped from the front.
-            // Trimming the prefix at both ends instead would hand back its own
-            // trailing whitespace as new content — three newlines where the
-            // buffered parser produces two.
-            let already_streamed = whole.get(..streamed).unwrap_or_default();
-            let consumed = already_streamed.trim_start().len();
-            parsed.content.get(consumed..).unwrap_or_default()
+            String::new()
         };
         if !tail.is_empty() {
             let chunk = ChatCompletionChunk {
@@ -876,7 +916,7 @@ fn handle_chat_completions_streaming(
                 model: request.model.clone(),
                 choices: vec![ChunkChoice {
                     index: 0,
-                    delta: ChunkDelta::content(tail.to_owned()),
+                    delta: ChunkDelta::content(tail),
                     finish_reason: None,
                 }],
             };
@@ -979,16 +1019,20 @@ fn write_sse_chunk<T: serde::Serialize>(
 /// one JSON value, so a `{` anywhere but the start cannot begin a tool call —
 /// parsing would fail and the text stays content. The tagged parsers scan
 /// anywhere, because those models routinely emit prose and then a call.
-fn tool_call_openers(parser: ToolCallParser) -> (&'static [&'static str], bool) {
+fn tool_call_openers(
+    parser: ToolCallParser,
+) -> (&'static [&'static str], &'static [&'static str], bool) {
     match parser {
         // `[` matters as much as `{`: `tool_calls_from_value` accepts a bare
         // top-level array of calls, so omitting it would stream the payload as
         // content *and* emit it again as a structured call.
-        ToolCallParser::Json => (&["{", "[", "```"], true),
-        ToolCallParser::Qwen | ToolCallParser::QwenCoder => {
-            (&["<tool_call>", "<tool_calls>"], false)
-        }
-        ToolCallParser::Mistral => (&["[TOOL_CALLS]"], false),
+        ToolCallParser::Json => (&["{", "[", "```"], &[], true),
+        ToolCallParser::Qwen | ToolCallParser::QwenCoder => (
+            &["<tool_call>", "<tool_calls>"],
+            &["</tool_call>", "</tool_calls>"],
+            false,
+        ),
+        ToolCallParser::Mistral => (&["[TOOL_CALLS]"], &[], false),
     }
 }
 
@@ -1007,16 +1051,25 @@ fn tool_call_openers(parser: ToolCallParser) -> (&'static [&'static str], bool) 
 /// sequences.
 struct StreamingContentGate {
     openers: &'static [&'static str],
+    closers: &'static [&'static str],
     anchored: bool,
     hold: usize,
+    /// Before a marker is found this is only the undecidable suffix. Once
+    /// tripped it holds the marker and the un-emitted tail for parsing.
     seen: String,
-    emitted: usize,
+    /// Whitespace between emitted prose and a detected call. It is retained
+    /// separately because parsing the held tail alone trims its leading edge,
+    /// while in the complete response it is internal whitespace.
+    separator: String,
+    /// Once prose has left the gate, JSON can no longer be a whole-output
+    /// tool call even if the retained overlap happens to begin with `{`.
+    emitted_non_whitespace: bool,
     tripped: bool,
 }
 
 impl StreamingContentGate {
     fn new(parser: ToolCallParser) -> Self {
-        let (openers, anchored) = tool_call_openers(parser);
+        let (openers, closers, anchored) = tool_call_openers(parser);
         let hold = openers
             .iter()
             .map(|opener| opener.len())
@@ -1025,10 +1078,12 @@ impl StreamingContentGate {
             .saturating_sub(1);
         Self {
             openers,
+            closers,
             anchored,
             hold,
             seen: String::new(),
-            emitted: 0,
+            separator: String::new(),
+            emitted_non_whitespace: false,
             tripped: false,
         }
     }
@@ -1049,11 +1104,11 @@ impl StreamingContentGate {
             // exactly that whitespace, and the streaming contract is that the
             // two are equal.
             //
-            // `emitted` still advances to the opener: the whitespace is
-            // accounted for, not pending, so the caller's tail reconciliation
-            // does not hand it back afterwards.
-            let content = self.seen[self.emitted..at].trim_end().to_owned();
-            self.emitted = at;
+            let prefix = &self.seen[..at];
+            let content = prefix.trim_end().to_owned();
+            self.emitted_non_whitespace |= !content.is_empty();
+            self.separator = prefix[content.len()..].to_owned();
+            self.seen = self.seen[at..].to_owned();
             return (!content.is_empty()).then_some(content);
         }
         let ceiling = floor_char_boundary(&self.seen, self.seen.len().saturating_sub(self.hold));
@@ -1062,16 +1117,17 @@ impl StreamingContentGate {
         // buffered parse then returns the text unchanged, and the caller emits
         // whatever it kept beyond what was streamed.
         let safe = self.seen[..ceiling].trim_end().len();
-        if safe <= self.emitted {
+        if safe == 0 {
             return None;
         }
-        let content = self.seen[self.emitted..safe].to_owned();
-        self.emitted = safe;
+        let content = self.seen[..safe].to_owned();
+        self.emitted_non_whitespace |= !content.trim().is_empty();
+        self.seen = self.seen[safe..].to_owned();
         Some(content)
     }
 
     fn find_opener(&self) -> Option<usize> {
-        if self.anchored {
+        if self.anchored && !self.emitted_non_whitespace {
             // Anchored openers only count at the start, ignoring leading
             // whitespace the model may have emitted first.
             let trimmed = self.seen.trim_start();
@@ -1088,9 +1144,19 @@ impl StreamingContentGate {
             .min()
     }
 
-    /// The whole generation, for the buffered parser to work on.
-    fn finish(self) -> (String, usize) {
-        (self.seen, self.emitted)
+    /// The un-emitted tail and whether it includes a tool-call marker.
+    fn finish(self) -> (String, String, String, bool) {
+        let post_separator = self
+            .closers
+            .iter()
+            .filter_map(|closer| self.seen.rfind(closer).map(|at| at + closer.len()))
+            .max()
+            .map(|after| {
+                let post = &self.seen[after..];
+                post[..post.len() - post.trim_start().len()].to_owned()
+            })
+            .unwrap_or_default();
+        (self.seen, self.separator, post_separator, self.tripped)
     }
 }
 
@@ -1210,7 +1276,8 @@ impl ChatCompletionRequest {
 
     /// Whether the caller offered the model any tool to call.
     fn has_tool_intent(&self) -> bool {
-        !self.tools.is_empty() || self.tool_choice.is_some()
+        !matches!(self.tool_choice.as_ref(), Some(serde_json::Value::String(choice)) if choice == "none")
+            && (!self.tools.is_empty() || self.tool_choice.is_some())
     }
 
     fn resolved_tool_call_parser(&self) -> Option<ToolCallParser> {
@@ -1471,7 +1538,10 @@ fn completion_id() -> String {
         .map(|since| since.as_nanos() as u64)
         .unwrap_or(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("chatcmpl-{nanos:016x}{seq:08x}")
+    let mut nonce = [0_u8; 8];
+    let _ = getrandom::fill(&mut nonce);
+    let random = u64::from_le_bytes(nonce);
+    format!("chatcmpl-{nanos:016x}{random:016x}{seq:08x}")
 }
 
 fn models_table() -> bindings::tachyon::mesh::kv_partition::Table {
@@ -1518,15 +1588,18 @@ fn generation_error_payload(
     error: bindings::tachyon::accelerator::cpu::GenerationError,
 ) -> (u16, Vec<u8>) {
     let message = format!("inference failed for model `{model}`: {}", error.message);
-    let (status, kind) = match error.upstream_status {
-        Some(429) => (429, "rate_limit_error"),
+    let (status, kind) = match (error.upstream_status, error.class.as_deref()) {
+        (None, Some("invalid-request")) => (400, "invalid_request_error"),
+        (None, Some("transport" | "malformed-response")) => (502, "server_error"),
+        (None, Some("timeout")) => (504, "server_error"),
+        (Some(429), _) => (429, "rate_limit_error"),
         // The provider rejected the request we forwarded, which almost always
         // reflects the caller's own parameters — an unknown model, a tool
         // schema it will not accept, a context overflow.
-        Some(400 | 404 | 405 | 409 | 413 | 422) => (400, "invalid_request_error"),
-        Some(status @ 502..=504) => (status, "server_error"),
-        Some(_) => (502, "server_error"),
-        None => (500, "server_error"),
+        (Some(400 | 404 | 405 | 409 | 413 | 422), _) => (400, "invalid_request_error"),
+        (Some(status @ 502..=504), _) => (status, "server_error"),
+        (Some(_), _) => (502, "server_error"),
+        (None, _) => (500, "server_error"),
     };
     openai_error_payload(status, message, kind)
 }
@@ -1946,7 +2019,10 @@ mod tests {
 
     /// Drive a gate with fragments, returning what it streamed as content and
     /// what it held back for the buffered parser.
-    fn run_gate(parser: ToolCallParser, fragments: &[&str]) -> (String, String, usize) {
+    fn run_gate(
+        parser: ToolCallParser,
+        fragments: &[&str],
+    ) -> (String, String, String, String, bool) {
         let mut gate = StreamingContentGate::new(parser);
         let mut streamed = String::new();
         for fragment in fragments {
@@ -1954,8 +2030,8 @@ mod tests {
                 streamed.push_str(&content);
             }
         }
-        let (whole, emitted) = gate.finish();
-        (streamed, whole, emitted)
+        let (held, separator, post_separator, tripped) = gate.finish();
+        (streamed, held, separator, post_separator, tripped)
     }
 
     #[test]
@@ -1965,27 +2041,62 @@ mod tests {
         // opener is where the two used to diverge: the buffered parser removes
         // the call region and trims, while the gate had already streamed the
         // newline.
-        let (streamed, whole, _emitted) = run_gate(
-            ToolCallParser::Qwen,
-            &[
-                "Let me check.",
-                "\n",
-                "<tool_call>",
-                r#"{"name":"read_file","arguments":{}}"#,
-                "</tool_call>",
-            ],
-        );
+        let fragments = [
+            "Let me check.",
+            "\n",
+            "<tool_call>",
+            r#"{"name":"read_file","arguments":{}}"#,
+            "</tool_call>",
+        ];
+        let (streamed, held, separator, post_separator, tripped) =
+            run_gate(ToolCallParser::Qwen, &fragments);
         let mut request = tool_request_named("local");
         request.tool_call_parser = Some(ToolCallParser::Qwen);
-        let parsed = parse_assistant_output(&request, &whole);
+        let parsed = parse_assistant_output(&request, &fragments.concat());
+        let held_parsed = parse_assistant_output(&request, &held);
         assert_eq!(
             parsed.tool_calls.len(),
             1,
             "the call must still be recovered"
         );
         assert_eq!(
-            streamed, parsed.content,
+            format!(
+                "{streamed}{}{}{}",
+                if !held_parsed.content.is_empty() {
+                    separator
+                } else {
+                    String::new()
+                },
+                if !held_parsed.content.is_empty() {
+                    post_separator
+                } else {
+                    String::new()
+                },
+                held_parsed.content
+            ),
+            parsed.content,
             "streamed content must equal the buffered message, whitespace included"
+        );
+        assert!(tripped);
+    }
+
+    #[test]
+    fn streaming_gate_preserves_whitespace_before_post_call_content() {
+        let fragments = [
+            "Hi \n<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>",
+            " after",
+        ];
+        let (streamed, held, separator, post_separator, tripped) =
+            run_gate(ToolCallParser::Qwen, &fragments);
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let expected = parse_assistant_output(&request, &fragments.concat());
+        let tail = parse_assistant_output(&request, &held);
+
+        assert!(tripped);
+        assert_eq!(
+            format!("{streamed}{separator}{post_separator}{}", tail.content),
+            expected.content
         );
     }
 
@@ -1994,22 +2105,22 @@ mod tests {
         // The other side of the same rule: whitespace is only *deferred*, never
         // dropped. With no call, the buffered parse returns the text unchanged
         // and the caller's reconciliation emits whatever the gate still held.
-        let (streamed, whole, emitted) = run_gate(
-            ToolCallParser::Qwen,
-            &[
-                "Here it is, at some length so the opener hold is not the binding constraint.",
-                "\n\n",
-            ],
-        );
+        let fragments = [
+            "Here it is, at some length so the opener hold is not the binding constraint.",
+            "\n\n",
+        ];
+        let (streamed, held, _separator, _post_separator, tripped) =
+            run_gate(ToolCallParser::Qwen, &fragments);
         assert!(
             !streamed.ends_with(char::is_whitespace),
             "trailing whitespace is withheld while an opener could still follow, got {streamed:?}"
         );
         assert_eq!(
-            format!("{streamed}{}", whole.get(emitted..).unwrap_or_default()),
-            whole,
+            format!("{streamed}{held}"),
+            fragments.concat(),
             "streamed content plus the caller's tail must reconstruct the whole generation"
         );
+        assert!(!tripped);
     }
 
     #[test]
@@ -2072,6 +2183,7 @@ mod tests {
         let rate_limited = bindings::tachyon::accelerator::cpu::GenerationError {
             message: "upstream returned HTTP 429".to_owned(),
             upstream_status: Some(429),
+            class: None,
         };
         let (status, body) = generation_error_payload("coder", rate_limited);
         assert_eq!(status, 429, "a client's backoff depends on seeing the 429");
@@ -2084,6 +2196,7 @@ mod tests {
             bindings::tachyon::accelerator::cpu::GenerationError {
                 message: "upstream returned HTTP 400".to_owned(),
                 upstream_status: Some(400),
+                class: None,
             },
         );
         assert_eq!(status, 400);
@@ -2095,6 +2208,7 @@ mod tests {
             bindings::tachyon::accelerator::cpu::GenerationError {
                 message: "upstream returned HTTP 401".to_owned(),
                 upstream_status: Some(401),
+                class: None,
             },
         );
         assert_eq!(status, 502);
@@ -2105,6 +2219,7 @@ mod tests {
             bindings::tachyon::accelerator::cpu::GenerationError {
                 message: "model alias `coder` is not loaded".to_owned(),
                 upstream_status: None,
+                class: None,
             },
         );
         assert_eq!(status, 500);
@@ -2115,7 +2230,7 @@ mod tests {
         // The prose before the call must reach the client as it is generated —
         // buffering everything would cost time-to-first-token on every request
         // that merely offers tools.
-        let (streamed, whole, emitted) = run_gate(
+        let (streamed, held, _separator, _post_separator, tripped) = run_gate(
             ToolCallParser::Qwen,
             &[
                 "Let me check.",
@@ -2128,19 +2243,17 @@ mod tests {
         // chunk cannot be un-sent, so it is withheld until the gate knows
         // whether a call follows.
         assert_eq!(streamed, "Let me check.");
-        // `emitted` still advances past the withheld newline to the opener, so
-        // the handler's tail reconciliation does not hand it back.
-        assert_eq!(emitted, streamed.len() + 1);
+        assert!(tripped);
         // The tag itself never leaks into the content stream.
         assert!(!streamed.contains("<tool_call>"));
-        assert!(whole.contains("<tool_call>"));
+        assert!(held.contains("<tool_call>"));
     }
 
     #[test]
     fn streaming_gate_matches_an_opener_split_across_fragments() {
         // `<tool_` / `call>` arriving separately must still be caught, or the
         // opening tag leaks into the transcript.
-        let (streamed, _, _) = run_gate(
+        let (streamed, _, _, _, _) = run_gate(
             ToolCallParser::Qwen,
             &["hi ", "<tool_", "call>{\"name\":\"f\"}</tool_call>"],
         );
@@ -2151,23 +2264,23 @@ mod tests {
 
     #[test]
     fn streaming_gate_streams_everything_when_no_tool_call_appears() {
-        let (streamed, whole, _) = run_gate(ToolCallParser::Qwen, &["all ", "plain ", "prose"]);
+        let (streamed, whole, _, _, _) =
+            run_gate(ToolCallParser::Qwen, &["all ", "plain ", "prose"]);
         // The tail is held back until the stream ends; the handler flushes it
         // from the parsed content afterwards.
-        assert!(whole.starts_with(&streamed));
-        assert_eq!(whole, "all plain prose");
+        assert_eq!(format!("{streamed}{whole}"), "all plain prose");
     }
 
     #[test]
     fn streaming_gate_withholds_an_anchored_json_call_entirely() {
         // A `json` response is a tool call only when the *whole* output is one
         // JSON value, so nothing may be streamed as content.
-        let (streamed, whole, emitted) = run_gate(
+        let (streamed, whole, _, _, tripped) = run_gate(
             ToolCallParser::Json,
             &["{\"tool_calls\":[{\"name\":", "\"search\"}]}"],
         );
         assert!(streamed.is_empty());
-        assert_eq!(emitted, 0);
+        assert!(tripped);
         assert!(whole.starts_with('{'));
     }
 
@@ -2175,15 +2288,14 @@ mod tests {
     fn streaming_gate_does_not_anchor_on_a_brace_inside_prose() {
         // A `{` mid-sentence cannot start a JSON tool call — the whole output
         // would have to parse — so it must not stop content from streaming.
-        let (_, whole, _) = run_gate(ToolCallParser::Json, &["use ", "Vec<T> { .. } ", "here"]);
         let mut gate = StreamingContentGate::new(ToolCallParser::Json);
-        gate.push(&whole);
+        gate.push("use Vec<T> { .. } here");
         assert!(!gate.tripped, "a brace inside prose must not trip the gate");
     }
 
     #[test]
     fn streaming_gate_withholds_the_mistral_marker() {
-        let (streamed, _, _) = run_gate(
+        let (streamed, _, _, _, _) = run_gate(
             ToolCallParser::Mistral,
             &["Checking\n", "[TOOL_CALLS] [{\"name\":\"fetch\"}]"],
         );
