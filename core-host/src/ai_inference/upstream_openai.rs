@@ -426,6 +426,7 @@ struct HostGenerationRequest {
 #[derive(Debug)]
 pub(crate) struct UpstreamGeneration {
     pub(crate) bytes: Vec<u8>,
+    pub(crate) refusal: Option<String>,
     pub(crate) usage: Option<TokenUsage>,
     pub(crate) finish_reason: Option<String>,
     pub(crate) tool_calls: Vec<ToolCall>,
@@ -764,6 +765,10 @@ impl UpstreamOpenAiRuntime {
                 detail: "response has no `choices[0].message` object".to_owned(),
             })?;
         let content = message.get("content").and_then(Value::as_str);
+        let refusal = message
+            .get("refusal")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
 
         // A tool call carries `content: null`, so requiring a content string
         // would turn every successful tool call into a malformed-response
@@ -777,6 +782,7 @@ impl UpstreamOpenAiRuntime {
         {
             return Ok(UpstreamGeneration {
                 bytes: content.unwrap_or_default().as_bytes().to_vec(),
+                refusal,
                 usage,
                 finish_reason,
                 tool_calls: tool_calls_from_value(&self.alias, tool_calls)?,
@@ -791,9 +797,12 @@ impl UpstreamOpenAiRuntime {
             });
         }
 
-        if content.is_none() && finish_reason.as_deref() == Some("content_filter") {
+        if refusal.is_some()
+            || (content.is_none() && finish_reason.as_deref() == Some("content_filter"))
+        {
             return Ok(UpstreamGeneration {
                 bytes: Vec::new(),
+                refusal,
                 usage,
                 finish_reason,
                 tool_calls: Vec::new(),
@@ -806,6 +815,7 @@ impl UpstreamOpenAiRuntime {
         })?;
         Ok(UpstreamGeneration {
             bytes: text.as_bytes().to_vec(),
+            refusal,
             usage,
             finish_reason,
             tool_calls: Vec::new(),
@@ -1840,6 +1850,7 @@ mod tests {
     #[derive(Default)]
     struct CapturedStream {
         content: Vec<String>,
+        refusals: Vec<String>,
         tool_calls: Vec<ToolCall>,
     }
 
@@ -1848,6 +1859,7 @@ mod tests {
             move |event| {
                 match event {
                     StreamEvent::Content(text) => self.content.push(text.to_owned()),
+                    StreamEvent::Refusal(text) => self.refusals.push(text.to_owned()),
                     StreamEvent::ToolCall(call) => self.tool_calls.push(call),
                 }
                 StreamControl::Continue
@@ -1863,6 +1875,7 @@ mod tests {
             move |event| {
                 match event {
                     StreamEvent::Content(text) => self.content.push(text.to_owned()),
+                    StreamEvent::Refusal(text) => self.refusals.push(text.to_owned()),
                     StreamEvent::ToolCall(call) => self.tool_calls.push(call),
                 }
                 if self.content.len() >= after {

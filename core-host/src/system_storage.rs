@@ -49,6 +49,10 @@ struct StorageComponentState {
 }
 
 const AI_MODELS_REGISTRY_TABLE: &str = "ai-models-registry";
+/// Upload-owned rows displaced by a non-dynamic manifest binding. A configured
+/// alias executes the manifest backend while present, but the upload remains
+/// on disk and must become discoverable again when that ownership ends.
+const AI_MODELS_SHADOWED_UPLOADS_TABLE: &str = "ai-models-shadowed-uploads";
 
 struct ComponentRequest {
     method: String,
@@ -625,6 +629,20 @@ pub(crate) fn publish_configured_model_bindings(
             // The write is still a single transaction: a read followed by a
             // write would let an upload land in between and be reported as the
             // winner when it is not.
+            if let Ok(Some(upload_row)) =
+                core_store.kv_partition_get(AI_MODELS_REGISTRY_TABLE, &binding.alias)
+            {
+                if !row_is_config_owned(Some(&upload_row)) {
+                    if let Err(error) = core_store.kv_partition_set(
+                        AI_MODELS_SHADOWED_UPLOADS_TABLE,
+                        &binding.alias,
+                        &upload_row,
+                    ) {
+                        tracing::warn!(alias = %binding.alias, "failed to preserve upload registry row hidden by configured binding: {error:#}");
+                        continue;
+                    }
+                }
+            }
             if let Err(error) = core_store.kv_partition_update(
                 AI_MODELS_REGISTRY_TABLE,
                 &binding.alias,
@@ -664,6 +682,12 @@ pub(crate) fn publish_configured_model_bindings(
         }
         // Same race: an upload may have replaced this row since the scan, so
         // ownership is re-checked inside the deleting transaction.
+        let hidden_upload = core_store
+            .kv_partition_get(AI_MODELS_SHADOWED_UPLOADS_TABLE, &alias)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%alias, "failed to read upload row hidden by configured binding: {error:#}");
+                None
+            });
         if let Err(error) =
             core_store.kv_partition_update(AI_MODELS_REGISTRY_TABLE, &alias, |current| {
                 if row_is_config_owned(current) {
@@ -679,6 +703,17 @@ pub(crate) fn publish_configured_model_bindings(
             );
         } else {
             tracing::info!(%alias, "dropped a configured model binding that left the manifest");
+            if let Some(upload_row) = hidden_upload {
+                if let Err(error) =
+                    core_store.kv_partition_set(AI_MODELS_REGISTRY_TABLE, &alias, &upload_row)
+                {
+                    tracing::warn!(%alias, "failed to restore upload registry row after configured binding withdrawal: {error:#}");
+                } else if let Err(error) =
+                    core_store.kv_partition_delete(AI_MODELS_SHADOWED_UPLOADS_TABLE, &alias)
+                {
+                    tracing::warn!(%alias, "failed to clear restored upload registry row backup: {error:#}");
+                }
+            }
         }
     }
 }

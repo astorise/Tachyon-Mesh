@@ -441,6 +441,7 @@ impl SharedInputTensor {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct InferenceOutput {
     pub(crate) bytes: Vec<u8>,
+    pub(crate) refusal: Option<String>,
     pub(crate) usage: Option<TokenUsage>,
     /// Why generation stopped, when the backend knows. `None` means "not
     /// reported": the caller then infers one rather than being handed `stop`
@@ -469,6 +470,7 @@ impl InferenceOutput {
     fn measured(bytes: Vec<u8>, usage: TokenUsage, finish_reason: Option<&'static str>) -> Self {
         Self {
             bytes,
+            refusal: None,
             usage: Some(usage),
             finish_reason: finish_reason.map(str::to_owned),
             tool_calls: Vec::new(),
@@ -483,6 +485,7 @@ impl From<Vec<u8>> for InferenceOutput {
     fn from(bytes: Vec<u8>) -> Self {
         Self {
             bytes,
+            refusal: None,
             usage: None,
             finish_reason: None,
             tool_calls: Vec::new(),
@@ -691,6 +694,7 @@ impl From<String> for GenerationError {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ComponentGeneration {
     pub(crate) text: String,
+    pub(crate) refusal: Option<String>,
     pub(crate) usage: Option<TokenUsage>,
     pub(crate) finish_reason: Option<String>,
     pub(crate) tool_calls: Vec<ToolCall>,
@@ -1225,6 +1229,7 @@ impl AiInferenceRuntime {
             .map_err(|error| GenerationError::local(error.to_string()))?;
         Ok(ComponentGeneration {
             text,
+            refusal: output.refusal,
             usage: output.usage,
             finish_reason: output.finish_reason,
             tool_calls: output.tool_calls,
@@ -2654,6 +2659,7 @@ impl BackendModel for CandleBackendModel {
                             .generate(&[input.data.as_ref()])
                             .map(|generation| InferenceOutput {
                                 bytes: generation.bytes,
+                                refusal: generation.refusal,
                                 usage: generation.usage,
                                 finish_reason: generation.finish_reason,
                                 tool_calls: generation.tool_calls,
@@ -4305,7 +4311,7 @@ mod tests {
     fn an_upstream_permit_is_returned_when_its_request_unwinds() {
         let gate = UpstreamAdmission::new(1);
         let failed: Result<(), String> = (|| {
-            let _permit = gate.acquire()?;
+            let _permit = gate.acquire().map_err(|error| error.to_string())?;
             Err("upstream returned 500".to_owned())
         })();
         assert!(failed.is_err());

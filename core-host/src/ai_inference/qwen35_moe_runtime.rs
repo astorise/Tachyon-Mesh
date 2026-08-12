@@ -685,6 +685,9 @@ impl Qwen35MoeRuntime {
                 abandoned = on_token(&text[emitted..safe_end]).is_stop();
                 emitted = safe_end;
             }
+            if abandoned {
+                break;
+            }
             if stop.is_some() {
                 break;
             }

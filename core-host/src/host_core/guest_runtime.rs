@@ -1081,6 +1081,7 @@ pub(crate) fn host_frame_to_websocket_binding_frame(
 /// Load the WASM component artifact and forward to
 /// `execute_streaming_component_guest`. Mirrors `execute_websocket_guest`.
 #[cfg(feature = "ai-inference")]
+#[allow(clippy::too_many_arguments)] // HTTP stream wiring needs the response channels and liveness handle.
 pub(crate) fn execute_streaming_guest(
     engine: &Engine,
     route: &IntegrityRoute,

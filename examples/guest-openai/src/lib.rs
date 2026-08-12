@@ -713,7 +713,7 @@ fn handle_chat_completions_buffered(
                 } else {
                     Some(parsed.content)
                 },
-                refusal: None,
+                refusal: completed.refusal,
                 tool_calls: parsed.tool_calls,
                 // Response-side only: an assistant turn never carries these.
                 tool_call_id: None,
@@ -1061,6 +1061,9 @@ struct StreamingContentGate {
     /// separately because parsing the held tail alone trims its leading edge,
     /// while in the complete response it is internal whitespace.
     separator: String,
+    /// Once prose has left the gate, JSON can no longer be a whole-output
+    /// tool call even if the retained overlap happens to begin with `{`.
+    emitted_non_whitespace: bool,
     tripped: bool,
 }
 
@@ -1080,6 +1083,7 @@ impl StreamingContentGate {
             hold,
             seen: String::new(),
             separator: String::new(),
+            emitted_non_whitespace: false,
             tripped: false,
         }
     }
@@ -1102,6 +1106,7 @@ impl StreamingContentGate {
             //
             let prefix = &self.seen[..at];
             let content = prefix.trim_end().to_owned();
+            self.emitted_non_whitespace |= !content.is_empty();
             self.separator = prefix[content.len()..].to_owned();
             self.seen = self.seen[at..].to_owned();
             return (!content.is_empty()).then_some(content);
@@ -1116,12 +1121,13 @@ impl StreamingContentGate {
             return None;
         }
         let content = self.seen[..safe].to_owned();
+        self.emitted_non_whitespace |= !content.trim().is_empty();
         self.seen = self.seen[safe..].to_owned();
         Some(content)
     }
 
     fn find_opener(&self) -> Option<usize> {
-        if self.anchored {
+        if self.anchored && !self.emitted_non_whitespace {
             // Anchored openers only count at the start, ignoring leading
             // whitespace the model may have emitted first.
             let trimmed = self.seen.trim_start();
@@ -1270,7 +1276,8 @@ impl ChatCompletionRequest {
 
     /// Whether the caller offered the model any tool to call.
     fn has_tool_intent(&self) -> bool {
-        !self.tools.is_empty() || self.tool_choice.is_some()
+        !matches!(self.tool_choice.as_ref(), Some(serde_json::Value::String(choice)) if choice == "none")
+            && (!self.tools.is_empty() || self.tool_choice.is_some())
     }
 
     fn resolved_tool_call_parser(&self) -> Option<ToolCallParser> {
@@ -2055,12 +2062,16 @@ mod tests {
         assert_eq!(
             format!(
                 "{streamed}{}{}{}",
-                (!held_parsed.content.is_empty())
-                    .then_some(separator)
-                    .unwrap_or_default(),
-                (!held_parsed.content.is_empty())
-                    .then_some(post_separator)
-                    .unwrap_or_default(),
+                if !held_parsed.content.is_empty() {
+                    separator
+                } else {
+                    String::new()
+                },
+                if !held_parsed.content.is_empty() {
+                    post_separator
+                } else {
+                    String::new()
+                },
                 held_parsed.content
             ),
             parsed.content,

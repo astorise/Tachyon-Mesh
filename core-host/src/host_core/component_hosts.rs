@@ -2343,6 +2343,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
         Ok(
             accelerator_component_bindings::tachyon::accelerator::cpu::Generation {
                 text: generation.text,
+                refusal: generation.refusal,
                 finish_reason: generation.finish_reason,
                 usage: generation.usage.map(|usage| {
                     accelerator_component_bindings::tachyon::accelerator::cpu::TokenUsage {
