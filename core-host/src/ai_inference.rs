@@ -85,6 +85,15 @@ const UPSTREAM_MAX_CONCURRENCY_ENV: &str = "TACHYON_UPSTREAM_MAX_CONCURRENCY";
 /// backlog it cannot see.
 const UPSTREAM_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Host-process admission state. Runtime generations are replaced during a hot
+/// reload, but an upstream socket owned by a draining generation still consumes
+/// the same node-level capacity as one owned by the incoming generation.
+static HOST_UPSTREAM_ADMISSION: OnceLock<Arc<UpstreamAdmission>> = OnceLock::new();
+
+fn host_upstream_admission() -> Arc<UpstreamAdmission> {
+    Arc::clone(HOST_UPSTREAM_ADMISSION.get_or_init(|| Arc::new(UpstreamAdmission::from_env())))
+}
+
 /// Bounded admission gate for upstream (`openai:`) work.
 ///
 /// Upstream bindings deliberately do not run on an [`AcceleratorScheduler`].
@@ -113,6 +122,30 @@ struct UpstreamAdmissionState {
     waiting: usize,
 }
 
+/// A locally generated, but retryable, capacity rejection.  Keeping this as a
+/// type until it reaches `GenerationError` prevents admission shedding from
+/// being flattened into an indistinguishable internal error.
+#[derive(Debug)]
+enum UpstreamAdmissionError {
+    QueueFull { waiting: usize, limit: usize },
+    TimedOut { in_flight: usize, limit: usize },
+}
+
+impl std::fmt::Display for UpstreamAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull { waiting, limit } => write!(
+                f,
+                "upstream request queue is full ({waiting} waiting, limit {limit})"
+            ),
+            Self::TimedOut { in_flight, limit } => write!(
+                f,
+                "upstream request queue is saturated ({in_flight} in flight, limit {limit}): retry, or raise `{UPSTREAM_MAX_CONCURRENCY_ENV}`"
+            ),
+        }
+    }
+}
+
 impl UpstreamAdmission {
     fn new(capacity: usize) -> Self {
         Self {
@@ -135,14 +168,14 @@ impl UpstreamAdmission {
     /// Blocks until a permit is free, or until [`UPSTREAM_ADMISSION_TIMEOUT`]
     /// elapses. The permit is held for the whole upstream interaction — for a
     /// stream, that is the lifetime of the stream, not just its first byte.
-    fn acquire(&self) -> Result<UpstreamPermit<'_>, String> {
+    fn acquire(&self) -> std::result::Result<UpstreamPermit<'_>, UpstreamAdmissionError> {
         let mut state = self.state.lock().expect("upstream admission lock poisoned");
         if state.in_flight >= self.capacity {
             if state.waiting >= self.max_waiters {
-                return Err(format!(
-                    "upstream request queue is full ({} waiting, limit {})",
-                    state.waiting, self.max_waiters
-                ));
+                return Err(UpstreamAdmissionError::QueueFull {
+                    waiting: state.waiting,
+                    limit: self.max_waiters,
+                });
             }
             state.waiting += 1;
             let deadline = std::time::Instant::now() + UPSTREAM_ADMISSION_TIMEOUT;
@@ -153,10 +186,10 @@ impl UpstreamAdmission {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
                     state.waiting -= 1;
-                    return Err(format!(
-                        "upstream request queue is saturated ({} in flight, limit {}): retry, or raise `{UPSTREAM_MAX_CONCURRENCY_ENV}`",
-                        state.in_flight, self.capacity
-                    ));
+                    return Err(UpstreamAdmissionError::TimedOut {
+                        in_flight: state.in_flight,
+                        limit: self.capacity,
+                    });
                 }
                 let (next, _) = self
                     .released
@@ -484,6 +517,7 @@ pub(crate) struct ToolCall {
 /// the whole time-to-first-token.
 pub(crate) enum StreamEvent<'a> {
     Content(&'a str),
+    Refusal(&'a str),
     ToolCall(ToolCall),
 }
 
@@ -624,6 +658,19 @@ impl GenerationError {
                     _ => None,
                 })
                 .map(str::to_owned),
+        }
+    }
+}
+
+impl From<UpstreamAdmissionError> for GenerationError {
+    fn from(error: UpstreamAdmissionError) -> Self {
+        Self {
+            message: error.to_string(),
+            // This is a local response status, not an upstream provider
+            // status; the existing OpenAI payload mapper deliberately uses
+            // this field for both so clients receive a retryable 429.
+            upstream_status: Some(429),
+            class: Some("upstream-admission".to_owned()),
         }
     }
 }
@@ -819,8 +866,8 @@ pub(crate) struct AiInferenceRuntime {
     /// `allowed_model_aliases`. `None` disables lazy loading (tests, no broker).
     dynamic_models_root: Option<PathBuf>,
     /// Bounded concurrency for `openai:` bindings, which run off the batch
-    /// scheduler entirely. Shared across clones of the runtime so the cap is a
-    /// node-wide property.
+    /// scheduler entirely. The Arc is sourced from host-process state so it is
+    /// also shared by draining and replacement runtime generations.
     upstream_admission: Arc<UpstreamAdmission>,
 }
 
@@ -922,7 +969,7 @@ impl AiInferenceRuntime {
             schedulers,
             models: Arc::new(RwLock::new(models)),
             dynamic_models_root: None,
-            upstream_admission: Arc::new(UpstreamAdmission::from_env()),
+            upstream_admission: host_upstream_admission(),
         })
     }
 

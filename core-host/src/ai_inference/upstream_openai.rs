@@ -1004,6 +1004,24 @@ impl UpstreamOpenAiRuntime {
                     })
                 }
             }
+            match delta.get("refusal") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(refusal)) => {
+                    if !refusal.is_empty() && sink.emit(StreamEvent::Refusal(refusal)).is_stop() {
+                        abandoned = true;
+                        break;
+                    }
+                }
+                Some(other) => {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "streamed `choices[0].delta.refusal` is {}, expected a string",
+                            json_type_name(other)
+                        ),
+                    })
+                }
+            }
             // A streamed tool call arrives as `delta.tool_calls` fragments with
             // no content at all. Dropping them would make the whole request
             // look like a model that answered with silence, so accumulate them

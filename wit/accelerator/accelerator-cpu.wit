@@ -60,6 +60,10 @@ interface cpu {
     variant stream-event {
         /// Decoded text for the assistant message.
         content(string),
+        /// A provider safety refusal. This is distinct from assistant content
+        /// in the OpenAI stream protocol and must not be silently flattened
+        /// into an empty successful completion.
+        refusal(string),
         /// A tool call, complete. Tool calls arrive on this arm rather than
         /// inside `content` so that offering tools costs nothing in
         /// time-to-first-token: a backend that had to smuggle calls through the
