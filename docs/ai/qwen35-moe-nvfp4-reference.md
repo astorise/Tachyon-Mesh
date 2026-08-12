@@ -91,6 +91,13 @@ run the gated tests in `qwen35_upstream.rs`. They are the only coverage the
 loader has: no synthetic checkpoint exercises it, so a run without that
 variable set skips them rather than substituting a weaker check.
 
+The same name is the switch for the `GPU Acceptance` workflow, as a repository
+variable pointing at the checkpoint on the GPU runner. Setting it is the whole
+opt-in: unset, the workflow skips; set, it runs and fails if the path is not a
+directory on the runner. Nothing there is gated on the hardware — candle #3831
+dropped the FP4 tensor-core floor, so a device without the tensor cores takes
+the fallback and answers the same tokens more slowly.
+
 `scripts/export_qwen35_moe_fixtures.py` exported golden intermediate states and
 logits from a local trusted tiny model, for the scalar runtime's parity tests to
 compare against. Those tests were deleted with the runtime, so nothing reads its

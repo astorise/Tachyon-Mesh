@@ -17,17 +17,28 @@ concurrency:
   group: gpu-acceptance
   cancel-in-progress: false
 
-# Everything below is opt-in on `TACHYON_ENABLE_NVFP4_CI`, and the reason is
-# the checkpoint rather than the hardware: candle #3831 dropped the FP4
-# tensor-core floor, so the kernel itself runs anywhere CUDA does, but these
-# tests need the Qwen 3.5 NVFP4 weights installed on the runner and each one
-# returns early without them. Opting in is what turns those early returns into
-# hard requirements: a GPU job that silently tests nothing is worse than one
-# that fails. `cuda-quality` needs neither, and is no longer gated.
+# Nothing here is gated on hardware. candle #3831 dropped the FP4 tensor-core
+# floor, so the kernel runs anywhere CUDA does — a device without the tensor
+# cores takes the fallback and answers the same tokens more slowly, which is a
+# performance difference rather than a correctness one. `cuda-quality` is
+# ungated for that reason.
+#
+# What this job does need is the Qwen 3.5 NVFP4 weights installed on the
+# runner: every test below returns early without them, so an unconfigured run
+# would go green having executed nothing. `TACHYON_QWEN35_MOE_NVFP4_DIR` is
+# where an operator says the weights are there, so it is also the whole
+# condition for running — a repository without it skips, and a repository with
+# it runs and fails honestly if the path is wrong. A second opt-in flag beside
+# it only made it possible to configure a checkpoint and still silently test
+# nothing.
+#
+# `if:` cannot read the runner's own environment, so exporting the variable
+# from the runner image no longer enables the job on its own; the repository
+# variable is what turns it on.
 jobs:
   qwen35-nvfp4:
     name: Qwen 3.5 NVFP4 checkpoint
-    if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' }}
+    if: ${{ vars.TACHYON_QWEN35_MOE_NVFP4_DIR != '' }}
     runs-on: arc-gpu-runners
     env:
       CARGO_TERM_COLOR: always
@@ -98,21 +109,14 @@ jobs:
       # Every test below returns early when the checkpoint is missing, so
       # without this the job would go green having executed nothing.
       #
-      # Resolved here rather than assumed. The path used to be read straight
-      # from the process environment, which the workflow never sets — so it
-      # only worked if the runner image happened to export it, and an operator
-      # enabling this job had nowhere in the repository to say where the
-      # weights are. The repository variable is that place; a runner that
-      # exports its own value still wins nothing and loses nothing, because it
-      # is the fallback.
+      # The job only starts when the repository variable is set, so what is
+      # left to catch here is a value that is set and wrong: a typo, or a
+      # volume that did not mount on this runner. That has to fail rather than
+      # skip — it is the case where an operator believes the weights are being
+      # exercised.
       - name: Require the installed checkpoint
         run: |
           checkpoint="${{ vars.TACHYON_QWEN35_MOE_NVFP4_DIR }}"
-          checkpoint="${checkpoint:-${TACHYON_QWEN35_MOE_NVFP4_DIR:-}}"
-          if [ -z "$checkpoint" ]; then
-            echo "::error::no Qwen 3.5 NVFP4 checkpoint configured. Set the repository variable TACHYON_QWEN35_MOE_NVFP4_DIR to its directory on the runner, or export it from the runner image."
-            exit 1
-          fi
           if [ ! -d "$checkpoint" ]; then
             echo "::error::TACHYON_QWEN35_MOE_NVFP4_DIR is \`$checkpoint\`, which is not a directory on this runner."
             exit 1
