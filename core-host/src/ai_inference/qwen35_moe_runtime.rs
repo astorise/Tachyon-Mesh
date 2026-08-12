@@ -682,6 +682,7 @@ impl Qwen35MoeRuntime {
             }
             if step + 1 == request.max_new_tokens {
                 budget_exhausted = true;
+                break;
             }
             logits = self.forward_token(token, encoded.len() + step, &mut state)?;
         }

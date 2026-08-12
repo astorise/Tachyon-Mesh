@@ -446,7 +446,7 @@ pub(crate) struct UpstreamOpenAiRuntime {
     /// arrived, and the request held its admission permit meanwhile. Owning the
     /// runtime lets the read loop wrap each poll in a timeout and ask the sink
     /// whether anyone is still listening.
-    runtime: tokio::runtime::Runtime,
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
 /// How long the stream reader waits on the socket before checking whether the
@@ -460,6 +460,12 @@ pub(crate) struct UpstreamOpenAiRuntime {
 const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 impl UpstreamOpenAiRuntime {
+    fn runtime(&self) -> &tokio::runtime::Runtime {
+        self.runtime
+            .as_ref()
+            .expect("upstream runtime is available until the backend is dropped")
+    }
+
     /// Claim a binding whose `path` uses the `openai:` scheme.
     ///
     /// `Ok(None)` means "not mine" — the caller keeps probing the on-disk
@@ -496,7 +502,7 @@ impl UpstreamOpenAiRuntime {
             api_key: api_key_for(alias),
             endpoint,
             client,
-            runtime,
+            runtime: Some(runtime),
         }))
     }
 
@@ -732,7 +738,7 @@ impl UpstreamOpenAiRuntime {
             });
         };
         let (body, timeout) = self.chat_body(prompt, false)?;
-        let payload: Value = self.runtime.block_on(async {
+        let payload: Value = self.runtime().block_on(async {
             let mut response = self.post("/chat/completions", &body, timeout).await?;
             read_json(&self.alias, &mut response).await
         })?;
@@ -833,7 +839,7 @@ impl UpstreamOpenAiRuntime {
         // The whole read runs inside one `block_on`, so the sink is borrowed
         // across await points on a single thread — which is exactly why the
         // runtime is current-thread. Nothing here needs to be `Send`.
-        self.runtime
+        self.runtime()
             .block_on(self.stream_response(body, timeout, sink))
     }
 
@@ -1087,7 +1093,7 @@ impl UpstreamOpenAiRuntime {
     /// Forward a single embedding request to the upstream `/embeddings` route.
     pub(crate) fn embed(&self, input: &str) -> Result<Vec<f32>, UpstreamError> {
         let body = json!({"model": self.endpoint.model, "input": input});
-        let payload: Value = self.runtime.block_on(async {
+        let payload: Value = self.runtime().block_on(async {
             let mut response = self
                 .post("/embeddings", &body, self.endpoint.timeout)
                 .await?;
@@ -1152,6 +1158,17 @@ impl UpstreamOpenAiRuntime {
             detail,
         })?;
         Ok(vector)
+    }
+}
+
+impl Drop for UpstreamOpenAiRuntime {
+    fn drop(&mut self) {
+        // Reload reaping happens from Tokio tasks. Dropping a Runtime there
+        // panics because its shutdown may block; consume it with Tokio's
+        // non-blocking shutdown instead.
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 
@@ -1449,7 +1466,6 @@ enum SseReadError {
 /// never sends a newline would otherwise grow the buffer without limit;
 /// `MAX_STREAM_BYTES` bounds the whole response, because a stream that never
 /// ends would otherwise run forever.
-#[derive(Default)]
 struct SseReader {
     /// Bytes received but not yet consumed as a complete line.
     buffered: Vec<u8>,
@@ -1461,6 +1477,20 @@ struct SseReader {
     /// `data:` fields collected for the current SSE event. SSE joins multiple
     /// fields with a newline and dispatches only at the blank separator.
     event_data: String,
+    /// The UTF-8 BOM is permitted only at the beginning of a text stream.
+    first_line: bool,
+}
+
+impl Default for SseReader {
+    fn default() -> Self {
+        Self {
+            buffered: Vec::new(),
+            consumed: 0,
+            eof: false,
+            event_data: String::new(),
+            first_line: true,
+        }
+    }
 }
 
 impl SseReader {
@@ -1475,13 +1505,20 @@ impl SseReader {
                         return Ok(Some(std::mem::take(&mut self.event_data)));
                     }
                 }
-                Some(line) => {
+                Some(mut line) => {
+                    if self.first_line {
+                        self.first_line = false;
+                        line = line.strip_prefix('\u{feff}').unwrap_or(&line).to_owned();
+                    }
                     if let Some(data) = line.trim_end_matches('\r').strip_prefix("data:") {
                         if !self.event_data.is_empty() {
                             self.event_data.push('\n');
                         }
                         self.event_data
                             .push_str(data.strip_prefix(' ').unwrap_or(data));
+                        if self.event_data.len() > MAX_SSE_FRAME_BYTES {
+                            return Err(SseReadError::FrameTooLarge);
+                        }
                     }
                 }
                 None if self.event_data.is_empty() => return Ok(None),
