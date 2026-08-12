@@ -1081,6 +1081,7 @@ pub(crate) fn host_frame_to_websocket_binding_frame(
 /// Load the WASM component artifact and forward to
 /// `execute_streaming_component_guest`. Mirrors `execute_websocket_guest`.
 #[cfg(feature = "ai-inference")]
+#[allow(clippy::too_many_arguments)] // HTTP stream wiring needs the response channels and liveness handle.
 pub(crate) fn execute_streaming_guest(
     engine: &Engine,
     route: &IntegrityRoute,
@@ -1088,6 +1089,7 @@ pub(crate) fn execute_streaming_guest(
     request: GuestRequest,
     headers_tx: tokio::sync::oneshot::Sender<(StatusCode, GuestHttpFields)>,
     chunks_tx: tokio::sync::mpsc::Sender<Bytes>,
+    consumer_alive: Arc<std::sync::atomic::AtomicBool>,
     execution: &GuestExecutionContext,
 ) {
     let module_path = match resolve_guest_module_path(function_name) {
@@ -1123,6 +1125,7 @@ pub(crate) fn execute_streaming_guest(
         request,
         headers_tx,
         chunks_tx,
+        consumer_alive,
         execution,
     );
 }
@@ -1142,6 +1145,7 @@ pub(crate) fn execute_streaming_component_guest(
     request: GuestRequest,
     headers_tx: tokio::sync::oneshot::Sender<(StatusCode, GuestHttpFields)>,
     chunks_tx: tokio::sync::mpsc::Sender<Bytes>,
+    consumer_alive: Arc<std::sync::atomic::AtomicBool>,
     execution: &GuestExecutionContext,
 ) {
     let shape = route_scope_shape(route);
@@ -1284,7 +1288,12 @@ pub(crate) fn execute_streaming_component_guest(
     state.streaming_body = Some(HostStreamingBodySlot {
         headers_tx,
         chunk_tx: chunks_tx,
+        consumer_alive: Arc::clone(&consumer_alive),
     });
+    // Also held outside the slot: the slot is consumed by
+    // `get-streaming-response`, while an accelerator stream started later still
+    // needs the same flag.
+    state.streaming_consumer_alive = Some(consumer_alive);
 
     let mut store = Store::new(engine, state);
     store.limiter(|s| &mut s.limits);

@@ -549,6 +549,7 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
                 req,
                 htx,
                 ctx,
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 &test_guest_execution_context(config_c, seed),
             );
         });

@@ -154,6 +154,12 @@ pub(crate) struct ComponentHostState {
     /// `handle-request`. `None` on the buffered path — `get-streaming-response`
     /// returns an error, and the guest falls back to the buffered return value.
     pub(crate) streaming_body: Option<HostStreamingBodySlot>,
+    /// Shared with the HTTP response body so an accelerator stream can stop
+    /// while the guest is blocked waiting for an upstream frame. Kept beside
+    /// `streaming_body` rather than inside it, because that slot is consumed by
+    /// `get-streaming-response` and the flag outlives it.
+    #[cfg(feature = "ai-inference")]
+    pub(crate) streaming_consumer_alive: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Clone)]
@@ -755,6 +761,9 @@ pub(crate) struct HostWebSocketConnection {
 pub(crate) struct HostStreamingBodySlot {
     pub(crate) headers_tx: tokio::sync::oneshot::Sender<(StatusCode, GuestHttpFields)>,
     pub(crate) chunk_tx: tokio::sync::mpsc::Sender<Bytes>,
+    /// Cleared when the HTTP response body is dropped — the client hung up.
+    #[cfg(feature = "ai-inference")]
+    pub(crate) consumer_alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Host state stored in the `ResourceTable` behind a
@@ -765,6 +774,8 @@ pub(crate) struct HostStreamingResponseResource {
     /// `None` once `begin()` has been called (sender consumed).
     pub(crate) headers_tx: Option<tokio::sync::oneshot::Sender<(StatusCode, GuestHttpFields)>>,
     pub(crate) chunk_tx: tokio::sync::mpsc::Sender<Bytes>,
+    #[cfg(feature = "ai-inference")]
+    pub(crate) consumer_alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Streaming HTTP response body backed by a tokio channel. Produced by the
@@ -774,6 +785,21 @@ pub(crate) struct HostStreamingResponseResource {
 pub(crate) struct GuestStreamingBody {
     pub(crate) receiver: tokio::sync::mpsc::Receiver<Bytes>,
     pub(crate) _completion_guard: Option<RouteResponseGuard>,
+    /// Shared with the guest's accelerator stream. Cleared on drop, which is
+    /// when axum has finished with the body — either the response completed or
+    /// the client disconnected. A backend parked on a silent upstream reads
+    /// this between frames and abandons the request, releasing the socket and
+    /// the admission permit instead of holding both until the binding's
+    /// timeout.
+    pub(crate) consumer_alive: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "ai-inference")]
+impl Drop for GuestStreamingBody {
+    fn drop(&mut self) {
+        self.consumer_alive
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[cfg(feature = "ai-inference")]
