@@ -154,6 +154,7 @@ impl ComponentHostState {
             accelerator_models: HashMap::new(),
             #[cfg(feature = "ai-inference")]
             next_accelerator_model_id: 1,
+            #[cfg(feature = "ai-inference")]
             streaming_consumer_alive: None,
             streaming_body: None,
         })
@@ -3679,6 +3680,7 @@ impl component_bindings::tachyon::mesh::response_body::Host for ComponentHostSta
         let resource = HostStreamingResponseResource {
             headers_tx: Some(slot.headers_tx),
             chunk_tx: slot.chunk_tx,
+            #[cfg(feature = "ai-inference")]
             consumer_alive: Arc::clone(&slot.consumer_alive),
         };
         let owned = self
