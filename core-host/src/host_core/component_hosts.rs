@@ -431,6 +431,8 @@ impl ComponentHostState {
         let generation_alive = Arc::clone(&consumer_alive);
         let budget = Arc::new(StreamQueueBudget::default());
         let generation_budget = Arc::clone(&budget);
+        let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let generation_stalled = Arc::clone(&stalled);
         std::thread::Builder::new()
             .name("tachyon-stream-gen".to_owned())
             .spawn(move || {
@@ -445,6 +447,7 @@ impl ComponentHostState {
                     sender: &sender,
                     consumer_alive: &generation_alive,
                     budget: &generation_budget,
+                    stalled: &generation_stalled,
                     reported_stall: false,
                 };
                 match ai_runtime.stream_component_prompt(
@@ -479,6 +482,7 @@ impl ComponentHostState {
             outcome,
             consumer_alive,
             budget,
+            stalled,
         })
     }
 }
@@ -2358,6 +2362,9 @@ struct GuestStreamSink<'a> {
     >,
     consumer_alive: &'a Arc<std::sync::atomic::AtomicBool>,
     budget: &'a Arc<StreamQueueBudget>,
+    /// Set for the consumer's side, so a report that could not fit in the
+    /// channel is still there to be found at EOF.
+    stalled: &'a Arc<std::sync::atomic::AtomicBool>,
     /// Whether the stall has already been reported down the channel.
     reported_stall: bool,
 }
@@ -2436,6 +2443,11 @@ impl GuestStreamSink<'_> {
         if std::mem::replace(&mut self.reported_stall, true) {
             return;
         }
+        // Recorded before the send is attempted, because the send is the part
+        // that can fail: the channel being full is often exactly what stalled
+        // the stream. `next` reads this at EOF, where a slot is guaranteed.
+        self.stalled
+            .store(true, std::sync::atomic::Ordering::Release);
         let _ = Self::send_before(
             self.sender,
             Err(ai_inference::GenerationError::local(
@@ -2518,6 +2530,7 @@ pub(crate) struct StreamedGeneration {
     outcome: Arc<Mutex<ai_inference::StreamOutcome>>,
     consumer_alive: Arc<std::sync::atomic::AtomicBool>,
     budget: Arc<StreamQueueBudget>,
+    stalled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -2532,6 +2545,16 @@ pub(crate) struct HostTokenStream {
     /// Cleared on drop, so a backend blocked between frames can see that this
     /// caller has gone without having to emit something first.
     consumer_alive: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the producer gave up on a stalled consumer and could not get
+    /// the error into the channel.
+    ///
+    /// The report is a bounded send, and the thing that filled the channel is
+    /// often the same thing that stalls it — so a client resuming after the
+    /// second timeout drained the queued fragments and then saw a plain EOF,
+    /// and the guest emitted a normal final chunk and `[DONE]` for a truncated
+    /// answer. `next` consults this at EOF and synthesizes the error there,
+    /// which is the one moment a slot is guaranteed.
+    stalled: Arc<std::sync::atomic::AtomicBool>,
     /// Whether `next` has reported the end of the stream to this caller.
     ///
     /// The generation thread can finish while fragments are still queued, so
@@ -2632,6 +2655,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
             outcome,
             consumer_alive,
             budget,
+            stalled,
         } = self
             .stream_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
             .map_err(wit_generation_error)?;
@@ -2642,6 +2666,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
                 outcome,
                 consumer_alive,
                 budget,
+                stalled,
                 saw_eof: false,
             })
             .map_err(|error| {
@@ -2694,6 +2719,19 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
             )),
             Ok(Err(error)) => Err(wit_generation_error(error)),
             Err(_) => {
+                // A stall whose error could not be enqueued surfaces here, at
+                // the one moment there is room for it. Without this the client
+                // drained the queued fragments, saw a plain EOF, and the guest
+                // finished a truncated answer with an ordinary `[DONE]`.
+                if stream
+                    .stalled
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
+                    return Err(wit_generation_error(ai_inference::GenerationError::local(
+                        "the client stopped reading this stream for longer than the backpressure \
+                         limit allows, so generation was cancelled",
+                    )));
+                }
                 stream.saw_eof = true;
                 Ok(None)
             }

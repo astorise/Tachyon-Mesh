@@ -490,10 +490,17 @@ enum SseRead {
 /// connects and disconnects in a loop against a silent upstream accumulated a
 /// thread and a socket per attempt, past any concurrency bound.
 ///
-/// This bounds that accumulation. It is deliberately above the default upstream
-/// concurrency (8) so a healthy node never meets it: reaching this ceiling means
-/// readers are parked, which is a condition to refuse under rather than absorb.
-const MAX_LIVE_SSE_READERS: usize = 64;
+/// Derived from the admission gate rather than fixed. A constant 64 silently
+/// capped streaming at its own number: raising
+/// `TACHYON_UPSTREAM_MAX_CONCURRENCY` scaled buffered generation and embeddings
+/// while the 65th *stream* was refused with a gateway error even though every
+/// live reader belonged to a healthy request. The headroom is what the ceiling
+/// is actually for — parked readers whose requests have already ended — so it
+/// is expressed as a multiple of the admitted concurrency instead of replacing
+/// it.
+fn max_live_sse_readers() -> usize {
+    super::upstream_max_concurrency().saturating_mul(2)
+}
 
 /// Reader threads currently alive, including ones parked past their request.
 static LIVE_SSE_READERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -506,7 +513,7 @@ impl SseReaderSlot {
     /// `None` when the ceiling is reached, which the caller reports as an
     /// overloaded upstream rather than spawning a thread it cannot account for.
     fn claim() -> Option<Self> {
-        claim_below(&LIVE_SSE_READERS, MAX_LIVE_SSE_READERS).then_some(Self)
+        claim_below(&LIVE_SSE_READERS, max_live_sse_readers()).then_some(Self)
     }
 }
 
@@ -1170,8 +1177,9 @@ impl UpstreamOpenAiRuntime {
                 alias: self.alias.clone(),
                 endpoint: self.endpoint.url("/chat/completions"),
                 detail: format!(
-                    "{MAX_LIVE_SSE_READERS} upstream stream readers are already live on this \
-                     node, some of them parked on silent upstreams; refusing to open another"
+                    "{} upstream stream readers are already live on this node, some of them \
+                     parked on silent upstreams; refusing to open another",
+                    max_live_sse_readers()
                 ),
             });
         };

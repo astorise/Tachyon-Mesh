@@ -77,6 +77,11 @@ const SAFETENSORS_EXTENSION: &str = "safetensors";
 /// request here is one blocking thread and one socket, and the real limit is the
 /// provider's own rate limit. Overridable per deployment.
 const DEFAULT_UPSTREAM_MAX_CONCURRENCY: usize = 32;
+/// The configured upstream concurrency, for callers that must size their own
+/// bounds against it rather than against a constant that drifts from it.
+pub(crate) fn upstream_max_concurrency() -> usize {
+    node_upstream_admission().capacity
+}
 const UPSTREAM_MAX_CONCURRENCY_ENV: &str = "TACHYON_UPSTREAM_MAX_CONCURRENCY";
 /// How long a caller waits for an upstream permit before the node sheds it.
 /// Bounded on purpose: an unbounded wait converts provider slowness into an

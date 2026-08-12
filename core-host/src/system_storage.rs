@@ -1042,7 +1042,19 @@ pub(crate) fn withdraw_changed_model_bindings(
                     return crate::store::KvPartitionUpdate::Keep;
                 }
                 match reservation.clone() {
-                    Some(value) => crate::store::KvPartitionUpdate::Set(value),
+                    // The reservation replaces the whole row, so an upload this
+                    // binding had displaced would go down with it: the
+                    // publication after the swap either overwrites the
+                    // reservation or sweeps it, and neither can put back what
+                    // the reservation erased. The files stay on disk and vanish
+                    // from the listing for good. Carried across, exactly as the
+                    // refresh path carries it.
+                    Some(value) => {
+                        let carried = current
+                            .and_then(shadowed_upload_row)
+                            .and_then(|parked| carry_shadowed_upload(&value, &parked));
+                        crate::store::KvPartitionUpdate::Set(carried.unwrap_or(value))
+                    }
                     // Nothing to withdraw and nothing writable to reserve with.
                     None if current.is_none() => crate::store::KvPartitionUpdate::Keep,
                     None => crate::store::KvPartitionUpdate::Delete,

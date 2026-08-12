@@ -369,7 +369,7 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     // so the ownership check below and the deletion it guards cannot be split
     // by a second commit for this alias. Released on drop, including on every
     // early return between here and the end of the function.
-    let _commit_lock = AliasCommitLock::acquire(&alias)?;
+    let commit_lock = AliasCommitLock::acquire(&alias, &upload_id)?;
     reconcile_interrupted_commit(&model_dir, &backup_dir, &upload_id)?;
     fs::create_dir_all(&incoming_dir)
         .map_err(|error| format!("failed to create the staging model directory: {error}"))?;
@@ -386,6 +386,12 @@ fn commit_upload(uri: &str) -> Result<String, String> {
             let _ = fs::remove_dir_all(&incoming_dir);
             cleanup_staging(&upload_id);
         })?;
+
+    // The unpack above is the step that runs for minutes on a multi-gigabyte
+    // archive, and it is the reason a lock's age cannot stand in for its
+    // holder's health. Saying "still here" once it finishes keeps a slow but
+    // healthy commit from looking crashed to the next one.
+    commit_lock.refresh();
 
     // Move the previous checkpoint aside rather than deleting it, so a refused
     // publication can put it back exactly as it was.
@@ -532,18 +538,39 @@ const ALIAS_LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_se
 #[derive(Debug)]
 struct AliasCommitLock {
     path: PathBuf,
+    /// This holder's identity, written into the file and re-checked on drop.
+    owner: String,
 }
 
 impl AliasCommitLock {
-    fn acquire(alias: &str) -> Result<Self, String> {
-        let path = models_dir().join(format!(".commit-{alias}.lock"));
+    fn path(alias: &str) -> PathBuf {
+        models_dir().join(format!(".commit-{alias}.lock"))
+    }
+
+    /// Take the lock for `alias`, stamped with `owner`.
+    ///
+    /// The stamp is what makes both halves of this safe. Age alone is not:
+    /// nothing refreshes an mtime while a commit unpacks a multi-gigabyte
+    /// archive, so a healthy slow commit looked crashed — and the original
+    /// owner's `Drop` then deleted the *replacement's* lock, admitting a third
+    /// commit and recreating exactly the interleaving the lock exists to stop.
+    fn acquire(alias: &str, owner: &str) -> Result<Self, String> {
+        let path = Self::path(alias);
         for _ in 0..2 {
             match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(_) => return Ok(Self { path }),
+                Ok(mut file) => {
+                    file.write_all(owner.as_bytes()).map_err(|error| {
+                        format!("failed to stamp the commit lock for model `{alias}`: {error}")
+                    })?;
+                    return Ok(Self {
+                        path,
+                        owner: owner.to_owned(),
+                    });
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Held. Either by a commit still running — in which case
-                    // refusing is the whole point — or by one that died, in
-                    // which case the alias must not stay wedged forever.
+                    // Held: by a commit still running, which is the whole point,
+                    // or by one that died, which must not wedge the alias
+                    // forever.
                     let held_for = fs::metadata(&path)
                         .and_then(|meta| meta.modified())
                         .ok()
@@ -554,10 +581,15 @@ impl AliasCommitLock {
                              finishes"
                         ));
                     }
-                    // Taken over rather than removed and assumed: the retry
-                    // below goes through `create_new` again, so two processes
-                    // reclaiming the same stale lock cannot both win.
-                    let _ = fs::remove_file(&path);
+                    // Claimed by *moving* it aside rather than deleting it in
+                    // place: a rename within one directory is atomic, so of two
+                    // commits reclaiming the same stale lock exactly one
+                    // succeeds and the loser sees the winner's fresh lock on the
+                    // retry below.
+                    let claimed = models_dir().join(format!(".commit-{alias}.stale-{owner}"));
+                    if fs::rename(&path, &claimed).is_ok() {
+                        let _ = fs::remove_file(&claimed);
+                    }
                 }
                 Err(error) => {
                     return Err(format!(
@@ -567,15 +599,38 @@ impl AliasCommitLock {
             }
         }
         Err(format!(
-            "could not take the commit lock for model `{alias}`: it was reclaimed by another \
-             commit"
+            "could not take the commit lock for model `{alias}`: another commit reclaimed it first"
         ))
+    }
+
+    /// Prove the holder is still alive, at a point where the next step is long.
+    ///
+    /// The cheap half of a heartbeat: a guest is request-driven and has no
+    /// thread to tick from, but it can say "still here" at the boundaries of
+    /// the steps that actually take minutes, which is what keeps a healthy slow
+    /// commit from looking crashed.
+    fn refresh(&self) {
+        let _ = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .and_then(|mut file| file.write_all(self.owner.as_bytes()));
+    }
+
+    /// Whether this lock file is still the one this value took.
+    fn still_ours(&self) -> bool {
+        fs::read_to_string(&self.path).is_ok_and(|held| held == self.owner)
     }
 }
 
 impl Drop for AliasCommitLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // Only ever our own. Deleting unconditionally meant a commit whose lock
+        // had been taken over went on to delete the successor's lock on its way
+        // out, letting a third commit in beside the second.
+        if self.still_ours() {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -1301,19 +1356,33 @@ mod tests {
         std::env::set_current_dir(&root).expect("enter fixture");
         fs::create_dir_all(models_dir()).expect("models dir");
 
-        let held = AliasCommitLock::acquire("coder").expect("a free alias locks");
-        let denied = AliasCommitLock::acquire("coder")
+        let held = AliasCommitLock::acquire("coder", "up-1").expect("a free alias locks");
+        let denied = AliasCommitLock::acquire("coder", "up-2")
             .expect_err("a second commit for the same alias must wait, not interleave");
         assert!(denied.contains("in progress"), "{denied}");
 
         // A different alias is unaffected: the lock is per alias, not global.
-        let other = AliasCommitLock::acquire("embedder").expect("an unrelated alias is free");
+        let other =
+            AliasCommitLock::acquire("embedder", "up-3").expect("an unrelated alias is free");
         drop(other);
 
         // Released on drop, including on the early returns the commit path is
         // full of.
         drop(held);
-        AliasCommitLock::acquire("coder").expect("the alias frees when the commit ends");
+        let held = AliasCommitLock::acquire("coder", "up-4")
+            .expect("the alias frees when the commit ends");
+
+        // A holder whose lock was taken over must not delete its successor's.
+        // Simulating the takeover: the file now carries somebody else's stamp.
+        fs::write(AliasCommitLock::path("coder"), b"up-5").expect("successor stamp");
+        assert!(!held.still_ours());
+        drop(held);
+        assert_eq!(
+            fs::read_to_string(AliasCommitLock::path("coder")).expect("successor's lock survives"),
+            "up-5",
+            "a superseded holder must not unlock the alias on its way out"
+        );
+        fs::remove_file(AliasCommitLock::path("coder")).expect("clear");
 
         std::env::set_current_dir(previous).expect("restore cwd");
         let _ = fs::remove_dir_all(&root);
