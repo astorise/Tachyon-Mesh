@@ -6,11 +6,11 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use http_body_util::BodyExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
 };
 use wasmtime::{component::Linker as ComponentLinker, Engine, Store};
 use wasmtime_wasi::{
@@ -20,6 +20,14 @@ use wasmtime_wasi::{
 const ASSET_URI_PREFIX: &str = "tachyon://sha256:";
 const REGISTRY_MODULE_NAME: &str = "system-faas-registry";
 const MODEL_BROKER_MODULE_NAME: &str = "system-faas-model-broker";
+const MODEL_BROKER_COMMIT_PREFIX: &str = "/admin/models/commit/";
+
+/// The broker guest is instantiated per request, so serialization for a live
+/// model-directory swap must live in the host process rather than in guest
+/// statics. Keys are aliases; the fallback key deliberately serializes unknown
+/// metadata rather than allowing an unsafe concurrent swap.
+static MODEL_COMMIT_LOCKS: OnceLock<Mutex<std::collections::BTreeMap<String, Arc<Mutex<()>>>>> =
+    OnceLock::new();
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -47,6 +55,46 @@ struct ComponentRequest {
     uri: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct BrokerPendingUpload {
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    files: Vec<BrokerUploadFile>,
+}
+
+#[derive(Deserialize)]
+struct BrokerUploadFile {
+    sha256: String,
+}
+
+fn model_commit_lock(root_dir: &Path, uri: &str) -> Arc<Mutex<()>> {
+    let upload_id = uri
+        .split_once('?')
+        .map_or(uri, |(path, _)| path)
+        .strip_prefix(MODEL_BROKER_COMMIT_PREFIX);
+    let alias = upload_id
+        .and_then(|id| fs::read(root_dir.join("model-uploads").join(format!("{id}.json"))).ok())
+        .and_then(|raw| serde_json::from_slice::<BrokerPendingUpload>(&raw).ok())
+        .map(|pending| {
+            pending.alias.unwrap_or_else(|| {
+                pending
+                    .files
+                    .first()
+                    .map(|file| file.sha256.trim_start_matches("sha256:").to_owned())
+                    .unwrap_or_else(|| "unknown-model".to_owned())
+            })
+        })
+        .unwrap_or_else(|| "unknown-model".to_owned());
+    let locks = MODEL_COMMIT_LOCKS.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    locks
+        .lock()
+        .expect("model commit lock registry poisoned")
+        .entry(alias)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 struct ComponentResponse {
@@ -156,8 +204,19 @@ async fn proxy_request_to_component(
         }
     };
     let root_dir = working_dir(&manifest_path);
+    let commit_lock = (module_name == MODEL_BROKER_MODULE_NAME
+        && component_request.method.eq_ignore_ascii_case("POST")
+        && component_request
+            .uri
+            .starts_with(MODEL_BROKER_COMMIT_PREFIX))
+    .then(|| model_commit_lock(&root_dir, &component_request.uri));
 
     match tokio::task::spawn_blocking(move || {
+        // Keep the guard across guest instantiation and the full component call:
+        // the guest owns the directory swap and registry publication.
+        let _commit_guard = commit_lock
+            .as_ref()
+            .map(|lock| lock.lock().expect("model commit lock poisoned"));
         invoke_storage_component(
             &engine,
             module_name,

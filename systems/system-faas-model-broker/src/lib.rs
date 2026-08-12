@@ -15,7 +15,6 @@ use std::{
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock},
 };
 use uuid::Uuid;
 
@@ -38,22 +37,6 @@ const PROMPT_FINISHED_PATH: &str = "/internal/model-broker/prompt-finished";
 const STANDARD_VRAM_TTL_SECONDS: u64 = 300;
 const EXTENDED_VRAM_TTL_SECONDS: u64 = 1_800;
 const HIGH_FOLLOWUP_PROBABILITY: f32 = 0.8;
-
-/// Serializes the live-directory swap, publication and rollback for one alias.
-/// Different aliases remain independent.
-static MODEL_COMMIT_LOCKS: OnceLock<Mutex<std::collections::BTreeMap<String, Arc<Mutex<()>>>>> =
-    OnceLock::new();
-
-fn commit_lock(alias: &str) -> Result<Arc<Mutex<()>>, String> {
-    let locks = MODEL_COMMIT_LOCKS.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
-    let mut locks = locks
-        .lock()
-        .map_err(|_| "model commit lock registry was poisoned".to_owned())?;
-    Ok(locks
-        .entry(alias.to_owned())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone())
-}
 
 struct Component;
 
@@ -364,10 +347,6 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     // directory). Unpack it into a per-alias model directory that core-host can
     // mmap, detect the on-disk format, and drop the host dispatch sidecar.
     let alias = model_alias(&pending);
-    let alias_lock = commit_lock(&alias)?;
-    let _alias_guard = alias_lock
-        .lock()
-        .map_err(|_| format!("model commit lock for `{alias}` was poisoned"))?;
     let model_dir = models_dir().join(&alias);
 
     // Unpack beside the live directory, never into it. An upload can still be
