@@ -86,17 +86,34 @@ fixtures.
 
 ## Fixture regeneration and qualification
 
-For the installed production checkpoint, set `TACHYON_QWEN35_MOE_NVFP4_DIR` and
-run the gated tests in `qwen35_upstream.rs`. They are the only coverage the
-loader has: no synthetic checkpoint exercises it, so a run without that
-variable set skips them rather than substituting a weaker check.
+`core-host/src/ai_inference/qwen35_fixture.rs` writes a complete Qwen 3.5 MoE
+NVFP4 checkpoint — two layers, one of each attention kind, two experts, a
+64-wide hidden state — into a temporary directory. It is a real checkpoint by
+the profile's own standard: ModelOpt producer metadata, mixed FP8 and
+`W4A16_NVFP4` operators, packed nibbles beside per-block E4M3 scales, and every
+tensor the contract names. The loader, the contract, the packing and the forward
+pass are therefore covered on every run, with no network and no installed
+weights.
 
-The same name is the switch for the `GPU Acceptance` workflow, as a repository
-variable pointing at the checkpoint on the GPU runner. Setting it is the whole
-opt-in: unset, the workflow skips; set, it runs and fails if the path is not a
-directory on the runner. Nothing there is gated on the hardware — candle #3831
-dropped the FP4 tensor-core floor, so a device without the tensor cores takes
-the fallback and answers the same tokens more slowly.
+Nothing in the load path wants the production geometry: `validate_semantics`
+asks for consistency rather than size, `validate_tensor_contract` derives each
+expected shape from the config it was given, and `load` builds the model through
+upstream's projection factory off that same config.
+
+For the installed production checkpoint, set `TACHYON_QWEN35_MOE_NVFP4_DIR` and
+run the gated tests in `qwen35_upstream.rs`. What they add over the fixture is
+the one claim it cannot make: that *this* checkpoint is one this loader reads.
+A run without the variable skips them.
+
+The same name is a repository variable for the `GPU Acceptance` workflow,
+pointing at the checkpoint on the GPU runner, and it is now optional there too.
+The workflow's kernel proof — that a `cuda` route resolves to the native NVFP4
+operator rather than descending to the packed CPU one — runs against the fixture
+on every dispatch, because what it tests is the build and the device rather than
+the weights. Set the variable and the installed-checkpoint steps run beside it;
+leave it unset and they are skipped. Nothing there is gated on the hardware:
+candle #3831 dropped the FP4 tensor-core floor, so a device without the tensor
+cores takes the fallback and answers the same tokens more slowly.
 
 `scripts/export_qwen35_moe_fixtures.py` exported golden intermediate states and
 logits from a local trusted tiny model, for the scalar runtime's parity tests to

@@ -23,22 +23,20 @@ concurrency:
 # performance difference rather than a correctness one. `cuda-quality` is
 # ungated for that reason.
 #
-# What this job does need is the Qwen 3.5 NVFP4 weights installed on the
-# runner: every test below returns early without them, so an unconfigured run
-# would go green having executed nothing. `TACHYON_QWEN35_MOE_NVFP4_DIR` is
-# where an operator says the weights are there, so it is also the whole
-# condition for running — a repository without it skips, and a repository with
-# it runs and fails honestly if the path is wrong. A second opt-in flag beside
-# it only made it possible to configure a checkpoint and still silently test
-# nothing.
+# Nor is it gated on an installed checkpoint any more. What a `cuda` route has
+# to prove is which operator `auto_linear` chose — a property of the build and
+# the device, not of the weights — and `core-host` now writes a complete Qwen
+# 3.5 MoE NVFP4 checkpoint small enough to build in a test. That proof runs on
+# every dispatch, on the GPU, with nothing configured.
 #
-# `if:` cannot read the runner's own environment, so exporting the variable
-# from the runner image no longer enables the job on its own; the repository
-# variable is what turns it on.
+# `TACHYON_QWEN35_MOE_NVFP4_DIR` remains, and is now what it always described:
+# an optional extra. Set it, and the steps that load the *installed* weights run
+# too and fail honestly if the path is wrong. Leave it unset and they are
+# skipped, because "the production checkpoint loads" is a claim no fixture can
+# make on their behalf.
 jobs:
   qwen35-nvfp4:
     name: Qwen 3.5 NVFP4 checkpoint
-    if: ${{ vars.TACHYON_QWEN35_MOE_NVFP4_DIR != '' }}
     runs-on: arc-gpu-runners
     env:
       CARGO_TERM_COLOR: always
@@ -106,17 +104,19 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Every test below returns early when the checkpoint is missing, so
-      # without this the job would go green having executed nothing.
-      #
-      # The job only starts when the repository variable is set, so what is
-      # left to catch here is a value that is set and wrong: a typo, or a
-      # volume that did not mount on this runner. That has to fail rather than
-      # skip — it is the case where an operator believes the weights are being
-      # exercised.
-      - name: Require the installed checkpoint
+      # The installed checkpoint is optional, and the two outcomes are not
+      # symmetrical. Unset means an operator never claimed to have the weights,
+      # and the steps that need them are skipped. Set-and-wrong — a typo, a
+      # volume that did not mount — means an operator believes those weights are
+      # being exercised, and that has to fail rather than skip.
+      - name: Resolve the optional installed checkpoint
         run: |
           checkpoint="${{ vars.TACHYON_QWEN35_MOE_NVFP4_DIR }}"
+          if [ -z "$checkpoint" ]; then
+            echo "No TACHYON_QWEN35_MOE_NVFP4_DIR: the installed-checkpoint steps will be skipped."
+            echo "TACHYON_HAVE_CHECKPOINT=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
           if [ ! -d "$checkpoint" ]; then
             echo "::error::TACHYON_QWEN35_MOE_NVFP4_DIR is \`$checkpoint\`, which is not a directory on this runner."
             exit 1
@@ -138,12 +138,12 @@ jobs:
           fi
           echo "Using ModelOpt probe checkpoint $probe"
           echo "TACHYON_MODEL_OPT_NVFP4_DIR=$probe" >> "$GITHUB_ENV"
+          echo "TACHYON_HAVE_CHECKPOINT=1" >> "$GITHUB_ENV"
 
       # Every step below filters by test name, and `cargo test` exits 0 when a
       # filter matches nothing. Deleting the scalar runtime made four of these
       # filters stale at once, and the job would have gone green having run
-      # zero tests — the exact outcome the checkpoint requirement above exists
-      # to prevent.
+      # zero tests.
       #
       # Each filter is checked, not just "some gated test exists": with one
       # blanket check, renaming a single proof left the guard green while that
@@ -151,14 +151,21 @@ jobs:
       # filters below are the ones the steps use verbatim, and a libtest filter
       # is a substring match on the test path — which is exactly what `grep -F`
       # answers against the listing.
-      - name: Require the gated tests to exist
+      #
+      # This is still only half a guard, and the half it cannot cover is worth
+      # naming: it proves a filter names a test, not that the test did anything
+      # when it ran. A gated test whose environment variable is unset returns
+      # early and reports success, which is how the ModelOpt probe passed for as
+      # long as it did while executing nothing.
+      - name: Require the named tests to exist
         run: |
           set -o pipefail
           cargo test -p core-host --bin core-host \
             --features candle-cuda -- --list > /tmp/gated-tests.txt
           missing=0
           for filter in \
-            gated_prefill_is_invariant_to_chunk_size \
+            fixture_cuda_route_runs_the_kernel_or_refuses_to_load \
+            gated_prefill_spanning_several_chunks_is_reproducible \
             qwen35_upstream::tests::gated_ \
             gated_a_cuda_route_runs_the_kernel_or_refuses_to_load \
             gated_real_checkpoint_probe_loads_modelopt_nvfp4_directory
@@ -173,28 +180,35 @@ jobs:
           done
           exit "$missing"
 
-      # The prefill loop is still ours: `PREFILL_CHUNK_TOKENS` exists so the
-      # deadline can be observed, and it rests on upstream's forward being
-      # equivalent whether a prompt arrives in one pass or several.
-      - name: Prefill chunking equivalence
+      # The proof that needs the device and not the weights, so it runs on every
+      # dispatch: `auto_linear` hands back the packed *CPU* operator on a CUDA
+      # device when `nvfp4-cuda` is not compiled in, which answers with the same
+      # tokens off the wrong hardware. The checkpoint it runs against is the one
+      # `core-host` writes itself.
+      - name: Native NVFP4 execution on the fixture checkpoint
         run: |
           cargo test -p core-host --bin core-host \
             --features candle-cuda \
-            gated_prefill_is_invariant_to_chunk_size -- --nocapture
+            fixture_cuda_route_runs_the_kernel_or_refuses_to_load -- --nocapture
 
-      # Since the scalar runtime went away, nothing else loads a real
-      # checkpoint anywhere. This is the only coverage the loader has.
+      # Everything below needs weights nobody can synthesise: what they add over
+      # the fixture is that the *installed* checkpoint is one this loader reads.
+      - name: Prefill across several chunks, on the installed checkpoint
+        if: ${{ env.TACHYON_HAVE_CHECKPOINT == '1' }}
+        run: |
+          cargo test -p core-host --bin core-host \
+            --features candle-cuda \
+            gated_prefill_spanning_several_chunks_is_reproducible -- --nocapture
+
       - name: Load and generate on the installed checkpoint
+        if: ${{ env.TACHYON_HAVE_CHECKPOINT == '1' }}
         run: |
           cargo test -p core-host --bin core-host \
             --features candle-cuda \
             qwen35_upstream::tests::gated_ -- --nocapture
 
-      # `gated_a_cuda_route_runs_the_kernel_or_refuses_to_load` is what makes
-      # this step mean something: `auto_linear` hands back the packed *CPU*
-      # operator on a CUDA device when `nvfp4-cuda` is not compiled in, which
-      # answers with the same tokens off the wrong hardware.
-      - name: Native NVFP4 execution
+      - name: Native NVFP4 execution on the installed checkpoint
+        if: ${{ env.TACHYON_HAVE_CHECKPOINT == '1' }}
         run: |
           cargo test -p core-host --bin core-host \
             --features candle-cuda \
@@ -203,6 +217,7 @@ jobs:
       # The ModelOpt directory parser, which survived the runtime it used to
       # feed and is still the gate every checkpoint passes through.
       - name: ModelOpt checkpoint probe
+        if: ${{ env.TACHYON_HAVE_CHECKPOINT == '1' }}
         run: |
           cargo test -p core-host --bin core-host \
             --features candle-cuda \
