@@ -1457,6 +1457,34 @@ impl UpstreamOpenAiRuntime {
                     })
                 }
             }
+            // A streamed safety refusal, on its own field for the same reason
+            // the buffered path reads one there: it is the message's substance,
+            // not its content. Dropped, a `content_filter` stream reached the
+            // client as an empty assistant message with an ordinary finish —
+            // the exact failure the buffered path already refuses. Validated
+            // like `content`, so a non-string is a malformed frame rather than
+            // a silently missing refusal.
+            match delta.get("refusal") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(refusal)) => {
+                    if !refusal.is_empty() {
+                        saw_result = true;
+                        if sink.emit(StreamEvent::Refusal(refusal)).is_stop() {
+                            abandoned = true;
+                            break;
+                        }
+                    }
+                }
+                Some(other) => {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "streamed `choices[0].delta.refusal` is {}, expected a string",
+                            json_type_name(other)
+                        ),
+                    })
+                }
+            }
             // A streamed tool call arrives as `delta.tool_calls` fragments with
             // no content at all. Dropping them would make the whole request
             // look like a model that answered with silence, so accumulate them
@@ -1518,14 +1546,26 @@ impl UpstreamOpenAiRuntime {
         // `abandoned` keeps its own exemption: nobody is left to receive the
         // calls, so there is nothing to be premature about.
         if !abandoned && saw_done {
-            for call in
-                streamed_tool_calls
-                    .finish()
-                    .map_err(|detail| UpstreamError::MalformedResponse {
-                        alias: self.alias.clone(),
-                        detail,
-                    })?
-            {
+            let calls = streamed_tool_calls.finish().map_err(|detail| {
+                UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail,
+                }
+            })?;
+            // The upstream said the generation stopped to call something, and
+            // sent nothing to call. `saw_result` is satisfied by the finish
+            // reason alone, so the stream completed successfully with an empty
+            // `tool_calls` list — and an agent that branches on the reason
+            // rather than on the list waits for a call that will never arrive,
+            // or dispatches an empty one.
+            if finish_reason.as_deref() == Some("tool_calls") && calls.is_empty() {
+                return Err(UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail: "upstream reported `finish_reason: tool_calls` without a tool call"
+                        .to_owned(),
+                });
+            }
+            for call in calls {
                 if sink.emit(StreamEvent::ToolCall(call)).is_stop() {
                     abandoned = true;
                     break;
@@ -2253,6 +2293,74 @@ impl FakeUpstream {
         Self { base_url, requests }
     }
 
+    /// A server that answers the request headers and then says nothing.
+    ///
+    /// Chunked, with no chunk ever sent, so the client is committed to a
+    /// successful response and then left waiting. This is the case a blocking
+    /// `read_line` on this thread could not escape: the socket is open, the
+    /// upstream is alive, and no byte of body will arrive for `hold`.
+    pub(crate) fn start_silent(hold: Duration) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let (tx, requests) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Read, Write};
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = std::io::BufReader::new(stream);
+            let mut target = String::new();
+            let mut content_length = 0usize;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if line == "\r\n" {
+                    break;
+                }
+                if target.is_empty() {
+                    target = line.trim().to_owned();
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+                line.clear();
+            }
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+            let _ = tx.send((target, String::from_utf8_lossy(&body).into_owned()));
+
+            let mut stream = reader.into_inner();
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            );
+            let _ = stream.flush();
+            // Hold the connection open without sending a single chunk.
+            std::thread::sleep(hold);
+            // Then finish the way a real upstream does: a terminal choice, the
+            // `[DONE]` sentinel, then the terminating chunk. All three matter —
+            // a truncated body surfaces as a transport error, a missing
+            // sentinel as a malformed one, and a stream with no choice at all
+            // trips the "said nothing usable" guard. Any of those would mask
+            // what these tests measure, which is *when* the reader gave up
+            // rather than how it failed.
+            let completion = concat!(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let _ = stream.write_all(
+                format!("{:x}\r\n{completion}\r\n0\r\n\r\n", completion.len()).as_bytes(),
+            );
+            let _ = stream.flush();
+        });
+
+        Self { base_url, requests }
+    }
+
     pub(crate) fn binding(&self) -> String {
         format!("{UPSTREAM_SCHEME}{}", self.base_url)
     }
@@ -2279,6 +2387,7 @@ mod tests {
     #[derive(Default)]
     struct CapturedStream {
         content: Vec<String>,
+        refusals: Vec<String>,
         tool_calls: Vec<ToolCall>,
     }
 
@@ -2287,6 +2396,7 @@ mod tests {
             move |event| {
                 match event {
                     StreamEvent::Content(text) => self.content.push(text.to_owned()),
+                    StreamEvent::Refusal(text) => self.refusals.push(text.to_owned()),
                     StreamEvent::ToolCall(call) => self.tool_calls.push(call),
                 }
                 StreamControl::Continue
@@ -2302,6 +2412,7 @@ mod tests {
             move |event| {
                 match event {
                     StreamEvent::Content(text) => self.content.push(text.to_owned()),
+                    StreamEvent::Refusal(text) => self.refusals.push(text.to_owned()),
                     StreamEvent::ToolCall(call) => self.tool_calls.push(call),
                 }
                 if self.content.len() >= after {
@@ -3477,6 +3588,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_streamed_tool_call_finish_reason_with_no_call_is_refused() {
+        // The upstream said the generation stopped to call something and sent
+        // nothing to call. The terminal reason alone satisfies the
+        // "said something usable" guard, so this completed successfully with an
+        // empty call list — and an agent branching on the reason rather than on
+        // the list waits for a call that never arrives.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+            .expect_err("a promised tool call that never arrived is not a completed stream");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+    }
+
+    #[test]
+    fn a_streamed_refusal_reaches_the_sink_instead_of_vanishing() {
+        // The streaming counterpart of the buffered case below. `delta.refusal`
+        // was not read at all, so a `content_filter` stream carried no content,
+        // no tool call and no refusal — and because `finish_reason` alone
+        // counts as substance, it completed *successfully* as an empty
+        // assistant message. Exactly the silent-empty-answer failure the
+        // buffered path refuses.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"refusal":"I can't help with that."}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let outcome = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect("a refusal is a result, not a malformed response");
+
+        assert_eq!(
+            captured.refusals,
+            vec!["I can't help with that.".to_owned()],
+            "the refusal must reach the sink on its own arm"
+        );
+        assert!(
+            captured.content.is_empty(),
+            "a refusal is not assistant content and must not be folded into it"
+        );
+        assert_eq!(outcome.finish_reason.as_deref(), Some("content_filter"));
+    }
+
+    #[test]
+    fn a_streamed_non_string_refusal_is_a_malformed_frame() {
+        // Same rule as `delta.content`: reading it with `as_str` alone would
+        // report a structured refusal as absent, dropping it and completing the
+        // stream successfully.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"refusal":{"text":"no"}}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+            .expect_err("a structured refusal field is not a refusal string");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+    }
+
     /// A safety refusal is a result, and a distinguishable one.
     ///
     /// The structured shape is `content: null`, a non-empty `refusal`, and an
@@ -4167,6 +4364,62 @@ mod tests {
         fn is_live(&mut self) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn a_silent_upstream_still_notices_a_client_that_already_left() {
+        // The window the per-frame liveness probe could not close: the client
+        // leaves *before* the upstream's first frame, so there is no frame to
+        // probe on. A `read_line` on this thread parked here until the
+        // binding's whole `timeout_ms` — up to an hour — holding an admission
+        // permit the node only has a few dozen of.
+        let upstream = FakeUpstream::start_silent(Duration::from_secs(30));
+        // A 30s binding timeout, so "returned because it was cancelled" and
+        // "returned because the request timed out" cannot be confused.
+        let backend = runtime("coder", &format!("{}?timeout_ms=30000", upstream.binding()));
+
+        let started = std::time::Instant::now();
+        let mut sink = DepartedSink::default();
+        let outcome = backend.generate_streaming(&[b"go"], &mut sink);
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_ok(),
+            "an abandoned stream is not a failure, it is a stream nobody wanted: {outcome:?}"
+        );
+        assert_eq!(
+            sink.emitted, 0,
+            "a silent upstream produced nothing, so nothing should have been emitted"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the read must give up on a departed client within a poll interval or two, \
+             not hold the permit for the binding timeout; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_silent_upstream_is_not_abandoned_while_the_client_is_still_there() {
+        // The other half of the contract: the poll interval is not a deadline.
+        // A model that thinks for longer than one interval must not be treated
+        // as an abandoned request, or every slow generation would be cut off.
+        let upstream = FakeUpstream::start_silent(SSE_LIVENESS_POLL * 4);
+        let backend = runtime("coder", &format!("{}?timeout_ms=30000", upstream.binding()));
+
+        let started = std::time::Instant::now();
+        let mut captured = CapturedStream::default();
+        let outcome = backend.generate_streaming(&[b"go"], &mut captured.sink());
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_ok(),
+            "a quiet socket is not an error: {outcome:?}"
+        );
+        assert!(
+            elapsed >= SSE_LIVENESS_POLL * 3,
+            "a live consumer must keep waiting across poll intervals, not be cut off at the \
+             first one; took {elapsed:?}"
+        );
     }
 
     #[test]

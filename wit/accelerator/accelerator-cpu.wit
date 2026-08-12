@@ -1,10 +1,19 @@
-package tachyon:accelerator@2.0.0;
+package tachyon:accelerator@3.0.0;
 
-// Major, not minor, because `compute`, `embed`, `compute-stream` and
+// 3.0.0 adds a `refusal` case to `stream-event`. A new variant case is a
+// breaking change in the host→guest direction for the same reason the 2.0.0
+// reshape was: a component built against the smaller variant cannot decode a
+// case it has no arm for, and semver-compatible resolution would let it bind
+// anyway and fail at instantiation. The buffered `generation.refusal` had no
+// streaming counterpart, so a provider's safety refusal on `stream: true` was
+// dropped entirely — the stream completed, and the client saw an empty
+// assistant message with an ordinary finish.
+//
+// 2.0.0 was major, not minor, because `compute`, `embed`, `compute-stream` and
 // `token-stream.next` all changed shape: their error type became
-// `generation-error`, and `next` now yields a `stream-event` rather than a
+// `generation-error`, and `next` yields a `stream-event` rather than a
 // string. Wasmtime resolves an import by semver *compatible* name, so shipping
-// this as 1.2.0 would have let a component built against 1.1.0 bind to it and
+// that as 1.2.0 would have let a component built against 1.1.0 bind to it and
 // then fail instantiation with a structural type mismatch. A major bump makes
 // the break a clean unsatisfied import instead.
 //
@@ -66,6 +75,13 @@ interface cpu {
     variant stream-event {
         /// Decoded text for the assistant message.
         content(string),
+        /// A provider's structured safety refusal, on the same terms as
+        /// `generation.refusal`. Kept off the `content` arm because the OpenAI
+        /// stream protocol keeps `delta.refusal` off `delta.content`, and
+        /// flattening it either hands an agent "I can't help with that" as
+        /// data, or — as before this arm existed — drops it and completes the
+        /// stream as an empty successful answer.
+        refusal(string),
         /// A tool call, complete. Tool calls arrive on this arm rather than
         /// inside `content` so that offering tools costs nothing in
         /// time-to-first-token: a backend that had to smuggle calls through the

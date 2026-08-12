@@ -921,6 +921,17 @@ pub(crate) async fn handle_streaming_http_request(
 
     let (headers_tx, headers_rx) = tokio::sync::oneshot::channel::<(StatusCode, GuestHttpFields)>();
     let (chunks_tx, chunks_rx) = tokio::sync::mpsc::channel::<Bytes>(32);
+    // Cleared when axum drops the response body — the HTTP client hung up.
+    //
+    // The guest's own `token-stream` drop already reports a departed consumer,
+    // but only once the guest gets control back: while it is parked inside
+    // `next()` waiting on a silent upstream, nothing on that path can observe
+    // the disconnect. Handing the same flag to the accelerator sink is what
+    // lets the backend see it, so an upstream socket and its admission permit
+    // are released when the client leaves rather than when the binding times
+    // out.
+    let consumer_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let guest_consumer_alive = Arc::clone(&consumer_alive);
 
     std::thread::Builder::new()
         .name(format!("tachyon-streaming-{}", route.path))
@@ -956,6 +967,7 @@ pub(crate) async fn handle_streaming_http_request(
                 request,
                 headers_tx,
                 chunks_tx,
+                guest_consumer_alive,
                 &execution,
             );
         })
@@ -979,6 +991,7 @@ pub(crate) async fn handle_streaming_http_request(
     let body = GuestStreamingBody {
         receiver: chunks_rx,
         _completion_guard: Some(active_request_guard.into_response_guard()),
+        consumer_alive,
     };
 
     let mut response = Response::builder()

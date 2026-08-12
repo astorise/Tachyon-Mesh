@@ -556,6 +556,11 @@ pub(crate) struct ToolCall {
 /// the whole time-to-first-token.
 pub(crate) enum StreamEvent<'a> {
     Content(&'a str),
+    /// A provider's structured safety refusal, on the same terms as
+    /// [`UpstreamGeneration::refusal`] on the buffered path: distinct from
+    /// content, because folding it in hands an agent a refusal as data and
+    /// dropping it makes one indistinguishable from a model that said nothing.
+    Refusal(&'a str),
     ToolCall(ToolCall),
 }
 

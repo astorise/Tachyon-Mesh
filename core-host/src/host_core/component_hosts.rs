@@ -159,6 +159,8 @@ impl ComponentHostState {
             accelerator_models: HashMap::new(),
             #[cfg(feature = "ai-inference")]
             next_accelerator_model_id: 1,
+            #[cfg(feature = "ai-inference")]
+            streaming_consumer_alive: None,
             streaming_body: None,
         })
     }
@@ -427,7 +429,17 @@ impl ComponentHostState {
         // already reports a departed consumer, but only when there is something
         // to send; this is the same answer available *between* sends, which is
         // what a backend needs while it is waiting on a slow upstream.
-        let consumer_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        //
+        // Adopted from the HTTP response body when the guest is running on the
+        // streaming route, so a client that hangs up while the guest is parked
+        // inside `next()` is observed too. Nothing on the guest path can report
+        // that: the `token-stream` drop needs the guest to get control back
+        // first, and it does not until a frame arrives.
+        let consumer_alive = self
+            .streaming_consumer_alive
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(true)));
         let generation_alive = Arc::clone(&consumer_alive);
         let budget = Arc::new(StreamQueueBudget::default());
         let generation_budget = Arc::clone(&budget);
@@ -2374,6 +2386,7 @@ impl ai_inference::StreamSink for GuestStreamSink<'_> {
     fn emit(&mut self, event: ai_inference::StreamEvent<'_>) -> ai_inference::StreamControl {
         let payload = match event {
             ai_inference::StreamEvent::Content(text) => StreamPayload::Content(text.to_owned()),
+            ai_inference::StreamEvent::Refusal(text) => StreamPayload::Refusal(text.to_owned()),
             ai_inference::StreamEvent::ToolCall(call) => StreamPayload::ToolCall(call),
         };
         // Charged before the send and refunded when the guest takes the event,
@@ -2504,6 +2517,7 @@ enum SlotSend {
 #[cfg(feature = "ai-inference")]
 enum StreamPayload {
     Content(String),
+    Refusal(String),
     ToolCall(ai_inference::ToolCall),
 }
 
@@ -2514,7 +2528,7 @@ impl StreamPayload {
     /// scales with the model's output and the only part worth bounding.
     fn queued_bytes(&self) -> usize {
         match self {
-            Self::Content(text) => text.len(),
+            Self::Content(text) | Self::Refusal(text) => text.len(),
             Self::ToolCall(call) => {
                 call.name.len() + call.arguments.len() + call.id.as_ref().map_or(0, String::len)
             }
@@ -2709,6 +2723,11 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
         match received {
             Ok(Ok(StreamPayload::Content(text))) => Ok(Some(
                 accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Content(
+                    text,
+                ),
+            )),
+            Ok(Ok(StreamPayload::Refusal(text))) => Ok(Some(
+                accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Refusal(
                     text,
                 ),
             )),
@@ -3950,6 +3969,8 @@ impl component_bindings::tachyon::mesh::response_body::Host for ComponentHostSta
         let resource = HostStreamingResponseResource {
             headers_tx: Some(slot.headers_tx),
             chunk_tx: slot.chunk_tx,
+            #[cfg(feature = "ai-inference")]
+            consumer_alive: Arc::clone(&slot.consumer_alive),
         };
         let owned = self
             .table
