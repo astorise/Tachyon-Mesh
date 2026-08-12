@@ -123,6 +123,21 @@ jobs:
           fi
           echo "Using checkpoint $checkpoint"
           echo "TACHYON_QWEN35_MOE_NVFP4_DIR=$checkpoint" >> "$GITHUB_ENV"
+          # The ModelOpt probe reads a different name, and nothing set it — so
+          # that step ran a test that returned early, and the guard below could
+          # not tell: it proves a filter matches a test, not that the test did
+          # anything. The Qwen checkpoint *is* a ModelOpt/NVFP4 directory and
+          # the probe asserts only what any such directory must satisfy, so it
+          # is the default. A repository that keeps a separate probe checkpoint
+          # overrides it.
+          probe="${{ vars.TACHYON_MODEL_OPT_NVFP4_DIR }}"
+          probe="${probe:-$checkpoint}"
+          if [ ! -d "$probe" ]; then
+            echo "::error::TACHYON_MODEL_OPT_NVFP4_DIR is \`$probe\`, which is not a directory on this runner."
+            exit 1
+          fi
+          echo "Using ModelOpt probe checkpoint $probe"
+          echo "TACHYON_MODEL_OPT_NVFP4_DIR=$probe" >> "$GITHUB_ENV"
 
       # Every step below filters by test name, and `cargo test` exits 0 when a
       # filter matches nothing. Deleting the scalar runtime made four of these

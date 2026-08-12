@@ -107,7 +107,10 @@ file no test consumes.
 
 Runtime controls:
 
-- `TACHYON_MODEL_OPT_NVFP4_DIR`: generic ModelOpt parser probe.
+- `TACHYON_MODEL_OPT_NVFP4_DIR`: generic ModelOpt parser probe. In the `GPU
+  Acceptance` workflow it defaults to the Qwen checkpoint, which is a
+  ModelOpt/NVFP4 directory and satisfies everything the probe asserts; set the
+  repository variable only to point the probe at a different checkpoint.
 
 `TACHYON_QWEN35_MAX_DENSE_OPERATOR_BYTES` and `TACHYON_QWEN35_WORKING_SET_BYTES`
 bounded the scalar runtime's per-operator dequantization and its prepared-weight
