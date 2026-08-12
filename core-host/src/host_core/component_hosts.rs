@@ -154,6 +154,7 @@ impl ComponentHostState {
             accelerator_models: HashMap::new(),
             #[cfg(feature = "ai-inference")]
             next_accelerator_model_id: 1,
+            streaming_consumer_alive: None,
             streaming_body: None,
         })
     }
@@ -422,7 +423,11 @@ impl ComponentHostState {
         // already reports a departed consumer, but only when there is something
         // to send; this is the same answer available *between* sends, which is
         // what a backend needs while it is waiting on a slow upstream.
-        let consumer_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let consumer_alive = self
+            .streaming_consumer_alive
+            .as_ref()
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(true)));
         let generation_alive = Arc::clone(&consumer_alive);
         let budget = Arc::new(StreamQueueBudget::default());
         let generation_budget = Arc::clone(&budget);
@@ -3645,6 +3650,7 @@ impl component_bindings::tachyon::mesh::response_body::Host for ComponentHostSta
         let resource = HostStreamingResponseResource {
             headers_tx: Some(slot.headers_tx),
             chunk_tx: slot.chunk_tx,
+            consumer_alive: Arc::clone(&slot.consumer_alive),
         };
         let owned = self
             .table

@@ -1088,6 +1088,7 @@ pub(crate) fn execute_streaming_guest(
     request: GuestRequest,
     headers_tx: tokio::sync::oneshot::Sender<(StatusCode, GuestHttpFields)>,
     chunks_tx: tokio::sync::mpsc::Sender<Bytes>,
+    consumer_alive: Arc<std::sync::atomic::AtomicBool>,
     execution: &GuestExecutionContext,
 ) {
     let module_path = match resolve_guest_module_path(function_name) {
@@ -1123,6 +1124,7 @@ pub(crate) fn execute_streaming_guest(
         request,
         headers_tx,
         chunks_tx,
+        consumer_alive,
         execution,
     );
 }
@@ -1142,6 +1144,7 @@ pub(crate) fn execute_streaming_component_guest(
     request: GuestRequest,
     headers_tx: tokio::sync::oneshot::Sender<(StatusCode, GuestHttpFields)>,
     chunks_tx: tokio::sync::mpsc::Sender<Bytes>,
+    consumer_alive: Arc<std::sync::atomic::AtomicBool>,
     execution: &GuestExecutionContext,
 ) {
     let shape = route_scope_shape(route);
@@ -1284,7 +1287,9 @@ pub(crate) fn execute_streaming_component_guest(
     state.streaming_body = Some(HostStreamingBodySlot {
         headers_tx,
         chunk_tx: chunks_tx,
+        consumer_alive: Arc::clone(&consumer_alive),
     });
+    state.streaming_consumer_alive = Some(consumer_alive);
 
     let mut store = Store::new(engine, state);
     store.limiter(|s| &mut s.limits);
