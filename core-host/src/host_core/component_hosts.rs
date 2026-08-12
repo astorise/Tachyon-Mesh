@@ -202,6 +202,7 @@ impl ComponentHostState {
             let gpu = runtime.queue_tier_snapshot(ai_inference::AcceleratorKind::Gpu);
             let npu = runtime.queue_tier_snapshot(ai_inference::AcceleratorKind::Npu);
             let tpu = runtime.queue_tier_snapshot(ai_inference::AcceleratorKind::Tpu);
+            let network = runtime.queue_tier_snapshot(ai_inference::AcceleratorKind::Network);
             AcceleratorQueueLoads {
                 cpu_rt_load: cpu.realtime,
                 cpu_standard_load: cpu.standard,
@@ -215,6 +216,9 @@ impl ComponentHostState {
                 tpu_rt_load: tpu.realtime,
                 tpu_standard_load: tpu.standard,
                 tpu_batch_load: tpu.batch,
+                network_rt_load: network.realtime,
+                network_standard_load: network.standard,
+                network_batch_load: network.batch,
             }
         }
 
@@ -503,6 +507,9 @@ pub(crate) struct ControlPlaneSnapshot {
     pub(crate) tpu_rt_load: u32,
     pub(crate) tpu_standard_load: u32,
     pub(crate) tpu_batch_load: u32,
+    pub(crate) network_rt_load: u32,
+    pub(crate) network_standard_load: u32,
+    pub(crate) network_batch_load: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -519,6 +526,9 @@ pub(crate) struct AcceleratorQueueLoads {
     pub(crate) tpu_rt_load: u32,
     pub(crate) tpu_standard_load: u32,
     pub(crate) tpu_batch_load: u32,
+    pub(crate) network_rt_load: u32,
+    pub(crate) network_standard_load: u32,
+    pub(crate) network_batch_load: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -598,6 +608,9 @@ pub(crate) fn control_plane_snapshot(
         tpu_rt_load: queue_loads.tpu_rt_load,
         tpu_standard_load: queue_loads.tpu_standard_load,
         tpu_batch_load: queue_loads.tpu_batch_load,
+        network_rt_load: queue_loads.network_rt_load,
+        network_standard_load: queue_loads.network_standard_load,
+        network_batch_load: queue_loads.network_batch_load,
     }
 }
 
@@ -2653,6 +2666,9 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
             tpu_rt_load: control_plane.tpu_rt_load,
             tpu_standard_load: control_plane.tpu_standard_load,
             tpu_batch_load: control_plane.tpu_batch_load,
+            network_rt_load: control_plane.network_rt_load,
+            network_standard_load: control_plane.network_standard_load,
+            network_batch_load: control_plane.network_batch_load,
             hot_models,
             dropped_events,
             last_status,
@@ -2700,6 +2716,9 @@ impl control_plane_component_bindings::tachyon::mesh::telemetry_reader::Host
             tpu_rt_load: snapshot.tpu_rt_load,
             tpu_standard_load: snapshot.tpu_standard_load,
             tpu_batch_load: snapshot.tpu_batch_load,
+            network_rt_load: snapshot.network_rt_load,
+            network_standard_load: snapshot.network_standard_load,
+            network_batch_load: snapshot.network_batch_load,
             hot_models: snapshot.hot_models,
             dropped_events: snapshot.dropped_events,
             last_status: snapshot.last_status,
@@ -2745,6 +2764,9 @@ impl background_component_bindings::tachyon::mesh::telemetry_reader::Host for Co
             tpu_rt_load: snapshot.tpu_rt_load,
             tpu_standard_load: snapshot.tpu_standard_load,
             tpu_batch_load: snapshot.tpu_batch_load,
+            network_rt_load: snapshot.network_rt_load,
+            network_standard_load: snapshot.network_standard_load,
+            network_batch_load: snapshot.network_batch_load,
             hot_models: snapshot.hot_models,
             dropped_events: snapshot.dropped_events,
             last_status: snapshot.last_status,
