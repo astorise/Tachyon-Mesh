@@ -1546,14 +1546,26 @@ impl UpstreamOpenAiRuntime {
         // `abandoned` keeps its own exemption: nobody is left to receive the
         // calls, so there is nothing to be premature about.
         if !abandoned && saw_done {
-            for call in
-                streamed_tool_calls
-                    .finish()
-                    .map_err(|detail| UpstreamError::MalformedResponse {
-                        alias: self.alias.clone(),
-                        detail,
-                    })?
-            {
+            let calls = streamed_tool_calls.finish().map_err(|detail| {
+                UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail,
+                }
+            })?;
+            // The upstream said the generation stopped to call something, and
+            // sent nothing to call. `saw_result` is satisfied by the finish
+            // reason alone, so the stream completed successfully with an empty
+            // `tool_calls` list — and an agent that branches on the reason
+            // rather than on the list waits for a call that will never arrive,
+            // or dispatches an empty one.
+            if finish_reason.as_deref() == Some("tool_calls") && calls.is_empty() {
+                return Err(UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail: "upstream reported `finish_reason: tool_calls` without a tool call"
+                        .to_owned(),
+                });
+            }
+            for call in calls {
                 if sink.emit(StreamEvent::ToolCall(call)).is_stop() {
                     abandoned = true;
                     break;
@@ -3574,6 +3586,30 @@ mod tests {
                 arguments: "{\"path\":\"a.rs\"}".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn a_streamed_tool_call_finish_reason_with_no_call_is_refused() {
+        // The upstream said the generation stopped to call something and sent
+        // nothing to call. The terminal reason alone satisfies the
+        // "said something usable" guard, so this completed successfully with an
+        // empty call list — and an agent branching on the reason rather than on
+        // the list waits for a call that never arrives.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+            .expect_err("a promised tool call that never arrived is not a completed stream");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
     }
 
     #[test]
