@@ -365,6 +365,11 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     let incoming_dir = models_dir().join(format!(".incoming-{upload_id}"));
     let backup_dir = models_dir().join(format!(".replaced-{upload_id}"));
     let _ = fs::remove_dir_all(&incoming_dir);
+    // Held from before the first rename until after publication or rollback,
+    // so the ownership check below and the deletion it guards cannot be split
+    // by a second commit for this alias. Released on drop, including on every
+    // early return between here and the end of the function.
+    let _commit_lock = AliasCommitLock::acquire(&alias)?;
     reconcile_interrupted_commit(&model_dir, &backup_dir, &upload_id)?;
     fs::create_dir_all(&incoming_dir)
         .map_err(|error| format!("failed to create the staging model directory: {error}"))?;
@@ -500,6 +505,77 @@ fn reclaim_discarded_backups() {
         {
             let _ = fs::remove_dir_all(entry.path());
         }
+    }
+}
+
+/// How long a commit lock may sit untouched before a later commit takes it.
+///
+/// Generous on purpose: a commit unpacks and hashes a multi-gigabyte archive
+/// while holding this, so a limit tuned for a small upload would let a slow but
+/// healthy one be stolen from underneath itself. The only thing this bounds is
+/// how long an alias stays wedged after a crash.
+const ALIAS_LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Serializes the install / publish / rollback sequence for one alias.
+///
+/// Every step of that sequence is atomic on its own, and the sequence is not:
+/// the rollback checks that the live directory still carries this upload's id
+/// and *then* deletes it. Between those two operations a second commit for the
+/// same alias can rename ours aside and install its own — so the rollback
+/// deleted a checkpoint whose caller had been told it installed, restored a
+/// predecessor over it, and the second commit went on to publish successfully
+/// for files that no longer existed. No arrangement of individually-atomic
+/// filesystem calls closes that; only holding the alias does.
+///
+/// The lock is a file created with `create_new`, which is atomic, and released
+/// on drop — including on every `?` and every early return in the commit path.
+#[derive(Debug)]
+struct AliasCommitLock {
+    path: PathBuf,
+}
+
+impl AliasCommitLock {
+    fn acquire(alias: &str) -> Result<Self, String> {
+        let path = models_dir().join(format!(".commit-{alias}.lock"));
+        for _ in 0..2 {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(_) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Held. Either by a commit still running — in which case
+                    // refusing is the whole point — or by one that died, in
+                    // which case the alias must not stay wedged forever.
+                    let held_for = fs::metadata(&path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|at| std::time::SystemTime::now().duration_since(at).ok());
+                    if !held_for.is_some_and(|age| age >= ALIAS_LOCK_STALE_AFTER) {
+                        return Err(format!(
+                            "another commit for model `{alias}` is in progress; retry once it \
+                             finishes"
+                        ));
+                    }
+                    // Taken over rather than removed and assumed: the retry
+                    // below goes through `create_new` again, so two processes
+                    // reclaiming the same stale lock cannot both win.
+                    let _ = fs::remove_file(&path);
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "failed to take the commit lock for model `{alias}`: {error}"
+                    ))
+                }
+            }
+        }
+        Err(format!(
+            "could not take the commit lock for model `{alias}`: it was reclaimed by another \
+             commit"
+        ))
+    }
+}
+
+impl Drop for AliasCommitLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -1200,6 +1276,46 @@ mod tests {
             "a published upload must survive a retry"
         );
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two commits for one alias must not interleave.
+    ///
+    /// Every filesystem step in the install sequence is atomic on its own, and
+    /// the sequence is not: the rollback checks the live directory still
+    /// carries this upload's id and *then* deletes it. A second commit landing
+    /// between those two operations had its published checkpoint deleted by
+    /// the first one's rollback.
+    #[test]
+    fn a_commit_lock_excludes_a_second_commit_for_the_same_alias() {
+        let root = std::env::temp_dir().join(format!(
+            "tachyon-broker-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after the epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("fixture dir");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("enter fixture");
+        fs::create_dir_all(models_dir()).expect("models dir");
+
+        let held = AliasCommitLock::acquire("coder").expect("a free alias locks");
+        let denied = AliasCommitLock::acquire("coder")
+            .expect_err("a second commit for the same alias must wait, not interleave");
+        assert!(denied.contains("in progress"), "{denied}");
+
+        // A different alias is unaffected: the lock is per alias, not global.
+        let other = AliasCommitLock::acquire("embedder").expect("an unrelated alias is free");
+        drop(other);
+
+        // Released on drop, including on the early returns the commit path is
+        // full of.
+        drop(held);
+        AliasCommitLock::acquire("coder").expect("the alias frees when the commit ends");
+
+        std::env::set_current_dir(previous).expect("restore cwd");
         let _ = fs::remove_dir_all(&root);
     }
 

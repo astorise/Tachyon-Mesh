@@ -899,9 +899,11 @@ impl UpstreamOpenAiRuntime {
                 json_type_name(usage)
             ));
         }
-        let field = |name: &str| -> Result<u32, String> {
+        // `None` for absent, so a counter the upstream did not report stays
+        // distinguishable from one it reported as zero.
+        let field = |name: &str| -> Result<Option<u32>, String> {
             match usage.get(name) {
-                None | Some(Value::Null) => Ok(0),
+                None | Some(Value::Null) => Ok(None),
                 Some(value) => {
                     let count = value.as_u64().ok_or_else(|| {
                         format!(
@@ -909,7 +911,7 @@ impl UpstreamOpenAiRuntime {
                             json_type_name(value)
                         )
                     })?;
-                    u32::try_from(count).map_err(|_| {
+                    u32::try_from(count).map(Some).map_err(|_| {
                         format!("`usage.{name}` is {count}, beyond the range a token count carries")
                     })
                 }
@@ -917,6 +919,16 @@ impl UpstreamOpenAiRuntime {
         };
         let prompt_tokens = field("prompt_tokens")?;
         let completion_tokens = field("completion_tokens")?;
+        // Both or neither. Defaulting a missing counter to zero published an
+        // authoritative "0 prompt tokens" next to a real completion count —
+        // a figure that reaches the client's usage object and the node's
+        // billing telemetry as though it had been measured. A half-reported
+        // usage object says less than no usage object at all, and the caller
+        // already renders absent usage as unmeasured rather than as free.
+        let (Some(prompt_tokens), Some(completion_tokens)) = (prompt_tokens, completion_tokens)
+        else {
+            return Ok(None);
+        };
         if prompt_tokens == 0 && completion_tokens == 0 {
             return Ok(None);
         }
@@ -1197,13 +1209,18 @@ impl UpstreamOpenAiRuntime {
         let mut lines = SseLineReader::spawn(reader, slot);
         let mut line = String::new();
         let mut saw_done = false;
-        // Whether the upstream ever sent a choice. A stream of nothing but
-        // `[DONE]` — or keep-alives and a usage frame before it — parsed
-        // cleanly and returned success, so the guest turned a provider that
-        // said nothing at all into an empty assistant message with a clean
-        // `stop`. That is the same silent-empty-answer failure the buffered
-        // path refuses, on the other route.
-        let mut saw_choice = false;
+        // Whether the upstream ever sent anything a caller can use: content, a
+        // tool call, or a terminal reason. A stream of nothing but `[DONE]` —
+        // or keep-alives and a usage frame before it — parsed cleanly and
+        // returned success, so the guest turned a provider that said nothing at
+        // all into an empty assistant message with a clean `stop`. That is the
+        // same silent-empty-answer failure the buffered path refuses.
+        //
+        // Tracked on *substance*, not on the presence of a choice: an opening
+        // `{"delta":{"role":"assistant"}}` frame is structurally a choice and
+        // carries no result, so counting choices let the ordinary role-only
+        // preamble followed by `[DONE]` slip past the guard it was written for.
+        let mut saw_result = false;
         let mut usage = None;
         let mut finish_reason = None;
         // Set when the sink asks to stop — the client went away. The read loop
@@ -1344,10 +1361,7 @@ impl UpstreamOpenAiRuntime {
             // completed the stream on an ordinary `stop`.
             let choice = match choices.and_then(|choices| choices.first()) {
                 None => None,
-                Some(choice) if choice.is_object() => {
-                    saw_choice = true;
-                    Some(choice)
-                }
+                Some(choice) if choice.is_object() => Some(choice),
                 Some(other) => {
                     return Err(UpstreamError::MalformedResponse {
                         alias: self.alias.clone(),
@@ -1385,6 +1399,7 @@ impl UpstreamOpenAiRuntime {
                         ),
                     });
                 }
+                saw_result = true;
                 finish_reason = Some(reported);
             }
             // The same rule one level up: a frame legitimately carries no
@@ -1416,9 +1431,12 @@ impl UpstreamOpenAiRuntime {
             match delta.get("content") {
                 None | Some(Value::Null) => {}
                 Some(Value::String(content)) => {
-                    if !content.is_empty() && sink.emit(StreamEvent::Content(content)).is_stop() {
-                        abandoned = true;
-                        break;
+                    if !content.is_empty() {
+                        saw_result = true;
+                        if sink.emit(StreamEvent::Content(content)).is_stop() {
+                            abandoned = true;
+                            break;
+                        }
                     }
                 }
                 Some(other) => {
@@ -1455,6 +1473,7 @@ impl UpstreamOpenAiRuntime {
                                 json_type_name(fragments)
                             ),
                         })?;
+                saw_result = true;
                 for fragment in fragments {
                     streamed_tool_calls.absorb(fragment).map_err(|detail| {
                         UpstreamError::MalformedResponse {
@@ -1471,6 +1490,7 @@ impl UpstreamOpenAiRuntime {
                 .get("function_call")
                 .filter(|value| !is_empty_json(value))
             {
+                saw_result = true;
                 streamed_tool_calls
                     .absorb_legacy(legacy)
                     .map_err(|detail| UpstreamError::MalformedResponse {
@@ -1516,10 +1536,11 @@ impl UpstreamOpenAiRuntime {
         // A sentinel with nothing before it is not a completed generation
         // either. Same exemption for an abandoned stream, and the same reason:
         // nobody is left to be told.
-        if saw_done && !saw_choice && !abandoned {
+        if saw_done && !saw_result && !abandoned {
             return Err(UpstreamError::MalformedResponse {
                 alias: self.alias.clone(),
-                detail: "upstream stream ended at `[DONE]` without sending a single choice"
+                detail: "upstream stream ended at `[DONE]` without sending any content, tool call \
+                         or finish reason"
                     .to_owned(),
             });
         }
@@ -1736,11 +1757,11 @@ fn tool_calls_from_value(alias: &str, tool_calls: &Value) -> Result<Vec<ToolCall
                 }
             }
             Ok(ToolCall {
-                id: call
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned),
+                id: tool_call_id(call.get("id")).map_err(|detail| {
+                    malformed(format!(
+                        "`choices[0].message.tool_calls[{index}]`: {detail}"
+                    ))
+                })?,
                 name: name.to_owned(),
                 arguments: arguments.to_owned(),
             })
@@ -1777,6 +1798,26 @@ fn json_type_name(value: &Value) -> &'static str {
         Value::String(_) => "a string",
         Value::Array(_) => "an array",
         Value::Object(_) => "an object",
+    }
+}
+
+/// A tool call's `id`, or why it cannot be carried.
+///
+/// `Ok(None)` only for genuinely absent, null or empty — the shapes that mean
+/// "this provider mints no ids", where the guest is right to synthesize one.
+/// A *present* non-string is neither: `and_then(Value::as_str)` read `"id": 42`
+/// as absent, so the guest minted an id the provider had never issued, and a
+/// tool-result turn echoing it back could not be correlated with the call it
+/// answered — an agentic conversation that silently loses its thread.
+fn tool_call_id(id: Option<&Value>) -> Result<Option<String>, String> {
+    match id {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(id)) if id.is_empty() => Ok(None),
+        Some(Value::String(id)) => Ok(Some(id.clone())),
+        Some(other) => Err(format!(
+            "tool-call `id` is {}, expected a string",
+            json_type_name(other)
+        )),
     }
 }
 
@@ -1918,10 +1959,8 @@ impl StreamedToolCalls {
         // the caller dispatched a call that never existed: one function's name
         // with another's arguments, echoed back under an id the upstream never
         // paired with them.
-        if let Some(id) = fragment
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
+        if let Some(id) = tool_call_id(fragment.get("id"))
+            .map_err(|detail| format!("streamed tool call at index {index}: {detail}"))?
         {
             if !slot.id.is_empty() && slot.id != id {
                 return Err(format!(
@@ -1929,7 +1968,7 @@ impl StreamedToolCalls {
                     slot.id
                 ));
             }
-            slot.id = id.to_owned();
+            slot.id = id;
         }
         let function = fragment.get("function");
         if let Some(name) = function
@@ -3509,12 +3548,64 @@ mod tests {
             .expect_err("a sentinel with nothing before it is not a completed generation");
         assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
         assert!(
-            error
-                .to_string()
-                .contains("without sending a single choice"),
+            error.to_string().contains("without sending any content"),
             "{error}"
         );
         assert!(captured.content.is_empty());
+
+        // A role-only opening delta is structurally a choice and carries no
+        // result, so a guard counting *choices* let the ordinary preamble
+        // followed by the sentinel slip straight through it.
+        let preamble = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let mut captured = CapturedStream::default();
+        let error = runtime("coder", &preamble.binding())
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("an opening frame is not an answer");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(captured.content.is_empty());
+
+        // And the ordinary shape still completes: a preamble, then substance.
+        let real = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let mut captured = CapturedStream::default();
+        runtime("coder", &real.binding())
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect("a preamble followed by content is an ordinary stream");
+        assert_eq!(captured.content.concat(), "hi");
+
+        // A finish reason alone counts too: an upstream that stops on a filter
+        // said what happened, and that is a result rather than silence.
+        let filtered = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let mut captured = CapturedStream::default();
+        let outcome = runtime("coder", &filtered.binding())
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect("a terminal reason is a result");
+        assert_eq!(outcome.finish_reason.as_deref(), Some("content_filter"));
     }
 
     #[test]
