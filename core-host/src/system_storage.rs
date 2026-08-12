@@ -52,6 +52,7 @@ const AI_MODELS_REGISTRY_TABLE: &str = "ai-models-registry";
 /// Upload-owned rows displaced by a non-dynamic manifest binding. A configured
 /// alias executes the manifest backend while present, but the upload remains
 /// on disk and must become discoverable again when that ownership ends.
+#[cfg(feature = "ai-inference")]
 const AI_MODELS_SHADOWED_UPLOADS_TABLE: &str = "ai-models-shadowed-uploads";
 
 struct ComponentRequest {
