@@ -179,12 +179,14 @@ impl Qwen35MoeRuntime {
         // picks the packed CPU operator even on a CUDA device, which answers
         // with the same tokens off the wrong hardware. That silent descent is
         // the whole thing a `gpu` route exists to rule out.
+        // Whether the CUDA route resolved to the native kernel. Read once,
+        // here, so the telemetry label below reports what ran rather than what
+        // was asked for.
+        let native_fp4 = Nvfp4KernelAvailability::detect() == Nvfp4KernelAvailability::Reachable;
         let device = match route {
             Qwen35Route::Host => Device::Cpu,
             Qwen35Route::Cuda => {
-                if Nvfp4KernelAvailability::detect() != Nvfp4KernelAvailability::Reachable
-                    && !dequantized_fallback_opted_in()
-                {
+                if !native_fp4 && !dequantized_fallback_opted_in() {
                     bail!(
                         "candle reports no usable NVFP4 kernel on this host: build with the \
                          `candle-cuda` feature and run where there is a CUDA device, or set \
@@ -197,7 +199,14 @@ impl Qwen35MoeRuntime {
             }
         };
         let executed_on = match route {
-            Qwen35Route::Cuda => "gpu_native_fp4",
+            // Named from what the branch above actually resolved, not from the
+            // route alone. A CUDA route only reaches here two ways: the kernel
+            // is reachable, or the operator opted into the dequantized
+            // fallback because it is not — and reporting the second as
+            // `gpu_native_fp4` told telemetry a native-kernel execution had
+            // happened when the whole point of the fallback is that it cannot.
+            Qwen35Route::Cuda if native_fp4 => "gpu_native_fp4",
+            Qwen35Route::Cuda => "gpu_dequantized_fallback",
             // Packed on the host since candle #3857: the checkpoint's own
             // footprint rather than eight times it, decoded per row during the
             // forward pass.
@@ -521,9 +530,16 @@ impl Qwen35MoeRuntime {
                         let content = match &message.content {
                             Value::Null => String::new(),
                             Value::String(text) => text.clone(),
-                            _ => bail!(
-                                "Qwen 3.5 text runtime does not support image or structured message content"
-                            ),
+                            // Typed, like the malformed-JSON and empty-prompt
+                            // refusals beside it. A bare `bail!` leaves
+                            // `invalid_request` false, so unsupported *caller*
+                            // input reached the client as a retryable 500 and
+                            // an agent retried a request that can never be
+                            // accepted.
+                            _ => return Err(invalid_request(
+                                &self.alias,
+                                "this Qwen 3.5 text runtime does not support image or structured message content",
+                            )),
                         };
                         Ok(ChatTurn {
                             role: message.role,
@@ -802,6 +818,26 @@ mod tests {
             "mtp_num_hidden_layers": 0
         }))
         .expect("fixture config should deserialize")
+    }
+
+    /// The CUDA route has two outcomes, and telemetry has to name which one.
+    ///
+    /// A binding only reaches the dequantized fallback because the native
+    /// kernel is *not* reachable, so labelling that execution `gpu_native_fp4`
+    /// told telemetry a native-kernel run had happened when the whole premise
+    /// of the fallback is that it could not.
+    #[test]
+    fn the_execution_label_names_the_route_that_actually_ran() {
+        let label = |route: Qwen35Route, native_fp4: bool| match route {
+            Qwen35Route::Cuda if native_fp4 => "gpu_native_fp4",
+            Qwen35Route::Cuda => "gpu_dequantized_fallback",
+            Qwen35Route::Host => "cpu_packed_fp4",
+        };
+        assert_eq!(label(Qwen35Route::Cuda, true), "gpu_native_fp4");
+        assert_eq!(label(Qwen35Route::Cuda, false), "gpu_dequantized_fallback");
+        // The host route is packed either way — it never had two outcomes.
+        assert_eq!(label(Qwen35Route::Host, true), "cpu_packed_fp4");
+        assert_eq!(label(Qwen35Route::Host, false), "cpu_packed_fp4");
     }
 
     /// A request the caller malformed is the caller's to fix.

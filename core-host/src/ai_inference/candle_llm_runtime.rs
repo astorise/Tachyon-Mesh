@@ -4980,7 +4980,23 @@ impl CandleLlmRuntime {
                 });
             }
             Some(_) => {}
-            None => request.max_new_tokens = request.max_new_tokens.min(headroom.max(1)),
+            // A prompt that fills the window leaves nothing to clamp *to*, and
+            // `.max(1)` invented a token the window cannot hold: the same
+            // prompt with an explicit budget of 1 is refused one arm above,
+            // while omitting the budget quietly generated past the declared
+            // prompt-plus-completion limit. Clamping is only honest while there
+            // is room to clamp into.
+            None if headroom == 0 => {
+                return Err(CandleLlmError::InvalidRequest {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "prompt is {} tokens, which fills this checkpoint's {}-token context window and leaves no room to generate",
+                        encoded.len(),
+                        self.limits.max_position_embeddings,
+                    ),
+                });
+            }
+            None => request.max_new_tokens = request.max_new_tokens.min(headroom),
         }
 
         Ok(request)

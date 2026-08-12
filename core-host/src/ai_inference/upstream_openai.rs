@@ -1197,6 +1197,13 @@ impl UpstreamOpenAiRuntime {
         let mut lines = SseLineReader::spawn(reader, slot);
         let mut line = String::new();
         let mut saw_done = false;
+        // Whether the upstream ever sent a choice. A stream of nothing but
+        // `[DONE]` — or keep-alives and a usage frame before it — parsed
+        // cleanly and returned success, so the guest turned a provider that
+        // said nothing at all into an empty assistant message with a clean
+        // `stop`. That is the same silent-empty-answer failure the buffered
+        // path refuses, on the other route.
+        let mut saw_choice = false;
         let mut usage = None;
         let mut finish_reason = None;
         // Set when the sink asks to stop — the client went away. The read loop
@@ -1337,7 +1344,10 @@ impl UpstreamOpenAiRuntime {
             // completed the stream on an ordinary `stop`.
             let choice = match choices.and_then(|choices| choices.first()) {
                 None => None,
-                Some(choice) if choice.is_object() => Some(choice),
+                Some(choice) if choice.is_object() => {
+                    saw_choice = true;
+                    Some(choice)
+                }
                 Some(other) => {
                     return Err(UpstreamError::MalformedResponse {
                         alias: self.alias.clone(),
@@ -1503,6 +1513,16 @@ impl UpstreamOpenAiRuntime {
         // An abandoned stream is exempt: nobody is left to receive the answer,
         // so stopping short is the intended outcome rather than a truncation to
         // report.
+        // A sentinel with nothing before it is not a completed generation
+        // either. Same exemption for an abandoned stream, and the same reason:
+        // nobody is left to be told.
+        if saw_done && !saw_choice && !abandoned {
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: "upstream stream ended at `[DONE]` without sending a single choice"
+                    .to_owned(),
+            });
+        }
         if !saw_done && !abandoned {
             return Err(UpstreamError::MalformedResponse {
                 alias: self.alias.clone(),
@@ -3464,6 +3484,37 @@ mod tests {
             .generate(&[b"go"])
             .expect_err("a structured refusal field is not a refusal string");
         assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+    }
+
+    #[test]
+    fn a_stream_that_only_says_done_is_not_a_generation() {
+        // Keep-alives and a usage frame followed by the sentinel parse
+        // perfectly and used to return success, so the guest turned a provider
+        // that said nothing at all into an empty assistant message with a
+        // clean `stop` — the same silent-empty-answer failure the buffered
+        // path refuses, on the other route.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                ": keep-alive\n\n",
+                r#"data: {"usage":{"prompt_tokens":3,"completion_tokens":0}}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let mut captured = CapturedStream::default();
+        let error = runtime("coder", &upstream.binding())
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("a sentinel with nothing before it is not a completed generation");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("without sending a single choice"),
+            "{error}"
+        );
+        assert!(captured.content.is_empty());
     }
 
     #[test]
