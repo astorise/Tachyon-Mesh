@@ -2054,7 +2054,13 @@ mod tests {
         );
         assert_eq!(
             format!(
-                "{streamed}{separator}{post_separator}{}",
+                "{streamed}{}{}{}",
+                (!held_parsed.content.is_empty())
+                    .then_some(separator)
+                    .unwrap_or_default(),
+                (!held_parsed.content.is_empty())
+                    .then_some(post_separator)
+                    .unwrap_or_default(),
                 held_parsed.content
             ),
             parsed.content,
