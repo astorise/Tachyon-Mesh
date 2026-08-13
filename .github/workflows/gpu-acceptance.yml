@@ -45,11 +45,36 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # `candle-kernels` compiles for whatever architecture `cudaforge` detects,
+      # and `CUDA_COMPUTE_CAP` is what it reads before falling back to
+      # `nvidia-smi`. Pinned here so the build is a function of this runner's
+      # device rather than of whatever was visible when the build ran.
+      #
+      # It also goes into the cache key, and that is the part that matters. The
+      # key was the toolchain and the lockfiles — nothing about the GPU — so
+      # artifacts built against one architecture restored cleanly onto another
+      # and then failed at the first launch with `CUDA_ERROR_NOT_FOUND`: the
+      # fatbin carries no code for kernels the source guards on the
+      # architecture, and candle guards its FP8 casts on `__CUDA_ARCH__ >= 800`.
+      # `cuda-quality` compiles and lints without ever launching a kernel, so it
+      # could neither notice nor be hurt by this.
+      - name: Pin the build to this runner's device
+        run: |
+          cap="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d ' .')"
+          if [ -z "$cap" ]; then
+            echo "::error::nvidia-smi reported no compute capability; this job needs a CUDA device."
+            exit 1
+          fi
+          echo "Building for compute capability $cap"
+          echo "CUDA_COMPUTE_CAP=$cap" >> "$GITHUB_ENV"
+
       - uses: Swatinem/rust-cache@v2
         with:
-          # Shared with `cuda-quality`: the CUDA dependency build is the
-          # expensive part and it is byte-identical between the two.
-          shared-key: cuda-quality
+          # Was `cuda-quality`, shared with that job because the CUDA dependency
+          # build is the expensive part. It is only byte-identical while both
+          # run on the same architecture, which nothing enforced — hence the
+          # suffix.
+          shared-key: cuda-quality-sm${{ env.CUDA_COMPUTE_CAP }}
           cache-on-failure: true
 
       - name: Put CUDA toolkit on PATH
