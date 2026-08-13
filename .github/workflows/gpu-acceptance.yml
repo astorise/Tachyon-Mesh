@@ -164,6 +164,7 @@ jobs:
             --features candle-cuda -- --list > /tmp/gated-tests.txt
           missing=0
           for filter in \
+            the_nvfp4_kernel_multiplies_on_a_real_device \
             fixture_cuda_route_runs_the_kernel_or_refuses_to_load \
             gated_prefill_spanning_several_chunks_is_reproducible \
             qwen35_upstream::tests::gated_ \
@@ -179,6 +180,18 @@ jobs:
             fi
           done
           exit "$missing"
+
+      # Ordered before the model: one operator, one token, straight into the
+      # kernel. When the step below fails, this is what says whether the kernel
+      # module is usable on this device at all — candle reports availability
+      # from "the crate has its CUDA feature and a device exists", which a build
+      # whose cubin carries no code for this compute capability also satisfies.
+      - name: NVFP4 kernel probe
+        run: |
+          nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv || true
+          cargo test -p core-host --bin core-host \
+            --features candle-cuda \
+            the_nvfp4_kernel_multiplies_on_a_real_device -- --nocapture
 
       # The proof that needs the device and not the weights, so it runs on every
       # dispatch: `auto_linear` hands back the packed *CPU* operator on a CUDA

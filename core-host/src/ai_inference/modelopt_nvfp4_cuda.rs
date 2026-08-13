@@ -182,3 +182,58 @@ impl Nvfp4CudaBackend {
         .map_err(|error| anyhow!("NVFP4 CUDA batched linear failed: {error}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::NVFP4_BLOCK_SIZE;
+    use super::*;
+
+    /// The smallest possible proof that the NVFP4 kernel is real.
+    ///
+    /// `Nvfp4KernelAvailability::detect()` answers from
+    /// `candle_nvfp4_kernels::is_available()`, which reports whether the crate
+    /// was compiled with its `cuda` feature and a device is present. Neither
+    /// says the kernel module can be *loaded*: a build whose cubin carries no
+    /// code for the runner's compute capability answers `Reachable` and then
+    /// fails at the first launch with `CUDA_ERROR_NOT_FOUND`.
+    ///
+    /// That gap is not theoretical — it is what the Qwen fixture hit on the GPU
+    /// runner, inside candle's model construction, where the error names a
+    /// layer rather than a kernel. This calls the entry point directly with one
+    /// operator and one token, so a failure separates "the kernel module is not
+    /// usable on this device" from "candle cannot build this model".
+    #[test]
+    fn the_nvfp4_kernel_multiplies_on_a_real_device() {
+        if candle_core::Device::new_cuda(0).is_err() {
+            eprintln!("skipping NVFP4 kernel probe: no CUDA device");
+            return;
+        }
+        if !Nvfp4CudaBackend::is_available() {
+            eprintln!("skipping NVFP4 kernel probe: candle reports the kernel unavailable");
+            return;
+        }
+
+        const ROWS: usize = 16;
+        const COLS: usize = 32;
+        // Both nibbles are E2M1 code 2, which is 1.0, and every block scale is
+        // E4M3 1.0 — so the dequantized weight is all ones and each output is
+        // the sum of the inputs. A kernel that ran but computed nothing would
+        // answer zeros and be caught here rather than reported as a pass.
+        let packed = vec![0x22u8; ROWS * COLS / 2];
+        let scales = vec![0x38u8; ROWS * COLS / NVFP4_BLOCK_SIZE];
+        let inputs = vec![1.0f32; COLS];
+
+        let output = Nvfp4CudaBackend::linear_f32_host_batched(
+            &inputs, &packed, &scales, 1.0, ROWS, COLS, 1,
+        )
+        .expect("the NVFP4 kernel must run on a device candle reports as available");
+
+        assert_eq!(output.len(), ROWS);
+        for value in output {
+            assert!(
+                (value - COLS as f32).abs() < 1e-3,
+                "each row sums the inputs against a weight of ones: expected {COLS}, got {value}"
+            );
+        }
+    }
+}
