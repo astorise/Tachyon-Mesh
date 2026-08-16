@@ -2,7 +2,7 @@
 
 use super::{
     execute_route_with_middleware_inner, ResiliencyConfig, RouteExecutionResult, RouteInvocation,
-    RouteServiceError,
+    RouteResponseBody, RouteServiceError,
 };
 use axum::http::StatusCode;
 use std::{collections::BTreeSet, future, time::Duration};
@@ -52,8 +52,14 @@ where
         result: &mut Result<RouteExecutionResult, E>,
     ) -> Option<Self::Future> {
         match result {
+            // A streaming response has already sent bytes to the client by the
+            // time it reaches this policy; re-driving the invocation would
+            // duplicate whatever the client already received. Only a
+            // buffered response, whose body has not left the host yet, is
+            // eligible for a status-based retry.
             Ok(response)
                 if self.remaining_retries > 0
+                    && matches!(response.response.body, RouteResponseBody::Buffered(_))
                     && self.should_retry_status(response.response.status) =>
             {
                 self.remaining_retries -= 1;
@@ -161,7 +167,20 @@ mod tests {
             response: super::super::GuestHttpResponse {
                 status,
                 headers: Vec::new(),
-                body: Bytes::from(body.to_owned()),
+                body: RouteResponseBody::Buffered(Bytes::from(body.to_owned())),
+                trailers: Vec::new(),
+            },
+            fuel_consumed: None,
+            completion_guard: None,
+        }
+    }
+
+    fn streaming_response(status: StatusCode, body: &'static str) -> RouteExecutionResult {
+        RouteExecutionResult {
+            response: super::super::GuestHttpResponse {
+                status,
+                headers: Vec::new(),
+                body: RouteResponseBody::Streaming(axum::body::Body::from(body)),
                 trailers: Vec::new(),
             },
             fuel_consumed: None,
@@ -200,6 +219,64 @@ mod tests {
 
         assert_eq!(result.response.status, StatusCode::OK);
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_a_streaming_response_but_still_retries_a_buffered_one() {
+        // Streaming: the retriable status is on a response whose body is
+        // already a live stream, so a single attempt must be made and the
+        // retriable status must be returned as-is rather than re-driven.
+        let stream_attempts = Arc::new(AtomicUsize::new(0));
+        let stream_service = service_fn({
+            let attempts = Arc::clone(&stream_attempts);
+            move |_: ()| {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(streaming_response(StatusCode::SERVICE_UNAVAILABLE, "retry"))
+                }
+            }
+        });
+        let config = ResiliencyConfig {
+            timeout_ms: None,
+            retry_policy: Some(super::super::RetryPolicy {
+                max_retries: 5,
+                retry_on: vec![503],
+            }),
+        };
+
+        let result = call_with_resiliency(stream_service, (), "/api/stream", Some(&config))
+            .await
+            .expect("streaming service call should still return its response");
+
+        assert_eq!(result.response.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stream_attempts.load(Ordering::SeqCst), 1);
+
+        // Buffered: the same retriable status on a buffered body is still
+        // re-driven until it succeeds, proving the streaming case above is
+        // not just a broken retry policy.
+        let buffered_attempts = Arc::new(AtomicUsize::new(0));
+        let buffered_service = service_fn({
+            let attempts = Arc::clone(&buffered_attempts);
+            move |_: ()| {
+                let attempts = Arc::clone(&attempts);
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt < 2 {
+                        Ok(response(StatusCode::SERVICE_UNAVAILABLE, "retry"))
+                    } else {
+                        Ok(response(StatusCode::OK, "ok"))
+                    }
+                }
+            }
+        });
+
+        let result = call_with_resiliency(buffered_service, (), "/api/buffered", Some(&config))
+            .await
+            .expect("buffered service should eventually succeed");
+
+        assert_eq!(result.response.status, StatusCode::OK);
+        assert_eq!(buffered_attempts.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

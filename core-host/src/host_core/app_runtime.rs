@@ -146,7 +146,11 @@ pub(crate) fn distributed_rate_limit_decision(
         return None;
     }
 
-    let value = match serde_json::from_slice::<Value>(&response.body) {
+    let Some(body) = response.body.as_buffered() else {
+        record_distributed_rate_limit_bypass(&route.path, "limiter returned a streaming response");
+        return None;
+    };
+    let value = match serde_json::from_slice::<Value>(body) {
         Ok(value) => value,
         Err(error) => {
             record_distributed_rate_limit_bypass(
@@ -834,13 +838,20 @@ pub(crate) fn build_guest_response(
         Some(trailers)
     };
 
+    let body = match response.body {
+        RouteResponseBody::Buffered(bytes) => {
+            Body::new(GuestResponseBody::new(bytes, trailer_map, completion_guard))
+        }
+        // A peer-forwarded stream on a saturation path: trailers and the
+        // completion guard have nowhere to attach mid-stream, but neither
+        // client-facing overflow site produces either (see
+        // `forward_request_to_override_as_streaming_response`).
+        RouteResponseBody::Streaming(body) => body,
+    };
+
     let mut built = Response::builder()
         .status(response.status)
-        .body(Body::new(GuestResponseBody::new(
-            response.body,
-            trailer_map,
-            completion_guard,
-        )))
+        .body(body)
         .map_err(|error| format!("failed to construct guest HTTP response: {error}"))?;
     built.headers_mut().extend(response_headers);
     Ok(built)
@@ -951,7 +962,56 @@ pub(crate) async fn forward_request_to_override_as_guest_response(
     Ok(GuestHttpResponse {
         status,
         headers,
-        body,
+        body: RouteResponseBody::Buffered(body),
+        trailers: Vec::new(),
+    })
+}
+
+/// Like `forward_request_to_override_as_guest_response`, but streams the
+/// peer's body through instead of buffering it whole. Used only by the two
+/// client-facing overflow sites (`RoutePermitError::TimedOut` with
+/// `allow_overflow`, and the `AdmissionStrategy::MeshRetry` branch) so an SSE
+/// generation redirected under load still delivers its first chunk before
+/// the peer has finished generating.
+///
+/// Never call this for a response that will be handed to a WASM guest —
+/// `try_peer_overflow_dispatch` (the mesh-fetch path) must keep using the
+/// buffered variant above.
+pub(crate) async fn forward_request_to_override_as_streaming_response(
+    http_client: &Client,
+    destination: &str,
+    headers: &HeaderMap,
+    method: &Method,
+    body: &Bytes,
+    hop_limit: HopLimit,
+) -> std::result::Result<GuestHttpResponse, (StatusCode, String)> {
+    let mut request = http_client.request(method.clone(), destination);
+    for (name, value) in headers {
+        if name == "host" || name == "content-length" || name == "connection" {
+            continue;
+        }
+        request = request.header(name, value);
+    }
+    request = request.header(HOP_LIMIT_HEADER, hop_limit.decremented().to_string());
+    let response = request.body(body.clone()).send().await.map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("mesh-overlay forward to `{destination}` failed: {error}"),
+        )
+    })?;
+    let status = response.status();
+    let headers = header_map_to_guest_fields(response.headers())
+        .into_iter()
+        .filter(|(name, _)| {
+            let name = name.to_ascii_lowercase();
+            name != "content-length" && name != "connection" && name != "transfer-encoding"
+        })
+        .collect();
+    let body = Body::from_stream(response.bytes_stream());
+    Ok(GuestHttpResponse {
+        status,
+        headers,
+        body: RouteResponseBody::Streaming(body),
         trailers: Vec::new(),
     })
 }
@@ -1902,7 +1962,7 @@ pub(crate) fn spawn_shadow_traffic_task(
         "body_hex": hex::encode(body),
         "primary_status": primary_response.status.as_u16(),
         "primary_headers": primary_response.headers,
-        "primary_body_sha256": sha256_hex(&primary_response.body),
+        "primary_body_sha256": primary_response.body.as_buffered().map(|bytes| sha256_hex(bytes)),
         "trace_id": trace_id,
     })) else {
         tracing::warn!(route = %route.path, "failed to encode shadow traffic event");
@@ -2075,7 +2135,7 @@ pub(crate) async fn execute_route_request(
                         .required_capability_mask,
                     requested_model.as_deref(),
                 ) {
-                    let response = forward_request_to_override_as_guest_response(
+                    let response = forward_request_to_override_as_streaming_response(
                         &state.http_client,
                         &destination,
                         headers,
@@ -2184,7 +2244,7 @@ pub(crate) async fn enforce_resource_admission(
             target.required_capability_mask,
             requested_model.as_deref(),
         ) {
-            let response = forward_request_to_override_as_guest_response(
+            let response = forward_request_to_override_as_streaming_response(
                 &state.http_client,
                 &destination,
                 headers,
@@ -2821,7 +2881,7 @@ async fn invoke_enarx_tee_backend(
     let mut guest_response = GuestHttpResponse {
         status,
         headers: tee_response.headers,
-        body: Bytes::from(tee_response.body),
+        body: RouteResponseBody::Buffered(Bytes::from(tee_response.body)),
         trailers: tee_response.trailers,
     };
     annotate_tee_response(&mut guest_response, "enarx");

@@ -679,7 +679,10 @@ async fn local_mesh_dispatch_overflows_to_peer_when_saturated_and_overflow_allow
         panic!("expected the saturated route to be handled via peer overflow");
     };
     assert_eq!(handled.status, StatusCode::OK);
-    assert_eq!(&handled.body[..], b"peer-ok");
+    assert_eq!(
+        handled.body.as_buffered().map(|bytes| &bytes[..]),
+        Some(&b"peer-ok"[..])
+    );
     assert_eq!(
         mesh_dispatch_total_for(MeshDispatchMode::Peer, MeshDispatchReason::Saturated),
         before + 1

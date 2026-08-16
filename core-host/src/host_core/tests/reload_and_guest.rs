@@ -307,18 +307,19 @@ fn execute_guest_returns_component_response_payload() {
     )
     .expect("guest execution should succeed");
 
-    assert_eq!(
-        response,
-        GuestExecutionOutcome {
-            output: GuestExecutionOutput::Http(GuestHttpResponse::new(
-                StatusCode::OK,
-                Bytes::from(expected_guest_example_body(
+    assert_eq!(response.fuel_consumed, None);
+    match response.output {
+        GuestExecutionOutput::Http(http) => {
+            assert_eq!(http.status, StatusCode::OK);
+            assert_eq!(
+                http.body.as_buffered(),
+                Some(&Bytes::from(expected_guest_example_body(
                     "FaaS received: Hello Lean FaaS!"
-                )),
-            )),
-            fuel_consumed: None,
+                )))
+            );
         }
-    );
+        other => panic!("expected Http output, got {other:?}"),
+    }
 }
 
 #[test]
@@ -335,13 +336,13 @@ fn execute_guest_falls_back_to_legacy_stdout_for_non_component_module() {
     )
     .expect("legacy guest execution should succeed");
 
-    assert_eq!(
-        response,
-        GuestExecutionOutcome {
-            output: GuestExecutionOutput::LegacyStdout(Bytes::from("legacy guest stdout\n")),
-            fuel_consumed: None,
+    assert_eq!(response.fuel_consumed, None);
+    match response.output {
+        GuestExecutionOutput::LegacyStdout(stdout) => {
+            assert_eq!(stdout, Bytes::from("legacy guest stdout\n"));
         }
-    );
+        other => panic!("expected LegacyStdout output, got {other:?}"),
+    }
 }
 
 #[test]
@@ -362,13 +363,13 @@ fn execute_legacy_guest_reads_stdin_for_tcp_echo_module() {
     )
     .expect("legacy guest execution should succeed");
 
-    assert_eq!(
-        response,
-        GuestExecutionOutcome {
-            output: GuestExecutionOutput::LegacyStdout(Bytes::from_static(b"ping over tcp")),
-            fuel_consumed: None,
+    assert_eq!(response.fuel_consumed, None);
+    match response.output {
+        GuestExecutionOutput::LegacyStdout(stdout) => {
+            assert_eq!(stdout, Bytes::from_static(b"ping over tcp"));
         }
-    );
+        other => panic!("expected LegacyStdout output, got {other:?}"),
+    }
 }
 
 #[cfg(feature = "ai-inference")]
@@ -439,13 +440,14 @@ fn execute_guest_persists_volume_data_for_component_guest() {
     )
     .expect("volume guest should write successfully");
 
-    assert_eq!(
-        save_response,
-        GuestExecutionOutcome {
-            output: GuestExecutionOutput::Http(GuestHttpResponse::new(StatusCode::OK, "Saved",)),
-            fuel_consumed: None,
+    assert_eq!(save_response.fuel_consumed, None);
+    match save_response.output {
+        GuestExecutionOutput::Http(http) => {
+            assert_eq!(http.status, StatusCode::OK);
+            assert_eq!(http.body.as_buffered(), Some(&Bytes::from("Saved")));
         }
-    );
+        other => panic!("expected Http output, got {other:?}"),
+    }
 
     let read_response = execute_guest(
         &engine,
@@ -456,16 +458,17 @@ fn execute_guest_persists_volume_data_for_component_guest() {
     )
     .expect("volume guest should read successfully");
 
-    assert_eq!(
-        read_response,
-        GuestExecutionOutcome {
-            output: GuestExecutionOutput::Http(GuestHttpResponse::new(
-                StatusCode::OK,
-                "Hello Stateful World",
-            )),
-            fuel_consumed: None,
+    assert_eq!(read_response.fuel_consumed, None);
+    match read_response.output {
+        GuestExecutionOutput::Http(http) => {
+            assert_eq!(http.status, StatusCode::OK);
+            assert_eq!(
+                http.body.as_buffered(),
+                Some(&Bytes::from("Hello Stateful World"))
+            );
         }
-    );
+        other => panic!("expected Http output, got {other:?}"),
+    }
     assert_eq!(
         fs::read_to_string(volume_dir.join("state.txt")).expect("host volume file should exist"),
         "Hello Stateful World"

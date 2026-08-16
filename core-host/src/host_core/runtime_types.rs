@@ -440,11 +440,57 @@ pub(crate) struct GuestRequest {
     pub(crate) trailers: GuestHttpFields,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A route response body: either fully read into memory, or a live stream
+/// forwarded from a peer.
+///
+/// `Streaming` is only ever produced by a peer forward on a client-facing
+/// saturation path (see `forward_request_to_override_as_streaming_response`).
+/// It must never be handed to a WASM guest — guests only ever produce and
+/// consume `Buffered` — and it is never retried: `StatusRetryPolicy` treats
+/// any `Streaming` response as already delivered to the client.
+pub(crate) enum RouteResponseBody {
+    Buffered(Bytes),
+    Streaming(Body),
+}
+
+impl fmt::Debug for RouteResponseBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RouteResponseBody::Buffered(bytes) => {
+                f.debug_tuple("Buffered").field(&bytes.len()).finish()
+            }
+            RouteResponseBody::Streaming(_) => f.write_str("Streaming(..)"),
+        }
+    }
+}
+
+impl RouteResponseBody {
+    pub(crate) fn as_buffered(&self) -> Option<&Bytes> {
+        match self {
+            RouteResponseBody::Buffered(bytes) => Some(bytes),
+            RouteResponseBody::Streaming(_) => None,
+        }
+    }
+
+    pub(crate) fn into_body(self) -> Body {
+        match self {
+            RouteResponseBody::Buffered(bytes) => Body::from(bytes),
+            RouteResponseBody::Streaming(body) => body,
+        }
+    }
+}
+
+impl From<Bytes> for RouteResponseBody {
+    fn from(bytes: Bytes) -> Self {
+        RouteResponseBody::Buffered(bytes)
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct GuestHttpResponse {
     pub(crate) status: StatusCode,
     pub(crate) headers: GuestHttpFields,
-    pub(crate) body: Bytes,
+    pub(crate) body: RouteResponseBody,
     pub(crate) trailers: GuestHttpFields,
 }
 
@@ -460,13 +506,13 @@ pub(crate) struct UdpResponseDatagram {
     pub(crate) payload: Bytes,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum GuestExecutionOutput {
     Http(GuestHttpResponse),
     LegacyStdout(Bytes),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct GuestExecutionOutcome {
     pub(crate) output: GuestExecutionOutput,
     pub(crate) fuel_consumed: Option<u64>,
@@ -626,7 +672,7 @@ impl GuestHttpResponse {
         Self {
             status,
             headers: Vec::new(),
-            body: body.into(),
+            body: RouteResponseBody::Buffered(body.into()),
             trailers: Vec::new(),
         }
     }
