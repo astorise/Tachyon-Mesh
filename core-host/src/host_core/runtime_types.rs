@@ -440,11 +440,172 @@ pub(crate) struct GuestRequest {
     pub(crate) trailers: GuestHttpFields,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A route response body: either fully read into memory, or a live stream
+/// forwarded from a peer.
+///
+/// `Streaming` is only ever produced by a peer forward on a client-facing
+/// saturation path (see `forward_request_to_override_as_streaming_response`).
+/// It must never be handed to a WASM guest — guests only ever produce and
+/// consume `Buffered`.
+pub(crate) enum RouteResponseBody {
+    Buffered(Bytes),
+    Streaming(Body),
+}
+
+impl fmt::Debug for RouteResponseBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RouteResponseBody::Buffered(bytes) => {
+                f.debug_tuple("Buffered").field(&bytes.len()).finish()
+            }
+            RouteResponseBody::Streaming(_) => f.write_str("Streaming(..)"),
+        }
+    }
+}
+
+impl RouteResponseBody {
+    pub(crate) fn as_buffered(&self) -> Option<&Bytes> {
+        match self {
+            RouteResponseBody::Buffered(bytes) => Some(bytes),
+            RouteResponseBody::Streaming(_) => None,
+        }
+    }
+
+    pub(crate) fn into_body(self) -> Body {
+        match self {
+            RouteResponseBody::Buffered(bytes) => Body::from(bytes),
+            RouteResponseBody::Streaming(body) => body,
+        }
+    }
+}
+
+/// Wraps a peer-forwarded `reqwest::Response` so that, when the route has a
+/// configured `resiliency.timeout_ms`, a stalled stream still gets cut off —
+/// not just a stalled handshake.
+///
+/// `resiliency::call_with_resiliency`'s `TimeoutLayer` only wraps the future
+/// that resolves once `forward_request_to_override_as_streaming_response`
+/// returns a `RouteExecutionResult`; the body then drains later, inside
+/// axum's response-writing path, entirely outside that timed future. Before
+/// streaming was introduced, this didn't matter because
+/// `forward_request_to_override_as_guest_response` awaited the whole body
+/// (`response.bytes().await`) inside the timed future, so `timeout_ms` acted
+/// as a bound on total response time.
+///
+/// This applies `timeout_ms` as a per-chunk *idle* deadline instead — the
+/// gap since the last chunk, reset on every chunk — deliberately, not as an
+/// approximation of the old total-duration bound: for a streamed response
+/// (typically a long AI generation), an absolute deadline would kill a
+/// healthy, steadily-producing stream the moment it runs longer than a
+/// timeout sized for a quick buffered call, which is exactly the workload
+/// streaming exists to support. Idle timeout is the standard semantic for
+/// proxied streaming timeouts for the same reason (compare e.g. nginx's
+/// `proxy_read_timeout`): a peer that stalls mid-generation still gets cut
+/// off, but one making steady progress is never punished for taking a while.
+///
+/// Spawns a task that reads `response.chunk()` in a loop under
+/// `tokio::time::timeout` and forwards chunks over a channel, so the
+/// `hyper::body::Body` impl below just drains that channel. A body cut short
+/// mid-stream is standard behavior for a timed-out proxy connection — but the
+/// client must be told the response was cut short rather than seeing a clean
+/// 200, so the last thing sent on an abnormal exit (idle timeout or an
+/// upstream read error) is an error frame instead of just closing the
+/// channel. Only the receiver — the client — going away ends the task
+/// silently, since there is nobody left to tell.
+pub(crate) struct TimeoutBoundedStreamBody {
+    pub(crate) receiver: mpsc::Receiver<std::result::Result<Bytes, StreamForwardError>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StreamForwardError(pub(crate) String);
+
+impl fmt::Display for StreamForwardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StreamForwardError {}
+
+pub(crate) fn stream_response_with_idle_timeout(
+    mut response: reqwest::Response,
+    idle_timeout: Duration,
+) -> TimeoutBoundedStreamBody {
+    let (sender, receiver) = mpsc::channel::<std::result::Result<Bytes, StreamForwardError>>(1);
+    tokio::spawn(async move {
+        loop {
+            // Race the timed peer read against the receiver closing, so a
+            // client that disconnects (or a `StatusRetryPolicy` that drops a
+            // retriable streaming response) cancels the upstream read
+            // immediately instead of leaving this task — and the peer
+            // connection, and whatever generation is producing it — alive
+            // for up to `idle_timeout` after there is nobody left to send to.
+            tokio::select! {
+                _ = sender.closed() => break,
+                chunk = tokio::time::timeout(idle_timeout, response.chunk()) => {
+                    match chunk {
+                        Ok(Ok(Some(chunk))) => {
+                            if sender.send(Ok(chunk)).await.is_err() {
+                                // The client (or an intermediate drop of the
+                                // body) went away; stop reading from the peer.
+                                break;
+                            }
+                        }
+                        // Peer finished the response normally: a clean end of stream.
+                        Ok(Ok(None)) => break,
+                        // The read itself failed, or no chunk arrived within
+                        // `idle_timeout`: the client already has a partial
+                        // body, so it must see this as a failure, not a
+                        // clean 200.
+                        Ok(Err(error)) => {
+                            let _ = sender
+                                .send(Err(StreamForwardError(format!(
+                                    "peer forward failed while streaming: {error}"
+                                ))))
+                                .await;
+                            break;
+                        }
+                        Err(_) => {
+                            let _ = sender
+                                .send(Err(StreamForwardError(format!(
+                                    "peer forward idle timeout of {idle_timeout:?} exceeded while streaming"
+                                ))))
+                                .await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    TimeoutBoundedStreamBody { receiver }
+}
+
+impl hyper::body::Body for TimeoutBoundedStreamBody {
+    type Data = Bytes;
+    type Error = StreamForwardError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        self.receiver
+            .poll_recv(cx)
+            .map(|chunk| chunk.map(|result| result.map(Frame::data)))
+    }
+}
+
+impl From<Bytes> for RouteResponseBody {
+    fn from(bytes: Bytes) -> Self {
+        RouteResponseBody::Buffered(bytes)
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct GuestHttpResponse {
     pub(crate) status: StatusCode,
     pub(crate) headers: GuestHttpFields,
-    pub(crate) body: Bytes,
+    pub(crate) body: RouteResponseBody,
     pub(crate) trailers: GuestHttpFields,
 }
 
@@ -460,13 +621,13 @@ pub(crate) struct UdpResponseDatagram {
     pub(crate) payload: Bytes,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum GuestExecutionOutput {
     Http(GuestHttpResponse),
     LegacyStdout(Bytes),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct GuestExecutionOutcome {
     pub(crate) output: GuestExecutionOutput,
     pub(crate) fuel_consumed: Option<u64>,
@@ -577,6 +738,20 @@ pub(crate) struct RouteInvocation {
     pub(crate) trace_id: Option<String>,
     pub(crate) sampled_execution: bool,
     pub(crate) selected_module: Option<String>,
+    /// Whether a peer-overflow response reached from this invocation may
+    /// stream (`RouteResponseBody::Streaming`) instead of buffering whole.
+    ///
+    /// Only true for invocations whose result is handed straight to
+    /// `build_guest_response`/`guest_response_into_response` for a real
+    /// client socket (the top-level HTTP handler, the mTLS gateway, and the
+    /// local route-override branch). Every internal, recursive, or
+    /// guest-facing invocation — the distributed rate-limiter's nested route
+    /// call, the metering/logger system routes, shadow-traffic dispatch, and
+    /// the in-process mesh-fetch path (`try_dispatch_local_mesh_request`) —
+    /// must keep this false: their caller inspects or forwards the body
+    /// (JSON-parses it, hashes it, or hands it to a WASM guest), none of
+    /// which tolerate a live stream.
+    pub(crate) allow_streaming_overflow: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -626,7 +801,7 @@ impl GuestHttpResponse {
         Self {
             status,
             headers: Vec::new(),
-            body: body.into(),
+            body: RouteResponseBody::Buffered(body.into()),
             trailers: Vec::new(),
         }
     }

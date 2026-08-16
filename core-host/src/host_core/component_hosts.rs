@@ -3673,7 +3673,15 @@ impl ComponentHostState {
                 background_component_bindings::tachyon::mesh::outbound_http::Response {
                     status: response.status.as_u16(),
                     headers: response.headers,
-                    body: response.body.to_vec(),
+                    // The mesh-fetch path only ever produces buffered bodies:
+                    // a guest's `wasi:http` response handle is fed from
+                    // bytes, never a live stream.
+                    body: response
+                        .body
+                        .as_buffered()
+                        .cloned()
+                        .unwrap_or_default()
+                        .to_vec(),
                 },
             ),
             LocalMeshDispatchAttempt::Fallback(reason) => {

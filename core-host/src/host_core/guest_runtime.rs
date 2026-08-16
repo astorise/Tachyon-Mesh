@@ -672,7 +672,7 @@ pub(crate) fn execute_component_guest(
         output: GuestExecutionOutput::Http(GuestHttpResponse {
             status,
             headers: response.headers,
-            body: Bytes::from(response.body),
+            body: RouteResponseBody::Buffered(Bytes::from(response.body)),
             trailers: response.trailers,
         }),
         fuel_consumed,
@@ -1617,7 +1617,7 @@ pub(crate) fn execute_system_component_guest(
             output: GuestExecutionOutput::Http(GuestHttpResponse {
                 status,
                 headers: response.headers,
-                body: Bytes::from(response.body),
+                body: RouteResponseBody::Buffered(Bytes::from(response.body)),
                 trailers: response.trailers,
             }),
             fuel_consumed,
@@ -1670,7 +1670,7 @@ pub(crate) fn execute_system_component_guest(
         output: GuestExecutionOutput::Http(GuestHttpResponse {
             status,
             headers: response.headers,
-            body: Bytes::from(response.body),
+            body: RouteResponseBody::Buffered(Bytes::from(response.body)),
             trailers: response.trailers,
         }),
         fuel_consumed,
