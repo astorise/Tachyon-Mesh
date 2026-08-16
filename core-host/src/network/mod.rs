@@ -372,6 +372,7 @@ pub(crate) async fn dispatch_mtls_gateway_request(
         Some(&trace_id),
         false,
         None,
+        true,
     )
     .await
     {

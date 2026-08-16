@@ -114,6 +114,7 @@ pub(crate) async fn enforce_distributed_rate_limit(
             None,
             false,
             None,
+            false,
         )),
     )
     .await;
@@ -464,6 +465,7 @@ pub(crate) async fn export_metering_batch(
         None,
         false,
         None,
+        false,
     )
     .await
     .map_err(|(status, message)| format!("metering route failed with {status}: {message}"))?;
@@ -688,6 +690,7 @@ pub(crate) async fn export_log_batch(
         None,
         false,
         None,
+        false,
     )
     .await
     .map_err(|(status, message)| format!("logger route failed with {status}: {message}"))?;
@@ -1379,6 +1382,7 @@ pub(crate) async fn execute_route_override(
                     Some(trace_id),
                     sampled_execution,
                     None,
+                    true,
                 )
                 .await
                 {
@@ -1660,6 +1664,7 @@ pub(crate) async fn faas_handler(
                                 Some(&trace_id),
                                 sampled_execution,
                                 Some(selected_target.module.as_str()),
+                                true,
                             )
                             .await
                             {
@@ -1739,6 +1744,7 @@ pub(crate) async fn faas_handler(
                                 Some(&trace_id),
                                 sampled_execution,
                                 Some(selected_target.module.as_str()),
+                                true,
                             )
                             .await
                             {
@@ -1786,6 +1792,7 @@ pub(crate) async fn execute_route_with_middleware(
     trace_id: Option<&str>,
     sampled_execution: bool,
     selected_module: Option<&str>,
+    allow_streaming_overflow: bool,
 ) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
     execute_route_arc_with_middleware(
         state,
@@ -1800,6 +1807,7 @@ pub(crate) async fn execute_route_with_middleware(
         trace_id,
         sampled_execution,
         selected_module,
+        allow_streaming_overflow,
     )
     .await
 }
@@ -1818,6 +1826,7 @@ pub(crate) async fn execute_route_arc_with_middleware(
     trace_id: Option<&str>,
     sampled_execution: bool,
     selected_module: Option<&str>,
+    allow_streaming_overflow: bool,
 ) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
     let invocation = RouteInvocation {
         state: state.clone(),
@@ -1832,6 +1841,7 @@ pub(crate) async fn execute_route_arc_with_middleware(
         trace_id: trace_id.map(str::to_owned),
         sampled_execution,
         selected_module: selected_module.map(str::to_owned),
+        allow_streaming_overflow,
     };
 
     resiliency::execute_route_with_resiliency(invocation).await
@@ -1884,6 +1894,7 @@ pub(crate) async fn execute_route_with_middleware_inner(
             trace_id,
             sampled_execution,
             None,
+            invocation.allow_streaming_overflow,
         )
         .await?;
         if middleware_response.response.status != StatusCode::OK {
@@ -1905,6 +1916,7 @@ pub(crate) async fn execute_route_with_middleware_inner(
         trace_id,
         sampled_execution,
         selected_module,
+        invocation.allow_streaming_overflow,
     )
     .await?;
     result.fuel_consumed = merge_fuel_samples(accumulated_fuel, result.fuel_consumed);
@@ -1999,6 +2011,7 @@ pub(crate) fn spawn_shadow_traffic_task(
             None,
             false,
             None,
+            false,
         )
         .await
         {
@@ -2030,6 +2043,7 @@ pub(crate) async fn execute_route_request(
     trace_id: Option<&str>,
     sampled_execution: bool,
     selected_module: Option<&str>,
+    allow_streaming_overflow: bool,
 ) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
     if route.role == RouteRole::System && should_shed_system_route(&state.telemetry) {
         return Err((
@@ -2075,8 +2089,17 @@ pub(crate) async fn execute_route_request(
         }
     };
 
-    if let Some(rejection) =
-        enforce_resource_admission(state, route, headers, method, body, hop_limit, runtime).await?
+    if let Some(rejection) = enforce_resource_admission(
+        state,
+        route,
+        headers,
+        method,
+        body,
+        hop_limit,
+        runtime,
+        allow_streaming_overflow,
+    )
+    .await?
     {
         return Ok(rejection);
     }
@@ -2146,15 +2169,27 @@ pub(crate) async fn execute_route_request(
                         .required_capability_mask,
                     requested_model.as_deref(),
                 ) {
-                    let response = forward_request_to_override_as_streaming_response(
-                        &state.http_client,
-                        &destination,
-                        headers,
-                        method,
-                        body,
-                        hop_limit,
-                    )
-                    .await?;
+                    let response = if allow_streaming_overflow {
+                        forward_request_to_override_as_streaming_response(
+                            &state.http_client,
+                            &destination,
+                            headers,
+                            method,
+                            body,
+                            hop_limit,
+                        )
+                        .await?
+                    } else {
+                        forward_request_to_override_as_guest_response(
+                            &state.http_client,
+                            &destination,
+                            headers,
+                            method,
+                            body,
+                            hop_limit,
+                        )
+                        .await?
+                    };
                     return Ok(RouteExecutionResult {
                         response,
                         fuel_consumed: None,
@@ -2222,6 +2257,7 @@ pub(crate) async fn execute_route_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn enforce_resource_admission(
     state: &AppState,
     route: &IntegrityRoute,
@@ -2230,6 +2266,7 @@ pub(crate) async fn enforce_resource_admission(
     body: &Bytes,
     hop_limit: HopLimit,
     runtime: &Arc<RuntimeState>,
+    allow_streaming_overflow: bool,
 ) -> std::result::Result<Option<RouteExecutionResult>, (StatusCode, String)> {
     let Some(policy) = route.resource_policy.as_ref() else {
         return Ok(None);
@@ -2255,15 +2292,27 @@ pub(crate) async fn enforce_resource_admission(
             target.required_capability_mask,
             requested_model.as_deref(),
         ) {
-            let response = forward_request_to_override_as_streaming_response(
-                &state.http_client,
-                &destination,
-                headers,
-                method,
-                body,
-                hop_limit,
-            )
-            .await?;
+            let response = if allow_streaming_overflow {
+                forward_request_to_override_as_streaming_response(
+                    &state.http_client,
+                    &destination,
+                    headers,
+                    method,
+                    body,
+                    hop_limit,
+                )
+                .await?
+            } else {
+                forward_request_to_override_as_guest_response(
+                    &state.http_client,
+                    &destination,
+                    headers,
+                    method,
+                    body,
+                    hop_limit,
+                )
+                .await?
+            };
             return Ok(Some(RouteExecutionResult {
                 response,
                 fuel_consumed: None,
@@ -3123,6 +3172,10 @@ pub(crate) async fn try_dispatch_local_mesh_request(
         None,
         false,
         Some(selected_target.module.as_str()),
+        // This response is fed to a WASM guest's outbound-HTTP import
+        // (see component_hosts.rs), never to a client socket — it must
+        // stay `RouteResponseBody::Buffered`.
+        false,
     ))
     .await
     .map_err(|(status, message)| {

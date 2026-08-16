@@ -623,6 +623,20 @@ pub(crate) struct RouteInvocation {
     pub(crate) trace_id: Option<String>,
     pub(crate) sampled_execution: bool,
     pub(crate) selected_module: Option<String>,
+    /// Whether a peer-overflow response reached from this invocation may
+    /// stream (`RouteResponseBody::Streaming`) instead of buffering whole.
+    ///
+    /// Only true for invocations whose result is handed straight to
+    /// `build_guest_response`/`guest_response_into_response` for a real
+    /// client socket (the top-level HTTP handler, the mTLS gateway, and the
+    /// local route-override branch). Every internal, recursive, or
+    /// guest-facing invocation — the distributed rate-limiter's nested route
+    /// call, the metering/logger system routes, shadow-traffic dispatch, and
+    /// the in-process mesh-fetch path (`try_dispatch_local_mesh_request`) —
+    /// must keep this false: their caller inspects or forwards the body
+    /// (JSON-parses it, hashes it, or hands it to a WASM guest), none of
+    /// which tolerate a live stream.
+    pub(crate) allow_streaming_overflow: bool,
 }
 
 #[derive(Clone, Debug)]

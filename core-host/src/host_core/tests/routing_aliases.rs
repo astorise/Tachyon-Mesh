@@ -700,6 +700,91 @@ async fn local_mesh_dispatch_overflows_to_peer_when_saturated_and_overflow_allow
     peer_server.abort();
 }
 
+// Regression test for a bug caught in review on #392/#399: `execute_route_request`
+// is shared between the real HTTP client path (which may stream a peer-overflow
+// body) and the in-process guest mesh-fetch path (`try_dispatch_local_mesh_request`,
+// exercised here), which must always get `RouteResponseBody::Buffered` because its
+// result is fed straight to a WASM guest's outbound-HTTP import
+// (`component_hosts.rs`). A `RouteResponseBody::Streaming` reaching that boundary
+// used to be silently collapsed to an empty body while keeping the peer's real
+// status — a guest would see a corrupted "successful" response.
+#[tokio::test]
+async fn local_mesh_dispatch_buffers_ram_pressure_mesh_retry_overflow() {
+    use axum::{body::Bytes as AxumBytes, routing::any, Router};
+
+    let peer_app = Router::new().route(
+        DEFAULT_ROUTE,
+        any(|_headers: HeaderMap, _body: AxumBytes| async move { (StatusCode::OK, "peer-ok") }),
+    );
+    let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("peer listener should bind");
+    let peer_address = peer_listener
+        .local_addr()
+        .expect("peer listener should expose an address");
+    let peer_server = tokio::spawn(async move {
+        axum::serve(peer_listener, peer_app)
+            .await
+            .expect("peer app should stay up");
+    });
+
+    let mut route = IntegrityRoute::user(DEFAULT_ROUTE);
+    // Deliberately does NOT exhaust the route's concurrency permits and does
+    // NOT set `allow_overflow`: this test targets the RAM-based
+    // `AdmissionStrategy::MeshRetry` branch in `enforce_resource_admission`,
+    // reached unconditionally at the top of `execute_route_request` — not the
+    // semaphore-saturation fast path already covered above.
+    route.resource_policy = Some(ResourcePolicy {
+        // No real machine has an exabyte of RAM available, so this
+        // deterministically fails the `available_ram >= required_ram_bytes`
+        // check regardless of the host running the test.
+        min_ram_gb: Some(1024 * 1024 * 1024),
+        admission_strategy: AdmissionStrategy::MeshRetry,
+        ..Default::default()
+    });
+    let config = validate_integrity_config(IntegrityConfig {
+        routes: vec![route],
+        ..IntegrityConfig::default_sealed()
+    })
+    .expect("config should validate");
+    let state = build_test_state(config, telemetry::init_test_telemetry());
+    let runtime = state.runtime.load_full();
+
+    update_control_plane_route_override(
+        state.route_overrides.as_ref(),
+        &state.peer_capabilities,
+        DEFAULT_ROUTE,
+        &format!("http://{peer_address}{DEFAULT_ROUTE}"),
+    )
+    .expect("route override should install");
+
+    let response = try_dispatch_local_mesh_request(
+        &state,
+        &runtime,
+        "http://127.0.0.1:9/api/guest-example",
+        &Method::GET,
+        &HeaderMap::new(),
+        Bytes::new(),
+        Vec::new(),
+        HopLimit(DEFAULT_HOP_LIMIT),
+    )
+    .await
+    .expect("RAM-pressured route with an eligible peer should mesh-retry, not error");
+
+    let LocalMeshDispatchAttempt::Handled(handled) = response else {
+        panic!("expected the RAM-pressured route to be handled via mesh-retry overflow");
+    };
+    assert_eq!(handled.status, StatusCode::OK);
+    // The bug this guards against: the streaming body silently became an
+    // empty buffered body while still reporting HTTP 200 to the guest.
+    assert_eq!(
+        handled.body.as_buffered().map(|bytes| &bytes[..]),
+        Some(&b"peer-ok"[..])
+    );
+
+    peer_server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn local_mesh_dispatch_stays_local_when_no_peer_is_eligible_despite_allow_overflow() {
     let mut route = IntegrityRoute::user(DEFAULT_ROUTE);
