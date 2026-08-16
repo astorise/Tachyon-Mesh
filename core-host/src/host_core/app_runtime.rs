@@ -1028,6 +1028,64 @@ pub(crate) async fn forward_request_to_override_as_streaming_response(
     })
 }
 
+/// The idle-chunk deadline a streaming peer forward should use, or `None` to
+/// leave the stream unbounded.
+///
+/// Gated on the `resiliency` feature so a build that omits it behaves like
+/// every other resiliency knob in that configuration: `route.resiliency` is
+/// still accepted and stored, but has no effect. Without this gate, a
+/// `resiliency`-less build would apply `timeout_ms` to overflow streams while
+/// silently ignoring the same field for local/buffered execution — the two
+/// code paths disagreeing about whether resiliency config does anything.
+#[cfg(feature = "resiliency")]
+pub(crate) fn route_stream_idle_timeout(route: &IntegrityRoute) -> Option<Duration> {
+    route
+        .resiliency
+        .as_ref()
+        .and_then(|resiliency| resiliency.timeout_ms)
+        .map(Duration::from_millis)
+}
+
+#[cfg(not(feature = "resiliency"))]
+pub(crate) fn route_stream_idle_timeout(_route: &IntegrityRoute) -> Option<Duration> {
+    None
+}
+
+/// The status-based retry budget a streaming peer forward should use:
+/// `(retries_remaining, retry_on_statuses)`, or `None` to never retry.
+///
+/// Only used by `handle_streaming_http_request` (the SSE path), which never
+/// goes through `execute_route_with_resiliency`/`StatusRetryPolicy` — every
+/// other overflow response gets its `retry_on` behavior from that shared
+/// machinery for free by virtue of running inside it. Each retry here
+/// re-resolves the destination and re-forwards from scratch, matching
+/// `StatusRetryPolicy`'s "safe to retry" reasoning: no response bytes have
+/// reached the client yet at the point a streaming overflow response's
+/// status is inspected. Gated on the `resiliency` feature for the same
+/// reason as `route_stream_idle_timeout`.
+#[cfg(feature = "resiliency")]
+#[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
+pub(crate) fn route_stream_retry_budget(
+    route: &IntegrityRoute,
+) -> Option<(u32, std::collections::BTreeSet<u16>)> {
+    let policy = route.resiliency.as_ref()?.retry_policy.as_ref()?;
+    if policy.max_retries == 0 || policy.retry_on.is_empty() {
+        return None;
+    }
+    Some((
+        policy.max_retries,
+        policy.retry_on.iter().copied().collect(),
+    ))
+}
+
+#[cfg(not(feature = "resiliency"))]
+#[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
+pub(crate) fn route_stream_retry_budget(
+    _route: &IntegrityRoute,
+) -> Option<(u32, std::collections::BTreeSet<u16>)> {
+    None
+}
+
 /// Like `forward_request_to_override_as_streaming_response`, but also bounds
 /// the wait for the peer to accept the connection and return headers with
 /// `idle_timeout`.
@@ -1958,7 +2016,13 @@ pub(crate) async fn execute_route_with_middleware_inner(
             trace_id,
             sampled_execution,
             None,
-            invocation.allow_streaming_overflow,
+            // Always buffered, regardless of the outer invocation: on success
+            // this body is never read (see the status check below) — a
+            // still-open peer stream would just get dropped before it
+            // finishes, and streaming a response nobody consumes buys
+            // nothing while adding exactly the completion-ordering risk
+            // flagged in review.
+            false,
         )
         .await?;
         if middleware_response.response.status != StatusCode::OK {
@@ -2234,11 +2298,7 @@ pub(crate) async fn execute_route_request(
                     requested_model.as_deref(),
                 ) {
                     let response = if allow_streaming_overflow {
-                        let idle_timeout = route
-                            .resiliency
-                            .as_ref()
-                            .and_then(|resiliency| resiliency.timeout_ms)
-                            .map(Duration::from_millis);
+                        let idle_timeout = route_stream_idle_timeout(route);
                         forward_request_to_override_as_streaming_response_with_handshake_timeout(
                             &state.http_client,
                             &destination,
@@ -2364,11 +2424,7 @@ pub(crate) async fn enforce_resource_admission(
             requested_model.as_deref(),
         ) {
             let response = if allow_streaming_overflow {
-                let idle_timeout = route
-                    .resiliency
-                    .as_ref()
-                    .and_then(|resiliency| resiliency.timeout_ms)
-                    .map(Duration::from_millis);
+                let idle_timeout = route_stream_idle_timeout(route);
                 forward_request_to_override_as_streaming_response_with_handshake_timeout(
                     &state.http_client,
                     &destination,

@@ -870,18 +870,27 @@ pub(crate) async fn handle_streaming_http_request(
     method: &Method,
     hop_limit: HopLimit,
 ) -> std::result::Result<Response, (StatusCode, String)> {
-    if let Some(result) = enforce_resource_admission(
-        &state,
-        &route,
-        headers,
-        method,
-        &request.body,
-        hop_limit,
-        &runtime,
-        true,
-    )
-    .await?
-    {
+    let (mut ram_retries_left, ram_retry_on) =
+        route_stream_retry_budget(&route).unwrap_or_default();
+    loop {
+        let Some(result) = enforce_resource_admission(
+            &state,
+            &route,
+            headers,
+            method,
+            &request.body,
+            hop_limit,
+            &runtime,
+            true,
+        )
+        .await?
+        else {
+            break;
+        };
+        if ram_retries_left > 0 && ram_retry_on.contains(&result.response.status.as_u16()) {
+            ram_retries_left -= 1;
+            continue;
+        }
         return Ok(guest_response_into_response(result));
     }
 
@@ -919,28 +928,32 @@ pub(crate) async fn handle_streaming_http_request(
         }
         Err(RoutePermitError::TimedOut) => {
             if route.allow_overflow {
-                let requested_model = requested_model_alias(&route, headers, &request.body);
-                if let Some(destination) = control_plane_override_destination(
-                    state.route_overrides.as_ref(),
-                    &state.peer_capabilities,
-                    &route.path,
-                    headers,
-                    select_route_target(&route, headers)
-                        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
-                        .required_capability_mask,
-                    requested_model.as_deref(),
-                ) {
-                    let idle_timeout = route
-                        .resiliency
-                        .as_ref()
-                        .and_then(|resiliency| resiliency.timeout_ms)
-                        .map(Duration::from_millis);
+                let (mut retries_left, retry_on) =
+                    route_stream_retry_budget(&route).unwrap_or_default();
+                loop {
+                    let requested_model = requested_model_alias(&route, headers, &request.body);
+                    let Some(destination) = control_plane_override_destination(
+                        state.route_overrides.as_ref(),
+                        &state.peer_capabilities,
+                        &route.path,
+                        headers,
+                        select_route_target(&route, headers)
+                            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
+                            .required_capability_mask,
+                        requested_model.as_deref(),
+                    ) else {
+                        break;
+                    };
+                    let idle_timeout = route_stream_idle_timeout(&route);
                     // This call runs outside `execute_route_with_resiliency`'s
                     // `TimeoutLayer` entirely (this handler never goes
                     // through it), so nothing else bounds the wait for the
                     // peer to accept the connection and return headers —
                     // hence the `_with_handshake_timeout` variant here, unlike
-                    // the two call sites inside `execute_route_request`.
+                    // the two call sites inside `execute_route_request`. The
+                    // retry loop is the SSE-path equivalent of
+                    // `StatusRetryPolicy` for the same reason: nothing else
+                    // applies `resiliency.retry_on` here.
                     let response =
                         forward_request_to_override_as_streaming_response_with_handshake_timeout(
                             &state.http_client,
@@ -953,6 +966,10 @@ pub(crate) async fn handle_streaming_http_request(
                             &route.path,
                         )
                         .await?;
+                    if retries_left > 0 && retry_on.contains(&response.status.as_u16()) {
+                        retries_left -= 1;
+                        continue;
+                    }
                     return build_guest_response(response, None)
                         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error));
                 }

@@ -480,8 +480,8 @@ impl RouteResponseBody {
 }
 
 /// Wraps a peer-forwarded `reqwest::Response` so that, when the route has a
-/// configured `resiliency.timeout_ms`, the deadline keeps applying for the
-/// life of the stream — not just until headers arrive.
+/// configured `resiliency.timeout_ms`, a stalled stream still gets cut off —
+/// not just a stalled handshake.
 ///
 /// `resiliency::call_with_resiliency`'s `TimeoutLayer` only wraps the future
 /// that resolves once `forward_request_to_override_as_streaming_response`
@@ -489,10 +489,19 @@ impl RouteResponseBody {
 /// axum's response-writing path, entirely outside that timed future. Before
 /// streaming was introduced, this didn't matter because
 /// `forward_request_to_override_as_guest_response` awaited the whole body
-/// (`response.bytes().await`) inside the timed future. A per-chunk idle
-/// timeout here is what restores an equivalent guarantee for the streaming
-/// case: no single gap between chunks may exceed the route's configured
-/// budget, so a peer that stalls mid-generation still gets cut off.
+/// (`response.bytes().await`) inside the timed future, so `timeout_ms` acted
+/// as a bound on total response time.
+///
+/// This applies `timeout_ms` as a per-chunk *idle* deadline instead — the
+/// gap since the last chunk, reset on every chunk — deliberately, not as an
+/// approximation of the old total-duration bound: for a streamed response
+/// (typically a long AI generation), an absolute deadline would kill a
+/// healthy, steadily-producing stream the moment it runs longer than a
+/// timeout sized for a quick buffered call, which is exactly the workload
+/// streaming exists to support. Idle timeout is the standard semantic for
+/// proxied streaming timeouts for the same reason (compare e.g. nginx's
+/// `proxy_read_timeout`): a peer that stalls mid-generation still gets cut
+/// off, but one making steady progress is never punished for taking a while.
 ///
 /// Spawns a task that reads `response.chunk()` in a loop under
 /// `tokio::time::timeout` and forwards chunks over a channel, so the
@@ -525,34 +534,46 @@ pub(crate) fn stream_response_with_idle_timeout(
     let (sender, receiver) = mpsc::channel::<std::result::Result<Bytes, StreamForwardError>>(1);
     tokio::spawn(async move {
         loop {
-            match tokio::time::timeout(idle_timeout, response.chunk()).await {
-                Ok(Ok(Some(chunk))) => {
-                    if sender.send(Ok(chunk)).await.is_err() {
-                        // The client (or an intermediate drop of the body)
-                        // went away; stop reading from the peer.
-                        break;
+            // Race the timed peer read against the receiver closing, so a
+            // client that disconnects (or a `StatusRetryPolicy` that drops a
+            // retriable streaming response) cancels the upstream read
+            // immediately instead of leaving this task — and the peer
+            // connection, and whatever generation is producing it — alive
+            // for up to `idle_timeout` after there is nobody left to send to.
+            tokio::select! {
+                _ = sender.closed() => break,
+                chunk = tokio::time::timeout(idle_timeout, response.chunk()) => {
+                    match chunk {
+                        Ok(Ok(Some(chunk))) => {
+                            if sender.send(Ok(chunk)).await.is_err() {
+                                // The client (or an intermediate drop of the
+                                // body) went away; stop reading from the peer.
+                                break;
+                            }
+                        }
+                        // Peer finished the response normally: a clean end of stream.
+                        Ok(Ok(None)) => break,
+                        // The read itself failed, or no chunk arrived within
+                        // `idle_timeout`: the client already has a partial
+                        // body, so it must see this as a failure, not a
+                        // clean 200.
+                        Ok(Err(error)) => {
+                            let _ = sender
+                                .send(Err(StreamForwardError(format!(
+                                    "peer forward failed while streaming: {error}"
+                                ))))
+                                .await;
+                            break;
+                        }
+                        Err(_) => {
+                            let _ = sender
+                                .send(Err(StreamForwardError(format!(
+                                    "peer forward idle timeout of {idle_timeout:?} exceeded while streaming"
+                                ))))
+                                .await;
+                            break;
+                        }
                     }
-                }
-                // Peer finished the response normally: a clean end of stream.
-                Ok(Ok(None)) => break,
-                // The read itself failed, or no chunk arrived within
-                // `idle_timeout`: the client already has a partial body, so
-                // it must see this as a failure, not a clean 200.
-                Ok(Err(error)) => {
-                    let _ = sender
-                        .send(Err(StreamForwardError(format!(
-                            "peer forward failed while streaming: {error}"
-                        ))))
-                        .await;
-                    break;
-                }
-                Err(_) => {
-                    let _ = sender
-                        .send(Err(StreamForwardError(format!(
-                            "peer forward idle timeout of {idle_timeout:?} exceeded while streaming"
-                        ))))
-                        .await;
-                    break;
                 }
             }
         }
