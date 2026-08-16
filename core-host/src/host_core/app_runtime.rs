@@ -1942,6 +1942,17 @@ pub(crate) fn spawn_shadow_traffic_task(
     if route.path == SYSTEM_SHADOW_PROXY_ROUTE {
         return;
     }
+    // `system-faas-shadow-proxy` hashes the primary body to compare it against
+    // the shadow target's response; a streaming primary (peer overflow) was
+    // never buffered on this host, so there is nothing to hash and no
+    // meaningful byte-for-byte comparison to make. The shadow-proxy guest's
+    // `primary_body_sha256` field is a required `String`, so sending it a
+    // streaming event would fail deserialization rather than degrade
+    // gracefully — skip the comparison instead of emitting a request the
+    // guest cannot parse.
+    let Some(primary_body) = primary_response.body.as_buffered() else {
+        return;
+    };
     let Some(shadow_route) = runtime
         .route_registry
         .sealed_route(SYSTEM_SHADOW_PROXY_ROUTE)
@@ -1962,7 +1973,7 @@ pub(crate) fn spawn_shadow_traffic_task(
         "body_hex": hex::encode(body),
         "primary_status": primary_response.status.as_u16(),
         "primary_headers": primary_response.headers,
-        "primary_body_sha256": primary_response.body.as_buffered().map(|bytes| sha256_hex(bytes)),
+        "primary_body_sha256": sha256_hex(primary_body),
         "trace_id": trace_id,
     })) else {
         tracing::warn!(route = %route.path, "failed to encode shadow traffic event");
