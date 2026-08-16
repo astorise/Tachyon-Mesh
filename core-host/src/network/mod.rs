@@ -848,14 +848,43 @@ pub(crate) async fn handle_websocket_connection(
 /// axum `Response` with a `GuestStreamingBody` body that drains live as the
 /// guest produces chunks. Triggered by `Accept: text/event-stream` on
 /// ai-inference routes.
+///
+/// Before running a local guest, this mirrors the two overflow checks
+/// `execute_route_request` already applies for every other route shape —
+/// RAM-pressure `AdmissionStrategy::MeshRetry` and a saturated
+/// `RoutePermitError::TimedOut` with `allow_overflow` — so a genuine SSE
+/// client (`Accept: text/event-stream`) can stream from a peer too, instead
+/// of always either running locally or getting a bare 429. There is no
+/// buffered-queue fallback here, matching this handler's pre-existing
+/// behavior: a route that can't run locally and can't overflow to a peer
+/// still just gets the timeout/429 it always got.
 #[cfg(feature = "ai-inference")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_streaming_http_request(
     state: AppState,
     runtime: Arc<RuntimeState>,
     route: Arc<IntegrityRoute>,
     function_name: String,
     request: GuestRequest,
+    headers: &HeaderMap,
+    method: &Method,
+    hop_limit: HopLimit,
 ) -> std::result::Result<Response, (StatusCode, String)> {
+    if let Some(result) = enforce_resource_admission(
+        &state,
+        &route,
+        headers,
+        method,
+        &request.body,
+        hop_limit,
+        &runtime,
+        true,
+    )
+    .await?
+    {
+        return Ok(guest_response_into_response(result));
+    }
+
     let volume_leases = state
         .volume_manager
         .acquire_route_volumes(&route, Arc::clone(&state.storage_broker))
@@ -880,18 +909,52 @@ pub(crate) async fn handle_streaming_http_request(
             )
         })?;
     let active_request_guard = semaphore.begin_request();
-    let permit = acquire_route_permit(semaphore)
-        .await
-        .map_err(|error| match error {
-            RoutePermitError::Closed => (
+    let permit = match acquire_route_permit(semaphore).await {
+        Ok(permit) => permit,
+        Err(RoutePermitError::Closed) => {
+            return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("streaming route `{}` is unavailable", route.path),
-            ),
-            RoutePermitError::TimedOut => (
+            ));
+        }
+        Err(RoutePermitError::TimedOut) => {
+            if route.allow_overflow {
+                let requested_model = requested_model_alias(&route, headers, &request.body);
+                if let Some(destination) = control_plane_override_destination(
+                    state.route_overrides.as_ref(),
+                    &state.peer_capabilities,
+                    &route.path,
+                    headers,
+                    select_route_target(&route, headers)
+                        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
+                        .required_capability_mask,
+                    requested_model.as_deref(),
+                ) {
+                    let idle_timeout = route
+                        .resiliency
+                        .as_ref()
+                        .and_then(|resiliency| resiliency.timeout_ms)
+                        .map(Duration::from_millis);
+                    let response = forward_request_to_override_as_streaming_response(
+                        &state.http_client,
+                        &destination,
+                        headers,
+                        method,
+                        &request.body,
+                        hop_limit,
+                        idle_timeout,
+                    )
+                    .await?;
+                    return build_guest_response(response, None)
+                        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error));
+                }
+            }
+            return Err((
                 StatusCode::TOO_MANY_REQUESTS,
                 format!("streaming route `{}` is saturated", route.path),
-            ),
-        })?;
+            ));
+        }
+    };
 
     let engine = runtime.engine.clone();
     let config = runtime.config.clone();

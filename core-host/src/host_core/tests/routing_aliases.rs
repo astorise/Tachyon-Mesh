@@ -785,6 +785,74 @@ async fn local_mesh_dispatch_buffers_ram_pressure_mesh_retry_overflow() {
     peer_server.abort();
 }
 
+// Regression test for review feedback on #399: once a peer-overflow response
+// starts streaming, `resiliency.timeout_ms`'s `TimeoutLayer` has already
+// resolved (it only wraps the wait for headers) and can no longer cut off a
+// peer that stalls mid-body. `TimeoutBoundedStreamBody` restores an
+// equivalent guarantee with a per-chunk idle timeout. Without it, this test
+// hangs until the peer thread is killed by the OS rather than completing.
+#[tokio::test]
+async fn forward_as_streaming_response_cuts_off_a_peer_that_stalls_mid_body() {
+    use axum::{body::Body as AxumBody, response::Response as AxumResponse, routing::any, Router};
+
+    async fn stalls_after_first_chunk() -> AxumResponse {
+        let (sender, receiver) = mpsc::channel::<Bytes>(1);
+        sender
+            .send(Bytes::from_static(b"first-chunk"))
+            .await
+            .expect("channel should accept the first chunk");
+        // Leaked deliberately: the peer must never close the stream on its
+        // own, so the only thing that can end this test's response body is
+        // the client-side idle timeout under test.
+        std::mem::forget(sender);
+        AxumResponse::builder()
+            .status(StatusCode::OK)
+            .body(AxumBody::new(TimeoutBoundedStreamBody { receiver }))
+            .expect("stalling peer response should build")
+    }
+
+    let peer_app = Router::new().route(DEFAULT_ROUTE, any(stalls_after_first_chunk));
+    let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("peer listener should bind");
+    let peer_address = peer_listener
+        .local_addr()
+        .expect("peer listener should expose an address");
+    let peer_server = tokio::spawn(async move {
+        axum::serve(peer_listener, peer_app)
+            .await
+            .expect("peer app should stay up");
+    });
+
+    let http_client = reqwest::Client::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        forward_request_to_override_as_streaming_response(
+            &http_client,
+            &format!("http://{peer_address}{DEFAULT_ROUTE}"),
+            &HeaderMap::new(),
+            &Method::GET,
+            &Bytes::new(),
+            HopLimit(DEFAULT_HOP_LIMIT),
+            Some(Duration::from_millis(100)),
+        ),
+    )
+    .await
+    .expect("forwarding a stalling peer under an idle timeout should not hang")
+    .expect("forwarding to the peer should succeed");
+
+    let body = result.body.into_body();
+    let collected = tokio::time::timeout(Duration::from_secs(5), body.collect())
+        .await
+        .expect("the idle timeout should end the body instead of hanging forever")
+        .expect("draining the body should not error")
+        .to_bytes();
+
+    assert_eq!(&collected[..], b"first-chunk");
+
+    peer_server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn local_mesh_dispatch_stays_local_when_no_peer_is_eligible_despite_allow_overflow() {
     let mut route = IntegrityRoute::user(DEFAULT_ROUTE);

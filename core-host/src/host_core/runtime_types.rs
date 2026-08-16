@@ -446,8 +446,7 @@ pub(crate) struct GuestRequest {
 /// `Streaming` is only ever produced by a peer forward on a client-facing
 /// saturation path (see `forward_request_to_override_as_streaming_response`).
 /// It must never be handed to a WASM guest — guests only ever produce and
-/// consume `Buffered` — and it is never retried: `StatusRetryPolicy` treats
-/// any `Streaming` response as already delivered to the client.
+/// consume `Buffered`.
 pub(crate) enum RouteResponseBody {
     Buffered(Bytes),
     Streaming(Body),
@@ -477,6 +476,65 @@ impl RouteResponseBody {
             RouteResponseBody::Buffered(bytes) => Body::from(bytes),
             RouteResponseBody::Streaming(body) => body,
         }
+    }
+}
+
+/// Wraps a peer-forwarded `reqwest::Response` so that, when the route has a
+/// configured `resiliency.timeout_ms`, the deadline keeps applying for the
+/// life of the stream — not just until headers arrive.
+///
+/// `resiliency::call_with_resiliency`'s `TimeoutLayer` only wraps the future
+/// that resolves once `forward_request_to_override_as_streaming_response`
+/// returns a `RouteExecutionResult`; the body then drains later, inside
+/// axum's response-writing path, entirely outside that timed future. Before
+/// streaming was introduced, this didn't matter because
+/// `forward_request_to_override_as_guest_response` awaited the whole body
+/// (`response.bytes().await`) inside the timed future. A per-chunk idle
+/// timeout here is what restores an equivalent guarantee for the streaming
+/// case: no single gap between chunks may exceed the route's configured
+/// budget, so a peer that stalls mid-generation still gets cut off.
+///
+/// Spawns a task that reads `response.chunk()` in a loop under
+/// `tokio::time::timeout` and forwards chunks over a channel, so the
+/// `hyper::body::Body` impl below just drains that channel. Ending the task
+/// (idle timeout, upstream error, or the receiver — the client — going away)
+/// ends the body; a body cut short mid-stream is standard behavior for a
+/// timed-out proxy connection, not a new failure mode this introduces.
+pub(crate) struct TimeoutBoundedStreamBody {
+    pub(crate) receiver: mpsc::Receiver<Bytes>,
+}
+
+pub(crate) fn stream_response_with_idle_timeout(
+    mut response: reqwest::Response,
+    idle_timeout: Duration,
+) -> TimeoutBoundedStreamBody {
+    let (sender, receiver) = mpsc::channel::<Bytes>(1);
+    tokio::spawn(async move {
+        while let Ok(Ok(Some(chunk))) = tokio::time::timeout(idle_timeout, response.chunk()).await {
+            if sender.send(chunk).await.is_err() {
+                // The client (or an intermediate drop of the body) went
+                // away; stop reading from the peer.
+                break;
+            }
+        }
+        // Loop exit also covers: the peer finished the response normally,
+        // the read itself failed, or no chunk arrived within
+        // `idle_timeout` — in every case there is nothing more to forward.
+    });
+    TimeoutBoundedStreamBody { receiver }
+}
+
+impl hyper::body::Body for TimeoutBoundedStreamBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        self.receiver
+            .poll_recv(cx)
+            .map(|chunk| chunk.map(|bytes| Ok(Frame::data(bytes))))
     }
 }
 

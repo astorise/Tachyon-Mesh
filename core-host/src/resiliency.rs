@@ -2,7 +2,7 @@
 
 use super::{
     execute_route_with_middleware_inner, ResiliencyConfig, RouteExecutionResult, RouteInvocation,
-    RouteResponseBody, RouteServiceError,
+    RouteServiceError,
 };
 use axum::http::StatusCode;
 use std::{collections::BTreeSet, future, time::Duration};
@@ -52,14 +52,17 @@ where
         result: &mut Result<RouteExecutionResult, E>,
     ) -> Option<Self::Future> {
         match result {
-            // A streaming response has already sent bytes to the client by the
-            // time it reaches this policy; re-driving the invocation would
-            // duplicate whatever the client already received. Only a
-            // buffered response, whose body has not left the host yet, is
-            // eligible for a status-based retry.
+            // A streaming `RouteResponseBody` is just as retriable as a
+            // buffered one here: `Policy::retry` runs inside `RetryLayer`,
+            // strictly before `execute_route_arc_with_middleware(...).await`
+            // returns to its caller — and only that caller's
+            // `build_guest_response`/`guest_response_into_response` ever turns
+            // a `Streaming` body into bytes on the wire. No byte of either
+            // variant has left this host at this point, so dropping the
+            // unpolled stream and re-driving the invocation is exactly as
+            // safe as re-driving a buffered attempt.
             Ok(response)
                 if self.remaining_retries > 0
-                    && matches!(response.response.body, RouteResponseBody::Buffered(_))
                     && self.should_retry_status(response.response.status) =>
             {
                 self.remaining_retries -= 1;
@@ -155,6 +158,7 @@ fn map_box_error(error: BoxError, route_path: &str, timeout: Duration) -> (Statu
 
 #[cfg(test)]
 mod tests {
+    use super::super::RouteResponseBody;
     use super::*;
     use bytes::Bytes;
     use std::sync::{
@@ -222,18 +226,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_retry_a_streaming_response_but_still_retries_a_buffered_one() {
-        // Streaming: the retriable status is on a response whose body is
-        // already a live stream, so a single attempt must be made and the
-        // retriable status must be returned as-is rather than re-driven.
+    async fn retries_a_streaming_response_exactly_like_a_buffered_one() {
+        // `Policy::retry` runs before a `RouteExecutionResult` is ever turned
+        // into bytes on the wire (see the comment on `StatusRetryPolicy::retry`),
+        // so a retriable status on a streaming body must be re-driven exactly
+        // like a buffered one — retried until success, same attempt count.
         let stream_attempts = Arc::new(AtomicUsize::new(0));
         let stream_service = service_fn({
             let attempts = Arc::clone(&stream_attempts);
             move |_: ()| {
                 let attempts = Arc::clone(&attempts);
                 async move {
-                    attempts.fetch_add(1, Ordering::SeqCst);
-                    Ok(streaming_response(StatusCode::SERVICE_UNAVAILABLE, "retry"))
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt < 2 {
+                        Ok(streaming_response(StatusCode::SERVICE_UNAVAILABLE, "retry"))
+                    } else {
+                        Ok(streaming_response(StatusCode::OK, "ok"))
+                    }
                 }
             }
         });
@@ -247,14 +256,11 @@ mod tests {
 
         let result = call_with_resiliency(stream_service, (), "/api/stream", Some(&config))
             .await
-            .expect("streaming service call should still return its response");
+            .expect("streaming service should eventually succeed");
 
-        assert_eq!(result.response.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(stream_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(result.response.status, StatusCode::OK);
+        assert_eq!(stream_attempts.load(Ordering::SeqCst), 3);
 
-        // Buffered: the same retriable status on a buffered body is still
-        // re-driven until it succeeds, proving the streaming case above is
-        // not just a broken retry policy.
         let buffered_attempts = Arc::new(AtomicUsize::new(0));
         let buffered_service = service_fn({
             let attempts = Arc::clone(&buffered_attempts);

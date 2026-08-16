@@ -980,6 +980,11 @@ pub(crate) async fn forward_request_to_override_as_guest_response(
 /// Never call this for a response that will be handed to a WASM guest —
 /// `try_peer_overflow_dispatch` (the mesh-fetch path) must keep using the
 /// buffered variant above.
+///
+/// `idle_timeout`, when the route configures `resiliency.timeout_ms`, bounds
+/// the gap between chunks so a peer that stalls mid-generation is still cut
+/// off — see `TimeoutBoundedStreamBody` for why the surrounding
+/// `TimeoutLayer` cannot do this on its own once the body is streaming.
 pub(crate) async fn forward_request_to_override_as_streaming_response(
     http_client: &Client,
     destination: &str,
@@ -987,6 +992,7 @@ pub(crate) async fn forward_request_to_override_as_streaming_response(
     method: &Method,
     body: &Bytes,
     hop_limit: HopLimit,
+    idle_timeout: Option<Duration>,
 ) -> std::result::Result<GuestHttpResponse, (StatusCode, String)> {
     let mut request = http_client.request(method.clone(), destination);
     for (name, value) in headers {
@@ -1010,7 +1016,10 @@ pub(crate) async fn forward_request_to_override_as_streaming_response(
             name != "content-length" && name != "connection" && name != "transfer-encoding"
         })
         .collect();
-    let body = Body::from_stream(response.bytes_stream());
+    let body = match idle_timeout {
+        Some(idle_timeout) => Body::new(stream_response_with_idle_timeout(response, idle_timeout)),
+        None => Body::from_stream(response.bytes_stream()),
+    };
     Ok(GuestHttpResponse {
         status,
         headers,
@@ -1644,6 +1653,9 @@ pub(crate) async fn faas_handler(
                                     Arc::clone(&route),
                                     selected_target.module.clone(),
                                     request,
+                                    &headers,
+                                    &method,
+                                    hop_limit,
                                 )
                                 .await
                                 {
@@ -1724,6 +1736,9 @@ pub(crate) async fn faas_handler(
                                     Arc::clone(&route),
                                     selected_target.module.clone(),
                                     request,
+                                    &headers,
+                                    &method,
+                                    hop_limit,
                                 )
                                 .await
                                 {
@@ -2170,6 +2185,11 @@ pub(crate) async fn execute_route_request(
                     requested_model.as_deref(),
                 ) {
                     let response = if allow_streaming_overflow {
+                        let idle_timeout = route
+                            .resiliency
+                            .as_ref()
+                            .and_then(|resiliency| resiliency.timeout_ms)
+                            .map(Duration::from_millis);
                         forward_request_to_override_as_streaming_response(
                             &state.http_client,
                             &destination,
@@ -2177,6 +2197,7 @@ pub(crate) async fn execute_route_request(
                             method,
                             body,
                             hop_limit,
+                            idle_timeout,
                         )
                         .await?
                     } else {
@@ -2293,6 +2314,11 @@ pub(crate) async fn enforce_resource_admission(
             requested_model.as_deref(),
         ) {
             let response = if allow_streaming_overflow {
+                let idle_timeout = route
+                    .resiliency
+                    .as_ref()
+                    .and_then(|resiliency| resiliency.timeout_ms)
+                    .map(Duration::from_millis);
                 forward_request_to_override_as_streaming_response(
                     &state.http_client,
                     &destination,
@@ -2300,6 +2326,7 @@ pub(crate) async fn enforce_resource_admission(
                     method,
                     body,
                     hop_limit,
+                    idle_timeout,
                 )
                 .await?
             } else {
