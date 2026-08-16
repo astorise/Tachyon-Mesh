@@ -172,6 +172,153 @@ async fn router_skips_telemetry_export_for_unsampled_requests() {
     );
 }
 
+// Regression test for #400: `faas_handler`'s `active_requests` gauge and
+// `TelemetryEvent::RequestEnd` used to be scoped to "the handler returned a
+// `Response`," not "the response body finished draining." For a streaming
+// response (here: the `x-tachyon-route-override` direct-streaming path
+// forwarding to a slow peer) that meant both dropped the instant headers
+// were ready, even though the peer kept sending chunks for a while after.
+// `TelemetryCompletionBody` fixes this by deferring both to the body's own
+// completion. This drives a real streaming response end to end through
+// `faas_handler` and asserts `active_requests` stays elevated across two
+// separate chunks and only drops — and `RequestEnd` only fires — once the
+// peer's stream actually ends.
+#[tokio::test]
+async fn streaming_override_response_keeps_active_requests_elevated_until_stream_ends() {
+    use axum::{body::Body as AxumBody, response::Response as AxumResponse, routing::any, Router};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    async fn drip_two_chunks_then_end() -> AxumResponse {
+        let (sender, receiver) = mpsc::channel::<std::result::Result<Bytes, StreamForwardError>>(1);
+        tokio::spawn(async move {
+            let _ = sender.send(Ok(Bytes::from_static(b"chunk-1"))).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = sender.send(Ok(Bytes::from_static(b"chunk-2"))).await;
+            // Dropping `sender` here ends the stream cleanly.
+        });
+        AxumResponse::builder()
+            .status(StatusCode::OK)
+            .body(AxumBody::new(TimeoutBoundedStreamBody { receiver }))
+            .expect("peer response should build")
+    }
+
+    let peer_app = Router::new().route(DEFAULT_ROUTE, any(drip_two_chunks_then_end));
+    let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("peer listener should bind");
+    let peer_address = peer_listener
+        .local_addr()
+        .expect("peer listener should expose an address");
+    let peer_server = tokio::spawn(async move {
+        axum::serve(peer_listener, peer_app)
+            .await
+            .expect("peer app should stay up");
+    });
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let telemetry = telemetry::init_test_telemetry_with_emitter({
+        let captured = Arc::clone(&captured);
+        move |line| {
+            captured
+                .lock()
+                .expect("captured telemetry should not be poisoned")
+                .push(line);
+            true
+        }
+    });
+    let telemetry_handle = telemetry.clone();
+
+    let config = validate_integrity_config(IntegrityConfig {
+        telemetry_sample_rate: 1.0,
+        ..IntegrityConfig::default_sealed()
+    })
+    .expect("config should validate");
+    let state = build_test_state(config, telemetry);
+    update_control_plane_route_override(
+        state.route_overrides.as_ref(),
+        &state.peer_capabilities,
+        DEFAULT_ROUTE,
+        &format!("http://{peer_address}{DEFAULT_ROUTE}"),
+    )
+    .expect("route override should install");
+
+    assert_eq!(telemetry::active_requests(&telemetry_handle), 0);
+
+    let app = build_app(state);
+    let response = app
+        .oneshot(
+            Request::get(DEFAULT_ROUTE)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Headers are ready, but the peer is still mid-stream: the old behavior
+    // would already have dropped the slot here.
+    assert_eq!(
+        telemetry::active_requests(&telemetry_handle),
+        1,
+        "active_requests must stay elevated once headers are ready but the body is still streaming"
+    );
+
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(5), body.frame())
+        .await
+        .expect("first chunk should arrive")
+        .expect("body should yield a frame")
+        .expect("frame should not be an error");
+    assert_eq!(&first.into_data().expect("data frame")[..], b"chunk-1");
+    assert_eq!(
+        telemetry::active_requests(&telemetry_handle),
+        1,
+        "active_requests must stay elevated between chunks"
+    );
+
+    let second = tokio::time::timeout(Duration::from_secs(5), body.frame())
+        .await
+        .expect("second chunk should arrive")
+        .expect("body should yield a frame")
+        .expect("frame should not be an error");
+    assert_eq!(&second.into_data().expect("data frame")[..], b"chunk-2");
+
+    let end = tokio::time::timeout(Duration::from_secs(5), body.frame())
+        .await
+        .expect("stream should end promptly after the second chunk");
+    assert!(end.is_none(), "stream should end after the second chunk");
+
+    assert_eq!(
+        telemetry::active_requests(&telemetry_handle),
+        0,
+        "active_requests must drop back to 0 once the stream actually ends"
+    );
+
+    let line = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(line) = captured
+                .lock()
+                .expect("captured telemetry should not be poisoned")
+                .first()
+                .cloned()
+            {
+                break line;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("RequestEnd telemetry line should be emitted once the stream ends");
+    let record: serde_json::Value =
+        serde_json::from_str(&line).expect("telemetry output should be valid JSON");
+    assert_eq!(record["status"], 200);
+
+    peer_server.abort();
+}
+
 #[tokio::test]
 async fn metering_outbox_retry_drain_removes_successfully_exported_records() {
     let state = build_test_state(
