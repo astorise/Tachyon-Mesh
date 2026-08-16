@@ -86,10 +86,34 @@ fixtures.
 
 ## Fixture regeneration and qualification
 
+`core-host/src/ai_inference/qwen35_fixture.rs` writes a complete Qwen 3.5 MoE
+NVFP4 checkpoint — two layers, one of each attention kind, two experts, a
+64-wide hidden state — into a temporary directory. It is a real checkpoint by
+the profile's own standard: ModelOpt producer metadata, mixed FP8 and
+`W4A16_NVFP4` operators, packed nibbles beside per-block E4M3 scales, and every
+tensor the contract names. The loader, the contract, the packing and the forward
+pass are therefore covered on every run, with no network and no installed
+weights.
+
+Nothing in the load path wants the production geometry: `validate_semantics`
+asks for consistency rather than size, `validate_tensor_contract` derives each
+expected shape from the config it was given, and `load` builds the model through
+upstream's projection factory off that same config.
+
 For the installed production checkpoint, set `TACHYON_QWEN35_MOE_NVFP4_DIR` and
-run the gated tests in `qwen35_upstream.rs`. They are the only coverage the
-loader has: no synthetic checkpoint exercises it, so a run without that
-variable set skips them rather than substituting a weaker check.
+run the gated tests in `qwen35_upstream.rs`. What they add over the fixture is
+the one claim it cannot make: that *this* checkpoint is one this loader reads.
+A run without the variable skips them.
+
+The same name is a repository variable for the `GPU Acceptance` workflow,
+pointing at the checkpoint on the GPU runner, and it is now optional there too.
+The workflow's kernel proof — that a `cuda` route resolves to the native NVFP4
+operator rather than descending to the packed CPU one — runs against the fixture
+on every dispatch, because what it tests is the build and the device rather than
+the weights. Set the variable and the installed-checkpoint steps run beside it;
+leave it unset and they are skipped. Nothing there is gated on the hardware:
+candle #3831 dropped the FP4 tensor-core floor, so a device without the tensor
+cores takes the fallback and answers the same tokens more slowly.
 
 `scripts/export_qwen35_moe_fixtures.py` exported golden intermediate states and
 logits from a local trusted tiny model, for the scalar runtime's parity tests to
@@ -100,7 +124,10 @@ file no test consumes.
 
 Runtime controls:
 
-- `TACHYON_MODEL_OPT_NVFP4_DIR`: generic ModelOpt parser probe.
+- `TACHYON_MODEL_OPT_NVFP4_DIR`: generic ModelOpt parser probe. In the `GPU
+  Acceptance` workflow it defaults to the Qwen checkpoint, which is a
+  ModelOpt/NVFP4 directory and satisfies everything the probe asserts; set the
+  repository variable only to point the probe at a different checkpoint.
 
 `TACHYON_QWEN35_MAX_DENSE_OPERATOR_BYTES` and `TACHYON_QWEN35_WORKING_SET_BYTES`
 bounded the scalar runtime's per-operator dequantization and its prepared-weight

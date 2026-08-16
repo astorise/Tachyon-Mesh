@@ -18,6 +18,8 @@ mod paged_kv;
 pub(crate) mod parallel;
 #[path = "ai_inference/pipeline_parallel_llama.rs"]
 pub(crate) mod pipeline_parallel_llama;
+#[cfg(test)]
+mod qwen35_fixture;
 mod qwen35_profile;
 mod qwen35_upstream;
 #[path = "ai_inference/samplers.rs"]

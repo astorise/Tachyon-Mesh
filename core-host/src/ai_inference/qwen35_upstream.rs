@@ -945,6 +945,157 @@ mod tests {
         );
     }
 
+    /// Build the tiny checkpoint and load it on the host path.
+    ///
+    /// The gated tests below need the installed weights and therefore cover
+    /// nothing wherever those are absent — which is every environment except a
+    /// configured GPU runner. These carry the same properties against a
+    /// checkpoint the test writes itself, so the loader, the tensor contract
+    /// and the forward pass are covered on every run.
+    fn load_fixture(tag: &str) -> (Qwen35MoeRuntime, std::path::PathBuf) {
+        let root = super::super::modelopt_nvfp4::tests_support::temp_model_dir(tag);
+        super::super::qwen35_fixture::write_tiny_qwen35_nvfp4_fixture(&root)
+            .expect("fixture checkpoint should be written");
+        let runtime = Qwen35MoeRuntime::try_load(tag, &root, "cpu")
+            .expect("fixture runtime construction should succeed")
+            .expect("fixture should select the Qwen runtime");
+        (runtime, root)
+    }
+
+    /// The fixture is a Qwen 3.5 MoE NVFP4 checkpoint by the profile's own
+    /// standard, not merely by ours.
+    ///
+    /// Everything else here rests on that: if the fixture drifted out of the
+    /// contract, the tests below would fail for a reason that has nothing to do
+    /// with what they assert.
+    #[test]
+    fn the_fixture_checkpoint_satisfies_the_qwen35_profile() {
+        let (runtime, root) = load_fixture("qwen35-fixture-profile");
+        assert_eq!(runtime.config.num_hidden_layers, 2);
+        assert_eq!(runtime.config.num_experts, 2);
+        assert!(
+            runtime.chat_template.is_some(),
+            "the fixture ships a chat template, so one must be found and parsed"
+        );
+        assert_eq!(
+            runtime.executed_on(),
+            "cpu_packed_fp4",
+            "the host path keeps the weight packed; reporting a fallback would say the \
+             checkpoint had been expanded when it has not"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A prompt that spans several prefill chunks decodes reproducibly.
+    ///
+    /// Named for what it proves. `PREFILL_CHUNK_TOKENS` is a constant, so no
+    /// test can hold the prompt fixed and vary the chunk size — what is
+    /// reachable is that a prompt long enough to take several passes gives the
+    /// same answer twice, which fails if a previous request's KV cache or
+    /// recurrent state survived into the next one. Proving invariance *to* the
+    /// chunk size would need the loop's stride to be settable, and the same
+    /// limit applies to the gated test beside this one.
+    #[test]
+    fn fixture_prefill_spanning_several_chunks_is_reproducible() {
+        let (runtime, root) = load_fixture("qwen35-fixture-chunking");
+        // The tokenizer is word-level on whitespace, so this is one token per
+        // word: comfortably past `PREFILL_CHUNK_TOKENS`.
+        let prompt = "hello tachyon mesh ".repeat(40);
+        assert!(
+            prompt.split_whitespace().count() > PREFILL_CHUNK_TOKENS,
+            "the prompt must span more than one prefill pass to exercise the loop"
+        );
+        let request = serde_json::json!({
+            "prompt": prompt,
+            "max_new_tokens": 4,
+        })
+        .to_string();
+        let (first, _, _) = runtime
+            .generate(&[request.as_bytes()])
+            .expect("generation should succeed");
+        let (second, _, _) = runtime
+            .generate(&[request.as_bytes()])
+            .expect("generation should succeed");
+        assert_eq!(
+            first, second,
+            "greedy decoding of one prompt must be reproducible across calls; a difference here \
+             means the previous request's KV cache or recurrent state survived into this one"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Both entry points decode the same prompt identically.
+    #[test]
+    fn fixture_generates_buffered_and_streaming_text() {
+        let (runtime, root) = load_fixture("qwen35-fixture-generate");
+        let request = serde_json::json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_new_tokens": 4,
+        })
+        .to_string();
+
+        let (buffered, usage, _) = runtime
+            .generate(&[request.as_bytes()])
+            .expect("buffered generation should succeed");
+        assert!(!buffered.is_empty(), "a buffered answer must carry text");
+        assert!(usage.prompt_tokens > 0);
+        assert!(usage.completion_tokens > 0);
+
+        let mut streamed = String::new();
+        let (stream_usage, _) = runtime
+            .generate_streaming(&[request.as_bytes()], &mut |delta| {
+                streamed.push_str(delta);
+                StreamControl::Continue
+            })
+            .expect("streaming generation should succeed");
+        assert_eq!(
+            streamed.as_bytes(),
+            buffered.as_slice(),
+            "the two entry points decode the same prompt with the same weights"
+        );
+        assert_eq!(stream_usage.prompt_tokens, usage.prompt_tokens);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A `cuda` route runs the kernel or refuses to load — on the fixture.
+    ///
+    /// The weights this needs are any valid NVFP4 checkpoint; what it proves is
+    /// which operator `auto_linear` chose, which is a property of the build and
+    /// the device rather than of the checkpoint. Running it on the fixture is
+    /// what lets the GPU job stop needing installed weights.
+    #[test]
+    fn fixture_cuda_route_runs_the_kernel_or_refuses_to_load() {
+        let root =
+            super::super::modelopt_nvfp4::tests_support::temp_model_dir("qwen35-fixture-cuda");
+        super::super::qwen35_fixture::write_tiny_qwen35_nvfp4_fixture(&root)
+            .expect("fixture checkpoint should be written");
+        if candle_core::Device::new_cuda(0).is_err() {
+            eprintln!("skipping CUDA-route selection: no CUDA device");
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        let loaded = Qwen35MoeRuntime::try_load(
+            "qwen35-fixture-cuda",
+            &root,
+            crate::ModelDevice::Cuda.as_str(),
+        );
+        if cfg!(feature = "candle-cuda") {
+            let runtime = loaded
+                .expect("a CUDA route must load where the kernel is reachable")
+                .expect("fixture should select the Qwen runtime");
+            assert_eq!(runtime.executed_on(), "gpu_native_fp4");
+        } else {
+            let Err(error) = loaded else {
+                panic!("a build with no kernel must refuse a CUDA route, not load one");
+            };
+            assert!(
+                error.to_string().contains("no usable NVFP4 kernel"),
+                "the refusal should name the missing kernel, got: {error}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// The installed checkpoint constructs the runtime on the host path.
     ///
     /// Everything above this line is a translation test: it proves the config
@@ -1005,15 +1156,18 @@ mod tests {
         }
     }
 
-    /// Chunk size must not change the answer.
+    /// A prompt that spans several prefill chunks decodes reproducibly, on the
+    /// installed weights.
     ///
     /// The prefill loop is still ours — `PREFILL_CHUNK_TOKENS` exists so the
-    /// deadline can be observed — and it rests on upstream's forward being
-    /// equivalent whether a prompt arrives in one pass or several. Greedy
-    /// decoding makes that comparable: same prompt, same weights, so any
-    /// difference is the chunking.
+    /// deadline can be observed. This used to be called
+    /// `gated_prefill_is_invariant_to_chunk_size`, which claimed more than it
+    /// did: it runs one prompt twice at one stride, so what it can catch is
+    /// state surviving from the previous request, not a chunk boundary changing
+    /// the answer. The stride is a constant; making invariance provable means
+    /// making it settable.
     #[test]
-    fn gated_prefill_is_invariant_to_chunk_size() {
+    fn gated_prefill_spanning_several_chunks_is_reproducible() {
         let Ok(path) = std::env::var("TACHYON_QWEN35_MOE_NVFP4_DIR") else {
             return;
         };
