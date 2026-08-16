@@ -1028,6 +1028,55 @@ pub(crate) async fn forward_request_to_override_as_streaming_response(
     })
 }
 
+/// Like `forward_request_to_override_as_streaming_response`, but also bounds
+/// the wait for the peer to accept the connection and return headers with
+/// `idle_timeout`.
+///
+/// `forward_request_to_override_as_streaming_response`'s own `idle_timeout`
+/// only takes effect once `TimeoutBoundedStreamBody` starts reading the body
+/// — the handshake (`send().await`, waiting for status + headers) happens
+/// before that and is otherwise unbounded. The two call sites inside
+/// `execute_route_request`/`enforce_resource_admission` get handshake
+/// coverage for free from the surrounding `execute_route_with_resiliency`
+/// `TimeoutLayer`, so wrapping here is redundant-but-harmless for them; for
+/// `handle_streaming_http_request` (the SSE path, which never goes through
+/// that layer) this is the only thing bounding the handshake at all.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forward_request_to_override_as_streaming_response_with_handshake_timeout(
+    http_client: &Client,
+    destination: &str,
+    headers: &HeaderMap,
+    method: &Method,
+    body: &Bytes,
+    hop_limit: HopLimit,
+    idle_timeout: Option<Duration>,
+    route_path: &str,
+) -> std::result::Result<GuestHttpResponse, (StatusCode, String)> {
+    let forward = forward_request_to_override_as_streaming_response(
+        http_client,
+        destination,
+        headers,
+        method,
+        body,
+        hop_limit,
+        idle_timeout,
+    );
+    match idle_timeout {
+        Some(idle_timeout) => tokio::time::timeout(idle_timeout, forward)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!(
+                        "route `{route_path}` peer handshake timed out after {}ms",
+                        idle_timeout.as_millis()
+                    ),
+                )
+            })?,
+        None => forward.await,
+    }
+}
+
 pub(crate) fn requested_model_alias(
     route: &IntegrityRoute,
     headers: &HeaderMap,
@@ -2190,7 +2239,7 @@ pub(crate) async fn execute_route_request(
                             .as_ref()
                             .and_then(|resiliency| resiliency.timeout_ms)
                             .map(Duration::from_millis);
-                        forward_request_to_override_as_streaming_response(
+                        forward_request_to_override_as_streaming_response_with_handshake_timeout(
                             &state.http_client,
                             &destination,
                             headers,
@@ -2198,6 +2247,7 @@ pub(crate) async fn execute_route_request(
                             body,
                             hop_limit,
                             idle_timeout,
+                            &route.path,
                         )
                         .await?
                     } else {
@@ -2319,7 +2369,7 @@ pub(crate) async fn enforce_resource_admission(
                     .as_ref()
                     .and_then(|resiliency| resiliency.timeout_ms)
                     .map(Duration::from_millis);
-                forward_request_to_override_as_streaming_response(
+                forward_request_to_override_as_streaming_response_with_handshake_timeout(
                     &state.http_client,
                     &destination,
                     headers,
@@ -2327,6 +2377,7 @@ pub(crate) async fn enforce_resource_admission(
                     body,
                     hop_limit,
                     idle_timeout,
+                    &route.path,
                 )
                 .await?
             } else {
