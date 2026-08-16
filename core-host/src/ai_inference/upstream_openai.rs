@@ -512,13 +512,33 @@ static LIVE_SSE_READERS: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 
 /// Decrements the live-reader count however its thread ends — a clean EOF, a
 /// read error, or a send to a receiver that has gone away.
-struct SseReaderSlot;
+struct SseReaderSlot {
+    /// Lets a test observe *this specific* slot's release directly, instead
+    /// of diffing the shared `LIVE_SSE_READERS` counter across two instants
+    /// — which every other streaming test in this file also mutates, so a
+    /// diff can be thrown off by unrelated concurrent activity that has
+    /// nothing to do with the slot under test. Never set outside tests.
+    #[cfg(test)]
+    on_drop: Option<std::sync::mpsc::SyncSender<()>>,
+}
 
 impl SseReaderSlot {
     /// `None` when the ceiling is reached, which the caller reports as an
     /// overloaded upstream rather than spawning a thread it cannot account for.
     fn claim() -> Option<Self> {
-        claim_below(&LIVE_SSE_READERS, max_live_sse_readers()).then_some(Self)
+        claim_below(&LIVE_SSE_READERS, max_live_sse_readers()).then_some(Self {
+            #[cfg(test)]
+            on_drop: None,
+        })
+    }
+
+    /// Attach a channel that fires the instant this slot is released,
+    /// wherever that happens — including inside the reader thread's closure,
+    /// well before the thread itself finishes exiting.
+    #[cfg(test)]
+    fn notify_drop(mut self, tx: std::sync::mpsc::SyncSender<()>) -> Self {
+        self.on_drop = Some(tx);
+        self
     }
 }
 
@@ -548,6 +568,10 @@ fn claim_below(counter: &std::sync::atomic::AtomicUsize, ceiling: usize) -> bool
 impl Drop for SseReaderSlot {
     fn drop(&mut self) {
         LIVE_SSE_READERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        #[cfg(test)]
+        if let Some(tx) = self.on_drop.take() {
+            let _ = tx.send(());
+        }
     }
 }
 
@@ -616,6 +640,17 @@ impl SseLineReader {
                     tx,
                     cancel_thread,
                 ));
+                // DNS resolution runs on tokio's blocking pool and, once
+                // started, cannot be aborted by dropping its future — a
+                // stalled `getaddrinfo` keeps that pool thread busy well
+                // past `cancel.notified()` firing. An ordinary drop of `rt`
+                // blocks this thread until every such task finishes, which
+                // would hold `_slot` for however long DNS takes instead of
+                // releasing it the moment `drive` returns. Shutting down in
+                // the background lets this thread — and the slot — go free
+                // immediately, leaving the runtime's own cleanup to finish
+                // on its own time.
+                rt.shutdown_background();
             });
         // A host that cannot spawn is already failing; report it as an empty
         // stream rather than panicking inside a request.
@@ -699,6 +734,15 @@ impl SseLineReader {
         // grow the reader without limit.
         let mut budget = MAX_STREAM_BYTES;
         let mut line = Vec::new();
+        // How much of `line`, from the start, is already known to contain no
+        // newline. Without this, a frame arriving as many small chunks
+        // rescanned the whole accumulated buffer from byte zero on every
+        // chunk — quadratic in the frame's length, cheap enough to pin a
+        // reader thread's CPU until the request timeout on nothing more than
+        // an upstream that writes one byte at a time. Reset to zero whenever
+        // a line is drained, since the leftover after the split has never
+        // been scanned.
+        let mut scanned = 0usize;
         loop {
             let chunk = tokio::select! {
                 chunk = response.chunk() => chunk,
@@ -724,7 +768,11 @@ impl SseLineReader {
             line.extend_from_slice(&bytes[..take]);
 
             loop {
-                let Some(newline) = line.iter().position(|&byte| byte == b'\n') else {
+                let found = line[scanned..]
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .map(|relative| scanned + relative);
+                let Some(newline) = found else {
                     // A plain accumulate-until-newline would grow without
                     // bound if the upstream never sends one — and several
                     // concurrent streams would multiply that. This is the
@@ -739,6 +787,7 @@ impl SseLineReader {
                         }));
                         return;
                     }
+                    scanned = line.len();
                     break;
                 };
                 let split = line.split_off(newline + 1);
@@ -753,6 +802,7 @@ impl SseLineReader {
                         return;
                     }
                 };
+                scanned = 0;
                 // A closed receiver means the caller has stopped caring.
                 // Returning drops the response, which closes the socket.
                 if tx.send(Ok(text)).is_err() {
@@ -4653,31 +4703,48 @@ mod tests {
     /// since moved on.
     #[test]
     fn an_abandoned_reader_frees_its_slot_without_waiting_for_the_upstream() {
-        let upstream = FakeUpstream::start_silent(Duration::from_secs(30));
-        let backend = runtime("coder", &format!("{}?timeout_ms=30000", upstream.binding()));
+        // Built directly against `SseLineReader` rather than through
+        // `generate_streaming`, with the slot wired to `notify_drop` so the
+        // test learns the instant *this specific* slot is released. An
+        // earlier version of this test diffed the shared `LIVE_SSE_READERS`
+        // counter across two instants instead — racy in a suite that runs
+        // tests in parallel, since every other streaming test in this file
+        // claims and releases slots on that same counter between those two
+        // instants, for reasons that have nothing to do with the reader
+        // under test here. `notify_drop` sidesteps the shared counter
+        // entirely: the signal fires from inside the slot's own `Drop`.
+        let (upstream, _feed) = FakeUpstream::start_scripted();
+        let client = reqwest::Client::new();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
+        let slot = SseReaderSlot::claim()
+            .expect("a fresh node has reader slots")
+            .notify_drop(dropped_tx);
 
-        let live = || LIVE_SSE_READERS.load(std::sync::atomic::Ordering::Relaxed);
-        let before = live();
+        let mut reader = SseLineReader::spawn(
+            client,
+            "coder".to_owned(),
+            format!("{}/chat/completions", upstream.base_url()),
+            json!({}),
+            Duration::from_secs(30),
+            None,
+            slot,
+        );
 
-        let mut sink = DepartedSink::default();
-        backend
-            .generate_streaming(&[b"go"], &mut sink)
-            .expect("an abandoned stream is not a failure");
+        // Confirm it is genuinely parked — mid-connect, here, since the
+        // fixture never answers — before asking it to give up. Otherwise a
+        // reader that happened to exit on its own for an unrelated reason
+        // would make this test pass for the wrong reason.
+        assert!(
+            matches!(reader.next_line(Duration::from_millis(50)), SseRead::Idle),
+            "the reader must still be waiting on the fixture, not already done"
+        );
 
-        // The reader thread races its cancellation notify against the same
-        // socket read a real upstream would still be silent on; give it a
-        // moment to actually finish rather than asserting the instant
-        // `generate_streaming` returns.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while live() > before && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        drop(reader);
 
-        assert_eq!(
-            live(),
-            before,
-            "the parked reader must release its slot once the caller is gone, not hold it \
-             for the binding's 30s timeout"
+        assert!(
+            dropped_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the parked reader must release its slot once cancelled, not hold it for the \
+             binding's timeout"
         );
     }
 
