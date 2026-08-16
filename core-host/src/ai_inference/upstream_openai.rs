@@ -760,12 +760,18 @@ impl SseLineReader {
                 }
             }
 
-            // The whole-stream cap was hit mid-chunk: the remaining bytes
-            // were never read, so what has been buffered is all there is —
-            // the same shape `Read::take` left behind for the old blocking
-            // reader, and the outer frame loop already treats a stream that
-            // ends without `[DONE]` as truncated.
-            if take < bytes.len() {
+            // The whole-stream cap is now exhausted, whether this chunk ran
+            // past it or landed exactly on it: either way the remaining
+            // bytes were never read, so what has been buffered is all there
+            // is — the same shape `Read::take` left behind for the old
+            // blocking reader, and the outer frame loop already treats a
+            // stream that ends without `[DONE]` as truncated. Checking only
+            // `take < bytes.len()` missed the exact-boundary case: `budget`
+            // still landed on zero, but the loop went on to call
+            // `response.chunk()` again and blocked on a silent upstream
+            // until the request timeout, holding the reader slot the whole
+            // time.
+            if budget == 0 {
                 Self::flush_tail(&mut line, &tx, &alias, &url);
                 return;
             }
@@ -4672,6 +4678,60 @@ mod tests {
             before,
             "the parked reader must release its slot once the caller is gone, not hold it \
              for the binding's 30s timeout"
+        );
+    }
+
+    /// A chunk that lands exactly on `MAX_STREAM_BYTES`, with the upstream
+    /// left open and silent afterward.
+    ///
+    /// `take` is computed as `bytes.len().min(budget)`, so a chunk that
+    /// exactly exhausts the remaining budget has `take == bytes.len()` —
+    /// the same shape as an ordinary chunk that stayed under the cap.
+    /// Checking only `take < bytes.len()` (true when a chunk runs *past*
+    /// the cap) missed this boundary: `budget` reached zero, but the loop
+    /// still went on to await another `response.chunk()` from an upstream
+    /// that never spoke again, parking until the request timeout instead of
+    /// treating the cap as this side's own end of stream.
+    #[test]
+    fn the_whole_stream_budget_is_enforced_exactly_at_the_boundary() {
+        let (upstream, feed) = FakeUpstream::start_scripted();
+        let backend = runtime("coder", &format!("{}?timeout_ms=30000", upstream.binding()));
+
+        // 1024 frames of 64 KiB each, every one a valid content delta well
+        // under the per-frame cap, summing to exactly `MAX_STREAM_BYTES` —
+        // so the very last byte read is also the byte that exhausts the
+        // budget, regardless of how the transport happens to split it into
+        // `response.chunk()` calls.
+        let prefix = r#"data: {"choices":[{"delta":{"content":""#;
+        let suffix = "\"}}]}\n\n";
+        let frame_len = 65536usize;
+        let payload_len = frame_len - prefix.len() - suffix.len();
+        let frame = format!("{prefix}{}{suffix}", "x".repeat(payload_len));
+        assert_eq!(frame.len(), frame_len);
+        let frames = MAX_STREAM_BYTES as usize / frame_len;
+        assert_eq!(
+            frames * frame_len,
+            MAX_STREAM_BYTES as usize,
+            "the frame size must evenly divide the cap for this test to land on it exactly"
+        );
+        feed.send(frame.repeat(frames).into_bytes())
+            .expect("fixture feed");
+        // Left open on purpose: no `[DONE]`, no close. A silent upstream
+        // past the cap is exactly the case that used to hang.
+
+        let started = std::time::Instant::now();
+        let mut captured = CapturedStream::default();
+        let outcome = backend.generate_streaming(&[b"go"], &mut captured.sink());
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the reader must stop at the whole-stream cap rather than waiting on a chunk \
+             from a since-silent upstream; took {elapsed:?}"
+        );
+        assert!(
+            outcome.is_err(),
+            "a stream cut off at the cap without `[DONE]` is truncated, not complete: {outcome:?}"
         );
     }
 
