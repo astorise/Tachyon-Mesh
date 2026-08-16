@@ -791,14 +791,17 @@ async fn local_mesh_dispatch_buffers_ram_pressure_mesh_retry_overflow() {
 // peer that stalls mid-body. `TimeoutBoundedStreamBody` restores an
 // equivalent guarantee with a per-chunk idle timeout. Without it, this test
 // hangs until the peer thread is killed by the OS rather than completing.
+// It also proves the cutoff surfaces as a stream error rather than a clean
+// end of stream — a truncated body must not look like a complete HTTP 200
+// to the client.
 #[tokio::test]
 async fn forward_as_streaming_response_cuts_off_a_peer_that_stalls_mid_body() {
     use axum::{body::Body as AxumBody, response::Response as AxumResponse, routing::any, Router};
 
     async fn stalls_after_first_chunk() -> AxumResponse {
-        let (sender, receiver) = mpsc::channel::<Bytes>(1);
+        let (sender, receiver) = mpsc::channel::<std::result::Result<Bytes, StreamForwardError>>(1);
         sender
-            .send(Bytes::from_static(b"first-chunk"))
+            .send(Ok(Bytes::from_static(b"first-chunk")))
             .await
             .expect("channel should accept the first chunk");
         // Leaked deliberately: the peer must never close the stream on its
@@ -841,14 +844,27 @@ async fn forward_as_streaming_response_cuts_off_a_peer_that_stalls_mid_body() {
     .expect("forwarding a stalling peer under an idle timeout should not hang")
     .expect("forwarding to the peer should succeed");
 
-    let body = result.body.into_body();
-    let collected = tokio::time::timeout(Duration::from_secs(5), body.collect())
-        .await
-        .expect("the idle timeout should end the body instead of hanging forever")
-        .expect("draining the body should not error")
-        .to_bytes();
+    let mut body = result.body.into_body();
 
-    assert_eq!(&collected[..], b"first-chunk");
+    let first_frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+        .await
+        .expect("the first chunk should arrive quickly")
+        .expect("body should yield a first frame")
+        .expect("first frame should not be an error");
+    assert_eq!(
+        &first_frame
+            .into_data()
+            .expect("first frame should carry the peer's chunk")[..],
+        b"first-chunk"
+    );
+
+    let second_frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+        .await
+        .expect("the idle timeout should end the body instead of hanging forever");
+    assert!(
+        matches!(second_frame, Some(Err(_))),
+        "a peer that stalls mid-body must surface as a stream error, not a clean end of stream; got {second_frame:?}"
+    );
 
     peer_server.abort();
 }

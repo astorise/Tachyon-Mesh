@@ -935,7 +935,7 @@ pub(crate) async fn handle_streaming_http_request(
                         .as_ref()
                         .and_then(|resiliency| resiliency.timeout_ms)
                         .map(Duration::from_millis);
-                    let response = forward_request_to_override_as_streaming_response(
+                    let forward = forward_request_to_override_as_streaming_response(
                         &state.http_client,
                         &destination,
                         headers,
@@ -943,8 +943,29 @@ pub(crate) async fn handle_streaming_http_request(
                         &request.body,
                         hop_limit,
                         idle_timeout,
-                    )
-                    .await?;
+                    );
+                    // This call runs outside `execute_route_with_resiliency`'s
+                    // `TimeoutLayer` entirely (this handler never goes
+                    // through it), so nothing else bounds the wait for the
+                    // peer to accept the connection and return headers. A
+                    // peer that accepts but never responds would otherwise
+                    // hang the request forever instead of honoring
+                    // `resiliency.timeout_ms`.
+                    let response = match idle_timeout {
+                        Some(idle_timeout) => tokio::time::timeout(idle_timeout, forward)
+                            .await
+                            .map_err(|_| {
+                            (
+                                StatusCode::GATEWAY_TIMEOUT,
+                                format!(
+                                    "streaming route `{}` peer handshake timed out after {}ms",
+                                    route.path,
+                                    idle_timeout.as_millis()
+                                ),
+                            )
+                        })??,
+                        None => forward.await?,
+                    };
                     return build_guest_response(response, None)
                         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error));
                 }

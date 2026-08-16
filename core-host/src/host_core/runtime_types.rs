@@ -496,37 +496,73 @@ impl RouteResponseBody {
 ///
 /// Spawns a task that reads `response.chunk()` in a loop under
 /// `tokio::time::timeout` and forwards chunks over a channel, so the
-/// `hyper::body::Body` impl below just drains that channel. Ending the task
-/// (idle timeout, upstream error, or the receiver — the client — going away)
-/// ends the body; a body cut short mid-stream is standard behavior for a
-/// timed-out proxy connection, not a new failure mode this introduces.
+/// `hyper::body::Body` impl below just drains that channel. A body cut short
+/// mid-stream is standard behavior for a timed-out proxy connection — but the
+/// client must be told the response was cut short rather than seeing a clean
+/// 200, so the last thing sent on an abnormal exit (idle timeout or an
+/// upstream read error) is an error frame instead of just closing the
+/// channel. Only the receiver — the client — going away ends the task
+/// silently, since there is nobody left to tell.
 pub(crate) struct TimeoutBoundedStreamBody {
-    pub(crate) receiver: mpsc::Receiver<Bytes>,
+    pub(crate) receiver: mpsc::Receiver<std::result::Result<Bytes, StreamForwardError>>,
 }
+
+#[derive(Debug)]
+pub(crate) struct StreamForwardError(pub(crate) String);
+
+impl fmt::Display for StreamForwardError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StreamForwardError {}
 
 pub(crate) fn stream_response_with_idle_timeout(
     mut response: reqwest::Response,
     idle_timeout: Duration,
 ) -> TimeoutBoundedStreamBody {
-    let (sender, receiver) = mpsc::channel::<Bytes>(1);
+    let (sender, receiver) = mpsc::channel::<std::result::Result<Bytes, StreamForwardError>>(1);
     tokio::spawn(async move {
-        while let Ok(Ok(Some(chunk))) = tokio::time::timeout(idle_timeout, response.chunk()).await {
-            if sender.send(chunk).await.is_err() {
-                // The client (or an intermediate drop of the body) went
-                // away; stop reading from the peer.
-                break;
+        loop {
+            match tokio::time::timeout(idle_timeout, response.chunk()).await {
+                Ok(Ok(Some(chunk))) => {
+                    if sender.send(Ok(chunk)).await.is_err() {
+                        // The client (or an intermediate drop of the body)
+                        // went away; stop reading from the peer.
+                        break;
+                    }
+                }
+                // Peer finished the response normally: a clean end of stream.
+                Ok(Ok(None)) => break,
+                // The read itself failed, or no chunk arrived within
+                // `idle_timeout`: the client already has a partial body, so
+                // it must see this as a failure, not a clean 200.
+                Ok(Err(error)) => {
+                    let _ = sender
+                        .send(Err(StreamForwardError(format!(
+                            "peer forward failed while streaming: {error}"
+                        ))))
+                        .await;
+                    break;
+                }
+                Err(_) => {
+                    let _ = sender
+                        .send(Err(StreamForwardError(format!(
+                            "peer forward idle timeout of {idle_timeout:?} exceeded while streaming"
+                        ))))
+                        .await;
+                    break;
+                }
             }
         }
-        // Loop exit also covers: the peer finished the response normally,
-        // the read itself failed, or no chunk arrived within
-        // `idle_timeout` — in every case there is nothing more to forward.
     });
     TimeoutBoundedStreamBody { receiver }
 }
 
 impl hyper::body::Body for TimeoutBoundedStreamBody {
     type Data = Bytes;
-    type Error = std::convert::Infallible;
+    type Error = StreamForwardError;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
@@ -534,7 +570,7 @@ impl hyper::body::Body for TimeoutBoundedStreamBody {
     ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
         self.receiver
             .poll_recv(cx)
-            .map(|chunk| chunk.map(|bytes| Ok(Frame::data(bytes))))
+            .map(|chunk| chunk.map(|result| result.map(Frame::data)))
     }
 }
 
