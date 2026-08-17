@@ -1413,16 +1413,34 @@ struct StreamingContentGate {
     /// of the generation from that point on, so the caller must not treat
     /// whatever `finish()` returns as a real completion.
     overflowed: bool,
-    /// Absolute position of the earliest byte seen so far that opens one of
-    /// `openers` or one of their closing tags — `None` until the first one
-    /// appears. Once set it never moves, which permanently stops dropping at
-    /// that point; see the long note in `push`'s unanchored branch for why
-    /// a byte this simple check flags as "content" still cannot be dropped.
+    /// Absolute position of the earliest byte not yet proven walled off from
+    /// every later byte — `None` when nothing is pinning the drop boundary.
+    /// Fixed at the position it was first set to for as long as it stays
+    /// `Some`: extending *how far* the search for a wall has to look (see
+    /// `protected_until`) must never be confused with moving *this* floor
+    /// forward, or bytes between the original pin and wherever the search
+    /// got to would be dropped despite the risk they were pinned against
+    /// still being unresolved. See the long note in `push`'s unanchored
+    /// branch for what "walled off" means.
     drop_ceiling: Option<usize>,
+    /// Absolute position such that a wall search has confirmed no wall
+    /// exists in `[drop_ceiling, protected_until)` — every byte in it is
+    /// either the original pin or a later tag-start byte whose own
+    /// resolution window is still being chased. Meaningless while
+    /// `drop_ceiling` is `None`.
+    protected_until: usize,
+    /// Absolute position the wall search has scanned to without yet finding
+    /// either a wall or a reason to extend `protected_until` further —
+    /// tracked separately so each round only examines newly-arrived bytes
+    /// instead of re-scanning `[drop_ceiling, protected_until)` from
+    /// scratch. Meaningless while `drop_ceiling` is `None`.
+    scan_cursor: usize,
     /// The leading byte of every tag this parser recognizes, open or close —
-    /// every dialect's pair shares one (`<` for the tagged parsers, `[` for
-    /// Mistral's marker). Unused for an anchored gate, which never runs the
-    /// drop logic `drop_ceiling` guards.
+    /// every tagged dialect's pair shares one (`<`). Empty for a parser whose
+    /// buffered parse cannot rejoin bytes a drop has separated — Mistral's
+    /// single-marker split never rescans or mutates, so `drop_ceiling` has
+    /// nothing to protect against for it — and for an anchored gate, which
+    /// never runs the drop logic this guards at all.
     tag_start_chars: Vec<char>,
 }
 
@@ -1451,11 +1469,22 @@ impl StreamingContentGate {
             .max()
             .unwrap_or(1)
             .saturating_sub(1);
-        // Every dialect's closing tag shares its opener's leading byte
-        // (`</tool_call>` vs `<tool_call>`), so the openers alone are enough
-        // to derive it without hard-coding the closers here too.
+        // `drop_ceiling` exists to protect against `parse_tagged_tool_calls`'s
+        // iterative, mutating tag removal splicing distant bytes together —
+        // that rewriting only happens for the tagged dialects. Mistral's
+        // parser does one split on a single marker and never rescans or
+        // mutates, so it has nothing for a dropped prefix to rejoin with; an
+        // incidental `[` from ordinary code (`items[0]`) is exactly the kind
+        // of realistic content this must not needlessly pin retention on.
         let mut tag_start_chars: Vec<char> =
-            openers.iter().filter_map(|o| o.chars().next()).collect();
+            if matches!(parser, ToolCallParser::Qwen | ToolCallParser::QwenCoder) {
+                // Every dialect's closing tag shares its opener's leading byte
+                // (`</tool_call>` vs `<tool_call>`), so the openers alone are
+                // enough to derive it without hard-coding the closers here too.
+                openers.iter().filter_map(|o| o.chars().next()).collect()
+            } else {
+                Vec::new()
+            };
         tag_start_chars.sort_unstable();
         tag_start_chars.dedup();
         Self {
@@ -1470,6 +1499,8 @@ impl StreamingContentGate {
             decided_no_call: false,
             overflowed: false,
             drop_ceiling: None,
+            protected_until: 0,
+            scan_cursor: 0,
             tag_start_chars,
         }
     }
@@ -1645,17 +1676,83 @@ impl StreamingContentGate {
         // such a rewrite might be, so the only sound rule is to never drop
         // past the first byte that could start any of this parser's tags,
         // open or close (they all share the same leading byte for every
-        // dialect in use). Once that position is known it is fixed for good:
-        // nothing found after it changes whether the earlier one is safe.
+        // dialect in use).
+        //
+        // That pin does not have to last forever: the risk requires an
+        // *unbroken* run of tag-start bytes connecting the pinned position to
+        // whatever match eventually gets removed, and a byte that is provably
+        // outside every such run is a wall — it can never be part of a
+        // removed span (removal only ever targets a matched tag, which
+        // starts with one of `tag_start_chars`), so nothing later can ever
+        // splice across it back to the pin. Once a wall is found anywhere,
+        // `drop_ceiling` clears and dropping resumes from scratch.
+        //
+        // Finding one takes more than checking the very next byte, though: a
+        // false start like `<tool_calls` is packed with ordinary,
+        // non-tag-start characters (`t`, `o`, `o`, `l`, …) that prove
+        // nothing on their own — they are still part of the very attempt
+        // being resolved, and a tag-start byte immediately after it (a
+        // second false start, or the real match this whole thing exists to
+        // protect) extends how far the run reaches before a wall can be
+        // confirmed. `protected_until` tracks that reach; `drop_ceiling`
+        // itself never moves until a wall is actually found, however far the
+        // search has to extend to find one — moving it early, to wherever
+        // the run currently reaches, would let bytes between the original
+        // pin and there be dropped while the very risk they were pinned
+        // against is still unresolved.
+        // A wall found below is not yet physically gone from `seen` — it is
+        // only actually removed at the bottom of this function, once
+        // `drop_amount` is final. Searching for a *new* pin from position 0
+        // right after clearing one would find that same, still-present byte
+        // again and immediately re-pin it, so detection starts from wherever
+        // the wall search reached instead of from 0 whenever a wall was
+        // found this round; it stays 0 when there was nothing to clear.
+        let mut search_ceiling_from = 0;
+        if let Some(dc) = self.drop_ceiling {
+            if self.protected_until < dc + self.hold + 1 {
+                self.protected_until = dc + self.hold + 1;
+                self.scan_cursor = dc + 1;
+            }
+            loop {
+                // Checked before rounding up to a char boundary: rounding
+                // first and comparing after could clamp a target beyond what
+                // has actually arrived down to exactly `seen.len()`, which
+                // would then read as "enough data" and resolve early.
+                let target_local = self.protected_until - self.dropped;
+                if target_local > self.seen.len() {
+                    break; // not enough data yet to finish resolving the run
+                }
+                let scan_end = ceil_char_boundary(&self.seen, target_local);
+                let scan_start = self.scan_cursor - self.dropped;
+                match self.seen[scan_start..scan_end]
+                    .find(|c: char| self.tag_start_chars.contains(&c))
+                {
+                    Some(rel) => {
+                        let found = self.dropped + scan_start + rel;
+                        self.protected_until = self.protected_until.max(found + self.hold + 1);
+                        self.scan_cursor = found + 1;
+                    }
+                    None => {
+                        self.drop_ceiling = None;
+                        search_ceiling_from = scan_end;
+                        break;
+                    }
+                }
+            }
+        }
         if self.drop_ceiling.is_none() {
-            // From position 0, not `local_emitted`: a byte can already have
-            // been streamed as content in an earlier round without yet being
-            // physically dropped, and it is about to be swept up in this
-            // round's `drain` regardless of which round first called it safe.
-            if let Some(at) =
-                self.seen[..drop_amount].find(|c: char| self.tag_start_chars.contains(&c))
+            // From `search_ceiling_from`, not `local_emitted`: a byte can
+            // already have been streamed as content in an earlier round
+            // without yet being physically dropped, and it is about to be
+            // swept up in this round's `drain` regardless of which round
+            // first called it safe.
+            if let Some(at) = self.seen[search_ceiling_from..drop_amount]
+                .find(|c: char| self.tag_start_chars.contains(&c))
             {
-                self.drop_ceiling = Some(self.dropped + at);
+                let dc = self.dropped + search_ceiling_from + at;
+                self.drop_ceiling = Some(dc);
+                self.protected_until = dc + self.hold + 1;
+                self.scan_cursor = dc + 1;
             }
         }
         if let Some(ceiling) = self.drop_ceiling {
@@ -1734,6 +1831,21 @@ fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
     }
     while idx > 0 && !text.is_char_boundary(idx) {
         idx -= 1;
+    }
+    idx
+}
+
+/// Smallest index `idx` that is a char boundary of `text`, no smaller than
+/// the given one. The `floor` counterpart above rounds a byte count down to
+/// stay inside a bound; this is for the opposite case — a byte count derived
+/// from an arbitrary length (like `hold`) that has to examine *at least*
+/// that many bytes, so rounding down would under-count.
+fn ceil_char_boundary(text: &str, mut idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    while !text.is_char_boundary(idx) {
+        idx += 1;
     }
     idx
 }
@@ -3776,6 +3888,79 @@ mod tests {
             buffered.content,
             "reconstructed content must match the buffered message"
         );
+    }
+
+    #[test]
+    fn mistral_never_pins_the_drop_ceiling_on_an_incidental_bracket() {
+        // Mistral's parser does one split on a single marker and never
+        // rescans or mutates, so a dropped prefix has nothing to rejoin
+        // with — `drop_ceiling` exists for the tagged dialects' rewriting
+        // parser, not this one. Ordinary code containing `[` (array
+        // indexing, literals) must not fall back to O(N) retention just
+        // because it looks tag-adjacent to the wrong parser.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Mistral);
+        let line = "result = items[0] + items[1]; // ordinary code, no call here. ";
+        let mut full = String::new();
+        for _ in 0..5_000 {
+            full.push_str(line);
+            gate.push(line);
+        }
+        assert!(full.len() > MAX_GATED_RETENTION);
+        assert!(
+            gate.drop_ceiling.is_none(),
+            "Mistral must never engage the tag-rewrite protection at all"
+        );
+        assert!(
+            gate.seen.len() <= gate.hold + 4 * line.len(),
+            "an incidental `[` must not stop a call-free Mistral stream from staying bounded, got {} bytes retained",
+            gate.seen.len(),
+        );
+        let (_, _, overflowed) = gate.finish();
+        assert!(!overflowed);
+    }
+
+    #[test]
+    fn a_qwen_drop_ceiling_clears_once_a_wall_proves_the_chain_is_broken() {
+        // The pin `drop_ceiling` puts on a false tag start is not meant to be
+        // permanent: an ordinary `<` in code (`Vec<T>`) that is followed by
+        // plenty of unrelated content afterward can never be spliced back
+        // together with anything later, because that unrelated content can
+        // never itself be part of a removed tag region. Once such a byte is
+        // seen the pin must clear, or a single incidental `<` early in a
+        // long, call-free response would push it toward the retention cap.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        gate.push("fn f() -> Vec<T> { "); // a `<` that never becomes a tag
+                                          // The `<` starts out inside the trailing `hold` bytes, so it takes a
+                                          // little more content arriving after it before the gate's own
+                                          // opener-length lookahead resolves it as "definitely not a tag" and
+                                          // the drop logic notices it at all.
+        gate.push("return Default::default();");
+        assert!(
+            gate.drop_ceiling.is_some(),
+            "the `<` must be pinned once it is resolved as unmatched but not yet walled off"
+        );
+        let line = "ordinary prose with no angle brackets in it at all. ";
+        let mut full = String::from("fn f() -> Vec<T> { return Default::default();");
+        for _ in 0..6_000 {
+            full.push_str(line);
+            gate.push(line);
+        }
+        assert!(full.len() > MAX_GATED_RETENTION);
+        assert!(
+            gate.drop_ceiling.is_none(),
+            "a wall of ordinary content after the `<` must clear the pin"
+        );
+        assert!(
+            gate.seen.len() <= gate.hold + 4 * line.len(),
+            "once cleared, retention must go back to bounded, got {} bytes retained",
+            gate.seen.len(),
+        );
+        let (whole, _sent, overflowed) = gate.finish();
+        assert!(!overflowed);
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert!(parsed.tool_calls.is_empty());
     }
 
     #[test]
