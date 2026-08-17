@@ -1413,6 +1413,17 @@ struct StreamingContentGate {
     /// of the generation from that point on, so the caller must not treat
     /// whatever `finish()` returns as a real completion.
     overflowed: bool,
+    /// Absolute position of the earliest byte seen so far that opens one of
+    /// `openers` or one of their closing tags — `None` until the first one
+    /// appears. Once set it never moves, which permanently stops dropping at
+    /// that point; see the long note in `push`'s unanchored branch for why
+    /// a byte this simple check flags as "content" still cannot be dropped.
+    drop_ceiling: Option<usize>,
+    /// The leading byte of every tag this parser recognizes, open or close —
+    /// every dialect's pair shares one (`<` for the tagged parsers, `[` for
+    /// Mistral's marker). Unused for an anchored gate, which never runs the
+    /// drop logic `drop_ceiling` guards.
+    tag_start_chars: Vec<char>,
 }
 
 /// Ceiling on what a single gate will retain once it can no longer bound
@@ -1424,6 +1435,13 @@ struct StreamingContentGate {
 /// unbounded gate is an unbounded multiple of that.
 const MAX_GATED_RETENTION: usize = 256 * 1024;
 
+/// Granularity `push` slices a large fragment into before running it through
+/// the ordinary per-push resolve logic. Large enough that a realistic
+/// fragment (SSE frames are accepted up to 1 MiB) needs only a handful of
+/// iterations; comfortably above the widest UTF-8 character (4 bytes), which
+/// `push`'s slicing loop relies on to always make progress.
+const PUSH_CHUNK_SIZE: usize = 64 * 1024;
+
 impl StreamingContentGate {
     fn new(parser: ToolCallParser) -> Self {
         let (openers, anchored) = tool_call_openers(parser);
@@ -1433,6 +1451,13 @@ impl StreamingContentGate {
             .max()
             .unwrap_or(1)
             .saturating_sub(1);
+        // Every dialect's closing tag shares its opener's leading byte
+        // (`</tool_call>` vs `<tool_call>`), so the openers alone are enough
+        // to derive it without hard-coding the closers here too.
+        let mut tag_start_chars: Vec<char> =
+            openers.iter().filter_map(|o| o.chars().next()).collect();
+        tag_start_chars.sort_unstable();
+        tag_start_chars.dedup();
         Self {
             openers,
             anchored,
@@ -1444,11 +1469,64 @@ impl StreamingContentGate {
             tripped: false,
             decided_no_call: false,
             overflowed: false,
+            drop_ceiling: None,
+            tag_start_chars,
         }
     }
 
     /// Absorb a fragment, returning the content safe to stream right now.
+    ///
+    /// A single upstream fragment is not necessarily small: SSE frames up to
+    /// 1 MiB are accepted, and some backends emit the whole generation as one
+    /// fragment. Handing all of it to [`Self::push_chunk`] in one call would
+    /// grow `seen` to the fragment's full size before that call ever gets a
+    /// chance to find an opener or release safe content — tripping
+    /// `MAX_GATED_RETENTION` on a fragment that is, in fact, fully
+    /// resolvable (most of it content, with no call anywhere in it). So a
+    /// large fragment is walked in bounded slices instead, each one run
+    /// through the ordinary per-push logic; that keeps `seen` from growing
+    /// past what driving the same bytes in through several smaller pushes
+    /// would have needed, which is the shape the retention cap is actually
+    /// meant to guard: a call that stays open, or an anchored prefix that
+    /// stays undecided, past what a single fragment could ever explain.
     fn push(&mut self, fragment: &str) -> Option<String> {
+        if fragment.len() <= PUSH_CHUNK_SIZE {
+            return self.push_chunk(fragment);
+        }
+        let mut streamed = String::new();
+        let mut rest = fragment;
+        while !rest.is_empty() {
+            // Once the gate can no longer resolve anything incrementally —
+            // tripped, or decided against ever tripping — slicing further
+            // buys nothing: a tripped gate's `push_chunk` just forwards to
+            // `absorb_capped`, which already caps on its own, and a decided
+            // gate forwards every fragment untouched. Handing over what's
+            // left in one call is equivalent and skips the bookkeeping.
+            if self.tripped || self.decided_no_call {
+                if let Some(content) = self.push_chunk(rest) {
+                    streamed.push_str(&content);
+                }
+                break;
+            }
+            let at = floor_char_boundary(rest, PUSH_CHUNK_SIZE.min(rest.len()));
+            // Always > 0 as long as `PUSH_CHUNK_SIZE` is at least as wide as
+            // the longest UTF-8 character (4 bytes): `floor_char_boundary`
+            // only walks backward to find one, and a character is never more
+            // than 4 bytes wide, so it cannot walk past a chunk size that
+            // size back to 0. Asserted rather than silently guarded, so a
+            // future change to the constant fails loudly instead of looping
+            // forever.
+            debug_assert!(at > 0, "PUSH_CHUNK_SIZE must be at least 4 bytes");
+            let (chunk, remainder) = rest.split_at(at);
+            if let Some(content) = self.push_chunk(chunk) {
+                streamed.push_str(&content);
+            }
+            rest = remainder;
+        }
+        (!streamed.is_empty()).then_some(streamed)
+    }
+
+    fn push_chunk(&mut self, fragment: &str) -> Option<String> {
         // Decided: the anchor can never be reached again, so nothing can open
         // a call. Nothing to buffer for — pass the fragment straight through.
         if self.decided_no_call {
@@ -1539,9 +1617,51 @@ impl StreamingContentGate {
         // a non-whitespace byte in front, nothing after the tag can be
         // mistaken for a leading edge, however far away it is or how much
         // whitespace it starts with. `safe` is the length of a string
-        // `trim_end`-ed to it, so `seen[safe - 1]` is guaranteed
-        // non-whitespace already — no separate check needed.
-        let drop_amount = safe - 1;
+        // `trim_end`-ed to it, so the anchor character is guaranteed
+        // non-whitespace already — no separate check needed. It is not
+        // necessarily one *byte*, though: `safe - 1` can land inside a
+        // multibyte character, which `drain` would panic on, so the drop
+        // stops at that character's start rather than exactly one byte short.
+        let mut drop_amount = floor_char_boundary(&self.seen, safe - 1);
+
+        // The anchor above is only enough to protect `trim()`'s own leading
+        // edge. `parse_tagged_tool_calls` does more than trim: it mutates as
+        // it scans, cutting out each matched region and rejoining what was on
+        // either side of it. Two bytes that were nowhere near each other in
+        // the response can end up adjacent after an earlier cut removes
+        // everything between them — `<tool_calls` immediately followed by a
+        // well-formed `<tool_call>…</tool_call>` rejoins, after that inner
+        // match is excised, into a `<tool_calls>` that was never literally in
+        // the text. `find_opener` only asks "is a complete opener present
+        // anywhere in `seen`", which says nothing about a malformed prefix
+        // like `<tool_calls` — it will never complete into an opener on its
+        // own, so nothing stops it from being marked `safe` and dropped. But
+        // dropped means gone from `whole` entirely, so the buffered parse at
+        // `finish()` can no longer reconstruct — or rule out — a rewrite that
+        // only the full text would have gone through, which can as easily
+        // erase a real call as fabricate one.
+        //
+        // There is no bound on how far ahead the match that would complete
+        // such a rewrite might be, so the only sound rule is to never drop
+        // past the first byte that could start any of this parser's tags,
+        // open or close (they all share the same leading byte for every
+        // dialect in use). Once that position is known it is fixed for good:
+        // nothing found after it changes whether the earlier one is safe.
+        if self.drop_ceiling.is_none() {
+            // From position 0, not `local_emitted`: a byte can already have
+            // been streamed as content in an earlier round without yet being
+            // physically dropped, and it is about to be swept up in this
+            // round's `drain` regardless of which round first called it safe.
+            if let Some(at) =
+                self.seen[..drop_amount].find(|c: char| self.tag_start_chars.contains(&c))
+            {
+                self.drop_ceiling = Some(self.dropped + at);
+            }
+        }
+        if let Some(ceiling) = self.drop_ceiling {
+            drop_amount = drop_amount.min(ceiling - self.dropped);
+        }
+
         self.seen.drain(..drop_amount);
         self.dropped += drop_amount;
         Some(content)
@@ -3467,6 +3587,40 @@ mod tests {
     }
 
     #[test]
+    fn a_single_huge_call_free_fragment_does_not_trip_the_retention_cap() {
+        // The backend is free to hand the whole generation to `push` as one
+        // fragment (SSE frames are accepted up to 1 MiB), and that fragment
+        // can easily be call-free prose bigger than `MAX_GATED_RETENTION` —
+        // a large code explanation, say. Absorbing it in one shot before
+        // ever running the opener/safe-release logic would trip the cap on
+        // a response that has nothing wrong with it; `push` has to walk it
+        // in slices instead so retention stays bounded exactly as it would
+        // if the same bytes had arrived as many small fragments.
+        let line = "no call ever appears in this sentence, only prose. ";
+        let full = line.repeat(20_000); // well past MAX_GATED_RETENTION (256 KiB)
+        assert!(full.len() > MAX_GATED_RETENTION);
+
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        let streamed = gate.push(&full).unwrap_or_default();
+        assert!(
+            gate.seen.len() <= gate.hold + PUSH_CHUNK_SIZE,
+            "a call-free fragment must not retain anywhere near its own size, got {} bytes retained out of {} pushed",
+            gate.seen.len(),
+            full.len(),
+        );
+        let (whole, sent, overflowed) = gate.finish();
+        assert!(
+            !overflowed,
+            "a legitimate call-free fragment must not be treated as a retention-cap failure"
+        );
+        assert_eq!(
+            format!("{streamed}{}", whole.get(sent..).unwrap_or_default()),
+            full,
+            "slicing the fragment internally must not lose or duplicate any byte"
+        );
+    }
+
+    #[test]
     fn a_decided_anchored_gate_stops_accumulating_entirely() {
         // Once an anchored gate's leading bytes diverge from every opener, no
         // later byte can retroactively open a call, so nothing more is worth
@@ -3554,6 +3708,73 @@ mod tests {
             format!("{streamed}{tail}"),
             full_parsed.content,
             "the separator between the prose and `AFTER` must not be lost, whatever the gate dropped along the way"
+        );
+    }
+
+    #[test]
+    fn a_drop_boundary_inside_a_multibyte_character_does_not_panic() {
+        // `safe` is always a char boundary (it comes out of `.trim_end().len()`
+        // on a valid `&str`), but `safe - 1` is not necessarily one when the
+        // last character of the safe prefix is multibyte. `é` is 2 bytes, so
+        // a run of them followed by plain ASCII puts exactly this shape in
+        // front of the gate.
+        let prose = "é".repeat(20) + &"b".repeat(20);
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        let _ = gate.push(&prose);
+        let (_whole, _sent, overflowed) = gate.finish();
+        assert!(!overflowed);
+    }
+
+    #[test]
+    fn a_malformed_nested_tag_does_not_fabricate_a_call_via_a_dropped_prefix() {
+        // `parse_tagged_tool_calls` mutates as it goes: removing one matched
+        // pair can splice previously non-adjacent bytes together into a tag
+        // that was never literally in the response. `<tool_calls` (missing
+        // its `>`) directly followed by a well-formed `<tool_call>bad</tool_call>`
+        // is exactly that: removing the inner match joins the leftover
+        // `<tool_calls` to the `>` right after it, completing an opener that
+        // then swallows the second, genuinely well-formed `<tool_calls>...`
+        // tag as part of its own (invalid-JSON) payload — so the buffered
+        // parse of the *full* text finds no calls at all.
+        //
+        // If the gate had already dropped `<tool_calls` from `seen` (proven,
+        // wrongly, "safe" because it doesn't itself complete into a literal
+        // opener), the buffered parse of the truncated tail never sees that
+        // merge: the second `<tool_calls>{"name":"y"}</tool_calls>` is found
+        // on its own, with valid JSON, and fabricates a dispatchable call.
+        let raw = r#"<tool_calls<tool_call>bad</tool_call>><tool_calls>{"name":"y"}</tool_calls>"#;
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let buffered = parse_assistant_output(&request, raw);
+        assert!(
+            buffered.tool_calls.is_empty(),
+            "sanity check on the buffered path: the malformed nesting must not parse as a call"
+        );
+
+        // Push it one byte at a time — the tightest fragmentation, and the
+        // one that gives the per-fragment drop the most chances to fire
+        // before the whole picture is in.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        let mut streamed = String::new();
+        for ch in raw.chars() {
+            let mut buf = [0u8; 4];
+            if let Some(c) = gate.push(ch.encode_utf8(&mut buf)) {
+                streamed.push_str(&c);
+            }
+        }
+        let (whole, sent, overflowed) = gate.finish();
+        assert!(!overflowed);
+        let parsed = parse_assistant_output(&request, &whole);
+        let tail = unsent_tail(&whole, sent, &parsed, false);
+        assert!(
+            parsed.tool_calls.is_empty(),
+            "the streaming path must not fabricate a call the buffered path never found; got {:?} from whole={whole:?}",
+            parsed.tool_calls,
+        );
+        assert_eq!(
+            format!("{streamed}{tail}"),
+            buffered.content,
+            "reconstructed content must match the buffered message"
         );
     }
 
