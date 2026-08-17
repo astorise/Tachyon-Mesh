@@ -1564,11 +1564,15 @@ impl StreamingContentGate {
             return Some(fragment.to_owned());
         }
         if self.tripped {
-            self.absorb_capped(fragment);
+            // Never retried — a tripped gate only ever grows, so a rejection
+            // here is final.
+            if !self.absorb_capped(fragment).is_empty() {
+                self.overflowed = true;
+            }
             return None;
         }
 
-        self.absorb_capped(fragment);
+        let leftover = self.absorb_capped(fragment);
 
         if let Some(at) = self.find_opener() {
             self.tripped = true;
@@ -1604,6 +1608,12 @@ impl StreamingContentGate {
             // The caller decides once it has parsed the whole text.
             self.sent = self.emitted + content.len();
             self.emitted = self.dropped + at;
+            // Tripping is terminal — no later round exists to retry
+            // `leftover` in, so a rejection here is as final as the tripped
+            // branch's own.
+            if !leftover.is_empty() {
+                self.overflowed = true;
+            }
             return (!content.is_empty()).then_some(content);
         }
 
@@ -1623,7 +1633,18 @@ impl StreamingContentGate {
                 self.dropped += len;
                 self.emitted += len;
                 self.sent += len;
+                // Deciding is terminal the same way tripping is — every
+                // fragment from here on forwards straight through, so
+                // `leftover` gets no later round to retry in either.
+                if !leftover.is_empty() {
+                    self.overflowed = true;
+                }
                 return Some(content);
+            }
+            // Still undecided: nothing dropped this round, so retrying
+            // `leftover` now would just hit the same rejection again.
+            if !leftover.is_empty() {
+                self.overflowed = true;
             }
             return None;
         }
@@ -1636,6 +1657,11 @@ impl StreamingContentGate {
         let raw_safe = self.seen[..ceiling].trim_end().len();
         let local_emitted = self.emitted - self.dropped;
         if raw_safe <= local_emitted {
+            // Nothing became safe this round, so nothing dropped either —
+            // retrying `leftover` immediately would just be rejected again.
+            if !leftover.is_empty() {
+                self.overflowed = true;
+            }
             return None;
         }
 
@@ -1729,6 +1755,15 @@ impl StreamingContentGate {
         // droppable: anything in `[local_emitted, raw_safe)` is a candidate
         // to be *streamed* this round, and every one of those bytes needs the
         // same protection as what gets dropped.
+        //
+        // Never behind `local_emitted`, though: the wall search resolves
+        // purely against `dropped`, with no notion of what has already been
+        // committed as content, so its own landing spot can fall behind
+        // content this round (or an earlier one) already emitted. A pin
+        // installed there would sit *behind* the region `safe` is about to
+        // be computed relative to, making `capped < local_emitted` below and
+        // turning that slice into a start-past-end range.
+        let search_ceiling_from = search_ceiling_from.max(local_emitted);
         if self.drop_ceiling.is_none() && search_ceiling_from < raw_safe {
             if let Some(at) = self.seen[search_ceiling_from..raw_safe]
                 .find(|c: char| self.tag_start_chars.contains(&c))
@@ -1757,6 +1792,12 @@ impl StreamingContentGate {
             None => raw_safe,
         };
         if safe <= local_emitted {
+            // An open pin capped `safe` back down to nothing new — no drop
+            // happens this round either, so retrying `leftover` now would
+            // just be rejected again.
+            if !leftover.is_empty() {
+                self.overflowed = true;
+            }
             return None;
         }
 
@@ -1795,6 +1836,35 @@ impl StreamingContentGate {
         let drop_amount = floor_char_boundary(&self.seen, safe - 1);
         self.seen.drain(..drop_amount);
         self.dropped += drop_amount;
+
+        // `leftover` is whatever `absorb_capped` had to reject to stay under
+        // the cap at the *start* of this round — before the drop just above
+        // had a chance to shrink `seen` back down. A pin resolving mid-round
+        // (or an anchored gate deciding) can free up most of what was
+        // retained, so bytes rejected purely because they arrived slightly
+        // too early are worth one more attempt now that there may be room:
+        // otherwise a fragment that arrives right as a long-unresolved pin
+        // is about to clear gets truncated and flagged `overflowed` for a
+        // response that was never actually too large to handle, only too
+        // large to handle all at once. `drop_amount > 0` gates the retry so
+        // a round that made no progress cannot loop forever retrying the
+        // same rejection.
+        if !leftover.is_empty() {
+            if drop_amount > 0 {
+                // The recursive call runs this same logic against the
+                // now-shrunk state, and will flag `overflowed` itself if it
+                // still can't make room — nothing to decide about that here.
+                if let Some(more) = self.push_chunk(leftover) {
+                    let mut combined = content;
+                    combined.push_str(&more);
+                    return Some(combined);
+                }
+                return Some(content);
+            }
+            // Nothing dropped this round, so a retry would just be rejected
+            // again the same way.
+            self.overflowed = true;
+        }
         Some(content)
     }
 
@@ -1819,24 +1889,31 @@ impl StreamingContentGate {
     /// to one more slice of whatever a single fragment can add, not to be
     /// unbounded: a pin that still has not resolved by the time even that is
     /// exhausted is treated the same as any other overflow.
-    fn absorb_capped(&mut self, fragment: &str) {
+    /// Returns whatever of `fragment` did not fit — empty when it all did.
+    /// The caller is expected to retry that leftover once its own round has
+    /// had a chance to free up room (see the retry loop in `push_chunk`):
+    /// a pin that resolves mid-round can collapse `seen` right back down,
+    /// and bytes rejected here before that happened were never actually
+    /// beyond what the gate could handle, only beyond what fit *yet*.
+    /// Note that truncating here does *not* mark [`Self::overflowed`] — a
+    /// caller that can retry the leftover after this round frees up room
+    /// (see `push_chunk`'s retry loop) may yet absorb it all, and flagging
+    /// eagerly would report a real response as failed for what was only ever
+    /// a temporary, mid-resolution rejection. Setting the flag is the
+    /// caller's call once it knows no further attempt is coming.
+    fn absorb_capped<'a>(&mut self, fragment: &'a str) -> &'a str {
         let cap = if self.drop_ceiling.is_some() {
             MAX_GATED_RETENTION + PUSH_CHUNK_SIZE
         } else {
             MAX_GATED_RETENTION
         };
         if self.seen.len() >= cap {
-            if !fragment.is_empty() {
-                self.overflowed = true;
-            }
-            return;
+            return fragment;
         }
         let room = cap - self.seen.len();
         let take = floor_char_boundary(fragment, room.min(fragment.len()));
         self.seen.push_str(&fragment[..take]);
-        if take < fragment.len() {
-            self.overflowed = true;
-        }
+        &fragment[take..]
     }
 
     fn find_opener(&self) -> Option<usize> {
@@ -3839,6 +3916,74 @@ mod tests {
         }
         let (_, _, overflowed) = gate.finish();
         assert!(!overflowed);
+    }
+
+    #[test]
+    fn a_fresh_pin_search_never_lands_behind_the_emitted_anchor() {
+        // A byte the wall search resolves against is checked purely by
+        // position relative to `dropped` — it has no notion of what has
+        // already been committed as streamed content. If that landing spot
+        // falls behind `local_emitted`, a fresh pin gets installed *behind*
+        // the region `safe` is computed relative to, and slicing
+        // `seen[local_emitted..capped]` becomes a start-past-end range.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        for ch in "<<_CALLS]````/".chars() {
+            let mut buf = [0u8; 4];
+            gate.push(ch.encode_utf8(&mut buf));
+        }
+        let (_, _, overflowed) = gate.finish();
+        assert!(!overflowed);
+    }
+
+    #[test]
+    fn an_unabsorbed_remainder_is_retried_once_a_pin_resolves_mid_round() {
+        // The extra headroom `absorb_capped` grants a resolving pin is
+        // measured from `MAX_GATED_RETENTION`, not from wherever the pin
+        // currently sits — so a pin that has already grown close to that
+        // headroom leaves less than a full fragment's worth of *new* room
+        // for whatever arrives next, even though that fragment might easily
+        // resolve the pin and collapse retention right back down if it were
+        // just given the chance. The fragment gets truncated before the
+        // resolution that would have freed the room for it ever runs.
+        //
+        // A chain of false starts grown past the cap, immediately followed
+        // by one big ordinary-prose fragment, reproduces exactly that: only
+        // a sliver of the prose fits under the cap on the first pass, but
+        // that sliver alone is enough (`hold` is tiny) to resolve the pin
+        // and drop nearly everything retained — the rejected remainder must
+        // then get a real second attempt rather than being discarded with
+        // `overflowed` left set.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        let chain = "<a".repeat(150_000); // ~300 KiB, past MAX_GATED_RETENTION
+        assert!(chain.len() > MAX_GATED_RETENTION);
+        gate.push(&chain);
+        assert!(gate.drop_ceiling.is_some());
+
+        let prose = "ordinary prose with no angle brackets at all. ".repeat(1400); // ~64 KiB
+        assert!(prose.len() as u64 >= PUSH_CHUNK_SIZE as u64 / 2);
+        let streamed = gate.push(&prose).unwrap_or_default();
+
+        assert!(
+            gate.drop_ceiling.is_none(),
+            "the prose must have gotten enough of a chance to resolve the pin"
+        );
+        let (whole, sent, overflowed) = gate.finish();
+        assert!(
+            !overflowed,
+            "a fragment that arrives while a pin is resolving must not be truncated into a false overflow"
+        );
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert!(parsed.tool_calls.is_empty());
+        let tail = unsent_tail(&whole, sent, &parsed, false);
+        // Every byte of both the chain and the prose must be accounted for —
+        // none silently dropped along with, or because of, the pin.
+        assert_eq!(
+            format!("{streamed}{tail}"),
+            format!("{chain}{prose}"),
+            "the whole generation must survive the retry, not just the part that resolved the pin"
+        );
     }
 
     #[test]
