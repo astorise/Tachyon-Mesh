@@ -841,6 +841,7 @@ pub(crate) fn build_guest_response(
         Some(trailers)
     };
 
+    let is_streaming = matches!(response.body, RouteResponseBody::Streaming(_));
     let body = match response.body {
         RouteResponseBody::Buffered(bytes) => {
             Body::new(GuestResponseBody::new(bytes, trailer_map, completion_guard))
@@ -857,6 +858,9 @@ pub(crate) fn build_guest_response(
         .body(body)
         .map_err(|error| format!("failed to construct guest HTTP response: {error}"))?;
     built.headers_mut().extend(response_headers);
+    if is_streaming {
+        built.extensions_mut().insert(StreamingResponseMarker);
+    }
     Ok(built)
 }
 
@@ -929,6 +933,7 @@ pub(crate) async fn forward_request_to_override(
         }
         built.headers_mut().append(name.clone(), value.clone());
     }
+    built.extensions_mut().insert(StreamingResponseMarker);
     Ok(built)
 }
 
@@ -1550,7 +1555,7 @@ pub(crate) async fn faas_handler(
     let trailers = collected.trailers().cloned().unwrap_or_default();
     let body = collected.to_bytes();
     let trailer_fields = header_map_to_guest_fields(&trailers);
-    let _active_request = telemetry::begin_request(&state.telemetry);
+    let active_request = telemetry::begin_request(&state.telemetry);
     let runtime = state.runtime.load_full();
     let normalized_path = normalize_route_path(uri.path());
     if is_reserved_system_path(&normalized_path) {
@@ -1746,15 +1751,20 @@ pub(crate) async fn faas_handler(
                             )
                         } else {
                             #[cfg(feature = "ai-inference")]
-                            if is_streaming_accept_request(&headers) {
-                                let request = GuestRequest {
+                            let streaming_route =
+                                is_streaming_accept_request(&headers).then(|| GuestRequest {
                                     method: method.to_string(),
                                     uri: uri.to_string(),
                                     headers: header_map_to_guest_fields(&headers),
                                     body: body.clone(),
                                     trailers: trailer_fields.clone(),
-                                };
-                                return match network::handle_streaming_http_request(
+                                });
+                            #[cfg(not(feature = "ai-inference"))]
+                            let streaming_route: Option<()> = None;
+
+                            match streaming_route {
+                                #[cfg(feature = "ai-inference")]
+                                Some(request) => match network::handle_streaming_http_request(
                                     state.clone(),
                                     Arc::clone(&runtime),
                                     Arc::clone(&route),
@@ -1766,32 +1776,38 @@ pub(crate) async fn faas_handler(
                                 )
                                 .await
                                 {
-                                    Ok(response) => response,
-                                    Err((status, message)) => (status, message).into_response(),
-                                };
-                            }
-                            match execute_route_arc_with_middleware(
-                                &state,
-                                &runtime,
-                                Arc::clone(&route),
-                                &headers,
-                                &method,
-                                &uri,
-                                &body,
-                                &trailer_fields,
-                                hop_limit,
-                                Some(&trace_id),
-                                sampled_execution,
-                                Some(selected_target.module.as_str()),
-                                true,
-                            )
-                            .await
-                            {
-                                Ok(result) => {
-                                    let fuel_consumed = result.fuel_consumed;
-                                    (guest_response_into_response(result), fuel_consumed)
-                                }
-                                Err((status, message)) => ((status, message).into_response(), None),
+                                    Ok(response) => (response, None),
+                                    Err((status, message)) => {
+                                        ((status, message).into_response(), None)
+                                    }
+                                },
+                                #[cfg(not(feature = "ai-inference"))]
+                                Some(()) => unreachable!(),
+                                None => match execute_route_arc_with_middleware(
+                                    &state,
+                                    &runtime,
+                                    Arc::clone(&route),
+                                    &headers,
+                                    &method,
+                                    &uri,
+                                    &body,
+                                    &trailer_fields,
+                                    hop_limit,
+                                    Some(&trace_id),
+                                    sampled_execution,
+                                    Some(selected_target.module.as_str()),
+                                    true,
+                                )
+                                .await
+                                {
+                                    Ok(result) => {
+                                        let fuel_consumed = result.fuel_consumed;
+                                        (guest_response_into_response(result), fuel_consumed)
+                                    }
+                                    Err((status, message)) => {
+                                        ((status, message).into_response(), None)
+                                    }
+                                },
                             }
                         }
                     }
@@ -1829,15 +1845,20 @@ pub(crate) async fn faas_handler(
                             )
                         } else {
                             #[cfg(feature = "ai-inference")]
-                            if is_streaming_accept_request(&headers) {
-                                let request = GuestRequest {
+                            let streaming_route =
+                                is_streaming_accept_request(&headers).then(|| GuestRequest {
                                     method: method.to_string(),
                                     uri: uri.to_string(),
                                     headers: header_map_to_guest_fields(&headers),
                                     body: body.clone(),
                                     trailers: trailer_fields.clone(),
-                                };
-                                return match network::handle_streaming_http_request(
+                                });
+                            #[cfg(not(feature = "ai-inference"))]
+                            let streaming_route: Option<()> = None;
+
+                            match streaming_route {
+                                #[cfg(feature = "ai-inference")]
+                                Some(request) => match network::handle_streaming_http_request(
                                     state.clone(),
                                     Arc::clone(&runtime),
                                     Arc::clone(&route),
@@ -1849,32 +1870,38 @@ pub(crate) async fn faas_handler(
                                 )
                                 .await
                                 {
-                                    Ok(response) => response,
-                                    Err((status, message)) => (status, message).into_response(),
-                                };
-                            }
-                            match execute_route_arc_with_middleware(
-                                &state,
-                                &runtime,
-                                Arc::clone(&route),
-                                &headers,
-                                &method,
-                                &uri,
-                                &body,
-                                &trailer_fields,
-                                hop_limit,
-                                Some(&trace_id),
-                                sampled_execution,
-                                Some(selected_target.module.as_str()),
-                                true,
-                            )
-                            .await
-                            {
-                                Ok(result) => {
-                                    let fuel_consumed = result.fuel_consumed;
-                                    (guest_response_into_response(result), fuel_consumed)
-                                }
-                                Err((status, message)) => ((status, message).into_response(), None),
+                                    Ok(response) => (response, None),
+                                    Err((status, message)) => {
+                                        ((status, message).into_response(), None)
+                                    }
+                                },
+                                #[cfg(not(feature = "ai-inference"))]
+                                Some(()) => unreachable!(),
+                                None => match execute_route_arc_with_middleware(
+                                    &state,
+                                    &runtime,
+                                    Arc::clone(&route),
+                                    &headers,
+                                    &method,
+                                    &uri,
+                                    &body,
+                                    &trailer_fields,
+                                    hop_limit,
+                                    Some(&trace_id),
+                                    sampled_execution,
+                                    Some(selected_target.module.as_str()),
+                                    true,
+                                )
+                                .await
+                                {
+                                    Ok(result) => {
+                                        let fuel_consumed = result.fuel_consumed;
+                                        (guest_response_into_response(result), fuel_consumed)
+                                    }
+                                    Err((status, message)) => {
+                                        ((status, message).into_response(), None)
+                                    }
+                                },
                             }
                         }
                     }
@@ -1883,17 +1910,41 @@ pub(crate) async fn faas_handler(
         },
     };
 
-    telemetry::record_event(
-        &state.telemetry,
-        TelemetryEvent::RequestEnd {
+    // A streaming response's body may still be draining long after this
+    // function returns it, so its `active_requests` slot and `RequestEnd`
+    // duration must track the body's own lifetime rather than "the handler
+    // returned" — see `TelemetryCompletionBody`. Buffered responses have no
+    // such lag: the whole body is already known here, so `RequestEnd` is
+    // recorded immediately, as it always has been.
+    if response
+        .extensions()
+        .get::<StreamingResponseMarker>()
+        .is_some()
+    {
+        let completion = RequestCompletion::new(
+            state.telemetry.clone(),
+            active_request,
             trace_id,
-            status: response.status().as_u16(),
+            response.status().as_u16(),
             fuel_consumed,
-            timestamp: Instant::now(),
-        },
-    );
-
-    response
+        );
+        let (parts, body) = response.into_parts();
+        Response::from_parts(
+            parts,
+            Body::new(TelemetryCompletionBody::new(body, completion)),
+        )
+    } else {
+        telemetry::record_event(
+            &state.telemetry,
+            TelemetryEvent::RequestEnd {
+                trace_id,
+                status: response.status().as_u16(),
+                fuel_consumed,
+                timestamp: Instant::now(),
+            },
+        );
+        response
+    }
 }
 
 fn is_reserved_system_path(path: &str) -> bool {

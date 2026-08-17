@@ -1095,6 +1095,7 @@ pub(crate) async fn handle_streaming_http_request(
     if let Err(e) = insert_guest_fields(response.headers_mut(), &guest_headers, "response header") {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
     }
+    response.extensions_mut().insert(StreamingResponseMarker);
     Ok(response)
 }
 

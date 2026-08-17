@@ -615,6 +615,14 @@ pub(crate) struct GuestResponseBody {
     pub(crate) _completion_guard: Option<RouteResponseGuard>,
 }
 
+/// Marks a `Response` built with a genuinely streaming body (as opposed to a
+/// buffered one) via `Response::extensions`, so `faas_handler` can defer its
+/// telemetry completion to the body's own lifetime without threading a
+/// `bool` through every branch that can produce a response. Extensions never
+/// reach the wire, so this never leaks past the process.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamingResponseMarker;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UdpResponseDatagram {
     pub(crate) target: SocketAddr,
@@ -854,6 +862,58 @@ impl hyper::body::Body for GuestResponseBody {
             hint.set_exact(0);
         }
         hint
+    }
+}
+
+/// Wraps a streaming response body so its owning request's telemetry
+/// (`active_requests` gauge, `TelemetryEvent::RequestEnd`) stays live for as
+/// long as the body itself does, instead of being torn down the moment
+/// `faas_handler` returns a `Response` with headers ready. Applies uniformly
+/// to every streaming response shape — the `x-tachyon-route-override`
+/// direct-streaming path, the ai-inference SSE guest-streaming path, and the
+/// peer-overflow streaming paths — so all three report true request duration
+/// and keep the load-shedding gauge elevated for the stream's whole
+/// lifetime, not just until headers are sent.
+///
+/// `completion` finishes (records `RequestEnd`, releases the
+/// `active_requests` slot) either here, once `poll_frame` observes
+/// end-of-stream, or via its own `Drop` if the body is dropped first (client
+/// disconnects mid-stream) — whichever happens first, exactly once.
+pub(crate) struct TelemetryCompletionBody {
+    inner: Body,
+    completion: Option<RequestCompletion>,
+}
+
+impl TelemetryCompletionBody {
+    pub(crate) fn new(inner: Body, completion: RequestCompletion) -> Self {
+        Self {
+            inner,
+            completion: Some(completion),
+        }
+    }
+}
+
+impl hyper::body::Body for TelemetryCompletionBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
+        let poll = Pin::new(&mut self.inner).poll_frame(cx);
+        if let Poll::Ready(None) = &poll {
+            self.completion.take();
+        }
+        poll
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
