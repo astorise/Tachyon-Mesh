@@ -1147,7 +1147,27 @@ fn handle_chat_completions_streaming(
         Vec::new()
     };
     if let Some(gate) = gate {
-        let (whole, sent) = gate.finish();
+        let (whole, sent, overflowed) = gate.finish();
+        // The gate had to discard a fragment to stay within its retention
+        // cap, so `whole` is not the generation — it is missing bytes from
+        // somewhere in the middle. Parsing it anyway risks handing back a
+        // `tool_calls` delta built from a truncated argument list, or dropping
+        // a call the buffered parser can no longer find its closing tag for.
+        // The status line already went out with the headers, so this is
+        // reported the same way every other post-hoc failure on this path is:
+        // an SSE error frame in place of the completion.
+        if overflowed {
+            write_sse_error(
+                &writer,
+                &request.model,
+                bindings::tachyon::accelerator::cpu::GenerationError {
+                    message: "the response exceeded the tool-call gate's retention limit before it could be parsed".to_owned(),
+                    upstream_status: Some(502),
+                    invalid_request: false,
+                },
+            )?;
+            return Ok((200, Vec::new()));
+        }
         let parsed = parse_assistant_output(&request, &whole);
 
         // Everything the client has not received yet. `sent` is what actually
@@ -1355,10 +1375,14 @@ fn tool_call_openers(parser: ToolCallParser) -> (&'static [&'static str], bool) 
 /// the same as if no gate existed.
 ///
 /// What's left after both of those — the region from an opener to the end of
-/// the stream, and an anchored gate still undecided because the answer is
-/// nothing but whitespace so far — is capped at `MAX_GATED_RETENTION` so a
-/// hostile upstream that opens a call and never closes it, or never emits a
-/// non-whitespace byte, cannot pin unbounded memory per stream.
+/// the stream, an anchored gate still undecided because the answer is nothing
+/// but whitespace so far, and a separator so long it cannot yet be proven
+/// either internal or trailing (see the note on dropping below) — is capped at
+/// `MAX_GATED_RETENTION`. A hostile upstream that opens a call and never
+/// closes it, or never emits a non-whitespace byte, cannot pin unbounded
+/// memory per stream; hitting the cap sets `overflowed`, and the caller is
+/// expected to fail the completion rather than hand back content parsed from
+/// a buffer that was silently cut short.
 struct StreamingContentGate {
     openers: &'static [&'static str],
     anchored: bool,
@@ -1384,15 +1408,20 @@ struct StreamingContentGate {
     /// opener. From here on nothing can ever open a call, so nothing is
     /// buffered — every fragment is forwarded as-is.
     decided_no_call: bool,
+    /// Set once a fragment had to be discarded to stay within
+    /// `MAX_GATED_RETENTION`. The retained text is no longer a faithful copy
+    /// of the generation from that point on, so the caller must not treat
+    /// whatever `finish()` returns as a real completion.
+    overflowed: bool,
 }
 
 /// Ceiling on what a single gate will retain once it can no longer bound
 /// itself the cheap way — a tripped gate holding a call for the buffered
-/// parser, or an anchored gate that has seen nothing but whitespace so far.
-/// Without it, a stream that opens a call and never closes one, or never
-/// leaves whitespace, would retain up to the whole per-stream cap; the node
-/// admits many concurrent streams, so an unbounded gate is an unbounded
-/// multiple of that.
+/// parser, an anchored gate that has seen nothing but whitespace so far, or a
+/// separator ahead of a still-possible opener that is too long to resolve
+/// yet. Without it, a stream built out of any of those would retain up to the
+/// whole per-stream cap; the node admits many concurrent streams, so an
+/// unbounded gate is an unbounded multiple of that.
 const MAX_GATED_RETENTION: usize = 256 * 1024;
 
 impl StreamingContentGate {
@@ -1414,6 +1443,7 @@ impl StreamingContentGate {
             sent: 0,
             tripped: false,
             decided_no_call: false,
+            overflowed: false,
         }
     }
 
@@ -1489,23 +1519,51 @@ impl StreamingContentGate {
         self.emitted = self.dropped + safe;
         self.sent = self.emitted;
         // Everything below `safe` is proven opener-free and has now actually
-        // been sent, so it never needs to be rescanned or retained again.
-        self.seen.drain(..safe);
-        self.dropped += safe;
+        // been sent, so *usually* it never needs to be retained again — except
+        // when `seen[safe]` is itself whitespace, meaning `safe` sits right
+        // before a separator this push has not resolved yet (still trailing,
+        // possibly still growing). Dropping through it now would make that
+        // separator the new start of `seen`, and the buffered parser's own
+        // `trim()` cannot tell a truncation artefact from the true start of
+        // the message — it would strip a separator that must stay internal
+        // once the call turns out to have prose after it (`unsent_tail`'s
+        // "consumed" arithmetic only cancels this out when nothing follows
+        // the call). So the drop is deferred until either the separator
+        // resolves into an opener (tripping, which never drops again) or
+        // more content arrives after it — at which point the next `safe`
+        // computation lands past the whitespace on genuine content, and
+        // dropping through both at once is exactly as safe as dropping
+        // through ordinary content always was. `absorb_capped` still bounds
+        // how long an unresolved separator can be retained meanwhile.
+        let next_is_whitespace = self.seen[safe..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace);
+        if !next_is_whitespace {
+            self.seen.drain(..safe);
+            self.dropped += safe;
+        }
         Some(content)
     }
 
-    /// Append `fragment` to `seen`, silently discarding whatever would push it
-    /// past [`MAX_GATED_RETENTION`]. Only reachable while tripped or an
-    /// anchored decision is still pending — the two states that can otherwise
-    /// retain the entire remaining stream.
+    /// Append `fragment` to `seen`, discarding whatever would push it past
+    /// [`MAX_GATED_RETENTION`] and flagging [`Self::overflowed`] when that
+    /// happens. Reachable while tripped, while an anchored decision is still
+    /// pending, and while a long separator's drop is deferred — the states
+    /// that can otherwise retain the entire remaining stream.
     fn absorb_capped(&mut self, fragment: &str) {
         if self.seen.len() >= MAX_GATED_RETENTION {
+            if !fragment.is_empty() {
+                self.overflowed = true;
+            }
             return;
         }
         let room = MAX_GATED_RETENTION - self.seen.len();
         let take = floor_char_boundary(fragment, room.min(fragment.len()));
         self.seen.push_str(&fragment[..take]);
+        if take < fragment.len() {
+            self.overflowed = true;
+        }
     }
 
     fn find_opener(&self) -> Option<usize> {
@@ -1527,19 +1585,23 @@ impl StreamingContentGate {
     }
 
     /// The retained tail of the generation, for the buffered parser to work
-    /// on, and how much of *that* the client has actually received.
+    /// on; how much of *that* the client has actually received; and whether
+    /// the retention cap ever discarded a fragment, in which case the other
+    /// two values are not a faithful record of the generation and the caller
+    /// must not treat them as one.
     ///
-    /// Everything dropped along the way was proven opener-free and already
-    /// sent in full, so the caller never needs it back: `parse_assistant_output`
-    /// run on the retained text alone still finds every call (none of them
-    /// were in the dropped prefix), and its own `trim()` at the retained
-    /// text's edge cancels out against the same `trim_start()` the tail
-    /// reconciliation applies to `whole[..sent]` — both are computed from the
-    /// same truncated text, so the offsets stay consistent even though neither
-    /// equals what the untruncated generation would have produced.
-    fn finish(self) -> (String, usize) {
+    /// Everything dropped that was *not* an overflow was proven opener-free
+    /// and already sent in full, so the caller never needs it back:
+    /// `parse_assistant_output` run on the retained text alone still finds
+    /// every call (none of them were in the dropped prefix), and its own
+    /// `trim()` at the retained text's edge cancels out against the same
+    /// `trim_start()` the tail reconciliation applies to `whole[..sent]` —
+    /// both are computed from the same truncated text, so the offsets stay
+    /// consistent even though neither equals what the untruncated generation
+    /// would have produced.
+    fn finish(self) -> (String, usize, bool) {
         let sent = self.sent - self.dropped;
-        (self.seen, sent)
+        (self.seen, sent, self.overflowed)
     }
 }
 
@@ -2865,7 +2927,11 @@ mod tests {
             }
         }
         let full = fragments.concat();
-        let (whole, sent) = gate.finish();
+        let (whole, sent, overflowed) = gate.finish();
+        assert!(
+            !overflowed,
+            "these small test fragments must never hit the retention cap"
+        );
         (streamed, whole, sent, full)
     }
 
@@ -3378,12 +3444,20 @@ mod tests {
                 streamed.push_str(&content);
             }
         }
+        // A drop can lag by up to one extra fragment when it lands right
+        // before a still-unresolved separator (see the note in `push`), so
+        // the bound allows a small multiple of a single line rather than
+        // asserting the tightest possible byte count — the point being
+        // tested is boundedness relative to the 26 KB answer, not an exact
+        // constant.
         assert!(
-            gate.seen.len() <= gate.hold + line.len(),
-            "a call-free stream must not retain what it has already proven safe and sent, got {} bytes retained",
+            gate.seen.len() <= gate.hold + 4 * line.len(),
+            "a call-free stream must not retain what it has already proven safe and sent, got {} bytes retained out of {} generated",
             gate.seen.len(),
+            full.len(),
         );
-        let (whole, sent) = gate.finish();
+        let (whole, sent, overflowed) = gate.finish();
+        assert!(!overflowed);
         assert_eq!(
             format!("{streamed}{}", whole.get(sent..).unwrap_or_default()),
             full,
@@ -3430,6 +3504,54 @@ mod tests {
             gate.seen.len() <= MAX_GATED_RETENTION,
             "a tripped gate must be capped, got {} bytes retained",
             gate.seen.len(),
+        );
+        // A capped gate is not a shorter-but-still-correct call: the buffered
+        // parser can no longer find the closing tag for what was truncated,
+        // so the caller must be told the retained text is not trustworthy
+        // rather than silently handed a corrupted completion.
+        assert!(
+            gate.overflowed,
+            "discarding bytes to stay under the cap must be flagged, not silent"
+        );
+    }
+
+    #[test]
+    fn a_separator_longer_than_hold_stays_internal_when_prose_follows_the_call() {
+        // A drop that lands right before a still-unresolved separator must be
+        // deferred: dropping through it would make the separator the new
+        // start of the retained text, and the buffered parser's `trim()`
+        // cannot tell that apart from the true start of the message — it
+        // would eat a separator that has to stay internal once prose follows
+        // the call. Both the leading prose and the separator here exceed the
+        // Qwen hold (12 bytes) so a naive drop would have already discarded
+        // the prose by the time the separator is fully seen.
+        let prose = "A".repeat(40);
+        let separator = " ".repeat(40);
+        let (streamed, whole, sent, full) = run_gate(
+            ToolCallParser::Qwen,
+            &[
+                &prose,
+                &separator,
+                "<tool_call>",
+                r#"{"name":"search","arguments":{}}"#,
+                "</tool_call>",
+                "AFTER",
+            ],
+        );
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert_eq!(
+            parsed.tool_calls.len(),
+            1,
+            "the call must still be recovered"
+        );
+        let tail = unsent_tail(&whole, sent, &parsed, false);
+        let full_parsed = parse_assistant_output(&request, &full);
+        assert_eq!(
+            format!("{streamed}{tail}"),
+            full_parsed.content,
+            "the separator between the prose and `AFTER` must not be lost, whatever the gate dropped along the way"
         );
     }
 
