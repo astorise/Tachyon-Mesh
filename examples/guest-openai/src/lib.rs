@@ -1581,13 +1581,27 @@ impl StreamingContentGate {
             // exactly that whitespace, and the streaming contract is that the
             // two are equal.
             //
+            // Unless a pin is still open: this opener completing does not by
+            // itself prove the *prefix* before it survives the buffered
+            // parse's own rewriting unchanged — `<tool_calls` immediately
+            // ahead of exactly this kind of complete opener is the case that
+            // rejoins into a tag that was never literally in the response
+            // (see the long note below in the unanchored branch). Once
+            // tripped there is no later round left to reconsider a
+            // streaming decision, so the prefix stays fully withheld here
+            // rather than only partly, the same as a message that opens a
+            // call from its very first byte.
+            let content = if self.drop_ceiling.is_some() {
+                String::new()
+            } else {
+                self.seen[local_emitted..at].trim_end().to_owned()
+            };
             // `emitted` still advances to the opener — the whitespace is
             // accounted for, so nothing rescans it — but `sent` stops at what
             // actually went out. Whether that separator is dropped or restored
             // is not knowable yet: it is internal whitespace if prose follows
             // the call, and a trailing edge the buffered parser trims if not.
             // The caller decides once it has parsed the whole text.
-            let content = self.seen[local_emitted..at].trim_end().to_owned();
             self.sent = self.emitted + content.len();
             self.emitted = self.dropped + at;
             return (!content.is_empty()).then_some(content);
@@ -1619,61 +1633,33 @@ impl StreamingContentGate {
         // whether an opener follows it. Nothing is lost when none does: the
         // buffered parse then returns the text unchanged, and the caller emits
         // whatever it kept beyond what was streamed.
-        let safe = self.seen[..ceiling].trim_end().len();
+        let raw_safe = self.seen[..ceiling].trim_end().len();
         let local_emitted = self.emitted - self.dropped;
-        if safe <= local_emitted {
+        if raw_safe <= local_emitted {
             return None;
         }
-        let content = self.seen[local_emitted..safe].to_owned();
-        self.emitted = self.dropped + safe;
-        self.sent = self.emitted;
-        // Drop everything below `safe` except its very last byte, which is
-        // kept as a permanent one-byte anchor.
-        //
-        // Without it: if a later push's opener starts exactly at `safe` (no
-        // separator in between, or a separator that was itself dropped by an
-        // earlier round), the retained text ends up beginning exactly where
-        // the tag region will later be excised. The buffered parser's own
-        // `trim()` cannot tell that apart from the true start of the
-        // message — it would strip whatever follows the removed tag as
-        // leading whitespace, even though in the full response it is
-        // internal (the separator before the call, or the gap between the
-        // closing tag and trailing prose). That is not limited to a
-        // whitespace boundary at `safe`: content ending in a non-whitespace
-        // byte right before the opener has exactly the same failure mode
-        // once that byte is dropped.
-        //
-        // One retained byte of real content fixes both, because `trim()`
-        // only ever touches the outer edges of the string it is given: with
-        // a non-whitespace byte in front, nothing after the tag can be
-        // mistaken for a leading edge, however far away it is or how much
-        // whitespace it starts with. `safe` is the length of a string
-        // `trim_end`-ed to it, so the anchor character is guaranteed
-        // non-whitespace already — no separate check needed. It is not
-        // necessarily one *byte*, though: `safe - 1` can land inside a
-        // multibyte character, which `drain` would panic on, so the drop
-        // stops at that character's start rather than exactly one byte short.
-        let mut drop_amount = floor_char_boundary(&self.seen, safe - 1);
 
-        // The anchor above is only enough to protect `trim()`'s own leading
-        // edge. `parse_tagged_tool_calls` does more than trim: it mutates as
-        // it scans, cutting out each matched region and rejoining what was on
+        // `parse_tagged_tool_calls` does more than trim: it mutates as it
+        // scans, cutting out each matched region and rejoining what was on
         // either side of it. Two bytes that were nowhere near each other in
         // the response can end up adjacent after an earlier cut removes
         // everything between them — `<tool_calls` immediately followed by a
         // well-formed `<tool_call>…</tool_call>` rejoins, after that inner
         // match is excised, into a `<tool_calls>` that was never literally in
-        // the text. `find_opener` only asks "is a complete opener present
-        // anywhere in `seen`", which says nothing about a malformed prefix
-        // like `<tool_calls` — it will never complete into an opener on its
-        // own, so nothing stops it from being marked `safe` and dropped. But
-        // dropped means gone from `whole` entirely, so the buffered parse at
-        // `finish()` can no longer reconstruct — or rule out — a rewrite that
-        // only the full text would have gone through, which can as easily
-        // erase a real call as fabricate one.
+        // the text. A prefix like that can end up meaning something entirely
+        // different once the full response is seen — sometimes swallowed
+        // into a tool call's own payload, sometimes erased outright — so it
+        // must not be *streamed* any more than it may be dropped: once a
+        // byte like this has gone out over SSE there is no taking it back,
+        // regardless of what `finish()` later reconstructs internally.
+        // `find_opener` only asks "is a complete opener present anywhere in
+        // `seen`", which says nothing about a malformed prefix like
+        // `<tool_calls` — it will never complete into an opener on its own,
+        // so nothing stops it from otherwise being marked `safe` to send.
         //
         // There is no bound on how far ahead the match that would complete
-        // such a rewrite might be, so the only sound rule is to never drop
+        // such a rewrite might be, so the only sound rule is to never emit —
+        // as content, or into `seen` for the buffered parser to reconsider —
         // past the first byte that could start any of this parser's tags,
         // open or close (they all share the same leading byte for every
         // dialect in use).
@@ -1685,7 +1671,8 @@ impl StreamingContentGate {
         // removed span (removal only ever targets a matched tag, which
         // starts with one of `tag_start_chars`), so nothing later can ever
         // splice across it back to the pin. Once a wall is found anywhere,
-        // `drop_ceiling` clears and dropping resumes from scratch.
+        // `drop_ceiling` clears and both streaming and dropping resume from
+        // scratch.
         //
         // Finding one takes more than checking the very next byte, though: a
         // false start like `<tool_calls` is packed with ordinary,
@@ -1698,15 +1685,8 @@ impl StreamingContentGate {
         // itself never moves until a wall is actually found, however far the
         // search has to extend to find one — moving it early, to wherever
         // the run currently reaches, would let bytes between the original
-        // pin and there be dropped while the very risk they were pinned
-        // against is still unresolved.
-        // A wall found below is not yet physically gone from `seen` — it is
-        // only actually removed at the bottom of this function, once
-        // `drop_amount` is final. Searching for a *new* pin from position 0
-        // right after clearing one would find that same, still-present byte
-        // again and immediately re-pin it, so detection starts from wherever
-        // the wall search reached instead of from 0 whenever a wall was
-        // found this round; it stays 0 when there was nothing to clear.
+        // pin and there be streamed or dropped while the very risk they were
+        // pinned against is still unresolved.
         let mut search_ceiling_from = 0;
         if let Some(dc) = self.drop_ceiling {
             if self.protected_until < dc + self.hold + 1 {
@@ -1740,21 +1720,17 @@ impl StreamingContentGate {
                 }
             }
         }
-        // `search_ceiling_from` is where the wall search left off, which can
-        // be well past `drop_amount` — the search looks as far ahead as it
-        // needs to resolve a chain, while `drop_amount` only ever covers the
-        // *safe* prefix computed above. When the wall lands beyond it, there
-        // is nothing left in `[search_ceiling_from..drop_amount)` to search
-        // (an empty, not merely reordered, range — slicing it the other way
-        // round would panic), so detection for a fresh pin is skipped rather
-        // than clamped: nothing in the safe prefix was ever unscanned.
-        if self.drop_ceiling.is_none() && search_ceiling_from < drop_amount {
-            // From `search_ceiling_from`, not `local_emitted`: a byte can
-            // already have been streamed as content in an earlier round
-            // without yet being physically dropped, and it is about to be
-            // swept up in this round's `drain` regardless of which round
-            // first called it safe.
-            if let Some(at) = self.seen[search_ceiling_from..drop_amount]
+        // A byte found by the wall search above is not yet physically gone
+        // from `seen`, so re-scanning for a *new* pin from position 0 right
+        // after clearing one would find that same byte again and immediately
+        // re-pin it — detection starts from wherever the wall search reached
+        // instead; it stays 0 when there was nothing to clear. It searches up
+        // to `raw_safe`, not just the anchor-trimmed prefix that ends up
+        // droppable: anything in `[local_emitted, raw_safe)` is a candidate
+        // to be *streamed* this round, and every one of those bytes needs the
+        // same protection as what gets dropped.
+        if self.drop_ceiling.is_none() && search_ceiling_from < raw_safe {
+            if let Some(at) = self.seen[search_ceiling_from..raw_safe]
                 .find(|c: char| self.tag_start_chars.contains(&c))
             {
                 let dc = self.dropped + search_ceiling_from + at;
@@ -1763,10 +1739,60 @@ impl StreamingContentGate {
                 self.scan_cursor = dc + 1;
             }
         }
-        if let Some(ceiling) = self.drop_ceiling {
-            drop_amount = drop_amount.min(ceiling - self.dropped);
+
+        // With any pin now resolved as far as this round's data allows, the
+        // actual safe boundary — for streaming *and* for dropping alike — is
+        // capped at it: nothing at or past an unresolved pin may be emitted
+        // either way, only what precedes it. Trimmed again here, the same
+        // way `raw_safe` was: a pin sitting right after whitespace (`"Hello
+        // <tool_calls"`) must not commit that whitespace to the client
+        // either, since it is exactly the separator-before-a-call case the
+        // trailing-whitespace withholding above exists for — the pin is just
+        // another kind of thing that might turn out to be an opener.
+        let safe = match self.drop_ceiling {
+            Some(dc) => {
+                let capped = dc - self.dropped;
+                local_emitted + self.seen[local_emitted..capped].trim_end().len()
+            }
+            None => raw_safe,
+        };
+        if safe <= local_emitted {
+            return None;
         }
 
+        let content = self.seen[local_emitted..safe].to_owned();
+        self.emitted = self.dropped + safe;
+        self.sent = self.emitted;
+
+        // Drop everything below `safe` except its very last byte, which is
+        // kept as a permanent one-byte anchor.
+        //
+        // Without it: if a later push's opener starts exactly at `safe` (no
+        // separator in between, or a separator that was itself dropped by an
+        // earlier round), the retained text ends up beginning exactly where
+        // the tag region will later be excised. The buffered parser's own
+        // `trim()` cannot tell that apart from the true start of the
+        // message — it would strip whatever follows the removed tag as
+        // leading whitespace, even though in the full response it is
+        // internal (the separator before the call, or the gap between the
+        // closing tag and trailing prose). That is not limited to a
+        // whitespace boundary at `safe`: content ending in a non-whitespace
+        // byte right before the opener has exactly the same failure mode
+        // once that byte is dropped.
+        //
+        // One retained byte of real content fixes both, because `trim()`
+        // only ever touches the outer edges of the string it is given: with
+        // a non-whitespace byte in front, nothing after the tag can be
+        // mistaken for a leading edge, however far away it is or how much
+        // whitespace it starts with. `safe` is the length of a string
+        // `trim_end`-ed to it when `drop_ceiling` is `None`, so the anchor
+        // character is guaranteed non-whitespace in that case; when a pin
+        // capped `safe` instead, the anchor is that pin's own tag-start byte,
+        // also never whitespace. Either way no separate check is needed. It
+        // is not necessarily one *byte*, though: `safe - 1` can land inside a
+        // multibyte character, which `drain` would panic on, so the drop
+        // stops at that character's start rather than exactly one byte short.
+        let drop_amount = floor_char_boundary(&self.seen, safe - 1);
         self.seen.drain(..drop_amount);
         self.dropped += drop_amount;
         Some(content)
@@ -3966,6 +3992,62 @@ mod tests {
             "the streaming path must not fabricate a call the buffered path never found; got {:?} from whole={whole:?}",
             parsed.tool_calls,
         );
+        assert_eq!(
+            format!("{streamed}{tail}"),
+            buffered.content,
+            "reconstructed content must match the buffered message"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_sensitive_prefix_is_withheld_from_streaming_too() {
+        // Not just what gets dropped from `seen` — what gets *streamed* to
+        // the client is just as exposed to the same rewrite risk, and once a
+        // byte has gone out over SSE there is no taking it back regardless of
+        // what `finish()` later reconstructs internally.
+        //
+        // `<tool_calls` (missing its `>`) directly followed by a well-formed
+        // `<tool_call>{"name":"x"}</tool_call>` is a real, valid call on the
+        // buffered path — but the leftover `<tool_calls` rejoins the `>`
+        // right after the removed inner match into a `<tool_calls>` that
+        // then swallows the second, genuinely well-formed
+        // `<tool_calls>{"name":"y"}</tool_calls>` tag as its own payload, so
+        // the buffered content ends up fully empty (the whole text is
+        // consumed by the one real call plus the two merges). Before the
+        // gate knew any of that, `<tool_calls` looked like ordinary,
+        // trickle-released "safe" content — exactly what must never reach
+        // the client if the buffered answer never contained it.
+        let raw = r#"<tool_calls<tool_call>{"name":"x"}</tool_call>><tool_calls>{"name":"y"}</tool_calls>"#;
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let buffered = parse_assistant_output(&request, raw);
+        assert_eq!(
+            buffered.tool_calls.len(),
+            1,
+            "sanity check on the buffered path: exactly the first, well-formed call survives"
+        );
+        assert_eq!(
+            buffered.content, "",
+            "sanity check on the buffered path: nothing is left over as prose"
+        );
+
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        let mut streamed = String::new();
+        for ch in raw.chars() {
+            let mut buf = [0u8; 4];
+            if let Some(c) = gate.push(ch.encode_utf8(&mut buf)) {
+                streamed.push_str(&c);
+            }
+        }
+        assert_eq!(
+            streamed, "",
+            "the malformed prefix must be withheld, not trickled out as content before it is known safe"
+        );
+        let (whole, sent, overflowed) = gate.finish();
+        assert!(!overflowed);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        let tail = unsent_tail(&whole, sent, &parsed, false);
         assert_eq!(
             format!("{streamed}{tail}"),
             buffered.content,
