@@ -1740,7 +1740,15 @@ impl StreamingContentGate {
                 }
             }
         }
-        if self.drop_ceiling.is_none() {
+        // `search_ceiling_from` is where the wall search left off, which can
+        // be well past `drop_amount` — the search looks as far ahead as it
+        // needs to resolve a chain, while `drop_amount` only ever covers the
+        // *safe* prefix computed above. When the wall lands beyond it, there
+        // is nothing left in `[search_ceiling_from..drop_amount)` to search
+        // (an empty, not merely reordered, range — slicing it the other way
+        // round would panic), so detection for a fresh pin is skipped rather
+        // than clamped: nothing in the safe prefix was ever unscanned.
+        if self.drop_ceiling.is_none() && search_ceiling_from < drop_amount {
             // From `search_ceiling_from`, not `local_emitted`: a byte can
             // already have been streamed as content in an earlier round
             // without yet being physically dropped, and it is about to be
@@ -1765,18 +1773,39 @@ impl StreamingContentGate {
     }
 
     /// Append `fragment` to `seen`, discarding whatever would push it past
-    /// [`MAX_GATED_RETENTION`] and flagging [`Self::overflowed`] when that
-    /// happens. Reachable while tripped, while an anchored decision is still
-    /// pending, and while a long separator's drop is deferred — the states
-    /// that can otherwise retain the entire remaining stream.
+    /// the effective cap and flagging [`Self::overflowed`] when that happens.
+    /// Reachable while tripped and while an anchored decision is still
+    /// pending — states that can otherwise retain the entire remaining
+    /// stream — and, with a taller cap, while a `drop_ceiling` pin is still
+    /// being resolved.
+    ///
+    /// A pin gets the extra room because resolving it is not like the other
+    /// two: a tripped call or an undecided anchored prefix stay exactly as
+    /// large as whatever gets appended, but a resolved pin collapses back
+    /// to the ordinary bound on the very same round it clears (the drop
+    /// logic right above this call already handles it — nothing further is
+    /// needed here). Capping the fragment *before* that resolution ever runs
+    /// would refuse it the one thing it needs to clear: the bytes that would
+    /// have proven the wall. A single stray tag-start byte followed by dense
+    /// nested-generic code (`Vec<Box<dyn Trait>>>`, chained closely enough
+    /// to keep extending the pin) is a realistic way to stay unresolved for
+    /// a while without ever containing a call — the extra headroom is sized
+    /// to one more slice of whatever a single fragment can add, not to be
+    /// unbounded: a pin that still has not resolved by the time even that is
+    /// exhausted is treated the same as any other overflow.
     fn absorb_capped(&mut self, fragment: &str) {
-        if self.seen.len() >= MAX_GATED_RETENTION {
+        let cap = if self.drop_ceiling.is_some() {
+            MAX_GATED_RETENTION + PUSH_CHUNK_SIZE
+        } else {
+            MAX_GATED_RETENTION
+        };
+        if self.seen.len() >= cap {
             if !fragment.is_empty() {
                 self.overflowed = true;
             }
             return;
         }
-        let room = MAX_GATED_RETENTION - self.seen.len();
+        let room = cap - self.seen.len();
         let take = floor_char_boundary(fragment, room.min(fragment.len()));
         self.seen.push_str(&fragment[..take]);
         if take < fragment.len() {
@@ -3730,6 +3759,60 @@ mod tests {
             full,
             "slicing the fragment internally must not lose or duplicate any byte"
         );
+    }
+
+    #[test]
+    fn a_pin_gets_room_to_resolve_before_the_cap_gives_up_on_it() {
+        // A stray `<` followed closely enough by more `<`s to keep extending
+        // the pin (dense nested generics are a realistic source) can stay
+        // unresolved for a while without ever containing a call. Capping the
+        // fragment before the wall search ever gets to look at it would
+        // starve it of exactly the bytes that would let it resolve — even
+        // though, once it does, retention collapses straight back down.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        // Chained false starts, each well within `hold` (12 bytes) of the
+        // next, past MAX_GATED_RETENTION — the pin never gets to clear on
+        // its own here.
+        let chain = "<a".repeat(140_000);
+        assert!(chain.len() > MAX_GATED_RETENTION);
+        gate.push(&chain);
+        assert!(
+            gate.drop_ceiling.is_some(),
+            "the chain must still be unresolved after nothing but chained false starts"
+        );
+        // Ordinary prose, long enough to provide a wall well within the
+        // extra headroom `absorb_capped` grants a still-resolving pin.
+        let tail = "ordinary prose with no angle brackets at all. ".repeat(50);
+        gate.push(&tail);
+        assert!(
+            gate.drop_ceiling.is_none(),
+            "the wall in the trailing prose must have been given the chance to resolve the pin"
+        );
+        let (whole, _sent, overflowed) = gate.finish();
+        assert!(
+            !overflowed,
+            "a pin that successfully resolves must not be reported as an overflow"
+        );
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn a_wall_beyond_the_safe_prefix_does_not_panic_the_resumed_search() {
+        // The wall search can resolve a pin using bytes well past what this
+        // round's `drop_amount` covers (it looks as far ahead as the chain
+        // needs, independent of how much is currently safe to stream). When
+        // that happens, searching for a fresh pin afterward must not slice
+        // `[search_ceiling_from..drop_amount)` with a start past the end.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        for ch in "</tool_calls>{".chars() {
+            let mut buf = [0u8; 4];
+            gate.push(ch.encode_utf8(&mut buf));
+        }
+        let (_, _, overflowed) = gate.finish();
+        assert!(!overflowed);
     }
 
     #[test]
