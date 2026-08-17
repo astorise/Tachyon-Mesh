@@ -1360,13 +1360,14 @@ fn tool_call_openers(parser: ToolCallParser) -> (&'static [&'static str], bool) 
 /// sequences.
 ///
 /// `seen` does not retain the whole generation. Once a byte range is proven
-/// opener-free *and* has actually been sent downstream, it is dropped —
-/// `dropped` records how much, so `emitted`/`sent` can stay absolute offsets
-/// into the conceptual whole stream while indexing into `seen` at
-/// `offset - dropped`. That keeps `seen` at O(`hold`) for the common case of a
-/// long answer that never opens a call, which also fixes the quadratic
-/// rescanning `find_opener` used to do: it scans all of `seen`, and `seen` no
-/// longer grows without bound.
+/// opener-free *and* has actually been sent downstream, it is dropped down to
+/// a one-byte anchor (see the note on `push`'s unanchored branch for why the
+/// anchor has to stay) — `dropped` records how much, so `emitted`/`sent` can
+/// stay absolute offsets into the conceptual whole stream while indexing into
+/// `seen` at `offset - dropped`. That keeps `seen` at O(`hold`) for the common
+/// case of a long answer that never opens a call, which also fixes the
+/// quadratic rescanning `find_opener` used to do: it scans all of `seen`, and
+/// `seen` no longer grows without bound.
 ///
 /// An anchored gate gets a stronger version of the same idea: once its leading
 /// bytes diverge from every opener, no later byte can retroactively open a
@@ -1375,14 +1376,13 @@ fn tool_call_openers(parser: ToolCallParser) -> (&'static [&'static str], bool) 
 /// the same as if no gate existed.
 ///
 /// What's left after both of those — the region from an opener to the end of
-/// the stream, an anchored gate still undecided because the answer is nothing
-/// but whitespace so far, and a separator so long it cannot yet be proven
-/// either internal or trailing (see the note on dropping below) — is capped at
-/// `MAX_GATED_RETENTION`. A hostile upstream that opens a call and never
-/// closes it, or never emits a non-whitespace byte, cannot pin unbounded
-/// memory per stream; hitting the cap sets `overflowed`, and the caller is
-/// expected to fail the completion rather than hand back content parsed from
-/// a buffer that was silently cut short.
+/// the stream, and an anchored gate still undecided because the answer is
+/// nothing but whitespace so far — is capped at `MAX_GATED_RETENTION`. A
+/// hostile upstream that opens a call and never closes it, or never emits a
+/// non-whitespace byte, cannot pin unbounded memory per stream; hitting the
+/// cap sets `overflowed`, and the caller is expected to fail the completion
+/// rather than hand back content parsed from a buffer that was silently cut
+/// short.
 struct StreamingContentGate {
     openers: &'static [&'static str],
     anchored: bool,
@@ -1518,31 +1518,32 @@ impl StreamingContentGate {
         let content = self.seen[local_emitted..safe].to_owned();
         self.emitted = self.dropped + safe;
         self.sent = self.emitted;
-        // Everything below `safe` is proven opener-free and has now actually
-        // been sent, so *usually* it never needs to be retained again — except
-        // when `seen[safe]` is itself whitespace, meaning `safe` sits right
-        // before a separator this push has not resolved yet (still trailing,
-        // possibly still growing). Dropping through it now would make that
-        // separator the new start of `seen`, and the buffered parser's own
-        // `trim()` cannot tell a truncation artefact from the true start of
-        // the message — it would strip a separator that must stay internal
-        // once the call turns out to have prose after it (`unsent_tail`'s
-        // "consumed" arithmetic only cancels this out when nothing follows
-        // the call). So the drop is deferred until either the separator
-        // resolves into an opener (tripping, which never drops again) or
-        // more content arrives after it — at which point the next `safe`
-        // computation lands past the whitespace on genuine content, and
-        // dropping through both at once is exactly as safe as dropping
-        // through ordinary content always was. `absorb_capped` still bounds
-        // how long an unresolved separator can be retained meanwhile.
-        let next_is_whitespace = self.seen[safe..]
-            .chars()
-            .next()
-            .is_some_and(char::is_whitespace);
-        if !next_is_whitespace {
-            self.seen.drain(..safe);
-            self.dropped += safe;
-        }
+        // Drop everything below `safe` except its very last byte, which is
+        // kept as a permanent one-byte anchor.
+        //
+        // Without it: if a later push's opener starts exactly at `safe` (no
+        // separator in between, or a separator that was itself dropped by an
+        // earlier round), the retained text ends up beginning exactly where
+        // the tag region will later be excised. The buffered parser's own
+        // `trim()` cannot tell that apart from the true start of the
+        // message — it would strip whatever follows the removed tag as
+        // leading whitespace, even though in the full response it is
+        // internal (the separator before the call, or the gap between the
+        // closing tag and trailing prose). That is not limited to a
+        // whitespace boundary at `safe`: content ending in a non-whitespace
+        // byte right before the opener has exactly the same failure mode
+        // once that byte is dropped.
+        //
+        // One retained byte of real content fixes both, because `trim()`
+        // only ever touches the outer edges of the string it is given: with
+        // a non-whitespace byte in front, nothing after the tag can be
+        // mistaken for a leading edge, however far away it is or how much
+        // whitespace it starts with. `safe` is the length of a string
+        // `trim_end`-ed to it, so `seen[safe - 1]` is guaranteed
+        // non-whitespace already — no separate check needed.
+        let drop_amount = safe - 1;
+        self.seen.drain(..drop_amount);
+        self.dropped += drop_amount;
         Some(content)
     }
 
@@ -3517,14 +3518,15 @@ mod tests {
 
     #[test]
     fn a_separator_longer_than_hold_stays_internal_when_prose_follows_the_call() {
-        // A drop that lands right before a still-unresolved separator must be
-        // deferred: dropping through it would make the separator the new
-        // start of the retained text, and the buffered parser's `trim()`
-        // cannot tell that apart from the true start of the message — it
-        // would eat a separator that has to stay internal once prose follows
-        // the call. Both the leading prose and the separator here exceed the
-        // Qwen hold (12 bytes) so a naive drop would have already discarded
-        // the prose by the time the separator is fully seen.
+        // Dropping a prefix always keeps a one-byte anchor: without it, a
+        // drop that lands right at the start of a still-unresolved separator
+        // would make that separator the new start of the retained text, and
+        // the buffered parser's `trim()` cannot tell that apart from the true
+        // start of the message — it would eat a separator that has to stay
+        // internal once prose follows the call. Both the leading prose and
+        // the separator here exceed the Qwen hold (12 bytes) so a naive drop
+        // would have already discarded the prose by the time the separator is
+        // fully seen.
         let prose = "A".repeat(40);
         let separator = " ".repeat(40);
         let (streamed, whole, sent, full) = run_gate(
@@ -3552,6 +3554,42 @@ mod tests {
             format!("{streamed}{tail}"),
             full_parsed.content,
             "the separator between the prose and `AFTER` must not be lost, whatever the gate dropped along the way"
+        );
+    }
+
+    #[test]
+    fn prose_directly_against_a_split_opener_keeps_the_gap_after_the_call() {
+        // The same failure mode without any separator at all: prose runs
+        // straight into the opener (long enough, and split awkwardly enough,
+        // that the whole prose prefix would be dropped before the trip), and
+        // the call is followed directly by a space and more prose. With no
+        // anchor byte, the retained text would begin exactly at the opener,
+        // and after the tag is excised the space before `AFTER` would look
+        // like leading whitespace to the buffered parser and get trimmed away.
+        let prefix = "P".repeat(40);
+        let (streamed, whole, sent, full) = run_gate(
+            ToolCallParser::Qwen,
+            &[
+                &prefix,
+                "<tool_calls",
+                r#">{"name":"search","arguments":{}}</tool_calls>"#,
+                " AFTER",
+            ],
+        );
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert_eq!(
+            parsed.tool_calls.len(),
+            1,
+            "the call must still be recovered"
+        );
+        let tail = unsent_tail(&whole, sent, &parsed, false);
+        let full_parsed = parse_assistant_output(&request, &full);
+        assert_eq!(
+            format!("{streamed}{tail}"),
+            full_parsed.content,
+            "the space between the closing tag and `AFTER` must not be lost"
         );
     }
 
