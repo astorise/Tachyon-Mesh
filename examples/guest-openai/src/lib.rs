@@ -1147,7 +1147,27 @@ fn handle_chat_completions_streaming(
         Vec::new()
     };
     if let Some(gate) = gate {
-        let (whole, sent) = gate.finish();
+        let (whole, sent, overflowed) = gate.finish();
+        // The gate had to discard a fragment to stay within its retention
+        // cap, so `whole` is not the generation — it is missing bytes from
+        // somewhere in the middle. Parsing it anyway risks handing back a
+        // `tool_calls` delta built from a truncated argument list, or dropping
+        // a call the buffered parser can no longer find its closing tag for.
+        // The status line already went out with the headers, so this is
+        // reported the same way every other post-hoc failure on this path is:
+        // an SSE error frame in place of the completion.
+        if overflowed {
+            write_sse_error(
+                &writer,
+                &request.model,
+                bindings::tachyon::accelerator::cpu::GenerationError {
+                    message: "the response exceeded the tool-call gate's retention limit before it could be parsed".to_owned(),
+                    upstream_status: Some(502),
+                    invalid_request: false,
+                },
+            )?;
+            return Ok((200, Vec::new()));
+        }
         let parsed = parse_assistant_output(&request, &whole);
 
         // Everything the client has not received yet. `sent` is what actually
@@ -1338,23 +1358,107 @@ fn tool_call_openers(parser: ToolCallParser) -> (&'static [&'static str], bool) 
 /// Bytes are held back near the tail so an opener split across two fragments is
 /// still matched, the same trick the host's decode loop uses for stop
 /// sequences.
+///
+/// `seen` does not retain the whole generation. Once a byte range is proven
+/// opener-free *and* has actually been sent downstream, it is dropped down to
+/// a one-byte anchor (see the note on `push`'s unanchored branch for why the
+/// anchor has to stay) — `dropped` records how much, so `emitted`/`sent` can
+/// stay absolute offsets into the conceptual whole stream while indexing into
+/// `seen` at `offset - dropped`. That keeps `seen` at O(`hold`) for the common
+/// case of a long answer that never opens a call, which also fixes the
+/// quadratic rescanning `find_opener` used to do: it scans all of `seen`, and
+/// `seen` no longer grows without bound.
+///
+/// An anchored gate gets a stronger version of the same idea: once its leading
+/// bytes diverge from every opener, no later byte can retroactively open a
+/// call (the anchor is fixed at the start), so the gate is *decided* and never
+/// needs to buffer again — every further fragment is forwarded immediately,
+/// the same as if no gate existed.
+///
+/// What's left after both of those — the region from an opener to the end of
+/// the stream, and an anchored gate still undecided because the answer is
+/// nothing but whitespace so far — is capped at `MAX_GATED_RETENTION`. A
+/// hostile upstream that opens a call and never closes it, or never emits a
+/// non-whitespace byte, cannot pin unbounded memory per stream; hitting the
+/// cap sets `overflowed`, and the caller is expected to fail the completion
+/// rather than hand back content parsed from a buffer that was silently cut
+/// short.
 struct StreamingContentGate {
     openers: &'static [&'static str],
     anchored: bool,
     hold: usize,
     seen: String,
-    /// How far into `seen` the gate has *accounted* for content — the scan
-    /// position. Advances past whitespace it deliberately withheld.
+    /// Absolute offset of `seen[0]` into the conceptual whole stream. Bytes
+    /// below this were proven opener-free and already sent, so they no longer
+    /// need to be retained.
+    dropped: usize,
+    /// How far into the whole stream the gate has *accounted* for content —
+    /// the scan position. Advances past whitespace it deliberately withheld.
     emitted: usize,
-    /// How far into `seen` the gate has actually *sent* content. Never ahead of
-    /// `emitted`, and behind it exactly by the separator dropped before a tool
-    /// call. The two were one counter, which silently made "withheld" mean
-    /// "delivered": the caller's tail reconciliation then started after
-    /// whitespace nobody had received, so a response opening with whitespace
-    /// lost it, and prose *after* a call lost the separator before it.
+    /// How far into the whole stream the gate has actually *sent* content.
+    /// Never ahead of `emitted`, and behind it exactly by the separator
+    /// dropped before a tool call. The two were one counter, which silently
+    /// made "withheld" mean "delivered": the caller's tail reconciliation then
+    /// started after whitespace nobody had received, so a response opening
+    /// with whitespace lost it, and prose *after* a call lost the separator
+    /// before it.
     sent: usize,
     tripped: bool,
+    /// Set once an anchored gate's leading bytes have diverged from every
+    /// opener. From here on nothing can ever open a call, so nothing is
+    /// buffered — every fragment is forwarded as-is.
+    decided_no_call: bool,
+    /// Set once a fragment had to be discarded to stay within
+    /// `MAX_GATED_RETENTION`. The retained text is no longer a faithful copy
+    /// of the generation from that point on, so the caller must not treat
+    /// whatever `finish()` returns as a real completion.
+    overflowed: bool,
+    /// Absolute position of the earliest byte not yet proven walled off from
+    /// every later byte — `None` when nothing is pinning the drop boundary.
+    /// Fixed at the position it was first set to for as long as it stays
+    /// `Some`: extending *how far* the search for a wall has to look (see
+    /// `protected_until`) must never be confused with moving *this* floor
+    /// forward, or bytes between the original pin and wherever the search
+    /// got to would be dropped despite the risk they were pinned against
+    /// still being unresolved. See the long note in `push`'s unanchored
+    /// branch for what "walled off" means.
+    drop_ceiling: Option<usize>,
+    /// Absolute position such that a wall search has confirmed no wall
+    /// exists in `[drop_ceiling, protected_until)` — every byte in it is
+    /// either the original pin or a later tag-start byte whose own
+    /// resolution window is still being chased. Meaningless while
+    /// `drop_ceiling` is `None`.
+    protected_until: usize,
+    /// Absolute position the wall search has scanned to without yet finding
+    /// either a wall or a reason to extend `protected_until` further —
+    /// tracked separately so each round only examines newly-arrived bytes
+    /// instead of re-scanning `[drop_ceiling, protected_until)` from
+    /// scratch. Meaningless while `drop_ceiling` is `None`.
+    scan_cursor: usize,
+    /// The leading byte of every tag this parser recognizes, open or close —
+    /// every tagged dialect's pair shares one (`<`). Empty for a parser whose
+    /// buffered parse cannot rejoin bytes a drop has separated — Mistral's
+    /// single-marker split never rescans or mutates, so `drop_ceiling` has
+    /// nothing to protect against for it — and for an anchored gate, which
+    /// never runs the drop logic this guards at all.
+    tag_start_chars: Vec<char>,
 }
+
+/// Ceiling on what a single gate will retain once it can no longer bound
+/// itself the cheap way — a tripped gate holding a call for the buffered
+/// parser, an anchored gate that has seen nothing but whitespace so far, or a
+/// separator ahead of a still-possible opener that is too long to resolve
+/// yet. Without it, a stream built out of any of those would retain up to the
+/// whole per-stream cap; the node admits many concurrent streams, so an
+/// unbounded gate is an unbounded multiple of that.
+const MAX_GATED_RETENTION: usize = 256 * 1024;
+
+/// Granularity `push` slices a large fragment into before running it through
+/// the ordinary per-push resolve logic. Large enough that a realistic
+/// fragment (SSE frames are accepted up to 1 MiB) needs only a handful of
+/// iterations; comfortably above the widest UTF-8 character (4 bytes), which
+/// `push`'s slicing loop relies on to always make progress.
+const PUSH_CHUNK_SIZE: usize = 64 * 1024;
 
 impl StreamingContentGate {
     fn new(parser: ToolCallParser) -> Self {
@@ -1365,25 +1469,114 @@ impl StreamingContentGate {
             .max()
             .unwrap_or(1)
             .saturating_sub(1);
+        // `drop_ceiling` exists to protect against `parse_tagged_tool_calls`'s
+        // iterative, mutating tag removal splicing distant bytes together —
+        // that rewriting only happens for the tagged dialects. Mistral's
+        // parser does one split on a single marker and never rescans or
+        // mutates, so it has nothing for a dropped prefix to rejoin with; an
+        // incidental `[` from ordinary code (`items[0]`) is exactly the kind
+        // of realistic content this must not needlessly pin retention on.
+        let mut tag_start_chars: Vec<char> =
+            if matches!(parser, ToolCallParser::Qwen | ToolCallParser::QwenCoder) {
+                // Every dialect's closing tag shares its opener's leading byte
+                // (`</tool_call>` vs `<tool_call>`), so the openers alone are
+                // enough to derive it without hard-coding the closers here too.
+                openers.iter().filter_map(|o| o.chars().next()).collect()
+            } else {
+                Vec::new()
+            };
+        tag_start_chars.sort_unstable();
+        tag_start_chars.dedup();
         Self {
             openers,
             anchored,
             hold,
             seen: String::new(),
+            dropped: 0,
             emitted: 0,
             sent: 0,
             tripped: false,
+            decided_no_call: false,
+            overflowed: false,
+            drop_ceiling: None,
+            protected_until: 0,
+            scan_cursor: 0,
+            tag_start_chars,
         }
     }
 
     /// Absorb a fragment, returning the content safe to stream right now.
+    ///
+    /// A single upstream fragment is not necessarily small: SSE frames up to
+    /// 1 MiB are accepted, and some backends emit the whole generation as one
+    /// fragment. Handing all of it to [`Self::push_chunk`] in one call would
+    /// grow `seen` to the fragment's full size before that call ever gets a
+    /// chance to find an opener or release safe content — tripping
+    /// `MAX_GATED_RETENTION` on a fragment that is, in fact, fully
+    /// resolvable (most of it content, with no call anywhere in it). So a
+    /// large fragment is walked in bounded slices instead, each one run
+    /// through the ordinary per-push logic; that keeps `seen` from growing
+    /// past what driving the same bytes in through several smaller pushes
+    /// would have needed, which is the shape the retention cap is actually
+    /// meant to guard: a call that stays open, or an anchored prefix that
+    /// stays undecided, past what a single fragment could ever explain.
     fn push(&mut self, fragment: &str) -> Option<String> {
-        self.seen.push_str(fragment);
+        if fragment.len() <= PUSH_CHUNK_SIZE {
+            return self.push_chunk(fragment);
+        }
+        let mut streamed = String::new();
+        let mut rest = fragment;
+        while !rest.is_empty() {
+            // Once the gate can no longer resolve anything incrementally —
+            // tripped, or decided against ever tripping — slicing further
+            // buys nothing: a tripped gate's `push_chunk` just forwards to
+            // `absorb_capped`, which already caps on its own, and a decided
+            // gate forwards every fragment untouched. Handing over what's
+            // left in one call is equivalent and skips the bookkeeping.
+            if self.tripped || self.decided_no_call {
+                if let Some(content) = self.push_chunk(rest) {
+                    streamed.push_str(&content);
+                }
+                break;
+            }
+            let at = floor_char_boundary(rest, PUSH_CHUNK_SIZE.min(rest.len()));
+            // Always > 0 as long as `PUSH_CHUNK_SIZE` is at least as wide as
+            // the longest UTF-8 character (4 bytes): `floor_char_boundary`
+            // only walks backward to find one, and a character is never more
+            // than 4 bytes wide, so it cannot walk past a chunk size that
+            // size back to 0. Asserted rather than silently guarded, so a
+            // future change to the constant fails loudly instead of looping
+            // forever.
+            debug_assert!(at > 0, "PUSH_CHUNK_SIZE must be at least 4 bytes");
+            let (chunk, remainder) = rest.split_at(at);
+            if let Some(content) = self.push_chunk(chunk) {
+                streamed.push_str(&content);
+            }
+            rest = remainder;
+        }
+        (!streamed.is_empty()).then_some(streamed)
+    }
+
+    fn push_chunk(&mut self, fragment: &str) -> Option<String> {
+        // Decided: the anchor can never be reached again, so nothing can open
+        // a call. Nothing to buffer for — pass the fragment straight through.
+        if self.decided_no_call {
+            return Some(fragment.to_owned());
+        }
         if self.tripped {
+            // Never retried — a tripped gate only ever grows, so a rejection
+            // here is final.
+            if !self.absorb_capped(fragment).is_empty() {
+                self.overflowed = true;
+            }
             return None;
         }
+
+        let leftover = self.absorb_capped(fragment);
+
         if let Some(at) = self.find_opener() {
             self.tripped = true;
+            let local_emitted = self.emitted - self.dropped;
             // Everything before the opener is genuine content — minus the
             // whitespace that separates it from the call. The buffered parser
             // removes the call region and `trim()`s what is left, so emitting
@@ -1392,30 +1585,335 @@ impl StreamingContentGate {
             // exactly that whitespace, and the streaming contract is that the
             // two are equal.
             //
+            // Unless a pin is still open: this opener completing does not by
+            // itself prove the *prefix* before it survives the buffered
+            // parse's own rewriting unchanged — `<tool_calls` immediately
+            // ahead of exactly this kind of complete opener is the case that
+            // rejoins into a tag that was never literally in the response
+            // (see the long note below in the unanchored branch). Once
+            // tripped there is no later round left to reconsider a
+            // streaming decision, so the prefix stays fully withheld here
+            // rather than only partly, the same as a message that opens a
+            // call from its very first byte.
+            let content = if self.drop_ceiling.is_some() {
+                String::new()
+            } else {
+                self.seen[local_emitted..at].trim_end().to_owned()
+            };
             // `emitted` still advances to the opener — the whitespace is
             // accounted for, so nothing rescans it — but `sent` stops at what
             // actually went out. Whether that separator is dropped or restored
             // is not knowable yet: it is internal whitespace if prose follows
             // the call, and a trailing edge the buffered parser trims if not.
             // The caller decides once it has parsed the whole text.
-            let content = self.seen[self.emitted..at].trim_end().to_owned();
             self.sent = self.emitted + content.len();
-            self.emitted = at;
+            self.emitted = self.dropped + at;
+            // Tripping is terminal — no later round exists to retry
+            // `leftover` in, so a rejection here is as final as the tripped
+            // branch's own.
+            if !leftover.is_empty() {
+                self.overflowed = true;
+            }
             return (!content.is_empty()).then_some(content);
         }
+
+        if self.anchored {
+            // Anchored openers only count at the start, so a prefix that is
+            // no longer a prefix of any opener can never become one, however
+            // much more text arrives. Once that's true the gate is decided:
+            // flush what accumulated while deciding, and stop accumulating
+            // for the rest of the stream — the cheap win for the JSON parser,
+            // whose gate would otherwise retain the whole answer just to keep
+            // re-checking a question already settled.
+            let trimmed = self.seen.trim_start();
+            if !trimmed.is_empty() && !self.openers.iter().any(|o| o.starts_with(trimmed)) {
+                self.decided_no_call = true;
+                let content = std::mem::take(&mut self.seen);
+                let len = content.len();
+                self.dropped += len;
+                self.emitted += len;
+                self.sent += len;
+                // Deciding is terminal the same way tripping is — every
+                // fragment from here on forwards straight through, so
+                // `leftover` gets no later round to retry in either.
+                if !leftover.is_empty() {
+                    self.overflowed = true;
+                }
+                return Some(content);
+            }
+            // Still undecided: nothing dropped this round, so retrying
+            // `leftover` now would just hit the same rejection again.
+            if !leftover.is_empty() {
+                self.overflowed = true;
+            }
+            return None;
+        }
+
         let ceiling = floor_char_boundary(&self.seen, self.seen.len().saturating_sub(self.hold));
         // Trailing whitespace is withheld for the same reason, before we know
         // whether an opener follows it. Nothing is lost when none does: the
         // buffered parse then returns the text unchanged, and the caller emits
         // whatever it kept beyond what was streamed.
-        let safe = self.seen[..ceiling].trim_end().len();
-        if safe <= self.emitted {
+        let raw_safe = self.seen[..ceiling].trim_end().len();
+        let local_emitted = self.emitted - self.dropped;
+        if raw_safe <= local_emitted {
+            // Nothing became safe this round, so nothing dropped either —
+            // retrying `leftover` immediately would just be rejected again.
+            if !leftover.is_empty() {
+                self.overflowed = true;
+            }
             return None;
         }
-        let content = self.seen[self.emitted..safe].to_owned();
-        self.emitted = safe;
-        self.sent = safe;
+
+        // `parse_tagged_tool_calls` does more than trim: it mutates as it
+        // scans, cutting out each matched region and rejoining what was on
+        // either side of it. Two bytes that were nowhere near each other in
+        // the response can end up adjacent after an earlier cut removes
+        // everything between them — `<tool_calls` immediately followed by a
+        // well-formed `<tool_call>…</tool_call>` rejoins, after that inner
+        // match is excised, into a `<tool_calls>` that was never literally in
+        // the text. A prefix like that can end up meaning something entirely
+        // different once the full response is seen — sometimes swallowed
+        // into a tool call's own payload, sometimes erased outright — so it
+        // must not be *streamed* any more than it may be dropped: once a
+        // byte like this has gone out over SSE there is no taking it back,
+        // regardless of what `finish()` later reconstructs internally.
+        // `find_opener` only asks "is a complete opener present anywhere in
+        // `seen`", which says nothing about a malformed prefix like
+        // `<tool_calls` — it will never complete into an opener on its own,
+        // so nothing stops it from otherwise being marked `safe` to send.
+        //
+        // There is no bound on how far ahead the match that would complete
+        // such a rewrite might be, so the only sound rule is to never emit —
+        // as content, or into `seen` for the buffered parser to reconsider —
+        // past the first byte that could start any of this parser's tags,
+        // open or close (they all share the same leading byte for every
+        // dialect in use).
+        //
+        // That pin does not have to last forever: the risk requires an
+        // *unbroken* run of tag-start bytes connecting the pinned position to
+        // whatever match eventually gets removed, and a byte that is provably
+        // outside every such run is a wall — it can never be part of a
+        // removed span (removal only ever targets a matched tag, which
+        // starts with one of `tag_start_chars`), so nothing later can ever
+        // splice across it back to the pin. Once a wall is found anywhere,
+        // `drop_ceiling` clears and both streaming and dropping resume from
+        // scratch.
+        //
+        // Finding one takes more than checking the very next byte, though: a
+        // false start like `<tool_calls` is packed with ordinary,
+        // non-tag-start characters (`t`, `o`, `o`, `l`, …) that prove
+        // nothing on their own — they are still part of the very attempt
+        // being resolved, and a tag-start byte immediately after it (a
+        // second false start, or the real match this whole thing exists to
+        // protect) extends how far the run reaches before a wall can be
+        // confirmed. `protected_until` tracks that reach; `drop_ceiling`
+        // itself never moves until a wall is actually found, however far the
+        // search has to extend to find one — moving it early, to wherever
+        // the run currently reaches, would let bytes between the original
+        // pin and there be streamed or dropped while the very risk they were
+        // pinned against is still unresolved.
+        let mut search_ceiling_from = 0;
+        if let Some(dc) = self.drop_ceiling {
+            if self.protected_until < dc + self.hold + 1 {
+                self.protected_until = dc + self.hold + 1;
+                self.scan_cursor = dc + 1;
+            }
+            loop {
+                // Checked before rounding up to a char boundary: rounding
+                // first and comparing after could clamp a target beyond what
+                // has actually arrived down to exactly `seen.len()`, which
+                // would then read as "enough data" and resolve early.
+                let target_local = self.protected_until - self.dropped;
+                if target_local > self.seen.len() {
+                    break; // not enough data yet to finish resolving the run
+                }
+                let scan_end = ceil_char_boundary(&self.seen, target_local);
+                let scan_start = self.scan_cursor - self.dropped;
+                match self.seen[scan_start..scan_end]
+                    .find(|c: char| self.tag_start_chars.contains(&c))
+                {
+                    Some(rel) => {
+                        let found = self.dropped + scan_start + rel;
+                        self.protected_until = self.protected_until.max(found + self.hold + 1);
+                        self.scan_cursor = found + 1;
+                    }
+                    None => {
+                        self.drop_ceiling = None;
+                        search_ceiling_from = scan_end;
+                        break;
+                    }
+                }
+            }
+        }
+        // A byte found by the wall search above is not yet physically gone
+        // from `seen`, so re-scanning for a *new* pin from position 0 right
+        // after clearing one would find that same byte again and immediately
+        // re-pin it — detection starts from wherever the wall search reached
+        // instead; it stays 0 when there was nothing to clear. It searches up
+        // to `raw_safe`, not just the anchor-trimmed prefix that ends up
+        // droppable: anything in `[local_emitted, raw_safe)` is a candidate
+        // to be *streamed* this round, and every one of those bytes needs the
+        // same protection as what gets dropped.
+        //
+        // Never behind `local_emitted`, though: the wall search resolves
+        // purely against `dropped`, with no notion of what has already been
+        // committed as content, so its own landing spot can fall behind
+        // content this round (or an earlier one) already emitted. A pin
+        // installed there would sit *behind* the region `safe` is about to
+        // be computed relative to, making `capped < local_emitted` below and
+        // turning that slice into a start-past-end range.
+        let search_ceiling_from = search_ceiling_from.max(local_emitted);
+        if self.drop_ceiling.is_none() && search_ceiling_from < raw_safe {
+            if let Some(at) = self.seen[search_ceiling_from..raw_safe]
+                .find(|c: char| self.tag_start_chars.contains(&c))
+            {
+                let dc = self.dropped + search_ceiling_from + at;
+                self.drop_ceiling = Some(dc);
+                self.protected_until = dc + self.hold + 1;
+                self.scan_cursor = dc + 1;
+            }
+        }
+
+        // With any pin now resolved as far as this round's data allows, the
+        // actual safe boundary — for streaming *and* for dropping alike — is
+        // capped at it: nothing at or past an unresolved pin may be emitted
+        // either way, only what precedes it. Trimmed again here, the same
+        // way `raw_safe` was: a pin sitting right after whitespace (`"Hello
+        // <tool_calls"`) must not commit that whitespace to the client
+        // either, since it is exactly the separator-before-a-call case the
+        // trailing-whitespace withholding above exists for — the pin is just
+        // another kind of thing that might turn out to be an opener.
+        let safe = match self.drop_ceiling {
+            Some(dc) => {
+                let capped = dc - self.dropped;
+                local_emitted + self.seen[local_emitted..capped].trim_end().len()
+            }
+            None => raw_safe,
+        };
+        if safe <= local_emitted {
+            // An open pin capped `safe` back down to nothing new — no drop
+            // happens this round either, so retrying `leftover` now would
+            // just be rejected again.
+            if !leftover.is_empty() {
+                self.overflowed = true;
+            }
+            return None;
+        }
+
+        let content = self.seen[local_emitted..safe].to_owned();
+        self.emitted = self.dropped + safe;
+        self.sent = self.emitted;
+
+        // Drop everything below `safe` except its very last byte, which is
+        // kept as a permanent one-byte anchor.
+        //
+        // Without it: if a later push's opener starts exactly at `safe` (no
+        // separator in between, or a separator that was itself dropped by an
+        // earlier round), the retained text ends up beginning exactly where
+        // the tag region will later be excised. The buffered parser's own
+        // `trim()` cannot tell that apart from the true start of the
+        // message — it would strip whatever follows the removed tag as
+        // leading whitespace, even though in the full response it is
+        // internal (the separator before the call, or the gap between the
+        // closing tag and trailing prose). That is not limited to a
+        // whitespace boundary at `safe`: content ending in a non-whitespace
+        // byte right before the opener has exactly the same failure mode
+        // once that byte is dropped.
+        //
+        // One retained byte of real content fixes both, because `trim()`
+        // only ever touches the outer edges of the string it is given: with
+        // a non-whitespace byte in front, nothing after the tag can be
+        // mistaken for a leading edge, however far away it is or how much
+        // whitespace it starts with. `safe` is the length of a string
+        // `trim_end`-ed to it when `drop_ceiling` is `None`, so the anchor
+        // character is guaranteed non-whitespace in that case; when a pin
+        // capped `safe` instead, the anchor is that pin's own tag-start byte,
+        // also never whitespace. Either way no separate check is needed. It
+        // is not necessarily one *byte*, though: `safe - 1` can land inside a
+        // multibyte character, which `drain` would panic on, so the drop
+        // stops at that character's start rather than exactly one byte short.
+        let drop_amount = floor_char_boundary(&self.seen, safe - 1);
+        self.seen.drain(..drop_amount);
+        self.dropped += drop_amount;
+
+        // `leftover` is whatever `absorb_capped` had to reject to stay under
+        // the cap at the *start* of this round — before the drop just above
+        // had a chance to shrink `seen` back down. A pin resolving mid-round
+        // (or an anchored gate deciding) can free up most of what was
+        // retained, so bytes rejected purely because they arrived slightly
+        // too early are worth one more attempt now that there may be room:
+        // otherwise a fragment that arrives right as a long-unresolved pin
+        // is about to clear gets truncated and flagged `overflowed` for a
+        // response that was never actually too large to handle, only too
+        // large to handle all at once. `drop_amount > 0` gates the retry so
+        // a round that made no progress cannot loop forever retrying the
+        // same rejection.
+        if !leftover.is_empty() {
+            if drop_amount > 0 {
+                // The recursive call runs this same logic against the
+                // now-shrunk state, and will flag `overflowed` itself if it
+                // still can't make room — nothing to decide about that here.
+                if let Some(more) = self.push_chunk(leftover) {
+                    let mut combined = content;
+                    combined.push_str(&more);
+                    return Some(combined);
+                }
+                return Some(content);
+            }
+            // Nothing dropped this round, so a retry would just be rejected
+            // again the same way.
+            self.overflowed = true;
+        }
         Some(content)
+    }
+
+    /// Append `fragment` to `seen`, discarding whatever would push it past
+    /// the effective cap and flagging [`Self::overflowed`] when that happens.
+    /// Reachable while tripped and while an anchored decision is still
+    /// pending — states that can otherwise retain the entire remaining
+    /// stream — and, with a taller cap, while a `drop_ceiling` pin is still
+    /// being resolved.
+    ///
+    /// A pin gets the extra room because resolving it is not like the other
+    /// two: a tripped call or an undecided anchored prefix stay exactly as
+    /// large as whatever gets appended, but a resolved pin collapses back
+    /// to the ordinary bound on the very same round it clears (the drop
+    /// logic right above this call already handles it — nothing further is
+    /// needed here). Capping the fragment *before* that resolution ever runs
+    /// would refuse it the one thing it needs to clear: the bytes that would
+    /// have proven the wall. A single stray tag-start byte followed by dense
+    /// nested-generic code (`Vec<Box<dyn Trait>>>`, chained closely enough
+    /// to keep extending the pin) is a realistic way to stay unresolved for
+    /// a while without ever containing a call — the extra headroom is sized
+    /// to one more slice of whatever a single fragment can add, not to be
+    /// unbounded: a pin that still has not resolved by the time even that is
+    /// exhausted is treated the same as any other overflow.
+    /// Returns whatever of `fragment` did not fit — empty when it all did.
+    /// The caller is expected to retry that leftover once its own round has
+    /// had a chance to free up room (see the retry loop in `push_chunk`):
+    /// a pin that resolves mid-round can collapse `seen` right back down,
+    /// and bytes rejected here before that happened were never actually
+    /// beyond what the gate could handle, only beyond what fit *yet*.
+    /// Note that truncating here does *not* mark [`Self::overflowed`] — a
+    /// caller that can retry the leftover after this round frees up room
+    /// (see `push_chunk`'s retry loop) may yet absorb it all, and flagging
+    /// eagerly would report a real response as failed for what was only ever
+    /// a temporary, mid-resolution rejection. Setting the flag is the
+    /// caller's call once it knows no further attempt is coming.
+    fn absorb_capped<'a>(&mut self, fragment: &'a str) -> &'a str {
+        let cap = if self.drop_ceiling.is_some() {
+            MAX_GATED_RETENTION + PUSH_CHUNK_SIZE
+        } else {
+            MAX_GATED_RETENTION
+        };
+        if self.seen.len() >= cap {
+            return fragment;
+        }
+        let room = cap - self.seen.len();
+        let take = floor_char_boundary(fragment, room.min(fragment.len()));
+        self.seen.push_str(&fragment[..take]);
+        &fragment[take..]
     }
 
     fn find_opener(&self) -> Option<usize> {
@@ -1436,10 +1934,24 @@ impl StreamingContentGate {
             .min()
     }
 
-    /// The whole generation, for the buffered parser to work on, and how much
-    /// of it the client has actually received.
-    fn finish(self) -> (String, usize) {
-        (self.seen, self.sent)
+    /// The retained tail of the generation, for the buffered parser to work
+    /// on; how much of *that* the client has actually received; and whether
+    /// the retention cap ever discarded a fragment, in which case the other
+    /// two values are not a faithful record of the generation and the caller
+    /// must not treat them as one.
+    ///
+    /// Everything dropped that was *not* an overflow was proven opener-free
+    /// and already sent in full, so the caller never needs it back:
+    /// `parse_assistant_output` run on the retained text alone still finds
+    /// every call (none of them were in the dropped prefix), and its own
+    /// `trim()` at the retained text's edge cancels out against the same
+    /// `trim_start()` the tail reconciliation applies to `whole[..sent]` —
+    /// both are computed from the same truncated text, so the offsets stay
+    /// consistent even though neither equals what the untruncated generation
+    /// would have produced.
+    fn finish(self) -> (String, usize, bool) {
+        let sent = self.sent - self.dropped;
+        (self.seen, sent, self.overflowed)
     }
 }
 
@@ -1451,6 +1963,21 @@ fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
     }
     while idx > 0 && !text.is_char_boundary(idx) {
         idx -= 1;
+    }
+    idx
+}
+
+/// Smallest index `idx` that is a char boundary of `text`, no smaller than
+/// the given one. The `floor` counterpart above rounds a byte count down to
+/// stay inside a bound; this is for the opposite case — a byte count derived
+/// from an arbitrary length (like `hold`) that has to examine *at least*
+/// that many bytes, so rounding down would under-count.
+fn ceil_char_boundary(text: &str, mut idx: usize) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    while !text.is_char_boundary(idx) {
+        idx += 1;
     }
     idx
 }
@@ -2750,9 +3277,13 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].id, "call_tachyon_0");
     }
 
-    /// Drive a gate with fragments, returning what it streamed as content and
-    /// what it held back for the buffered parser.
-    fn run_gate(parser: ToolCallParser, fragments: &[&str]) -> (String, String, usize) {
+    /// Drive a gate with fragments, returning what it streamed as content,
+    /// what it held back for the buffered parser (which, once a call trips
+    /// the gate or an anchored gate decides it never will, may be a *tail* of
+    /// the generation rather than the whole thing — see [`StreamingContentGate::finish`]),
+    /// the offset within that tail still unsent, and the full concatenated
+    /// generation for tests that need the untruncated ground truth.
+    fn run_gate(parser: ToolCallParser, fragments: &[&str]) -> (String, String, usize, String) {
         let mut gate = StreamingContentGate::new(parser);
         let mut streamed = String::new();
         for fragment in fragments {
@@ -2760,8 +3291,13 @@ mod tests {
                 streamed.push_str(&content);
             }
         }
-        let (whole, sent) = gate.finish();
-        (streamed, whole, sent)
+        let full = fragments.concat();
+        let (whole, sent, overflowed) = gate.finish();
+        assert!(
+            !overflowed,
+            "these small test fragments must never hit the retention cap"
+        );
+        (streamed, whole, sent, full)
     }
 
     #[test]
@@ -2771,7 +3307,7 @@ mod tests {
         // opener is where the two used to diverge: the buffered parser removes
         // the call region and trims, while the gate had already streamed the
         // newline.
-        let (streamed, whole, _emitted) = run_gate(
+        let (streamed, whole, sent, full) = run_gate(
             ToolCallParser::Qwen,
             &[
                 "Let me check.",
@@ -2783,15 +3319,26 @@ mod tests {
         );
         let mut request = tool_request_named("local");
         request.tool_call_parser = Some(ToolCallParser::Qwen);
+        // `whole` may be a truncated tail of `full`: the gate drops a prefix
+        // once it is both proven opener-free and already sent, so with a
+        // prefix this long ("Let me check." exceeds the Qwen hold) some of it
+        // never makes it into `whole` at all. Reconciling through the same
+        // `unsent_tail` the production handler uses keeps the comparison in
+        // one coordinate space; comparing `streamed` straight to a parse of
+        // `whole` would not, since that parse's own `trim()` no longer lines
+        // up with the untruncated buffered message.
         let parsed = parse_assistant_output(&request, &whole);
         assert_eq!(
             parsed.tool_calls.len(),
             1,
             "the call must still be recovered"
         );
+        let tail = unsent_tail(&whole, sent, &parsed, false);
+        let full_parsed = parse_assistant_output(&request, &full);
         assert_eq!(
-            streamed, parsed.content,
-            "streamed content must equal the buffered message, whitespace included"
+            format!("{streamed}{tail}"),
+            full_parsed.content,
+            "streamed content plus the reconciled tail must equal the buffered message, whitespace included"
         );
     }
 
@@ -2800,7 +3347,7 @@ mod tests {
         // The other side of the same rule: whitespace is only *deferred*, never
         // dropped. With no call, the buffered parse returns the text unchanged
         // and the caller's reconciliation emits whatever the gate still held.
-        let (streamed, whole, emitted) = run_gate(
+        let (streamed, whole, sent, full) = run_gate(
             ToolCallParser::Qwen,
             &[
                 "Here it is, at some length so the opener hold is not the binding constraint.",
@@ -2811,9 +3358,12 @@ mod tests {
             !streamed.ends_with(char::is_whitespace),
             "trailing whitespace is withheld while an opener could still follow, got {streamed:?}"
         );
+        // `whole` is only the retained tail once the gate has dropped a
+        // proven-safe, already-sent prefix — `full` (the raw concatenation of
+        // every fragment) is the ground truth to reconstruct against.
         assert_eq!(
-            format!("{streamed}{}", whole.get(emitted..).unwrap_or_default()),
-            whole,
+            format!("{streamed}{}", whole.get(sent..).unwrap_or_default()),
+            full,
             "streamed content plus the caller's tail must reconstruct the whole generation"
         );
     }
@@ -3096,7 +3646,7 @@ mod tests {
         // The prose before the call must reach the client as it is generated —
         // buffering everything would cost time-to-first-token on every request
         // that merely offers tools.
-        let (streamed, whole, emitted) = run_gate(
+        let (streamed, whole, sent, _full) = run_gate(
             ToolCallParser::Qwen,
             &[
                 "Let me check.",
@@ -3109,10 +3659,14 @@ mod tests {
         // chunk cannot be un-sent, so it is withheld until the gate knows
         // whether a call follows.
         assert_eq!(streamed, "Let me check.");
-        // And `sent` counts exactly what went out — not the withheld newline.
-        // The handler decides that newline's fate once it has parsed the whole
+        // And `sent` stops exactly where the withheld newline starts, in the
+        // gate's own (possibly truncated) coordinate space — not past it. The
+        // handler decides that newline's fate once it has parsed the whole
         // text: internal whitespace if prose follows the call, trimmed if not.
-        assert_eq!(emitted, streamed.len());
+        assert!(
+            whole[sent..].starts_with('\n'),
+            "the withheld separator must still be there, unclaimed by `sent`"
+        );
         // The tag itself never leaks into the content stream.
         assert!(!streamed.contains("<tool_call>"));
         assert!(whole.contains("<tool_call>"));
@@ -3125,7 +3679,8 @@ mod tests {
         // streamed at that point, so `sent` must stay 0: it once advanced to
         // the opener, and the handler then cut the tail there and dropped the
         // leading whitespace the buffered response keeps.
-        let (streamed, whole, sent) = run_gate(ToolCallParser::Json, &["  {\"answer\"", ":1}"]);
+        let (streamed, whole, sent, _full) =
+            run_gate(ToolCallParser::Json, &["  {\"answer\"", ":1}"]);
         assert!(streamed.is_empty(), "an anchored gate streams nothing");
         assert_eq!(sent, 0, "nothing was sent, so nothing may be skipped");
 
@@ -3152,7 +3707,7 @@ mod tests {
         // buffered parser trims it — but only when the call ends the message.
         // With prose after the call that whitespace is *internal*, and the
         // buffered parser keeps it, so the tail has to hand it back.
-        let (streamed, whole, sent) = run_gate(
+        let (streamed, whole, sent, _full) = run_gate(
             ToolCallParser::Qwen,
             &[
                 "Hi \n",
@@ -3182,7 +3737,7 @@ mod tests {
     fn streaming_gate_matches_an_opener_split_across_fragments() {
         // `<tool_` / `call>` arriving separately must still be caught, or the
         // opening tag leaks into the transcript.
-        let (streamed, _, _) = run_gate(
+        let (streamed, _, _, _full) = run_gate(
             ToolCallParser::Qwen,
             &["hi ", "<tool_", "call>{\"name\":\"f\"}</tool_call>"],
         );
@@ -3193,23 +3748,29 @@ mod tests {
 
     #[test]
     fn streaming_gate_streams_everything_when_no_tool_call_appears() {
-        let (streamed, whole, _) = run_gate(ToolCallParser::Qwen, &["all ", "plain ", "prose"]);
+        let (streamed, whole, sent, full) =
+            run_gate(ToolCallParser::Qwen, &["all ", "plain ", "prose"]);
         // The tail is held back until the stream ends; the handler flushes it
-        // from the parsed content afterwards.
-        assert!(whole.starts_with(&streamed));
-        assert_eq!(whole, "all plain prose");
+        // from the parsed content afterwards. `whole` may only be a retained
+        // tail once a proven-safe, already-sent prefix has been dropped, so
+        // reconstruction is checked against `full` — the raw concatenation of
+        // every fragment — rather than `whole` itself.
+        assert_eq!(
+            format!("{streamed}{}", whole.get(sent..).unwrap_or_default()),
+            full,
+        );
     }
 
     #[test]
     fn streaming_gate_withholds_an_anchored_json_call_entirely() {
         // A `json` response is a tool call only when the *whole* output is one
         // JSON value, so nothing may be streamed as content.
-        let (streamed, whole, emitted) = run_gate(
+        let (streamed, whole, sent, _full) = run_gate(
             ToolCallParser::Json,
             &["{\"tool_calls\":[{\"name\":", "\"search\"}]}"],
         );
         assert!(streamed.is_empty());
-        assert_eq!(emitted, 0);
+        assert_eq!(sent, 0);
         assert!(whole.starts_with('{'));
     }
 
@@ -3217,19 +3778,535 @@ mod tests {
     fn streaming_gate_does_not_anchor_on_a_brace_inside_prose() {
         // A `{` mid-sentence cannot start a JSON tool call — the whole output
         // would have to parse — so it must not stop content from streaming.
-        let (_, whole, _) = run_gate(ToolCallParser::Json, &["use ", "Vec<T> { .. } ", "here"]);
+        let (_, _, _, full) = run_gate(ToolCallParser::Json, &["use ", "Vec<T> { .. } ", "here"]);
         let mut gate = StreamingContentGate::new(ToolCallParser::Json);
-        gate.push(&whole);
+        gate.push(&full);
         assert!(!gate.tripped, "a brace inside prose must not trip the gate");
     }
 
     #[test]
     fn streaming_gate_withholds_the_mistral_marker() {
-        let (streamed, _, _) = run_gate(
+        let (streamed, _, _, _full) = run_gate(
             ToolCallParser::Mistral,
             &["Checking\n", "[TOOL_CALLS] [{\"name\":\"fetch\"}]"],
         );
         assert_eq!(streamed, "Checking");
+    }
+
+    #[test]
+    fn an_unanchored_gate_retains_o_hold_not_o_n_for_a_long_call_free_answer() {
+        // The primary acceptance bar: a tool-enabled stream of N bytes with no
+        // call retains O(hold), not O(N). Feed a gate far more prose than the
+        // Qwen hold (12 bytes) and check what it is holding onto at the end,
+        // not just what it streamed.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        let mut streamed = String::new();
+        let line = "no call ever appears in this sentence, only prose. ";
+        let mut full = String::new();
+        for _ in 0..500 {
+            full.push_str(line);
+            if let Some(content) = gate.push(line) {
+                streamed.push_str(&content);
+            }
+        }
+        // A drop can lag by up to one extra fragment when it lands right
+        // before a still-unresolved separator (see the note in `push`), so
+        // the bound allows a small multiple of a single line rather than
+        // asserting the tightest possible byte count — the point being
+        // tested is boundedness relative to the 26 KB answer, not an exact
+        // constant.
+        assert!(
+            gate.seen.len() <= gate.hold + 4 * line.len(),
+            "a call-free stream must not retain what it has already proven safe and sent, got {} bytes retained out of {} generated",
+            gate.seen.len(),
+            full.len(),
+        );
+        let (whole, sent, overflowed) = gate.finish();
+        assert!(!overflowed);
+        assert_eq!(
+            format!("{streamed}{}", whole.get(sent..).unwrap_or_default()),
+            full,
+            "bounding retention must not lose or duplicate any byte of the answer"
+        );
+    }
+
+    #[test]
+    fn a_single_huge_call_free_fragment_does_not_trip_the_retention_cap() {
+        // The backend is free to hand the whole generation to `push` as one
+        // fragment (SSE frames are accepted up to 1 MiB), and that fragment
+        // can easily be call-free prose bigger than `MAX_GATED_RETENTION` —
+        // a large code explanation, say. Absorbing it in one shot before
+        // ever running the opener/safe-release logic would trip the cap on
+        // a response that has nothing wrong with it; `push` has to walk it
+        // in slices instead so retention stays bounded exactly as it would
+        // if the same bytes had arrived as many small fragments.
+        let line = "no call ever appears in this sentence, only prose. ";
+        let full = line.repeat(20_000); // well past MAX_GATED_RETENTION (256 KiB)
+        assert!(full.len() > MAX_GATED_RETENTION);
+
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        let streamed = gate.push(&full).unwrap_or_default();
+        assert!(
+            gate.seen.len() <= gate.hold + PUSH_CHUNK_SIZE,
+            "a call-free fragment must not retain anywhere near its own size, got {} bytes retained out of {} pushed",
+            gate.seen.len(),
+            full.len(),
+        );
+        let (whole, sent, overflowed) = gate.finish();
+        assert!(
+            !overflowed,
+            "a legitimate call-free fragment must not be treated as a retention-cap failure"
+        );
+        assert_eq!(
+            format!("{streamed}{}", whole.get(sent..).unwrap_or_default()),
+            full,
+            "slicing the fragment internally must not lose or duplicate any byte"
+        );
+    }
+
+    #[test]
+    fn a_pin_gets_room_to_resolve_before_the_cap_gives_up_on_it() {
+        // A stray `<` followed closely enough by more `<`s to keep extending
+        // the pin (dense nested generics are a realistic source) can stay
+        // unresolved for a while without ever containing a call. Capping the
+        // fragment before the wall search ever gets to look at it would
+        // starve it of exactly the bytes that would let it resolve — even
+        // though, once it does, retention collapses straight back down.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        // Chained false starts, each well within `hold` (12 bytes) of the
+        // next, past MAX_GATED_RETENTION — the pin never gets to clear on
+        // its own here.
+        let chain = "<a".repeat(140_000);
+        assert!(chain.len() > MAX_GATED_RETENTION);
+        gate.push(&chain);
+        assert!(
+            gate.drop_ceiling.is_some(),
+            "the chain must still be unresolved after nothing but chained false starts"
+        );
+        // Ordinary prose, long enough to provide a wall well within the
+        // extra headroom `absorb_capped` grants a still-resolving pin.
+        let tail = "ordinary prose with no angle brackets at all. ".repeat(50);
+        gate.push(&tail);
+        assert!(
+            gate.drop_ceiling.is_none(),
+            "the wall in the trailing prose must have been given the chance to resolve the pin"
+        );
+        let (whole, _sent, overflowed) = gate.finish();
+        assert!(
+            !overflowed,
+            "a pin that successfully resolves must not be reported as an overflow"
+        );
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn a_wall_beyond_the_safe_prefix_does_not_panic_the_resumed_search() {
+        // The wall search can resolve a pin using bytes well past what this
+        // round's `drop_amount` covers (it looks as far ahead as the chain
+        // needs, independent of how much is currently safe to stream). When
+        // that happens, searching for a fresh pin afterward must not slice
+        // `[search_ceiling_from..drop_amount)` with a start past the end.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        for ch in "</tool_calls>{".chars() {
+            let mut buf = [0u8; 4];
+            gate.push(ch.encode_utf8(&mut buf));
+        }
+        let (_, _, overflowed) = gate.finish();
+        assert!(!overflowed);
+    }
+
+    #[test]
+    fn a_fresh_pin_search_never_lands_behind_the_emitted_anchor() {
+        // A byte the wall search resolves against is checked purely by
+        // position relative to `dropped` — it has no notion of what has
+        // already been committed as streamed content. If that landing spot
+        // falls behind `local_emitted`, a fresh pin gets installed *behind*
+        // the region `safe` is computed relative to, and slicing
+        // `seen[local_emitted..capped]` becomes a start-past-end range.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        for ch in "<<_CALLS]````/".chars() {
+            let mut buf = [0u8; 4];
+            gate.push(ch.encode_utf8(&mut buf));
+        }
+        let (_, _, overflowed) = gate.finish();
+        assert!(!overflowed);
+    }
+
+    #[test]
+    fn an_unabsorbed_remainder_is_retried_once_a_pin_resolves_mid_round() {
+        // The extra headroom `absorb_capped` grants a resolving pin is
+        // measured from `MAX_GATED_RETENTION`, not from wherever the pin
+        // currently sits — so a pin that has already grown close to that
+        // headroom leaves less than a full fragment's worth of *new* room
+        // for whatever arrives next, even though that fragment might easily
+        // resolve the pin and collapse retention right back down if it were
+        // just given the chance. The fragment gets truncated before the
+        // resolution that would have freed the room for it ever runs.
+        //
+        // A chain of false starts grown past the cap, immediately followed
+        // by one big ordinary-prose fragment, reproduces exactly that: only
+        // a sliver of the prose fits under the cap on the first pass, but
+        // that sliver alone is enough (`hold` is tiny) to resolve the pin
+        // and drop nearly everything retained — the rejected remainder must
+        // then get a real second attempt rather than being discarded with
+        // `overflowed` left set.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        let chain = "<a".repeat(150_000); // ~300 KiB, past MAX_GATED_RETENTION
+        assert!(chain.len() > MAX_GATED_RETENTION);
+        gate.push(&chain);
+        assert!(gate.drop_ceiling.is_some());
+
+        let prose = "ordinary prose with no angle brackets at all. ".repeat(1400); // ~64 KiB
+        assert!(prose.len() as u64 >= PUSH_CHUNK_SIZE as u64 / 2);
+        let streamed = gate.push(&prose).unwrap_or_default();
+
+        assert!(
+            gate.drop_ceiling.is_none(),
+            "the prose must have gotten enough of a chance to resolve the pin"
+        );
+        let (whole, sent, overflowed) = gate.finish();
+        assert!(
+            !overflowed,
+            "a fragment that arrives while a pin is resolving must not be truncated into a false overflow"
+        );
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert!(parsed.tool_calls.is_empty());
+        let tail = unsent_tail(&whole, sent, &parsed, false);
+        // Every byte of both the chain and the prose must be accounted for —
+        // none silently dropped along with, or because of, the pin.
+        assert_eq!(
+            format!("{streamed}{tail}"),
+            format!("{chain}{prose}"),
+            "the whole generation must survive the retry, not just the part that resolved the pin"
+        );
+    }
+
+    #[test]
+    fn a_decided_anchored_gate_stops_accumulating_entirely() {
+        // Once an anchored gate's leading bytes diverge from every opener, no
+        // later byte can retroactively open a call, so nothing more is worth
+        // buffering — the cheap win the JSON parser gets from anchoring.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Json);
+        assert_eq!(
+            gate.push("plainly not a call, "),
+            Some("plainly not a call, ".to_owned())
+        );
+        assert!(gate.decided_no_call);
+        assert!(
+            gate.seen.is_empty(),
+            "a decided gate must not retain anything it no longer needs to re-examine"
+        );
+        // Further fragments — even ones that would otherwise look like an
+        // opener — are forwarded untouched rather than buffered.
+        assert_eq!(
+            gate.push("{ this looks like json but isn't at the anchor }"),
+            Some("{ this looks like json but isn't at the anchor }".to_owned())
+        );
+        assert!(gate.seen.is_empty());
+    }
+
+    #[test]
+    fn a_tripped_gate_never_retains_more_than_the_cap() {
+        // A hostile upstream that opens a call and never closes it must not be
+        // able to pin unbounded memory in the gate.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        gate.push("<tool_call>");
+        assert!(gate.tripped);
+        let chunk = "x".repeat(64 * 1024);
+        for _ in 0..8 {
+            gate.push(&chunk);
+        }
+        assert!(
+            gate.seen.len() <= MAX_GATED_RETENTION,
+            "a tripped gate must be capped, got {} bytes retained",
+            gate.seen.len(),
+        );
+        // A capped gate is not a shorter-but-still-correct call: the buffered
+        // parser can no longer find the closing tag for what was truncated,
+        // so the caller must be told the retained text is not trustworthy
+        // rather than silently handed a corrupted completion.
+        assert!(
+            gate.overflowed,
+            "discarding bytes to stay under the cap must be flagged, not silent"
+        );
+    }
+
+    #[test]
+    fn a_separator_longer_than_hold_stays_internal_when_prose_follows_the_call() {
+        // Dropping a prefix always keeps a one-byte anchor: without it, a
+        // drop that lands right at the start of a still-unresolved separator
+        // would make that separator the new start of the retained text, and
+        // the buffered parser's `trim()` cannot tell that apart from the true
+        // start of the message — it would eat a separator that has to stay
+        // internal once prose follows the call. Both the leading prose and
+        // the separator here exceed the Qwen hold (12 bytes) so a naive drop
+        // would have already discarded the prose by the time the separator is
+        // fully seen.
+        let prose = "A".repeat(40);
+        let separator = " ".repeat(40);
+        let (streamed, whole, sent, full) = run_gate(
+            ToolCallParser::Qwen,
+            &[
+                &prose,
+                &separator,
+                "<tool_call>",
+                r#"{"name":"search","arguments":{}}"#,
+                "</tool_call>",
+                "AFTER",
+            ],
+        );
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert_eq!(
+            parsed.tool_calls.len(),
+            1,
+            "the call must still be recovered"
+        );
+        let tail = unsent_tail(&whole, sent, &parsed, false);
+        let full_parsed = parse_assistant_output(&request, &full);
+        assert_eq!(
+            format!("{streamed}{tail}"),
+            full_parsed.content,
+            "the separator between the prose and `AFTER` must not be lost, whatever the gate dropped along the way"
+        );
+    }
+
+    #[test]
+    fn a_drop_boundary_inside_a_multibyte_character_does_not_panic() {
+        // `safe` is always a char boundary (it comes out of `.trim_end().len()`
+        // on a valid `&str`), but `safe - 1` is not necessarily one when the
+        // last character of the safe prefix is multibyte. `é` is 2 bytes, so
+        // a run of them followed by plain ASCII puts exactly this shape in
+        // front of the gate.
+        let prose = "é".repeat(20) + &"b".repeat(20);
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        let _ = gate.push(&prose);
+        let (_whole, _sent, overflowed) = gate.finish();
+        assert!(!overflowed);
+    }
+
+    #[test]
+    fn a_malformed_nested_tag_does_not_fabricate_a_call_via_a_dropped_prefix() {
+        // `parse_tagged_tool_calls` mutates as it goes: removing one matched
+        // pair can splice previously non-adjacent bytes together into a tag
+        // that was never literally in the response. `<tool_calls` (missing
+        // its `>`) directly followed by a well-formed `<tool_call>bad</tool_call>`
+        // is exactly that: removing the inner match joins the leftover
+        // `<tool_calls` to the `>` right after it, completing an opener that
+        // then swallows the second, genuinely well-formed `<tool_calls>...`
+        // tag as part of its own (invalid-JSON) payload — so the buffered
+        // parse of the *full* text finds no calls at all.
+        //
+        // If the gate had already dropped `<tool_calls` from `seen` (proven,
+        // wrongly, "safe" because it doesn't itself complete into a literal
+        // opener), the buffered parse of the truncated tail never sees that
+        // merge: the second `<tool_calls>{"name":"y"}</tool_calls>` is found
+        // on its own, with valid JSON, and fabricates a dispatchable call.
+        let raw = r#"<tool_calls<tool_call>bad</tool_call>><tool_calls>{"name":"y"}</tool_calls>"#;
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let buffered = parse_assistant_output(&request, raw);
+        assert!(
+            buffered.tool_calls.is_empty(),
+            "sanity check on the buffered path: the malformed nesting must not parse as a call"
+        );
+
+        // Push it one byte at a time — the tightest fragmentation, and the
+        // one that gives the per-fragment drop the most chances to fire
+        // before the whole picture is in.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        let mut streamed = String::new();
+        for ch in raw.chars() {
+            let mut buf = [0u8; 4];
+            if let Some(c) = gate.push(ch.encode_utf8(&mut buf)) {
+                streamed.push_str(&c);
+            }
+        }
+        let (whole, sent, overflowed) = gate.finish();
+        assert!(!overflowed);
+        let parsed = parse_assistant_output(&request, &whole);
+        let tail = unsent_tail(&whole, sent, &parsed, false);
+        assert!(
+            parsed.tool_calls.is_empty(),
+            "the streaming path must not fabricate a call the buffered path never found; got {:?} from whole={whole:?}",
+            parsed.tool_calls,
+        );
+        assert_eq!(
+            format!("{streamed}{tail}"),
+            buffered.content,
+            "reconstructed content must match the buffered message"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_sensitive_prefix_is_withheld_from_streaming_too() {
+        // Not just what gets dropped from `seen` — what gets *streamed* to
+        // the client is just as exposed to the same rewrite risk, and once a
+        // byte has gone out over SSE there is no taking it back regardless of
+        // what `finish()` later reconstructs internally.
+        //
+        // `<tool_calls` (missing its `>`) directly followed by a well-formed
+        // `<tool_call>{"name":"x"}</tool_call>` is a real, valid call on the
+        // buffered path — but the leftover `<tool_calls` rejoins the `>`
+        // right after the removed inner match into a `<tool_calls>` that
+        // then swallows the second, genuinely well-formed
+        // `<tool_calls>{"name":"y"}</tool_calls>` tag as its own payload, so
+        // the buffered content ends up fully empty (the whole text is
+        // consumed by the one real call plus the two merges). Before the
+        // gate knew any of that, `<tool_calls` looked like ordinary,
+        // trickle-released "safe" content — exactly what must never reach
+        // the client if the buffered answer never contained it.
+        let raw = r#"<tool_calls<tool_call>{"name":"x"}</tool_call>><tool_calls>{"name":"y"}</tool_calls>"#;
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let buffered = parse_assistant_output(&request, raw);
+        assert_eq!(
+            buffered.tool_calls.len(),
+            1,
+            "sanity check on the buffered path: exactly the first, well-formed call survives"
+        );
+        assert_eq!(
+            buffered.content, "",
+            "sanity check on the buffered path: nothing is left over as prose"
+        );
+
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        let mut streamed = String::new();
+        for ch in raw.chars() {
+            let mut buf = [0u8; 4];
+            if let Some(c) = gate.push(ch.encode_utf8(&mut buf)) {
+                streamed.push_str(&c);
+            }
+        }
+        assert_eq!(
+            streamed, "",
+            "the malformed prefix must be withheld, not trickled out as content before it is known safe"
+        );
+        let (whole, sent, overflowed) = gate.finish();
+        assert!(!overflowed);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        let tail = unsent_tail(&whole, sent, &parsed, false);
+        assert_eq!(
+            format!("{streamed}{tail}"),
+            buffered.content,
+            "reconstructed content must match the buffered message"
+        );
+    }
+
+    #[test]
+    fn mistral_never_pins_the_drop_ceiling_on_an_incidental_bracket() {
+        // Mistral's parser does one split on a single marker and never
+        // rescans or mutates, so a dropped prefix has nothing to rejoin
+        // with — `drop_ceiling` exists for the tagged dialects' rewriting
+        // parser, not this one. Ordinary code containing `[` (array
+        // indexing, literals) must not fall back to O(N) retention just
+        // because it looks tag-adjacent to the wrong parser.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Mistral);
+        let line = "result = items[0] + items[1]; // ordinary code, no call here. ";
+        let mut full = String::new();
+        for _ in 0..5_000 {
+            full.push_str(line);
+            gate.push(line);
+        }
+        assert!(full.len() > MAX_GATED_RETENTION);
+        assert!(
+            gate.drop_ceiling.is_none(),
+            "Mistral must never engage the tag-rewrite protection at all"
+        );
+        assert!(
+            gate.seen.len() <= gate.hold + 4 * line.len(),
+            "an incidental `[` must not stop a call-free Mistral stream from staying bounded, got {} bytes retained",
+            gate.seen.len(),
+        );
+        let (_, _, overflowed) = gate.finish();
+        assert!(!overflowed);
+    }
+
+    #[test]
+    fn a_qwen_drop_ceiling_clears_once_a_wall_proves_the_chain_is_broken() {
+        // The pin `drop_ceiling` puts on a false tag start is not meant to be
+        // permanent: an ordinary `<` in code (`Vec<T>`) that is followed by
+        // plenty of unrelated content afterward can never be spliced back
+        // together with anything later, because that unrelated content can
+        // never itself be part of a removed tag region. Once such a byte is
+        // seen the pin must clear, or a single incidental `<` early in a
+        // long, call-free response would push it toward the retention cap.
+        let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
+        gate.push("fn f() -> Vec<T> { "); // a `<` that never becomes a tag
+                                          // The `<` starts out inside the trailing `hold` bytes, so it takes a
+                                          // little more content arriving after it before the gate's own
+                                          // opener-length lookahead resolves it as "definitely not a tag" and
+                                          // the drop logic notices it at all.
+        gate.push("return Default::default();");
+        assert!(
+            gate.drop_ceiling.is_some(),
+            "the `<` must be pinned once it is resolved as unmatched but not yet walled off"
+        );
+        let line = "ordinary prose with no angle brackets in it at all. ";
+        let mut full = String::from("fn f() -> Vec<T> { return Default::default();");
+        for _ in 0..6_000 {
+            full.push_str(line);
+            gate.push(line);
+        }
+        assert!(full.len() > MAX_GATED_RETENTION);
+        assert!(
+            gate.drop_ceiling.is_none(),
+            "a wall of ordinary content after the `<` must clear the pin"
+        );
+        assert!(
+            gate.seen.len() <= gate.hold + 4 * line.len(),
+            "once cleared, retention must go back to bounded, got {} bytes retained",
+            gate.seen.len(),
+        );
+        let (whole, _sent, overflowed) = gate.finish();
+        assert!(!overflowed);
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn prose_directly_against_a_split_opener_keeps_the_gap_after_the_call() {
+        // The same failure mode without any separator at all: prose runs
+        // straight into the opener (long enough, and split awkwardly enough,
+        // that the whole prose prefix would be dropped before the trip), and
+        // the call is followed directly by a space and more prose. With no
+        // anchor byte, the retained text would begin exactly at the opener,
+        // and after the tag is excised the space before `AFTER` would look
+        // like leading whitespace to the buffered parser and get trimmed away.
+        let prefix = "P".repeat(40);
+        let (streamed, whole, sent, full) = run_gate(
+            ToolCallParser::Qwen,
+            &[
+                &prefix,
+                "<tool_calls",
+                r#">{"name":"search","arguments":{}}</tool_calls>"#,
+                " AFTER",
+            ],
+        );
+        let mut request = tool_request_named("local");
+        request.tool_call_parser = Some(ToolCallParser::Qwen);
+        let parsed = parse_assistant_output(&request, &whole);
+        assert_eq!(
+            parsed.tool_calls.len(),
+            1,
+            "the call must still be recovered"
+        );
+        let tail = unsent_tail(&whole, sent, &parsed, false);
+        let full_parsed = parse_assistant_output(&request, &full);
+        assert_eq!(
+            format!("{streamed}{tail}"),
+            full_parsed.content,
+            "the space between the closing tag and `AFTER` must not be lost"
+        );
     }
 
     #[test]
