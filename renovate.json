@@ -52,6 +52,12 @@
       "matchManagers": ["cargo"],
       "matchPackageNames": ["tokenizers"],
       "allowedVersions": "<0.23"
+    },
+    {
+      "description": "object_store is pinned through the workspace's git patch; Renovate cannot update the crates.io version until that patch is removed or moved to a matching revision.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["object_store"],
+      "enabled": false
     }
   ]
 }
