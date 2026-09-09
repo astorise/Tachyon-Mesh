@@ -233,6 +233,24 @@ impl Capabilities {
         Self { mask }
     }
 
+    #[cfg(feature = "ai-inference")]
+    pub(crate) fn with_ai_runtime_accelerators(
+        mut self,
+        ai_runtime: &crate::ai_inference::AiInferenceRuntime,
+    ) -> Self {
+        self.mask &= !(Self::ACCEL_CUDA | Self::ACCEL_OPENVINO | Self::ACCEL_TPU);
+        if ai_runtime.supports_accelerator(crate::ai_inference::AcceleratorKind::Gpu) {
+            self.mask |= Self::ACCEL_CUDA;
+        }
+        if ai_runtime.supports_accelerator(crate::ai_inference::AcceleratorKind::Npu) {
+            self.mask |= Self::ACCEL_OPENVINO;
+        }
+        if ai_runtime.supports_accelerator(crate::ai_inference::AcceleratorKind::Tpu) {
+            self.mask |= Self::ACCEL_TPU;
+        }
+        self
+    }
+
     pub(crate) fn from_mask(mask: u64) -> Self {
         Self { mask }
     }

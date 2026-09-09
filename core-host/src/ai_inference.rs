@@ -8,7 +8,8 @@ use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{Arc, Condvar, Mutex, OnceLock, RwLock},
+    time::Duration,
 };
 use wasmtime_wasi_nn::{
     witx::WasiNnCtx, Graph as WasiGraph, GraphRegistry, Registry as WasiRegistry,
@@ -20,6 +21,7 @@ pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
 pub(crate) use magnetar_runtime::MAGNETAR_PATH_PREFIX;
 const MODEL_META_JSON: &str = ".tachyon-model.json";
 const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
+const UPSTREAM_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) fn binding_runs_upstream(binding: &IntegrityModelBinding) -> bool {
     !binding.dynamic && binding.path.trim().starts_with(UPSTREAM_SCHEME)
@@ -31,6 +33,128 @@ pub(crate) fn upstream_max_concurrency() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(32)
+}
+
+static HOST_UPSTREAM_ADMISSION: OnceLock<Arc<UpstreamAdmission>> = OnceLock::new();
+
+fn host_upstream_admission() -> Arc<UpstreamAdmission> {
+    Arc::clone(HOST_UPSTREAM_ADMISSION.get_or_init(|| Arc::new(UpstreamAdmission::from_env())))
+}
+
+struct UpstreamAdmission {
+    state: Mutex<UpstreamAdmissionState>,
+    released: Condvar,
+    capacity: usize,
+    max_waiters: usize,
+}
+
+#[derive(Default)]
+struct UpstreamAdmissionState {
+    in_flight: usize,
+    waiting: usize,
+}
+
+#[derive(Debug)]
+enum UpstreamAdmissionError {
+    QueueFull { waiting: usize, limit: usize },
+    TimedOut { in_flight: usize, limit: usize },
+}
+
+impl std::fmt::Display for UpstreamAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull { waiting, limit } => write!(
+                f,
+                "upstream request queue is full ({waiting} waiting, limit {limit})"
+            ),
+            Self::TimedOut { in_flight, limit } => write!(
+                f,
+                "upstream request queue is saturated ({in_flight} in flight, limit {limit}): retry, or raise `TACHYON_UPSTREAM_MAX_CONCURRENCY`"
+            ),
+        }
+    }
+}
+
+impl UpstreamAdmission {
+    fn new(capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(UpstreamAdmissionState::default()),
+            released: Condvar::new(),
+            capacity: capacity.max(1),
+            max_waiters: capacity.max(1),
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::new(upstream_max_concurrency())
+    }
+
+    fn acquire(&self) -> std::result::Result<UpstreamPermit<'_>, UpstreamAdmissionError> {
+        let mut state = self.state.lock().expect("upstream admission lock poisoned");
+        if state.in_flight >= self.capacity {
+            if state.waiting >= self.max_waiters {
+                return Err(UpstreamAdmissionError::QueueFull {
+                    waiting: state.waiting,
+                    limit: self.max_waiters,
+                });
+            }
+            state.waiting += 1;
+            let deadline = std::time::Instant::now() + UPSTREAM_ADMISSION_TIMEOUT;
+            loop {
+                if state.in_flight < self.capacity {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    state.waiting -= 1;
+                    return Err(UpstreamAdmissionError::TimedOut {
+                        in_flight: state.in_flight,
+                        limit: self.capacity,
+                    });
+                }
+                let (next, _) = self
+                    .released
+                    .wait_timeout(state, remaining)
+                    .expect("upstream admission lock poisoned");
+                state = next;
+            }
+            state.waiting -= 1;
+        }
+        state.in_flight += 1;
+        Ok(UpstreamPermit { gate: self })
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("upstream admission lock poisoned");
+        state.in_flight = state.in_flight.saturating_sub(1);
+        drop(state);
+        self.released.notify_one();
+    }
+
+    fn waiting(&self) -> usize {
+        self.state
+            .lock()
+            .expect("upstream admission lock poisoned")
+            .waiting
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.state
+            .lock()
+            .expect("upstream admission lock poisoned")
+            .in_flight
+    }
+}
+
+struct UpstreamPermit<'a> {
+    gate: &'a UpstreamAdmission,
+}
+
+impl Drop for UpstreamPermit<'_> {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -205,6 +329,17 @@ impl From<upstream_openai::UpstreamError> for GenerationError {
             upstream_status,
             class: None,
             invalid_request,
+        }
+    }
+}
+
+impl From<UpstreamAdmissionError> for GenerationError {
+    fn from(error: UpstreamAdmissionError) -> Self {
+        Self {
+            message: error.to_string(),
+            upstream_status: Some(429),
+            class: Some("upstream-admission".to_owned()),
+            invalid_request: false,
         }
     }
 }
@@ -385,6 +520,7 @@ pub(crate) struct AiInferenceRuntime {
     models: Arc<RwLock<HashMap<String, LoadedModel>>>,
     dynamic_models_root: Option<PathBuf>,
     queue_snapshots: Arc<RwLock<HashMap<AcceleratorKind, QueueTierSnapshot>>>,
+    upstream_admission: Arc<UpstreamAdmission>,
 }
 
 impl AiInferenceRuntime {
@@ -394,7 +530,7 @@ impl AiInferenceRuntime {
                 .routes
                 .iter()
                 .flat_map(|route| route.models.iter())
-                .filter(|binding| binding.path.trim().starts_with(UPSTREAM_SCHEME))
+                .filter(|binding| binding_runs_upstream(binding))
                 .map(|binding| binding.alias.as_str()),
         )
         .map_err(|detail| anyhow!("Integrity Validation Failed: {detail}"))?;
@@ -426,6 +562,7 @@ impl AiInferenceRuntime {
             models: Arc::new(RwLock::new(models)),
             dynamic_models_root: None,
             queue_snapshots: Arc::new(RwLock::new(HashMap::new())),
+            upstream_admission: host_upstream_admission(),
         })
     }
 
@@ -495,10 +632,24 @@ impl AiInferenceRuntime {
     }
 
     pub(crate) fn supports_accelerator(&self, accelerator: AcceleratorKind) -> bool {
-        AcceleratorKind::ALL.contains(&accelerator)
+        matches!(accelerator, AcceleratorKind::Cpu)
+            || self
+                .models
+                .read()
+                .expect("model registry lock poisoned")
+                .values()
+                .any(|model| model.accelerator() == accelerator)
     }
 
     pub(crate) fn queue_tier_snapshot(&self, accelerator: AcceleratorKind) -> QueueTierSnapshot {
+        if matches!(accelerator, AcceleratorKind::Network) {
+            let waiting = self.upstream_admission.waiting().min(u32::MAX as usize) as u32;
+            return QueueTierSnapshot {
+                realtime: waiting,
+                standard: waiting,
+                batch: waiting,
+            };
+        }
         self.queue_snapshots
             .read()
             .expect("queue snapshots lock poisoned")
@@ -567,6 +718,10 @@ impl AiInferenceRuntime {
             .ok_or_else(|| {
                 GenerationError::local(format!("model alias `{alias}` is not loaded"))
             })?;
+        let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
+        let _upstream_permit = matches!(&model.runtime, ModelRuntime::Upstream(_))
+            .then(|| self.upstream_admission.acquire())
+            .transpose()?;
         let output = execute_model(&model, prompt.as_bytes())?;
         let text = String::from_utf8(output.bytes)
             .map_err(|error| GenerationError::local(error.to_string()))?;
@@ -595,8 +750,12 @@ impl AiInferenceRuntime {
             .ok_or_else(|| {
                 GenerationError::local(format!("model alias `{alias}` is not loaded"))
             })?;
+        let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
         match &model.runtime {
-            ModelRuntime::Upstream(runtime) => runtime.embed(input).map_err(GenerationError::from),
+            ModelRuntime::Upstream(runtime) => {
+                let _permit = self.upstream_admission.acquire()?;
+                runtime.embed(input).map_err(GenerationError::from)
+            }
             _ => Err(GenerationError::invalid_request(format!(
                 "model `{alias}` does not expose dense text embeddings in the Magnetar cutover"
             ))),
@@ -610,10 +769,11 @@ impl AiInferenceRuntime {
         adapter_id: Option<&str>,
         sink: &mut dyn StreamSink,
     ) -> std::result::Result<StreamOutcome, GenerationError> {
-        if adapter_id.is_some() {
-            return Err(GenerationError::local(
-                "Magnetar cutover does not support LoRA adapter injection",
-            ));
+        if let Some(adapter_id) = adapter_id {
+            validate_lora_adapter_id(adapter_id).map_err(GenerationError::local)?;
+            return Err(GenerationError::invalid_request(format!(
+                "LoRA adapter `{adapter_id}` is not supported by the Magnetar cutover"
+            )));
         }
         self.ensure_model_loaded(alias)
             .map_err(GenerationError::local)?;
@@ -626,6 +786,10 @@ impl AiInferenceRuntime {
             .ok_or_else(|| {
                 GenerationError::local(format!("model alias `{alias}` is not loaded"))
             })?;
+        let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
+        let _upstream_permit = matches!(&model.runtime, ModelRuntime::Upstream(_))
+            .then(|| self.upstream_admission.acquire())
+            .transpose()?;
         match &model.runtime {
             ModelRuntime::Mock { .. } => {
                 if sink.is_live() {
@@ -712,6 +876,69 @@ impl AiInferenceRuntime {
             .expect("model registry lock poisoned")
             .get(alias)
             .map(LoadedModel::memory_residency)
+    }
+
+    fn track_queue_depth(&self, accelerator: AcceleratorKind, qos: RouteQos) -> QueueDepthGuard {
+        if matches!(accelerator, AcceleratorKind::Network) {
+            return QueueDepthGuard::noop();
+        }
+        {
+            let mut snapshots = self
+                .queue_snapshots
+                .write()
+                .expect("queue snapshots lock poisoned");
+            adjust_queue_depth(&mut snapshots, accelerator, qos, 1);
+        }
+        QueueDepthGuard {
+            snapshots: Some(Arc::clone(&self.queue_snapshots)),
+            accelerator,
+            qos,
+        }
+    }
+}
+
+struct QueueDepthGuard {
+    snapshots: Option<Arc<RwLock<HashMap<AcceleratorKind, QueueTierSnapshot>>>>,
+    accelerator: AcceleratorKind,
+    qos: RouteQos,
+}
+
+impl QueueDepthGuard {
+    fn noop() -> Self {
+        Self {
+            snapshots: None,
+            accelerator: AcceleratorKind::Cpu,
+            qos: RouteQos::Standard,
+        }
+    }
+}
+
+impl Drop for QueueDepthGuard {
+    fn drop(&mut self) {
+        let Some(snapshots) = &self.snapshots else {
+            return;
+        };
+        let mut snapshots = snapshots.write().expect("queue snapshots lock poisoned");
+        adjust_queue_depth(&mut snapshots, self.accelerator, self.qos, -1);
+    }
+}
+
+fn adjust_queue_depth(
+    snapshots: &mut HashMap<AcceleratorKind, QueueTierSnapshot>,
+    accelerator: AcceleratorKind,
+    qos: RouteQos,
+    delta: i32,
+) {
+    let snapshot = snapshots.entry(accelerator).or_default();
+    let slot = match qos {
+        RouteQos::RealTime => &mut snapshot.realtime,
+        RouteQos::Standard => &mut snapshot.standard,
+        RouteQos::Batch => &mut snapshot.batch,
+    };
+    if delta.is_positive() {
+        *slot = slot.saturating_add(delta as u32);
+    } else {
+        *slot = slot.saturating_sub(delta.unsigned_abs());
     }
 }
 
@@ -1021,5 +1248,124 @@ mod tests {
 
         assert!(error.invalid_request);
         assert!(error.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn streaming_generation_rejects_lora_adapter_as_invalid_request() {
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![{
+                let mut route = IntegrityRoute::user("/api/guest-ai");
+                route.models = vec![IntegrityModelBinding {
+                    alias: "mock-model".to_owned(),
+                    path: "mock".to_owned(),
+                    device: ModelDevice::Cpu,
+                    qos: RouteQos::Standard,
+                    dynamic: false,
+                    hardware_strategy: Default::default(),
+                }];
+                route
+            }],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("runtime");
+        struct TestSink;
+        impl StreamSink for TestSink {
+            fn emit(&mut self, _event: StreamEvent<'_>) -> StreamControl {
+                StreamControl::Continue
+            }
+        }
+        let mut sink = TestSink;
+
+        let error = runtime
+            .stream_component_prompt("mock-model", "hello", Some("adapter-a"), &mut sink)
+            .expect_err("streaming adapter injection must be a client error");
+
+        assert!(error.invalid_request);
+        assert!(error.to_string().contains("adapter-a"));
+    }
+
+    #[test]
+    fn dynamic_openai_placeholders_do_not_collide_as_upstream_credentials() {
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![
+            IntegrityModelBinding {
+                alias: "vendor-a".to_owned(),
+                path: "openai:http://placeholder.invalid/v1".to_owned(),
+                device: ModelDevice::Cpu,
+                qos: RouteQos::Standard,
+                dynamic: true,
+                hardware_strategy: Default::default(),
+            },
+            IntegrityModelBinding {
+                alias: "vendor_a".to_owned(),
+                path: "openai:http://placeholder.invalid/v1".to_owned(),
+                device: ModelDevice::Cpu,
+                qos: RouteQos::Standard,
+                dynamic: true,
+                hardware_strategy: Default::default(),
+            },
+        ];
+
+        AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("dynamic placeholders should not be validated as upstream credentials");
+    }
+
+    #[test]
+    fn queue_tier_snapshot_tracks_active_local_execution_depths() {
+        let runtime =
+            AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed()).expect("runtime");
+
+        {
+            let _guard = runtime.track_queue_depth(AcceleratorKind::Gpu, RouteQos::RealTime);
+            assert_eq!(
+                runtime.queue_tier_snapshot(AcceleratorKind::Gpu),
+                QueueTierSnapshot {
+                    realtime: 1,
+                    standard: 0,
+                    batch: 0,
+                }
+            );
+        }
+
+        assert_eq!(
+            runtime.queue_tier_snapshot(AcceleratorKind::Gpu),
+            QueueTierSnapshot::default()
+        );
+    }
+
+    #[test]
+    fn accelerator_support_is_derived_from_loaded_models() {
+        let runtime =
+            AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed()).expect("runtime");
+
+        assert!(runtime.supports_accelerator(AcceleratorKind::Cpu));
+        assert!(!runtime.supports_accelerator(AcceleratorKind::Gpu));
+        assert!(!runtime.supports_accelerator(AcceleratorKind::Npu));
+        assert!(!runtime.supports_accelerator(AcceleratorKind::Tpu));
+    }
+
+    #[test]
+    fn upstream_admission_bounds_concurrent_work() {
+        let gate = UpstreamAdmission::new(1);
+        {
+            let mut state = gate.state.lock().expect("admission lock");
+            state.in_flight = 1;
+            state.waiting = 1;
+        }
+
+        match gate.acquire() {
+            Err(UpstreamAdmissionError::QueueFull { waiting, limit }) => {
+                assert_eq!(waiting, 1);
+                assert_eq!(limit, 1);
+            }
+            _ => panic!("expected queue-full admission error"),
+        }
+
+        assert_eq!(gate.in_flight(), 1);
+        gate.release();
+        assert_eq!(gate.in_flight(), 0);
     }
 }

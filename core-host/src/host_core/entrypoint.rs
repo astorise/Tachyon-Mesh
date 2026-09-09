@@ -99,7 +99,16 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
     let background_workers = Arc::new(BackgroundWorkerManager::default());
     let route_overrides = Arc::new(ArcSwap::from_pointee(HashMap::new()));
     let peer_capabilities = Arc::new(Mutex::new(HashMap::new()));
-    let host_capabilities = Capabilities::detect();
+    let host_capabilities = {
+        #[cfg(feature = "ai-inference")]
+        {
+            Capabilities::detect().with_ai_runtime_accelerators(runtime.ai_runtime.as_ref())
+        }
+        #[cfg(not(feature = "ai-inference"))]
+        {
+            Capabilities::detect()
+        }
+    };
     let host_load = Arc::new(HostLoadCounters::default());
     let tls_manager = Arc::new(tls_runtime::TlsManager::default());
     let mtls_gateway = tls_runtime::load_mtls_gateway_config_from_env()?;
