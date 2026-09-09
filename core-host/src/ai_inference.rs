@@ -4,6 +4,7 @@ mod magnetar_runtime;
 mod upstream_openai;
 
 use anyhow::{anyhow, Result};
+use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -17,6 +18,7 @@ use crate::{IntegrityConfig, IntegrityModelBinding, RouteQos};
 
 pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
 pub(crate) use magnetar_runtime::MAGNETAR_PATH_PREFIX;
+const MODEL_META_JSON: &str = ".tachyon-model.json";
 const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
 
 pub(crate) fn binding_runs_upstream(binding: &IntegrityModelBinding) -> bool {
@@ -805,6 +807,9 @@ fn execute_model(
 }
 
 pub(crate) fn detect_tool_call_parser(path: &Path) -> Option<&'static str> {
+    if let Some(declared) = read_declared_tool_call_parser(path) {
+        return Some(declared);
+    }
     let config = std::fs::read_to_string(path.join("config.json")).ok()?;
     let normalized = config.to_ascii_lowercase();
     if normalized.contains("qwen") && normalized.contains("coder") {
@@ -813,6 +818,28 @@ pub(crate) fn detect_tool_call_parser(path: &Path) -> Option<&'static str> {
         Some("qwen")
     } else {
         None
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelMeta {
+    #[serde(default)]
+    tool_call_parser: Option<String>,
+}
+
+fn read_declared_tool_call_parser(root: &Path) -> Option<&'static str> {
+    let raw = std::fs::read(root.join(MODEL_META_JSON)).ok()?;
+    let meta: ModelMeta = serde_json::from_slice(&raw).ok()?;
+    declared_tool_call_parser(meta.tool_call_parser.as_deref()?)
+}
+
+fn declared_tool_call_parser(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "json" => Some("json"),
+        "qwen" => Some("qwen"),
+        "qwen_coder" => Some("qwen_coder"),
+        "mistral" => Some("mistral"),
+        _ => None,
     }
 }
 
