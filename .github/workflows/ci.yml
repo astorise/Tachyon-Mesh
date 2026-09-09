@@ -417,20 +417,6 @@ jobs:
           nvidia-smi
           nvcc --version
 
-      # Native NVFP4 requires a runner GPU/toolchain that can execute the FP4
-      # kernels. Keep this proof opt-in until such a runner is available.
-      - name: Configure NVFP4 CUDA architecture
-        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' && env.RENOVATE_PR != 'true' }}
-        run: |
-          compute_capability="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '[:space:].')"
-          if [ -z "$compute_capability" ]; then
-            echo "::error::failed to determine GPU compute capability for NVFP4 CUDA build"
-            exit 1
-          fi
-          arch="sm_${compute_capability}"
-          echo "TACHYON_NVFP4_CUDA_ARCH=$arch" >> "$GITHUB_ENV"
-          echo "Using NVFP4 CUDA architecture $arch"
-
       # candle-onnx's build script compiles the ONNX .proto and needs `protoc`.
       # The CPU jobs get it from `apt-get install protobuf-compiler`, but this
       # GPU runner image is RPM/UBI-based (no apt), so install protoc in a
@@ -448,7 +434,7 @@ jobs:
       # covered by the FlashInfer test steps below, which the fast lane skips.
       - name: Check Candle CUDA + FlashInfer host build (Renovate compile-only lane)
         if: env.RENOVATE_PR == 'true'
-        run: cargo check -p core-host --features "candle-cuda candle-flashinfer"
+        run: cargo check -p core-host --features candle-cuda
 
       - name: Lint Candle CUDA host build
         if: env.RENOVATE_PR != 'true'
@@ -508,7 +494,7 @@ jobs:
       - name: Build FlashInfer CUDA test binaries
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 30
-        run: cargo test -p core-host --bin core-host --features "candle-cuda candle-flashinfer" --no-run
+        run: cargo test -p core-host --bin core-host --features candle-cuda --no-run
 
       # Proves hardware_strategy.flashinfer_attention (wire-flashinfer-decode-attention)
       # actually dispatches through candle-flashinfer-kernels::flashinfer_decode_attention
@@ -517,24 +503,27 @@ jobs:
       - name: Run FlashInfer decode-attention CUDA execution proof
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 15
-        run: cargo test -p core-host --bin core-host --features "candle-cuda candle-flashinfer" single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda -- --nocapture
+        run: cargo test -p core-host --bin core-host --features candle-cuda single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda -- --nocapture
 
       - name: Run FlashInfer/paged-attention combination rejection proof
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 10
-        run: cargo test -p core-host --bin core-host --features "candle-cuda candle-flashinfer" flashinfer_attention_and_paged_attention_combination_is_rejected -- --nocapture
+        run: cargo test -p core-host --bin core-host --features candle-cuda flashinfer_attention_and_paged_attention_combination_is_rejected -- --nocapture
 
-      - name: Fetch CUTLASS headers
-        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' && env.RENOVATE_PR != 'true' }}
-        run: git clone --depth 1 --branch v4.3.5 https://github.com/NVIDIA/cutlass.git .ci-cutlass
-
+      # The CUTLASS headers used to be cloned here because this repository
+      # compiled its own NVFP4 kernel. `candle-nvfp4-kernels` owns that now and
+      # brings its own build, so the checkout and the include-dir hand-off are
+      # both gone.
+      # Synthetic tensors, no checkpoint: this asks only whether the native
+      # kernel agrees with the scalar fallback on the runner's own device.
+      # candle #3831 removed the compute-capability floor that used to keep it
+      # opt-in, and candle's own suite owns the hardware question now, so it
+      # runs on every PR against whatever GPU the pool hands us.
       - name: Run native NVFP4 parity and telemetry proof
-        if: ${{ vars.TACHYON_ENABLE_NVFP4_CI == '1' && env.RENOVATE_PR != 'true' }}
+        if: env.RENOVATE_PR != 'true'
         env:
           TACHYON_NVFP4_CUDA_SMOKE: "1"
-          TACHYON_NVFP4_NATIVE_REQUIRED: "1"
-          TACHYON_CUTLASS_INCLUDE_DIR: ${{ github.workspace }}/.ci-cutlass/include
-        run: cargo test -p core-host --features "candle-cuda nvfp4-cuda" nvfp4_cuda -- --nocapture
+        run: cargo test -p core-host --features candle-cuda nvfp4_cuda -- --nocapture
 
   # ── 4. Tests (needs quality + guests) ───────────────────────────────────────
   # Runs the full workspace nextest suite — including the core-host chaos
@@ -735,12 +724,14 @@ jobs:
           # build (transport stack included); this one is the maximally
           # minimal floor.
           - "--no-default-features"
-          # "All CPU features": every feature except core-host/candle-cuda, which
-          # pulls in cudarc and requires `nvcc` (validated separately by the
-          # cuda-quality job on the GPU runner). A bare `--all-features` would
-          # break on these CPU-only runners. Mirrors publish-docker-images'
-          # "-all-features" variant.
-          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,nvfp4-cuda,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
+          # "All CPU features": every feature except the two GPU backends —
+          # `candle-cuda`, which pulls in cudarc and needs `nvcc` (validated
+          # separately by the cuda-quality job on the GPU runner), and
+          # `candle-metal`, which needs macOS. Both kernel crates are built
+          # here regardless: they ride in on `ai-inference` and compile as pure
+          # Rust. A bare `--all-features` would break on these CPU-only
+          # runners. Mirrors publish-docker-images' "-all-features" variant.
+          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
           # Worker data-plane profile (#310): `admin-plane` is in `default`, so
@@ -807,12 +798,14 @@ jobs:
         features:
           - ""
           - "--no-default-features"
-          # "All CPU features": every feature except core-host/candle-cuda, which
-          # pulls in cudarc and requires `nvcc` (validated separately by the
-          # cuda-quality job on the GPU runner). A bare `--all-features` would
-          # break on these CPU-only runners. Mirrors publish-docker-images'
-          # "-all-features" variant.
-          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,nvfp4-cuda,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
+          # "All CPU features": every feature except the two GPU backends —
+          # `candle-cuda`, which pulls in cudarc and needs `nvcc` (validated
+          # separately by the cuda-quality job on the GPU runner), and
+          # `candle-metal`, which needs macOS. Both kernel crates are built
+          # here regardless: they ride in on `ai-inference` and compile as pure
+          # Rust. A bare `--all-features` would break on these CPU-only
+          # runners. Mirrors publish-docker-images' "-all-features" variant.
+          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
           # Worker data-plane profile (#310) — see the matching comment on

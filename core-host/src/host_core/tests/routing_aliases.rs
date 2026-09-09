@@ -679,7 +679,10 @@ async fn local_mesh_dispatch_overflows_to_peer_when_saturated_and_overflow_allow
         panic!("expected the saturated route to be handled via peer overflow");
     };
     assert_eq!(handled.status, StatusCode::OK);
-    assert_eq!(&handled.body[..], b"peer-ok");
+    assert_eq!(
+        handled.body.as_buffered().map(|bytes| &bytes[..]),
+        Some(&b"peer-ok"[..])
+    );
     assert_eq!(
         mesh_dispatch_total_for(MeshDispatchMode::Peer, MeshDispatchReason::Saturated),
         before + 1
@@ -693,6 +696,175 @@ async fn local_mesh_dispatch_overflows_to_peer_when_saturated_and_overflow_allow
         vec![HopLimit(DEFAULT_HOP_LIMIT).decremented().to_string()]
     );
     drop(captured);
+
+    peer_server.abort();
+}
+
+// Regression test for a bug caught in review on #392/#399: `execute_route_request`
+// is shared between the real HTTP client path (which may stream a peer-overflow
+// body) and the in-process guest mesh-fetch path (`try_dispatch_local_mesh_request`,
+// exercised here), which must always get `RouteResponseBody::Buffered` because its
+// result is fed straight to a WASM guest's outbound-HTTP import
+// (`component_hosts.rs`). A `RouteResponseBody::Streaming` reaching that boundary
+// used to be silently collapsed to an empty body while keeping the peer's real
+// status — a guest would see a corrupted "successful" response.
+#[tokio::test]
+async fn local_mesh_dispatch_buffers_ram_pressure_mesh_retry_overflow() {
+    use axum::{body::Bytes as AxumBytes, routing::any, Router};
+
+    let peer_app = Router::new().route(
+        DEFAULT_ROUTE,
+        any(|_headers: HeaderMap, _body: AxumBytes| async move { (StatusCode::OK, "peer-ok") }),
+    );
+    let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("peer listener should bind");
+    let peer_address = peer_listener
+        .local_addr()
+        .expect("peer listener should expose an address");
+    let peer_server = tokio::spawn(async move {
+        axum::serve(peer_listener, peer_app)
+            .await
+            .expect("peer app should stay up");
+    });
+
+    let mut route = IntegrityRoute::user(DEFAULT_ROUTE);
+    // Deliberately does NOT exhaust the route's concurrency permits and does
+    // NOT set `allow_overflow`: this test targets the RAM-based
+    // `AdmissionStrategy::MeshRetry` branch in `enforce_resource_admission`,
+    // reached unconditionally at the top of `execute_route_request` — not the
+    // semaphore-saturation fast path already covered above.
+    route.resource_policy = Some(ResourcePolicy {
+        // No real machine has an exabyte of RAM available, so this
+        // deterministically fails the `available_ram >= required_ram_bytes`
+        // check regardless of the host running the test.
+        min_ram_gb: Some(1024 * 1024 * 1024),
+        admission_strategy: AdmissionStrategy::MeshRetry,
+        ..Default::default()
+    });
+    let config = validate_integrity_config(IntegrityConfig {
+        routes: vec![route],
+        ..IntegrityConfig::default_sealed()
+    })
+    .expect("config should validate");
+    let state = build_test_state(config, telemetry::init_test_telemetry());
+    let runtime = state.runtime.load_full();
+
+    update_control_plane_route_override(
+        state.route_overrides.as_ref(),
+        &state.peer_capabilities,
+        DEFAULT_ROUTE,
+        &format!("http://{peer_address}{DEFAULT_ROUTE}"),
+    )
+    .expect("route override should install");
+
+    let response = try_dispatch_local_mesh_request(
+        &state,
+        &runtime,
+        "http://127.0.0.1:9/api/guest-example",
+        &Method::GET,
+        &HeaderMap::new(),
+        Bytes::new(),
+        Vec::new(),
+        HopLimit(DEFAULT_HOP_LIMIT),
+    )
+    .await
+    .expect("RAM-pressured route with an eligible peer should mesh-retry, not error");
+
+    let LocalMeshDispatchAttempt::Handled(handled) = response else {
+        panic!("expected the RAM-pressured route to be handled via mesh-retry overflow");
+    };
+    assert_eq!(handled.status, StatusCode::OK);
+    // The bug this guards against: the streaming body silently became an
+    // empty buffered body while still reporting HTTP 200 to the guest.
+    assert_eq!(
+        handled.body.as_buffered().map(|bytes| &bytes[..]),
+        Some(&b"peer-ok"[..])
+    );
+
+    peer_server.abort();
+}
+
+// Regression test for review feedback on #399: once a peer-overflow response
+// starts streaming, `resiliency.timeout_ms`'s `TimeoutLayer` has already
+// resolved (it only wraps the wait for headers) and can no longer cut off a
+// peer that stalls mid-body. `TimeoutBoundedStreamBody` restores an
+// equivalent guarantee with a per-chunk idle timeout. Without it, this test
+// hangs until the peer thread is killed by the OS rather than completing.
+// It also proves the cutoff surfaces as a stream error rather than a clean
+// end of stream — a truncated body must not look like a complete HTTP 200
+// to the client.
+#[tokio::test]
+async fn forward_as_streaming_response_cuts_off_a_peer_that_stalls_mid_body() {
+    use axum::{body::Body as AxumBody, response::Response as AxumResponse, routing::any, Router};
+
+    async fn stalls_after_first_chunk() -> AxumResponse {
+        let (sender, receiver) = mpsc::channel::<std::result::Result<Bytes, StreamForwardError>>(1);
+        sender
+            .send(Ok(Bytes::from_static(b"first-chunk")))
+            .await
+            .expect("channel should accept the first chunk");
+        // Leaked deliberately: the peer must never close the stream on its
+        // own, so the only thing that can end this test's response body is
+        // the client-side idle timeout under test.
+        std::mem::forget(sender);
+        AxumResponse::builder()
+            .status(StatusCode::OK)
+            .body(AxumBody::new(TimeoutBoundedStreamBody { receiver }))
+            .expect("stalling peer response should build")
+    }
+
+    let peer_app = Router::new().route(DEFAULT_ROUTE, any(stalls_after_first_chunk));
+    let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("peer listener should bind");
+    let peer_address = peer_listener
+        .local_addr()
+        .expect("peer listener should expose an address");
+    let peer_server = tokio::spawn(async move {
+        axum::serve(peer_listener, peer_app)
+            .await
+            .expect("peer app should stay up");
+    });
+
+    let http_client = reqwest::Client::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        forward_request_to_override_as_streaming_response(
+            &http_client,
+            &format!("http://{peer_address}{DEFAULT_ROUTE}"),
+            &HeaderMap::new(),
+            &Method::GET,
+            &Bytes::new(),
+            HopLimit(DEFAULT_HOP_LIMIT),
+            Some(Duration::from_millis(100)),
+        ),
+    )
+    .await
+    .expect("forwarding a stalling peer under an idle timeout should not hang")
+    .expect("forwarding to the peer should succeed");
+
+    let mut body = result.body.into_body();
+
+    let first_frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+        .await
+        .expect("the first chunk should arrive quickly")
+        .expect("body should yield a first frame")
+        .expect("first frame should not be an error");
+    assert_eq!(
+        &first_frame
+            .into_data()
+            .expect("first frame should carry the peer's chunk")[..],
+        b"first-chunk"
+    );
+
+    let second_frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+        .await
+        .expect("the idle timeout should end the body instead of hanging forever");
+    assert!(
+        matches!(second_frame, Some(Err(_))),
+        "a peer that stalls mid-body must surface as a stream error, not a clean end of stream; got {second_frame:?}"
+    );
 
     peer_server.abort();
 }

@@ -343,14 +343,24 @@ impl TlsManager {
 
         match response.output {
             crate::GuestExecutionOutput::Http(http) if http.status == StatusCode::OK => {
-                serde_json::from_slice(&http.body)
+                let body = http.body.as_buffered().ok_or_else(|| {
+                    anyhow!("cert-manager returned an unexpected streaming response")
+                })?;
+                serde_json::from_slice(body)
                     .context("failed to decode certificate material returned by cert-manager")
             }
-            crate::GuestExecutionOutput::Http(http) => Err(anyhow!(
-                "cert-manager returned HTTP {}: {}",
-                http.status,
-                String::from_utf8_lossy(&http.body)
-            )),
+            crate::GuestExecutionOutput::Http(http) => {
+                let body = http
+                    .body
+                    .as_buffered()
+                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                    .unwrap_or_else(|| "<streaming response>".to_owned());
+                Err(anyhow!(
+                    "cert-manager returned HTTP {}: {}",
+                    http.status,
+                    body
+                ))
+            }
             other => Err(anyhow!(
                 "cert-manager returned an unexpected guest output variant: {other:?}"
             )),

@@ -36,6 +36,28 @@
       "matchCurrentVersion": "<0.11",
       "groupName": "rustcrypto-next-gen",
       "dependencyDashboardApproval": true
+    },
+    {
+      "description": "Wasmtime crates expose shared Rust types, so their major versions must move together. Keeping wasmtime, wasmtime-wasi, and wasmtime-wasi-nn aligned prevents duplicate-version type mismatches.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": [
+        "wasmtime",
+        "wasmtime-wasi",
+        "wasmtime-wasi-nn"
+      ],
+      "groupName": "wasmtime ecosystem"
+    },
+    {
+      "description": "Candle currently requires tokenizers 0.22: tokenizers 0.23 creates incompatible Tokenizer types in Candle's incremental decoder.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["tokenizers"],
+      "allowedVersions": "<0.23"
+    },
+    {
+      "description": "object_store is pinned through the workspace's git patch; Renovate cannot update the crates.io version until that patch is removed or moved to a matching revision.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["object_store"],
+      "enabled": false
     }
   ]
 }

@@ -16,6 +16,10 @@ use crate::{IntegrityConfig, IntegrityModelBinding, RouteQos};
 pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
 const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
 
+pub(crate) fn binding_runs_upstream(binding: &IntegrityModelBinding) -> bool {
+    !binding.dynamic && binding.path.trim().starts_with(UPSTREAM_SCHEME)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum AcceleratorKind {
     #[default]
@@ -155,6 +159,7 @@ pub(crate) struct GenerationError {
     pub(crate) message: String,
     pub(crate) upstream_status: Option<u16>,
     pub(crate) class: Option<String>,
+    pub(crate) invalid_request: bool,
 }
 
 impl GenerationError {
@@ -163,6 +168,16 @@ impl GenerationError {
             message: message.into(),
             upstream_status: None,
             class: None,
+            invalid_request: false,
+        }
+    }
+
+    pub(crate) fn invalid_request(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            upstream_status: None,
+            class: None,
+            invalid_request: true,
         }
     }
 }
@@ -518,6 +533,7 @@ impl AiInferenceRuntime {
                 message: "openai upstream bindings are disabled by the Magnetar cutover".to_owned(),
                 upstream_status: Some(503),
                 class: Some("magnetar-cutover".to_owned()),
+                invalid_request: false,
             }),
         }
     }
@@ -639,6 +655,7 @@ fn execute_model(
             message: "openai upstream bindings are disabled by the Magnetar cutover".to_owned(),
             upstream_status: Some(503),
             class: Some("magnetar-cutover".to_owned()),
+            invalid_request: false,
         }),
     }
 }

@@ -700,7 +700,7 @@ fn middleware_routes_short_circuit_non_ok_responses_and_allow_ok_responses() {
     fn simulate_middleware_chain(
         runtime: &RuntimeState,
         route: &IntegrityRoute,
-        responses: &HashMap<String, GuestHttpResponse>,
+        responses: &mut HashMap<String, GuestHttpResponse>,
         visited: &mut Vec<String>,
     ) -> GuestHttpResponse {
         if let Some(middleware_name) = route.middleware.as_deref() {
@@ -714,9 +714,8 @@ fn middleware_routes_short_circuit_non_ok_responses_and_allow_ok_responses() {
                 .expect("middleware route should stay sealed");
             visited.push(middleware_route.path.clone());
             let middleware_response = responses
-                .get(&middleware_route.path)
-                .expect("middleware response should be defined")
-                .clone();
+                .remove(&middleware_route.path)
+                .expect("middleware response should be defined");
             if middleware_response.status != StatusCode::OK {
                 return middleware_response;
             }
@@ -724,9 +723,8 @@ fn middleware_routes_short_circuit_non_ok_responses_and_allow_ok_responses() {
 
         visited.push(route.path.clone());
         responses
-            .get(&route.path)
+            .remove(&route.path)
             .expect("main route response should be defined")
-            .clone()
     }
 
     let mut protected_allow = targeted_route(
@@ -795,7 +793,7 @@ fn middleware_routes_short_circuit_non_ok_responses_and_allow_ok_responses() {
 
     let mut allow_visited = Vec::new();
     let allow_response =
-        simulate_middleware_chain(&runtime, allow_route, &responses, &mut allow_visited);
+        simulate_middleware_chain(&runtime, allow_route, &mut responses, &mut allow_visited);
     assert_eq!(
         allow_visited,
         vec![
@@ -805,18 +803,21 @@ fn middleware_routes_short_circuit_non_ok_responses_and_allow_ok_responses() {
     );
     assert_eq!(allow_response.status, StatusCode::OK);
     assert_eq!(
-        allow_response.body,
-        Bytes::from(expected_guest_example_body(
+        allow_response.body.as_buffered(),
+        Some(&Bytes::from(expected_guest_example_body(
             "FaaS received an empty payload"
-        ))
+        )))
     );
 
     let mut deny_visited = Vec::new();
     let deny_response =
-        simulate_middleware_chain(&runtime, deny_route, &responses, &mut deny_visited);
+        simulate_middleware_chain(&runtime, deny_route, &mut responses, &mut deny_visited);
     assert_eq!(deny_visited, vec!["/api/deny-middleware".to_owned()]);
     assert_eq!(deny_response.status, StatusCode::FORBIDDEN);
-    assert_eq!(deny_response.body, Bytes::from("forbidden"));
+    assert_eq!(
+        deny_response.body.as_buffered(),
+        Some(&Bytes::from("forbidden"))
+    );
 }
 
 #[test]

@@ -14,7 +14,7 @@ use candle_core::{
 };
 use candle_nn::VarBuilder;
 use candle_transformers::generation::IncrementalDecoder;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
+use candle_transformers::generation::{FinishReason, LogitsProcessor, Sampling, StopCriteria};
 use candle_transformers::models::deepseek2::{
     DeepSeekV2 as DeepSeekModel, DeepSeekV2Config as DeepSeekConfig,
 };
@@ -47,7 +47,7 @@ use super::paged_kv::{
 use super::parallel::{discover_cluster_topology, ExpertPlacementPlan};
 use super::pipeline_parallel_llama::PipelineParallelLlama;
 use super::samplers::{FsmCache, FsmLogitProcessor};
-use super::tensor_parallel_llama::{TensorParallelCache, TensorParallelLlama};
+use super::tensor_parallel_llama::{load_tensor_parallel_llama, TensorParallelCache};
 use super::ResolvedLoraAdapter;
 use super::StreamControl;
 use parallel_topology::{
@@ -82,10 +82,22 @@ struct MixtralConfigJson {
     num_local_experts: usize,
 }
 
-#[cfg(feature = "candle-cuda")]
-const PARALLEL_LLAMA_USE_FLASH_ATTN: bool = true;
-#[cfg(not(feature = "candle-cuda"))]
-const PARALLEL_LLAMA_USE_FLASH_ATTN: bool = false;
+/// Whether the parallel Llama engines ask upstream for flash attention.
+///
+/// False on every build, and not because the kernel is unavailable: it is
+/// because the weights are wrong for it. `load_parallel` builds tensor-,
+/// pipeline- and expert-parallel weights as F32, and `candle-flash-attn`
+/// accepts only F16/BF16 — on the CPU stand-ins a CUDA binary falls back to
+/// when no physical GPU is present, it has no implementation at all. Keyed to
+/// `candle-cuda` this read `true` on exactly the builds that would then fail
+/// on the first attention forward of every parallel mode, the supported
+/// no-GPU fallback included.
+///
+/// Earning it back means narrowing the parallel weights to F16/BF16 at load
+/// and gating on the resolved devices actually being CUDA. That is a real
+/// change to the numerics the dense-parity tests pin, so it belongs to
+/// whoever makes it deliberately rather than to a `cfg`.
+pub(crate) const PARALLEL_LLAMA_USE_FLASH_ATTN: bool = false;
 
 const CONFIG_JSON: &str = "config.json";
 const TOKENIZER_JSON: &str = "tokenizer.json";
@@ -246,6 +258,15 @@ enum ModelArchitecture {
     Glm4,
     Lfm2,
     Phi2,
+    /// Qwen 3.5's *hybrid* stack: Gated DeltaNet linear-attention layers
+    /// interleaved with full-attention ones.
+    ///
+    /// Distinct from [`Self::Qwen35Moe`], which is the Qwen3/3.5 mixture of
+    /// experts — full attention throughout, experts in the feed-forward.
+    /// Routing a hybrid checkpoint there would load it against the wrong layer
+    /// structure, so the two spellings must not collapse however similar the
+    /// names look.
+    Qwen35Hybrid,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,20 +314,60 @@ impl ModelArchitecture {
     /// one backend reads all of them — so a `gemma2` GGUF resolves to the
     /// gemma3 backend rather than to the safetensors-only `Gemma2`.
     fn from_gguf_architecture(architecture: &str) -> Option<Self> {
+        // Candle resolves the name, including every alias it recognises —
+        // `qwen35` beside `qwen3_5`, the whole gemma family onto one backend.
+        // This used to be a second `match` on the same strings, and it drifted
+        // twice in two days: `qwen35` (candle #3821) and `qwen35moe` were each
+        // added upstream and silently missing here, where a missing arm means
+        // a loadable checkpoint refused before the loader ever sees it.
+        if let Some(architecture) = GgufArchitecture::from_name(architecture) {
+            return Some(Self::from_quantized_lm(architecture));
+        }
+        // Families this host names but candle has no quantized backend for.
+        // Each is `gguf: false` in the capability table, so these arms change
+        // nothing about what loads — they change what the refusal *says*,
+        // naming the family instead of calling the checkpoint unrecognized.
         match architecture {
-            GGUF_LLAMA_ARCHITECTURE => Some(Self::Llama),
-            "qwen2" => Some(Self::Qwen2),
-            "qwen3" => Some(Self::Qwen3),
-            "qwen3moe" => Some(Self::Qwen35Moe),
-            "gemma" | "gemma2" | "gemma3" | "gemma-embedding" => Some(Self::Gemma3),
-            "glm4" => Some(Self::Glm4),
-            "lfm2" => Some(Self::Lfm2),
-            "phi2" => Some(Self::Phi2),
-            "phi3" => Some(Self::Phi3),
             "phi4" => Some(Self::Phi4),
             "deepseek2" => Some(Self::DeepSeekV2),
             "deepseek3" => Some(Self::DeepSeekV3),
             _ => None,
+        }
+    }
+
+    /// Candle's GGUF registry, mapped onto this host's wider enum.
+    ///
+    /// Total by construction, and that is the point: a family added upstream
+    /// stops compiling here until it is placed, instead of resolving to `None`
+    /// and being discovered by a test — or not discovered at all, which is how
+    /// `glm4`, `lfm2`, `phi2` and `qwen3moe` came to be advertised and
+    /// unloadable.
+    ///
+    /// This host's enum is the wider of the two: it also names safetensors-only
+    /// families candle has no quantized backend for, so the mapping runs one
+    /// way only.
+    fn from_quantized_lm(architecture: GgufArchitecture) -> Self {
+        match architecture {
+            GgufArchitecture::Llama => Self::Llama,
+            GgufArchitecture::Gemma3 => Self::Gemma3,
+            GgufArchitecture::Glm4 => Self::Glm4,
+            GgufArchitecture::Lfm2 => Self::Lfm2,
+            GgufArchitecture::Phi2 => Self::Phi2,
+            GgufArchitecture::Phi3 => Self::Phi3,
+            GgufArchitecture::Qwen2 => Self::Qwen2,
+            GgufArchitecture::Qwen3 => Self::Qwen3,
+            // Full attention with experts in the feed-forward, against the
+            // hybrid that interleaves Gated DeltaNet layers with full-attention
+            // ones. A checkpoint routed to the wrong one loads against the
+            // wrong layer structure.
+            GgufArchitecture::Qwen3Moe => Self::Qwen35Moe,
+            // The MoE sibling of the hybrid, and the reason the two spellings
+            // are pinned apart below: `qwen35moe` is a prefix of nothing and a
+            // suffix of nothing, but it shares `qwen35` with the hybrid, so a
+            // `starts_with` anywhere in this path would route a mixture into a
+            // backend built for interleaved Gated DeltaNet layers.
+            GgufArchitecture::Qwen3_5Moe => Self::Qwen35Moe,
+            GgufArchitecture::Qwen3_5 => Self::Qwen35Hybrid,
         }
     }
 
@@ -367,7 +428,7 @@ impl ModelArchitecture {
             },
             // GGUF-only: candle ships a quantized backend for each, and this
             // runtime has no safetensors loader for them.
-            Self::Glm4 | Self::Lfm2 | Self::Phi2 => ArchitectureCapabilities {
+            Self::Glm4 | Self::Lfm2 | Self::Phi2 | Self::Qwen35Hybrid => ArchitectureCapabilities {
                 safetensors: false,
                 gguf: true,
                 single: true,
@@ -414,6 +475,7 @@ impl ModelArchitecture {
             Self::Glm4 => "glm4",
             Self::Lfm2 => "lfm2",
             Self::Phi2 => "phi2",
+            Self::Qwen35Hybrid => "qwen3-5",
         }
     }
 
@@ -553,10 +615,18 @@ struct TokenSink<'a> {
     /// Latched rather than re-read because the answer cannot un-become "nobody
     /// is listening", and the decode loops check it beside the deadline.
     stopped: bool,
-    /// Set by a decode loop only when it exits by exhausting the token budget.
-    /// Token counts alone are insufficient because EOS may be sampled on the
-    /// final permitted token.
-    budget_exhausted: bool,
+    /// The request's `max_new_tokens`, recorded by whichever entry point parsed
+    /// it. Present so the sink can tell a generation that *ran out of budget*
+    /// from one that finished — see [`TokenSink::finish_reason`].
+    token_budget: Option<usize>,
+    /// What ended the generation, as `StopCriteria::finish_reason` judged it.
+    ///
+    /// The token count alone cannot express this: an answer whose EOS lands on
+    /// exactly the budget's last token has both spent its budget and finished
+    /// normally. That rule now lives upstream, so the four decode loops share
+    /// one verdict instead of each re-deriving it — which is how they came to
+    /// disagree in the first place.
+    finish: Option<FinishReason>,
 }
 
 impl<'a> TokenSink<'a> {
@@ -566,12 +636,30 @@ impl<'a> TokenSink<'a> {
             completion_tokens: 0,
             prompt_tokens: 0,
             stopped: false,
-            budget_exhausted: false,
+            token_budget: None,
+            finish: None,
         }
     }
 
     fn record_prompt_tokens(&mut self, tokens: usize) {
         self.prompt_tokens = tokens;
+    }
+
+    fn record_token_budget(&mut self, budget: usize) {
+        self.token_budget = Some(budget);
+    }
+
+    /// Record the verdict a loop obtained from its [`StopCriteria`].
+    fn record_finish(&mut self, reason: Option<FinishReason>) {
+        if let Some(reason) = reason {
+            self.finish = Some(reason);
+        }
+    }
+
+    /// Whether this generation has spent the budget it was given.
+    fn budget_exhausted(&self) -> bool {
+        self.token_budget
+            .is_some_and(|budget| self.completion_tokens >= budget)
     }
 
     /// Why decoding stopped, when this sink can tell.
@@ -588,8 +676,23 @@ impl<'a> TokenSink<'a> {
     /// finished normally. The upstream path already reported `length` here,
     /// so the same request was answered honestly or not depending on which
     /// backend served the alias.
+    /// `Stop` stays *unnamed* on the wire. `guest-openai` resolves an absent
+    /// reason to `stop`, so naming it would say the same thing twice; only
+    /// `length` has to be named, because that is the case an absent reason
+    /// would misreport as a clean finish.
+    ///
+    /// The wall-clock deadline records `Length` when it fires: the answer is
+    /// cut short, and an absent reason would be rendered as `stop` by
+    /// `guest-openai` — telling a caller a completion abandoned mid-function
+    /// finished cleanly. A departed consumer still records nothing, because
+    /// there is nobody left to mislead, and the count decides as it always
+    /// did.
     fn finish_reason(&self) -> Option<&'static str> {
-        self.budget_exhausted.then_some("length")
+        match self.finish {
+            Some(FinishReason::Stop) => None,
+            Some(FinishReason::Length) => Some("length"),
+            None => self.budget_exhausted().then_some("length"),
+        }
     }
 
     fn usage(&self) -> TokenUsage {
@@ -616,10 +719,6 @@ impl<'a> TokenSink<'a> {
     /// Record one token appended to the generated sequence.
     fn record_token(&mut self) {
         self.completion_tokens += 1;
-    }
-
-    fn mark_length_truncated(&mut self) {
-        self.budget_exhausted = true;
     }
 }
 
@@ -1223,13 +1322,17 @@ impl SingleDeviceBackend {
                         )
                     }
                     None => {
-                        let (logits, index_pos) = runtime.llama_prefill_with_prefix_cache(
-                            &model,
-                            prompt_ids,
-                            &mut cache,
-                            device,
-                            request.deadline,
-                        )?;
+                        let Prefill::Ready { logits, index_pos } = runtime
+                            .llama_prefill_with_prefix_cache(
+                                &model,
+                                prompt_ids,
+                                &mut cache,
+                                device,
+                                request.deadline,
+                            )?
+                        else {
+                            return Ok(());
+                        };
                         runtime.decode_loop_from_logits(
                             logits,
                             index_pos,
@@ -1455,7 +1558,7 @@ impl SingleDeviceBackend {
 /// [`PipelineParallelLlama::forward_at`] on every prefill/decode call.
 enum ParallelModel {
     Tensor {
-        model: Box<TensorParallelLlama>,
+        model: Box<candle_transformers::models::llama::Llama>,
         config: Config,
         eos_tokens: Vec<u32>,
         /// Devices the plan sharded across; `devices[0]` is the primary device
@@ -1778,14 +1881,34 @@ struct ModelMeta {
 /// template that never mentions tools yields `None` rather than a default.
 pub(crate) fn detect_tool_call_parser(root: &Path) -> Option<&'static str> {
     if let Some(declared) = read_declared_tool_call_parser(root) {
+        tracing::info!(
+            parser = declared,
+            path = %root.display(),
+            source = MODEL_META_JSON,
+            "tool-call dialect declared by sidecar"
+        );
         return Some(declared);
     }
-    let source = ChatTemplate::read_source(root)?;
+    let Some(source) = ChatTemplate::read_source(root) else {
+        // `ChatTemplate::load` warns about the same absence with the alias in
+        // hand, so this stays at debug rather than saying it twice per model.
+        tracing::debug!(
+            path = %root.display(),
+            "no chat template to read a tool-call dialect from"
+        );
+        return None;
+    };
     // Ordered by specificity: a template carrying a tag convention names its
     // dialect outright, so those are checked before the generic JSON case.
-    if source.contains("[TOOL_CALLS]") {
+    let detected = if source.contains("[TOOL_CALLS]") {
         Some("mistral")
     } else if source.contains("<tool_call>") || source.contains("<tool_calls>") {
+        // Both spellings, because the dialect is one convention with two tag
+        // renderings: `tool_call_openers` already treats `<tool_call>` and
+        // `<tool_calls>` as the same Qwen family, and a template that only ever
+        // emits the plural form used to fall through to the generic `json`
+        // branch below — which cannot parse a tagged call, so every call from
+        // such a model reached the client as prose.
         Some("qwen")
     } else if source.contains("tools") {
         // Tool-aware, but with no tag convention: the call is rendered as a
@@ -1795,7 +1918,28 @@ pub(crate) fn detect_tool_call_parser(root: &Path) -> Option<&'static str> {
         Some("json")
     } else {
         None
+    };
+    match detected {
+        // Named at info because it is the one line that explains, after the
+        // fact, why an agent's tool calls arrived as prose: the dialect is a
+        // guess from the template's markers, and `qwen` in particular covers
+        // several fine-tunes that do not all format calls the same way. When a
+        // model calls tools badly, this is the first thing to check, and
+        // `.tachyon-model.json` is how to overrule it.
+        Some(parser) => tracing::info!(
+            parser,
+            path = %root.display(),
+            source = "chat_template",
+            "tool-call dialect inferred from the chat template; override it with \
+             `tool_call_parser` in {MODEL_META_JSON} if calls come back as text"
+        ),
+        None => tracing::info!(
+            path = %root.display(),
+            "chat template mentions no tools: no tool-call dialect selected, so any call this \
+             model emits will be delivered as assistant content"
+        ),
     }
+    detected
 }
 
 /// The sidecar's declared parser, validated against the dialects
@@ -1836,11 +1980,40 @@ pub(crate) struct ChatTurn {
     /// Absent or `null` on an assistant turn that carried only tool calls —
     /// which is exactly what a client replays on the next turn of an agentic
     /// conversation. Requiring a string here rejected the whole request, so the
-    /// second turn after any tool call failed outright. This runtime has no
-    /// tool-aware template, so the turn renders as empty content rather than
-    /// carrying the calls, but the conversation survives.
+    /// second turn after any tool call failed outright.
     #[serde(default, deserialize_with = "nullable_string")]
     pub(crate) content: String,
+    /// The calls an assistant turn made, carried through to the template
+    /// unchanged.
+    ///
+    /// Kept rather than dropped, because the checkpoint's own template knows
+    /// what to do with them: a Qwen or Mistral template branches on
+    /// `message.tool_calls` and renders the tagged form the model was tuned on.
+    /// Dropping them left the assistant's turn as empty content, so on the
+    /// second turn of an agentic conversation the model saw a tool result with
+    /// no request behind it — and answered as if it had never asked. The
+    /// conversation survived; its meaning did not.
+    ///
+    /// Opaque `Value`: this side has no business reshaping a call it is only
+    /// relaying, and a template reads whatever fields its own model expects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_calls: Option<serde_json::Value>,
+    /// Which call a `role: "tool"` turn answers. Templates that render tool
+    /// results key the pairing off it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_call_id: Option<String>,
+    /// The function a tool result came from, for the templates that render the
+    /// name beside the result rather than relying on the id alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    /// The pre-`tool_calls` shape of an assistant turn that made a call.
+    ///
+    /// Carried for the same reason as `tool_calls`, and separately because a
+    /// client replaying a legacy conversation sends this one instead. A
+    /// template that handles it reads it; one that does not renders as it
+    /// always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) function_call: Option<serde_json::Value>,
 }
 
 /// Deserialize a missing or `null` string as empty rather than failing.
@@ -1860,6 +2033,33 @@ struct GenerationRequest {
     /// them into the final prompt; `prompt` is ignored.
     #[serde(default)]
     messages: Option<Vec<ChatTurn>>,
+    /// Tool schemas the caller offered, forwarded verbatim into the chat
+    /// template's `tools` variable.
+    ///
+    /// The guest has always put these on the wire; the host used to drop them
+    /// on the floor, because this struct had no field for them and serde
+    /// discards what it cannot name. A tool-aware template — every one of the
+    /// dialects `detect_tool_call_parser` recognises gates on `{% if tools %}`
+    /// — therefore rendered its no-tools branch, and the model was never told
+    /// which functions exist. The registry still advertised a parser and the
+    /// guest still armed its gate, so a local agent request came back as
+    /// ordinary prose with nothing to parse and no error anywhere.
+    ///
+    /// Kept as raw JSON: the schemas belong to the template, which reads
+    /// whatever shape the model was trained on. Giving them a typed shape here
+    /// would mean guessing that shape on the model's behalf.
+    #[serde(default)]
+    tools: Option<Vec<serde_json::Value>>,
+    /// What the caller wants done with those schemas.
+    ///
+    /// Dropped for the same reason `tools` was, and with a worse consequence
+    /// than rendering the wrong template branch: `tool_choice: "none"` means
+    /// the client forbade calls, so the template advertised functions the
+    /// client had ruled out, and if the model then emitted its dialect the
+    /// guest — which *does* honour the field — had already withdrawn intent
+    /// and returned the raw call markup as assistant prose.
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
     max_new_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
@@ -1907,6 +2107,20 @@ impl SamplingPolicy {
     }
 }
 
+/// What a prefill produced, so an expired deadline is a *state* rather than an
+/// error.
+///
+/// Prefill and decode share one deadline, and the spec is explicit that its
+/// expiry stops generation and returns the text produced so far without
+/// reporting a failure. Every prefill here got that wrong the same way — each
+/// returned `Execution` — which turned a long prompt on a busy node into a hard
+/// error rather than an empty answer. Making the outcome a value keeps the
+/// three of them honest.
+enum Prefill {
+    Ready { logits: Tensor, index_pos: usize },
+    DeadlineExpired,
+}
+
 struct ParsedGenerationRequest {
     prompt: String,
     max_new_tokens: usize,
@@ -1930,6 +2144,37 @@ struct ParsedGenerationRequest {
 }
 
 impl CandleLlmRuntime {
+    /// Whether the weights actually ended up on the host rather than a device.
+    ///
+    /// `Device::cuda_if_available` follows this runtime's convention of falling
+    /// back to `Device::Cpu` when no physical GPU is attached, which keeps a
+    /// `candle-cuda` build usable on a machine without one. But the binding
+    /// still says `cuda`, so the scheduler queued the work on the GPU lane and
+    /// accounted VRAM for it while every forward ran on the CPU — the GPU lane
+    /// showed load that could not exist, and the CPU lane, which was doing the
+    /// work, looked idle to mesh admission.
+    ///
+    /// Two loaders resolve a non-CPU device, not one. `load_safetensors` calls
+    /// `Device::cuda_if_available(0)` for a CUDA-bound Llama and falls back the
+    /// same way, so this used to answer `false` for a safetensors model running
+    /// every forward on the CPU — the case an earlier version of this comment
+    /// said could not happen. Each variant that can hold a device is asked
+    /// about it; the rest build against `Device::Cpu` regardless, and those
+    /// bindings are already declared `cpu`.
+    pub(crate) fn executes_on_host(&self) -> bool {
+        match self.inner.as_ref() {
+            LoadedModel::Gguf { device, .. } => device.is_cpu(),
+            LoadedModel::Safetensors {
+                backend: SingleDeviceBackend::Llama { device, .. },
+                ..
+            } => device.is_cpu(),
+            // Every other safetensors family is built against `Device::Cpu` —
+            // not a fallback there, so not a discrepancy to report — and the
+            // parallel engines carry their own device plan.
+            _ => false,
+        }
+    }
+
     pub(crate) fn try_load(
         alias: &str,
         path: impl AsRef<Path>,
@@ -2068,15 +2313,14 @@ impl CandleLlmRuntime {
             });
         }
 
-        // flashinfer_attention needs the same Llama+CUDA baseline plus the
-        // separate, optional `candle-flashinfer` Cargo feature: unlike
-        // `flash-attn` (unconditionally bundled into `candle-cuda`, so
-        // `single_device_cuda_supported` alone is enough for paged_attention),
-        // `candle-transformers/flashinfer-kernels` is only compiled in when
-        // `candle-flashinfer` is enabled. Without that check, a `candle-cuda`
-        // build lacking `candle-flashinfer` would report this as supported and
-        // then panic at decode time (`unimplemented!("compile with
-        // '--features flashinfer-kernels'")`).
+        // flashinfer_attention needs the same Llama+CUDA baseline as
+        // paged_attention, and nothing more. It used to need a
+        // `cfg!(feature = "candle-flashinfer")` beside it, because
+        // `candle-transformers/flashinfer-kernels` was compiled in only under
+        // that separate feature and a `candle-cuda` build without it would
+        // report support and then panic at decode time. `ai-inference` now
+        // compiles the seam unconditionally, so `single_device_cuda_supported`
+        // carries the whole question again.
         //
         // The Safetensors requirement is the same one paged_attention carries:
         // only `load_safetensors` builds the decode path FlashInfer hooks into.
@@ -2085,7 +2329,6 @@ impl CandleLlmRuntime {
         // quantized attention — `QuantizedLlama` owns its own decode path and
         // never sees `strategy` at all.
         let flashinfer_attention_supported = single_device_cuda_supported
-            && cfg!(feature = "candle-flashinfer")
             && format == ModelFormat::Safetensors
             && requested_device != "cpu";
         if strategy.flashinfer_attention {
@@ -2094,7 +2337,7 @@ impl CandleLlmRuntime {
                     alias: alias.to_owned(),
                     path: root.to_path_buf(),
                     detail:
-                        "flashinfer_attention requires Tachyon's decode-attention path to be wired to candle-flashinfer-kernels::flashinfer_decode_attention, and is only available for a Safetensors Llama checkpoint on a CUDA device with the candle-flashinfer feature compiled in"
+                        "flashinfer_attention requires Tachyon's decode-attention path to be wired to candle-flashinfer-kernels::flashinfer_decode_attention, and is only available for a Safetensors Llama checkpoint on a CUDA device"
                             .to_owned(),
                 });
             }
@@ -2286,13 +2529,10 @@ impl CandleLlmRuntime {
                         }
                     })?;
                 let mut config = llama_config.into_config(false);
-                // `Config::use_flashinfer_attention` exists regardless of the
-                // `candle-flashinfer` Cargo feature (only its dead-code lint
-                // is feature-gated on the fork side), and
                 // `try_load_with_topology` has already rejected every request
-                // where this would be `true` without that feature compiled
-                // in, so assigning it unconditionally here is safe — it's a
-                // no-op `false` on any build without the feature.
+                // where this could be `true` without a CUDA device under it,
+                // so assigning it unconditionally is safe: on any other build
+                // it is a no-op `false`.
                 config.use_flashinfer_attention = strategy.flashinfer_attention;
                 let limits = GenerationLimits::with_context(config.max_position_embeddings);
                 let eos_tokens = eos_token_ids(&config);
@@ -2829,7 +3069,7 @@ impl CandleLlmRuntime {
                 }
                 .map_err(invalid)?;
                 let model =
-                    TensorParallelLlama::load(var_builder, &config, &devices).map_err(invalid)?;
+                    load_tensor_parallel_llama(var_builder, &config, &devices).map_err(invalid)?;
                 Ok((
                     LoadedModel::Parallel(ParallelModel::Tensor {
                         model: Box::new(model),
@@ -3187,6 +3427,7 @@ impl CandleLlmRuntime {
             });
         }
         sink.record_prompt_tokens(prompt_ids.len());
+        sink.record_token_budget(request.max_new_tokens);
 
         let LoadedModel::Safetensors {
             backend,
@@ -3380,6 +3621,7 @@ impl CandleLlmRuntime {
             });
         }
         sink.record_prompt_tokens(prompt_ids.len());
+        sink.record_token_budget(request.max_new_tokens);
 
         self.decode(&prompt_ids, request, sink)
     }
@@ -3416,18 +3658,16 @@ impl CandleLlmRuntime {
             });
         }
         sink.record_prompt_tokens(prompt_ids.len());
+        sink.record_token_budget(request.max_new_tokens);
 
         let draft_tokens = draft_tokens.max(1);
         let mut context_ids = prompt_ids.clone();
         let mut generated = Vec::with_capacity(request.max_new_tokens);
-        let hold = request
-            .stop
-            .iter()
-            .map(String::len)
-            .max()
-            .unwrap_or(0)
-            .saturating_sub(1);
+        let criteria = StopCriteria::new(request.stop.clone(), self.eos_token_ids());
         let mut emitted = 0usize;
+        // The flush below needs the token the loop stopped on to ask the
+        // criteria what ended the generation.
+        let mut last_token = None;
         let mut decoder = IncrementalDecoder::from_tokenizer(&self.tokenizer);
 
         while generated.len() < request.max_new_tokens
@@ -3444,6 +3684,7 @@ impl CandleLlmRuntime {
                 &context_ids,
                 &request,
                 draft_tokens.min(remaining),
+                sink,
             )?;
             if proposed.is_empty() {
                 break;
@@ -3455,22 +3696,24 @@ impl CandleLlmRuntime {
                 };
                 context_ids.push(target_token);
                 generated.push(target_token);
+                last_token = Some(target_token);
                 sink.record_token();
 
                 decoder.push(target_token).map_err(|error| {
                     self.execution_error(format!("failed to decode token: {error}"))
                 })?;
                 let text = decoder.text();
-                if let Some(stop_at) = find_earliest_stop(text, &request.stop) {
+                if let Some(stop_at) = criteria.matched(text) {
+                    sink.record_finish(criteria.finish_reason(target_token, text, false));
                     emit_delta(sink, text, &mut emitted, stop_at);
                     return Ok(());
                 }
-                if self.is_eos_token(target_token) {
+                if criteria.is_eos(target_token) {
+                    sink.record_finish(criteria.finish_reason(target_token, text, false));
                     emit_delta(sink, text, &mut emitted, text.len());
                     return Ok(());
                 }
-                let safe = floor_char_boundary(text, text.len().saturating_sub(hold));
-                emit_delta(sink, text, &mut emitted, safe);
+                emit_delta(sink, text, &mut emitted, criteria.safe_emit_end(text));
 
                 if target_token != proposed_token
                     || generated.len() == request.max_new_tokens
@@ -3489,12 +3732,26 @@ impl CandleLlmRuntime {
         }
 
         let text = decoder.text();
-        if generated.len() >= request.max_new_tokens
-            || (Instant::now() >= request.deadline && !sink.stopped())
-        {
-            sink.mark_length_truncated();
+        // A stop sequence can still be sitting in the held-back tail when the
+        // budget runs out, and trimming it here is what completes the answer —
+        // so this is a natural end too, not a truncation. `safe_emit_end`
+        // returns the match when there is one and the whole text otherwise,
+        // which is exactly the flush this needs.
+        if let Some(token) = last_token {
+            let exhausted = sink.budget_exhausted();
+            // The clock is a third way to end, beside the token budget and the
+            // stop criteria, and only the first two reach `finish_reason`. A
+            // speculative decode that accepted some tokens and then ran out of
+            // wall clock arrived here with no verdict, so the guest reported a
+            // truncated answer as a clean `stop` — the same omission the
+            // single-sequence and batch deadlines carried.
+            let finish = match criteria.finish_reason(token, text, exhausted) {
+                None if Instant::now() >= request.deadline => Some(FinishReason::Length),
+                other => other,
+            };
+            sink.record_finish(finish);
         }
-        let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
+        let end = criteria.matched(text).unwrap_or(text.len());
         emit_delta(sink, text, &mut emitted, end);
         Ok(())
     }
@@ -3522,6 +3779,20 @@ impl CandleLlmRuntime {
         )
     }
 
+    /// The checkpoint's EOS ids, for building a [`StopCriteria`].
+    fn eos_token_ids(&self) -> Vec<u32> {
+        match &*self.inner {
+            LoadedModel::Safetensors { eos_tokens, .. } | LoadedModel::Gguf { eos_tokens, .. } => {
+                eos_tokens.clone()
+            }
+            LoadedModel::Parallel(parallel) => match parallel {
+                ParallelModel::Tensor { eos_tokens, .. }
+                | ParallelModel::Pipeline { eos_tokens, .. }
+                | ParallelModel::Expert { eos_tokens, .. } => eos_tokens.clone(),
+            },
+        }
+    }
+
     fn is_eos_token(&self, token: u32) -> bool {
         match &*self.inner {
             LoadedModel::Safetensors { eos_tokens, .. } | LoadedModel::Gguf { eos_tokens, .. } => {
@@ -3540,6 +3811,7 @@ impl CandleLlmRuntime {
         context_ids: &[u32],
         request: &ParsedGenerationRequest,
         max_tokens: usize,
+        sink: &TokenSink<'_>,
     ) -> Result<Vec<u32>, CandleLlmError> {
         let mut context = context_ids.to_vec();
         let mut tokens = Vec::with_capacity(max_tokens);
@@ -3549,7 +3821,13 @@ impl CandleLlmRuntime {
             // entered just before expiry could otherwise hold the lane for many
             // of them. Whatever has been proposed so far is still usable: the
             // caller verifies the prefix it got.
-            if Instant::now() >= request.deadline {
+            //
+            // The consumer is asked here as well as between rounds. The outer
+            // loop's check only fires once a whole round is done, so a client
+            // that left partway through one kept the draft proposing for the
+            // rest of it — the most expensive way there is to produce nothing,
+            // bounded only by a deadline that can be an hour.
+            if Instant::now() >= request.deadline || sink.stopped() {
                 break;
             }
             let Some(next) = self.greedy_next_token_id(&context, request)? else {
@@ -3815,8 +4093,20 @@ impl CandleLlmRuntime {
         if prompt_ids.len() > self.limits.max_position_embeddings {
             return Ok(());
         }
-        let (logits, index_pos) =
-            self.run_prefill_chunks(prompt_ids, device, request.deadline, &mut forward)?;
+        // Nothing was generated, and that is the answer: an expired deadline
+        // returns what was produced rather than failing.
+        //
+        // It still has to say *why* it produced nothing. Zero tokens is below
+        // any requested budget, so the result assembly cannot infer truncation
+        // from the count, and an absent reason reaches `guest-openai` as a
+        // clean `stop` — a request whose clock ran out during prefill reported
+        // as a model that chose to answer with silence.
+        let Prefill::Ready { logits, index_pos } =
+            self.run_prefill_chunks(prompt_ids, device, request.deadline, &mut forward)?
+        else {
+            sink.record_finish(Some(FinishReason::Length));
+            return Ok(());
+        };
         self.decode_loop_from_logits(
             logits,
             index_pos,
@@ -3836,27 +4126,36 @@ impl CandleLlmRuntime {
     /// same scheduler lane while it does — checking only in the decode loop
     /// would let a request blow through its stated wall-clock budget before
     /// producing a single token.
+    /// Run prefill, or stop because the deadline ran out mid-prompt.
+    ///
+    /// An expired deadline is not an execution failure. The contract is that
+    /// the deadline stops generation and returns what was produced — and a
+    /// prompt that outlasts it produces nothing, which is the empty case of
+    /// that rule, not an exception to it. Reporting it as an error meant a long
+    /// prompt on a slow node failed outright instead of returning early, and
+    /// the same mistake was made independently in each prefill; naming the
+    /// outcome is what stops the next one from repeating it.
     fn run_prefill_chunks(
         &self,
         prompt_ids: &[u32],
         device: &Device,
         deadline: Instant,
         forward: &mut impl FnMut(&Tensor, usize) -> candle_core::Result<Tensor>,
-    ) -> Result<(Tensor, usize), CandleLlmError> {
+    ) -> Result<Prefill, CandleLlmError> {
         let mut index_pos = 0usize;
         let mut logits = None;
         while index_pos < prompt_ids.len() {
             // Between chunks, not mid-chunk: a chunk is one forward pass and
             // cannot be interrupted. `prefill_chunk_tokens` is what bounds how
             // long the check can be delayed.
-            if logits.is_some() && Instant::now() >= deadline {
-                return Err(CandleLlmError::Execution {
-                    alias: self.alias.clone(),
-                    detail: format!(
-                        "generation deadline elapsed after prefilling {index_pos} of {} prompt tokens",
-                        prompt_ids.len()
-                    ),
-                });
+            //
+            // Checked before the first chunk too. It used to wait for `logits`
+            // to exist, so a request whose deadline had already passed while it
+            // queued still paid for one full forward over its prompt — the
+            // largest single unit of work on this path, and spent on an answer
+            // nobody would receive.
+            if Instant::now() >= deadline {
+                return Ok(Prefill::DeadlineExpired);
             }
             let remaining = prompt_ids.len() - index_pos;
             let chunk_len = self.limits.next_prefill_chunk_len(remaining);
@@ -3875,7 +4174,7 @@ impl CandleLlmRuntime {
 
         logits
             .ok_or_else(|| self.execution_error("prompt produced no prefill logits".to_owned()))
-            .map(|logits| (logits, index_pos))
+            .map(|logits| Prefill::Ready { logits, index_pos })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3924,9 +4223,23 @@ impl CandleLlmRuntime {
             // could retire a single one.
             let now = Instant::now();
             if index_pos < prompt_len && requests.iter().all(|request| now >= request.deadline) {
-                return Err(self.execution_error(format!(
-                    "generation deadline elapsed after prefilling {index_pos} of {prompt_len} prompt tokens"
-                )));
+                // Same rule as the other prefills: every row is out of time, so
+                // every row's answer is the empty one it produced. Failing the
+                // batch instead reported an error for requests that were merely
+                // slow.
+                return Ok(requests
+                    .iter()
+                    .map(|_| {
+                        (
+                            Vec::new(),
+                            TokenUsage {
+                                prompt_tokens: prompt_len as u32,
+                                completion_tokens: 0,
+                            },
+                            None,
+                        )
+                    })
+                    .collect());
             }
         }
         let mut logits = logits.ok_or_else(|| {
@@ -3961,8 +4274,15 @@ impl CandleLlmRuntime {
         // vocabulary copy nor the context resolution is paid `batch` times.
         let mut decoders = vec![IncrementalDecoder::from_tokenizer(&self.tokenizer); batch];
         let mut done = vec![false; batch];
-        let mut naturally_stopped = vec![false; batch];
-        let mut deadline_exhausted = vec![false; batch];
+        // Parallel to `done`: which rows the model itself ended, as opposed to
+        // rows their budget ended.
+        // One per row: rows share a forward pass but not a stop list, and the
+        // verdict each row retires with is its own.
+        let criteria: Vec<_> = requests
+            .iter()
+            .map(|request| StopCriteria::new(request.stop.clone(), eos_tokens.to_vec()))
+            .collect();
+        let mut finishes: Vec<Option<FinishReason>> = vec![None; batch];
         let mut next_tokens = vec![0u32; batch];
         let max_new_tokens = requests
             .iter()
@@ -3982,7 +4302,13 @@ impl CandleLlmRuntime {
                 // remaining rows keep their shared forward pass.
                 if Instant::now() >= requests[row].deadline {
                     done[row] = true;
-                    deadline_exhausted[row] = true;
+                    // The verdict travels with the row, the way a stop
+                    // sequence's does. Retiring it silently left `finish` unset
+                    // and the token count below the requested maximum, so the
+                    // assembly below reported a truncated answer as a clean
+                    // `stop` — for this row only, while its co-batched
+                    // neighbours reported correctly.
+                    finishes[row] = Some(FinishReason::Length);
                     continue;
                 }
                 let row_logits = logits.get(row).map_err(|error| {
@@ -4012,11 +4338,13 @@ impl CandleLlmRuntime {
                 decoders[row].push(next).map_err(|error| {
                     self.execution_error(format!("failed to decode token for row {row}: {error}"))
                 })?;
-                if eos_tokens.contains(&next)
-                    || find_earliest_stop(decoders[row].text(), &requests[row].stop).is_some()
-                {
+                let text = decoders[row].text();
+                if criteria[row].is_eos(next) || criteria[row].matched(text).is_some() {
                     done[row] = true;
-                    naturally_stopped[row] = true;
+                    // Why it retired, not just that it did: a row whose EOS
+                    // lands on its budget's last token finished normally, and
+                    // the count below cannot tell that from a truncation.
+                    finishes[row] = criteria[row].finish_reason(next, text, false);
                 }
             }
 
@@ -4053,10 +4381,11 @@ impl CandleLlmRuntime {
         decoders
             .iter()
             .zip(requests)
-            .enumerate()
-            .map(|(row, (decoder, request))| {
+            .zip(&criteria)
+            .zip(&finishes)
+            .map(|(((decoder, request), criteria), finish)| {
                 let text = decoder.text();
-                let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
+                let end = criteria.matched(text).unwrap_or(text.len());
                 let completion_tokens = decoder.tokens().len();
                 let usage = TokenUsage {
                     // Every row in a native batch shares one prompt length —
@@ -4068,10 +4397,13 @@ impl CandleLlmRuntime {
                 };
                 // Per row, not per batch: rows share a step count but not a
                 // budget, so one row can be truncated while its neighbours
-                // finished cleanly.
-                let finish_reason = (deadline_exhausted[row]
-                    || (!naturally_stopped[row] && completion_tokens >= request.max_new_tokens))
-                    .then_some("length");
+                // finished cleanly. A row that retired on its own criteria
+                // carries that verdict; only the rest fall back to the count.
+                let finish_reason = match finish {
+                    Some(FinishReason::Stop) => None,
+                    Some(FinishReason::Length) => Some("length"),
+                    None => (completion_tokens >= request.max_new_tokens).then_some("length"),
+                };
                 Ok((text.as_bytes()[..end].to_vec(), usage, finish_reason))
             })
             .collect()
@@ -4099,16 +4431,13 @@ impl CandleLlmRuntime {
             .map(|fsm| FsmLogitProcessor::new(Arc::clone(fsm)));
         let vocab_size = self.tokenizer.get_vocab_size(true);
         let mut generated = Vec::with_capacity(request.max_new_tokens);
-        // Hold back this many trailing bytes so a stop sequence split across the
-        // last token(s) is never partially emitted before it is matched.
-        let hold = request
-            .stop
-            .iter()
-            .map(String::len)
-            .max()
-            .unwrap_or(0)
-            .saturating_sub(1);
+        // Stop sequences, the held-back tail that keeps one split across two
+        // tokens matchable, and the finish-reason rule, all from upstream.
+        let criteria = StopCriteria::new(request.stop.clone(), eos_tokens.to_vec());
         let mut emitted = 0usize;
+        // The flush below needs the token the loop stopped on to ask the
+        // criteria what ended the generation.
+        let mut last_token = None;
         // Detokenize incrementally: re-decoding `generated` in full on every
         // step is O(n²) in the generated length, which only became worth fixing
         // once generation budgets moved past a few hundred tokens.
@@ -4133,6 +4462,7 @@ impl CandleLlmRuntime {
                 }
             }
             generated.push(next);
+            last_token = Some(next);
             sink.record_token();
 
             decoder.push(next).map_err(|error| {
@@ -4140,17 +4470,18 @@ impl CandleLlmRuntime {
             })?;
             let text = decoder.text();
             // A matched stop ends the decode: emit up to (not including) it.
-            if let Some(stop_at) = find_earliest_stop(text, &request.stop) {
+            if let Some(stop_at) = criteria.matched(text) {
+                sink.record_finish(criteria.finish_reason(next, text, false));
                 emit_delta(sink, text, &mut emitted, stop_at);
                 return Ok(());
             }
-            if eos_tokens.contains(&next) {
+            if criteria.is_eos(next) {
+                sink.record_finish(criteria.finish_reason(next, text, false));
                 emit_delta(sink, text, &mut emitted, text.len());
                 return Ok(());
             }
             // No stop yet: emit everything except the held-back tail.
-            let safe = floor_char_boundary(text, text.len().saturating_sub(hold));
-            emit_delta(sink, text, &mut emitted, safe);
+            emit_delta(sink, text, &mut emitted, criteria.safe_emit_end(text));
 
             if step + 1 == request.max_new_tokens {
                 break;
@@ -4162,8 +4493,16 @@ impl CandleLlmRuntime {
             // what was generated — rather than erroring: a partial answer is
             // worth more to the caller than a failure, and the point is to free
             // the scheduler slot.
+            //
+            // Recorded as `Length`, because that is what happened: the answer
+            // is cut short. Breaking without recording left `finish_reason`
+            // resolving to nothing, and `guest-openai` renders an absent reason
+            // as `stop` — so a completion abandoned mid-function was reported
+            // as having finished cleanly, which is the one thing a caller must
+            // not be told. The schema has no word for "ran out of clock", and
+            // `length` is the one that means "there was more to say".
             if Instant::now() >= request.deadline {
-                sink.mark_length_truncated();
+                sink.record_finish(Some(FinishReason::Length));
                 break;
             }
             // Nobody left to read it. Same reasoning as the deadline: the slot
@@ -4182,11 +4521,17 @@ impl CandleLlmRuntime {
             index_pos += 1;
         }
         // Token budget exhausted: flush the held-back tail, trimming any stop.
-        if sink.completion_tokens >= request.max_new_tokens {
-            sink.mark_length_truncated();
-        }
         let text = decoder.text();
-        let end = find_earliest_stop(text, &request.stop).unwrap_or(text.len());
+        // A stop sequence can still be sitting in the held-back tail when the
+        // budget runs out, and trimming it here is what completes the answer —
+        // so this is a natural end too, not a truncation. `safe_emit_end`
+        // returns the match when there is one and the whole text otherwise,
+        // which is exactly the flush this needs.
+        if let Some(token) = last_token {
+            let exhausted = sink.budget_exhausted();
+            sink.record_finish(criteria.finish_reason(token, text, exhausted));
+        }
+        let end = criteria.matched(text).unwrap_or(text.len());
         emit_delta(sink, text, &mut emitted, end);
         Ok(())
     }
@@ -4198,7 +4543,7 @@ impl CandleLlmRuntime {
         cache: &mut Cache,
         device: &Device,
         deadline: Instant,
-    ) -> Result<(Tensor, usize), CandleLlmError> {
+    ) -> Result<Prefill, CandleLlmError> {
         let mut index_pos = 0usize;
         let mut logits = None;
         if let Some(entry) = self
@@ -4220,13 +4565,7 @@ impl CandleLlmRuntime {
             // held its scheduler lane well past `max_generation_ms`, since the
             // decode loop's check is only reached once prefill finishes.
             if logits.is_some() && Instant::now() >= deadline {
-                return Err(CandleLlmError::Execution {
-                    alias: self.alias.clone(),
-                    detail: format!(
-                        "generation deadline elapsed after prefilling {index_pos} of {} prompt tokens",
-                        prompt_ids.len()
-                    ),
-                });
+                return Ok(Prefill::DeadlineExpired);
             }
             let remaining = prompt_ids.len() - index_pos;
             let chunk_len = self.limits.next_prefill_chunk_len(remaining);
@@ -4256,7 +4595,7 @@ impl CandleLlmRuntime {
 
         logits
             .ok_or_else(|| self.execution_error("prompt produced no prefill logits".to_owned()))
-            .map(|logits| (logits, index_pos))
+            .map(|logits| Prefill::Ready { logits, index_pos })
     }
 
     /// Mask every vocabulary logit the grammar would reject for the next
@@ -4341,7 +4680,51 @@ impl CandleLlmRuntime {
     /// `chat_template` (from `tokenizer_config.json`) when present so the result
     /// matches the checkpoint's expected control tokens; otherwise falls back to
     /// a generic, deterministic rendering that ends on an open assistant turn.
-    fn render_chat(&self, messages: &[ChatTurn]) -> Result<String, CandleLlmError> {
+    /// The tool schemas a local template should actually be given.
+    ///
+    /// `Err` names a choice this backend cannot honour. A local runtime has no
+    /// way to *force* a call — there is no constrained decoding for tool
+    /// dialects here — so accepting `required` or a named function would
+    /// promise something only the upstream backends can deliver, and the
+    /// caller would read ordinary prose as a refusal to call.
+    ///
+    /// `Ok(None)` for `"none"`: the template's no-tools branch is exactly what
+    /// "you may not call anything" renders to, and it keeps this side agreeing
+    /// with the guest, which withdraws its parser for the same request.
+    pub(crate) fn tools_for_choice<'a>(
+        alias: &str,
+        tools: Option<&'a [serde_json::Value]>,
+        choice: Option<&serde_json::Value>,
+    ) -> Result<Option<&'a [serde_json::Value]>, CandleLlmError> {
+        let refuse = |detail: String| CandleLlmError::InvalidRequest {
+            alias: alias.to_owned(),
+            detail,
+        };
+        match choice {
+            None | Some(serde_json::Value::Null) => Ok(tools),
+            Some(serde_json::Value::String(choice)) => match choice.as_str() {
+                "auto" => Ok(tools),
+                "none" => Ok(None),
+                other => Err(refuse(format!(
+                    "`tool_choice` `{other}` cannot be honoured by a local backend, which has no \
+                     way to force a call; use `auto` or `none`, or bind this alias to an \
+                     `openai:` upstream"
+                ))),
+            },
+            Some(_) => Err(refuse(
+                "`tool_choice` naming a specific function cannot be honoured by a local backend, \
+                 which has no way to force a call; use `auto` or `none`, or bind this alias to an \
+                 `openai:` upstream"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    fn render_chat(
+        &self,
+        messages: &[ChatTurn],
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<String, CandleLlmError> {
         if messages.is_empty() {
             return Err(CandleLlmError::InvalidRequest {
                 alias: self.alias.clone(),
@@ -4351,13 +4734,25 @@ impl CandleLlmRuntime {
         match &self.chat_template {
             Some(template) => {
                 template
-                    .render(messages)
+                    .render(messages, tools)
                     .map_err(|detail| CandleLlmError::InvalidRequest {
                         alias: self.alias.clone(),
                         detail: format!("failed to render chat template: {detail}"),
                     })
             }
-            None => Ok(render_generic_chat(messages)),
+            None => {
+                // No template means no place to put the schemas. Say so once
+                // rather than letting the caller wonder why the model ignored
+                // the tools it was offered.
+                if tools.is_some_and(|tools| !tools.is_empty()) {
+                    tracing::warn!(
+                        alias = %self.alias,
+                        "request offered tools but this model has no chat template; the generic \
+                         renderer cannot describe them, so the model will not be told they exist"
+                    );
+                }
+                Ok(render_generic_chat(messages))
+            }
         }
     }
 
@@ -4483,7 +4878,14 @@ impl CandleLlmRuntime {
             // Prefer structured `messages` (chat-templated); otherwise a raw
             // `prompt`. Exactly one source of prompt text must be present.
             let prompt = match (request.messages, request.prompt) {
-                (Some(messages), _) => self.render_chat(&messages)?,
+                (Some(messages), _) => {
+                    let tools = Self::tools_for_choice(
+                        &self.alias,
+                        request.tools.as_deref(),
+                        request.tool_choice.as_ref(),
+                    )?;
+                    self.render_chat(&messages, tools)?
+                }
                 (None, Some(prompt)) => prompt,
                 (None, None) => {
                     return Err(CandleLlmError::InvalidRequest {
@@ -4584,7 +4986,23 @@ impl CandleLlmRuntime {
                 });
             }
             Some(_) => {}
-            None => request.max_new_tokens = request.max_new_tokens.min(headroom.max(1)),
+            // A prompt that fills the window leaves nothing to clamp *to*, and
+            // `.max(1)` invented a token the window cannot hold: the same
+            // prompt with an explicit budget of 1 is refused one arm above,
+            // while omitting the budget quietly generated past the declared
+            // prompt-plus-completion limit. Clamping is only honest while there
+            // is room to clamp into.
+            None if headroom == 0 => {
+                return Err(CandleLlmError::InvalidRequest {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "prompt is {} tokens, which fills this checkpoint's {}-token context window and leaves no room to generate",
+                        encoded.len(),
+                        self.limits.max_position_embeddings,
+                    ),
+                });
+            }
+            None => request.max_new_tokens = request.max_new_tokens.min(headroom),
         }
 
         Ok(request)
@@ -4625,12 +5043,6 @@ fn sanitize_stop(stop: Option<Vec<String>>) -> Vec<String> {
 
 /// Byte offset of the earliest stop sequence in `text`, or `None`. The offset
 /// is a substring-match start, so it always lands on a UTF-8 codepoint boundary.
-fn find_earliest_stop(text: &str, stop: &[String]) -> Option<usize> {
-    stop.iter()
-        .filter_map(|needle| text.find(needle.as_str()))
-        .min()
-}
-
 /// Emit `text[*emitted..end]` through `sink` (when non-empty) and advance
 /// `*emitted`. `end` and `*emitted` must be codepoint boundaries.
 fn emit_delta(sink: &mut TokenSink<'_>, text: &str, emitted: &mut usize, end: usize) {
@@ -4638,18 +5050,6 @@ fn emit_delta(sink: &mut TokenSink<'_>, text: &str, emitted: &mut usize, end: us
         sink.emit(&text[*emitted..end]);
         *emitted = end;
     }
-}
-
-/// Largest codepoint boundary `<= idx` (a stable stand-in for the unstable
-/// `str::floor_char_boundary`).
-fn floor_char_boundary(text: &str, mut idx: usize) -> usize {
-    if idx >= text.len() {
-        return text.len();
-    }
-    while idx > 0 && !text.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
 }
 
 /// Generic chat rendering used when a checkpoint ships no `chat_template`:
@@ -4752,9 +5152,26 @@ impl ChatTemplate {
 
     /// Load the model's chat template from `tokenizer_config.json`, or `None`
     /// when the file or the `chat_template` field is absent.
+    ///
+    /// Both absences are logged, because both are silent in their consequences
+    /// and loud in their effects. Without a template, `messages` requests never
+    /// get the turn markers the checkpoint was tuned on: an instruct model
+    /// receives what looks to it like raw continuation text, answers plausibly,
+    /// and nothing in the response says why the quality collapsed. It is also
+    /// the packaging mistake GGUF invites — the template lives in the file's
+    /// own metadata, which candle's quantized loader does not surface, so a
+    /// `.gguf` downloaded without its Hugging Face siblings lands here.
     pub(crate) fn load(alias: &str, root: &Path) -> Result<Option<Self>, CandleLlmError> {
         let path = root.join(TOKENIZER_CONFIG_JSON);
         if !path.exists() {
+            tracing::warn!(
+                alias,
+                path = %root.display(),
+                file = TOKENIZER_CONFIG_JSON,
+                "no chat template: `messages` requests will be rendered without the model's \
+                 turn markers, and no tool-call dialect can be detected. Ship the checkpoint's \
+                 {TOKENIZER_CONFIG_JSON} beside the weights"
+            );
             return Ok(None);
         }
         let raw = fs::read(&path).map_err(|error| CandleLlmError::InvalidComponent {
@@ -4774,6 +5191,13 @@ impl ChatTemplate {
             .chat_template
             .and_then(ChatTemplateField::into_source)
         else {
+            tracing::warn!(
+                alias,
+                path = %root.display(),
+                file = TOKENIZER_CONFIG_JSON,
+                "{TOKENIZER_CONFIG_JSON} declares no `chat_template`: `messages` requests will \
+                 be rendered without the model's turn markers"
+            );
             return Ok(None);
         };
         Ok(Some(Self {
@@ -4791,7 +5215,17 @@ impl ChatTemplate {
 
     /// Render `messages` through the Jinja template with `add_generation_prompt`
     /// set, so the prompt ends ready for the assistant to continue.
-    pub(crate) fn render(&self, messages: &[ChatTurn]) -> Result<String, String> {
+    ///
+    /// `tools` populates the template variable of the same name. Every tool
+    /// dialect this runtime recognises gates its tool block on it, so passing
+    /// `None` renders the plain-chat branch — which is the right answer when
+    /// the caller offered nothing, and was the wrong one for every caller that
+    /// did.
+    pub(crate) fn render(
+        &self,
+        messages: &[ChatTurn],
+        tools: Option<&[serde_json::Value]>,
+    ) -> Result<String, String> {
         let mut env = minijinja::Environment::new();
         // Real HF templates call `raise_exception(...)` to reject malformed
         // conversations (e.g. a system turn where the model forbids one).
@@ -4814,6 +5248,11 @@ impl ChatTemplate {
         template
             .render(minijinja::context! {
                 messages => messages,
+                // Absent rather than empty when nothing was offered: templates
+                // test `{% if tools %}`, and an empty list is falsy in Jinja,
+                // but keeping the variable undefined matches what upstream
+                // `apply_chat_template` does when `tools=None`.
+                tools => tools,
                 add_generation_prompt => true,
                 bos_token => self.bos_token,
                 eos_token => self.eos_token,
@@ -6505,6 +6944,8 @@ mod tests {
     fn a_local_generation_that_spends_its_budget_reports_length() {
         let mut emit = |_: &str| StreamControl::Continue;
         let mut sink = TokenSink::new(&mut emit);
+        sink.record_token_budget(4);
+
         sink.completion_tokens = 3;
         assert_eq!(
             sink.finish_reason(),
@@ -6514,8 +6955,338 @@ mod tests {
         );
 
         sink.completion_tokens = 4;
-        sink.mark_length_truncated();
         assert_eq!(sink.finish_reason(), Some("length"));
+    }
+
+    /// A generation the clock cut off is not a generation that finished.
+    ///
+    /// The token budget was already reported; the wall-clock deadline was not.
+    /// It breaks the decode loop well short of the budget, so the count says
+    /// nothing, and `guest-openai` renders an absent reason as `stop` — a
+    /// completion abandoned mid-function reported as having ended cleanly.
+    /// The schema has no word for "ran out of clock"; `length` is the one that
+    /// means there was more to say.
+    /// A GGUF binding that landed on the host says so.
+    ///
+    /// `Device::cuda_if_available` falls back to `Device::Cpu` when no physical
+    /// GPU is attached, which is what keeps a `candle-cuda` build usable
+    /// without one. The binding still said `cuda`, so the scheduler queued the
+    /// work on the GPU lane and accounted VRAM for it while every forward ran
+    /// on the CPU — a GPU lane showing load that cannot exist, and a CPU lane
+    /// doing the work while looking idle to the admission that decides whether
+    /// to hand a request to a peer.
+    #[test]
+    fn a_gguf_model_that_fell_back_to_the_host_reports_the_cpu_lane() {
+        let (runtime, dir) = load_gguf_fixture("gguf-host-lane");
+        // The fixture loads on `cpu`, which is the same resolved state a `cuda`
+        // binding reaches on a host with no GPU — the seam reads the device the
+        // weights actually landed on, not the string the binding asked for.
+        assert!(
+            runtime.executes_on_host(),
+            "a GGUF checkpoint on `Device::Cpu` executes on the host whatever was requested"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A replayed tool exchange has to reach the template intact.
+    ///
+    /// `ChatTurn` carried only role and content, so an assistant turn that made
+    /// a call rendered as empty content. On the second turn of an agentic
+    /// conversation the model therefore saw a tool *result* with no request
+    /// behind it, and answered as if it had never asked. The conversation
+    /// survived; its meaning did not.
+    ///
+    /// The template here mirrors how a real Qwen template branches, so what is
+    /// checked is that the fields arrive — not that this runtime invents any
+    /// rendering of its own.
+    #[test]
+    fn a_replayed_tool_call_and_its_result_reach_the_chat_template() {
+        let template = ChatTemplate {
+            source: concat!(
+                "{% for m in messages %}",
+                "<|{{ m.role }}|>{{ m.content }}",
+                "{%- if m.tool_calls %}<call>{{ m.tool_calls[0].function.name }}</call>{% endif %}",
+                "{%- if m.tool_call_id %}<for>{{ m.tool_call_id }}</for>{% endif %}",
+                "{%- if m.name %}<from>{{ m.name }}</from>{% endif %}",
+                "{% endfor %}"
+            )
+            .to_owned(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+        };
+
+        let messages = vec![
+            ChatTurn {
+                role: "assistant".to_owned(),
+                content: String::new(),
+                tool_calls: Some(serde_json::json!([{
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }])),
+                tool_call_id: None,
+                name: None,
+                function_call: None,
+            },
+            ChatTurn {
+                role: "tool".to_owned(),
+                content: "fn main() {}".to_owned(),
+                tool_calls: None,
+                tool_call_id: Some("c1".to_owned()),
+                name: Some("read_file".to_owned()),
+                function_call: None,
+            },
+        ];
+
+        let rendered = template.render(&messages, None).expect("template renders");
+        assert!(
+            rendered.contains("<call>read_file</call>"),
+            "the assistant's call must survive the replay: {rendered}"
+        );
+        assert!(
+            rendered.contains("<for>c1</for>"),
+            "the result must stay paired with the call it answers: {rendered}"
+        );
+        assert!(
+            rendered.contains("<from>read_file</from>"),
+            "templates that name the function beside the result need it: {rendered}"
+        );
+        assert!(
+            rendered.contains("fn main() {}"),
+            "the result's own content is still the content: {rendered}"
+        );
+    }
+
+    /// The schemas the caller offered must reach the template's `tools`.
+    ///
+    /// Every dialect `detect_tool_call_parser` recognises gates its tool block
+    /// on `{% if tools %}`. The host used to render that branch's else-side
+    /// unconditionally — `GenerationRequest` had no `tools` field, so serde
+    /// dropped what the guest had already put on the wire — and the model was
+    /// never told which functions existed. The registry advertised a parser
+    /// and the guest armed its gate all the same, so the failure was a plain
+    /// prose answer with nothing to parse and no error to read.
+    ///
+    /// Both directions are asserted: offering nothing must still render the
+    /// plain branch, or this fix would have made every ordinary chat request
+    /// claim tools it does not have.
+    #[test]
+    fn offered_tools_reach_the_chat_template_and_absence_still_renders_plain() {
+        let template = ChatTemplate {
+            source: concat!(
+                "{% if tools %}<tools>",
+                "{% for t in tools %}{{ t.function.name }},{% endfor %}",
+                "</tools>{% else %}<no-tools>{% endif %}",
+                "{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}"
+            )
+            .to_owned(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+        };
+        let messages = vec![ChatTurn {
+            role: "user".to_owned(),
+            content: "read the file".to_owned(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            function_call: None,
+        }];
+        let tools = vec![
+            serde_json::json!({"type": "function", "function": {"name": "read_file"}}),
+            serde_json::json!({"type": "function", "function": {"name": "write_file"}}),
+        ];
+
+        let with_tools = template
+            .render(&messages, Some(&tools))
+            .expect("template renders with tools");
+        assert!(
+            with_tools.contains("<tools>read_file,write_file,</tools>"),
+            "every offered schema must reach the prompt, in order: {with_tools}"
+        );
+
+        let without = template
+            .render(&messages, None)
+            .expect("template renders without tools");
+        assert!(
+            without.contains("<no-tools>"),
+            "a request that offered nothing must still take the plain branch: {without}"
+        );
+    }
+
+    /// The same property one layer out, where the bug actually lived.
+    ///
+    /// The template test above would have passed at every point in this
+    /// runtime's history, because it calls `render` directly. What was broken
+    /// is the step before it: the host parsed the guest's JSON into a struct
+    /// with no `tools` field, so the schemas were discarded between the wire
+    /// and the renderer. This drives `parse_request` with the payload the
+    /// guest actually sends.
+    #[test]
+    fn tools_on_the_wire_survive_into_the_rendered_prompt() {
+        let (mut runtime, dir) = load_fixture("tools-on-the-wire");
+        runtime.chat_template = Some(std::sync::Arc::new(ChatTemplate {
+            source: "{% if tools %}TOOLS:{% for t in tools %}{{ t.function.name }}{% endfor %}\
+                     {% endif %}{% for m in messages %}{{ m.content }}{% endfor %}"
+                .to_owned(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+        }));
+
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "read it"}],
+            "tools": [{"type": "function", "function": {"name": "read_file"}}],
+        })
+        .to_string();
+        let parsed = runtime
+            .parse_request(body.as_bytes())
+            .expect("request parses");
+
+        assert!(
+            parsed.prompt.contains("TOOLS:read_file"),
+            "the offered schema must survive deserialization into the prompt: {}",
+            parsed.prompt
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A departed consumer stops the draft, not just the round.
+    ///
+    /// Speculative decoding runs `draft_tokens` full forwards per round, an
+    /// operator-supplied count with no small ceiling. The outer loop only asks
+    /// whether the consumer is still there *between* rounds, so a client that
+    /// left partway through one kept the draft proposing for the rest of it —
+    /// the most expensive way there is to produce nothing, bounded only by a
+    /// deadline that can be an hour.
+    #[test]
+    fn a_stopped_sink_is_visible_to_the_draft_loop() {
+        let mut emit = |_: &str| StreamControl::Stop;
+        let mut sink = TokenSink::new(&mut emit);
+        assert!(
+            !sink.stopped(),
+            "a fresh sink has no reason to think the consumer left"
+        );
+
+        // The consumer answers `Stop` to the first thing it is handed, which is
+        // how a departure is learned at all.
+        sink.emit("anything");
+        assert!(
+            sink.stopped(),
+            "the draft loop reads this to know it is working for nobody"
+        );
+    }
+
+    #[test]
+    fn a_generation_the_deadline_cut_short_reports_length() {
+        let mut emit = |_: &str| StreamControl::Continue;
+        let mut sink = TokenSink::new(&mut emit);
+        // A budget far from spent, so nothing but the recorded reason can carry
+        // the truncation.
+        sink.record_token_budget(4_096);
+        sink.completion_tokens = 12;
+        assert_eq!(
+            sink.finish_reason(),
+            None,
+            "before the deadline fires there is nothing to report"
+        );
+
+        sink.record_finish(Some(FinishReason::Length));
+        assert_eq!(
+            sink.finish_reason(),
+            Some("length"),
+            "the clock cutting an answer short has to reach the client"
+        );
+    }
+
+    /// `tool_choice` reaches the template, or is refused.
+    ///
+    /// The field was unnamed, so serde dropped it and `"none"` still rendered
+    /// the tools branch — advertising functions the client had just forbidden.
+    /// The guest *does* honour the field, so it had already withdrawn its
+    /// parser: if the model then emitted its dialect, the raw call markup came
+    /// back as assistant prose.
+    #[test]
+    fn tool_choice_decides_what_a_local_template_is_told() {
+        let tools = vec![serde_json::json!({"function": {"name": "read_file"}})];
+        let resolve = |choice: Option<serde_json::Value>| {
+            CandleLlmRuntime::tools_for_choice("coder", Some(tools.as_slice()), choice.as_ref())
+                .map(|tools| tools.map(<[serde_json::Value]>::len))
+        };
+
+        assert_eq!(resolve(None).expect("absent is allowed"), Some(1));
+        assert_eq!(
+            resolve(Some(serde_json::json!("auto"))).expect("auto is allowed"),
+            Some(1)
+        );
+        assert_eq!(
+            resolve(Some(serde_json::json!("none"))).expect("none is allowed"),
+            None,
+            "`none` renders the template's no-tools branch, agreeing with the guest"
+        );
+
+        // A local backend cannot *force* a call, so promising one would have
+        // the caller read ordinary prose as a refusal to call.
+        for forced in [
+            serde_json::json!("required"),
+            serde_json::json!({"type": "function", "function": {"name": "read_file"}}),
+        ] {
+            let error = resolve(Some(forced.clone())).expect_err("cannot be honoured locally");
+            assert!(
+                matches!(error, CandleLlmError::InvalidRequest { .. }),
+                "{forced} must be the caller's error, not a host fault: {error}"
+            );
+        }
+    }
+
+    /// A deadline that expires *before* any token is produced.
+    ///
+    /// The count cannot carry this one at all: zero is below every budget, so
+    /// the result assembly reads it as a generation that simply had more room —
+    /// and `guest-openai` renders an absent reason as a clean `stop`. A request
+    /// whose clock ran out during prefill was therefore reported as a model
+    /// that chose to answer with silence.
+    #[test]
+    fn a_deadline_that_expires_during_prefill_still_reports_length() {
+        let mut emit = |_: &str| StreamControl::Continue;
+        let mut sink = TokenSink::new(&mut emit);
+        sink.record_token_budget(4_096);
+        assert_eq!(sink.completion_tokens, 0);
+        assert_eq!(
+            sink.finish_reason(),
+            None,
+            "zero tokens under the budget reads as an ordinary short answer"
+        );
+
+        sink.record_finish(Some(FinishReason::Length));
+        assert_eq!(
+            sink.finish_reason(),
+            Some("length"),
+            "which is why the prefill path has to record the verdict itself"
+        );
+    }
+
+    /// The boundary the count alone cannot express: an answer whose EOS or stop
+    /// sequence lands on exactly the budget's last token has both spent its
+    /// budget and finished normally. Reporting `length` there tells the client
+    /// a complete answer was truncated — the same misreport as the untracked
+    /// case, in the other direction.
+    #[test]
+    fn a_natural_end_on_the_budgets_last_token_is_not_length() {
+        let mut emit = |_: &str| StreamControl::Continue;
+        let mut sink = TokenSink::new(&mut emit);
+        sink.record_token_budget(4);
+        sink.completion_tokens = 4;
+        assert_eq!(
+            sink.finish_reason(),
+            Some("length"),
+            "the count alone still reads as truncation"
+        );
+
+        sink.record_finish(Some(FinishReason::Stop));
+        assert_eq!(
+            sink.finish_reason(),
+            None,
+            "but the model ended this answer itself, so the caller's `stop` is right"
+        );
     }
 
     /// Only the budget is named. EOS, a stop sequence and the deadline all
@@ -6565,6 +7336,58 @@ mod tests {
         }
         assert!(!is_multimodal_hf_model_type("gemma3"));
         assert!(is_multimodal_hf_model_type("gemma3_vl"));
+    }
+
+    /// The two Qwen 3.5 spellings are different architectures, and the names
+    /// invite exactly the confusion this pins against: `qwen3moe` is full
+    /// attention with experts in the feed-forward, `qwen3_5` interleaves Gated
+    /// DeltaNet linear-attention layers with full-attention ones. A checkpoint
+    /// routed to the wrong one loads against the wrong layer structure.
+    #[test]
+    fn the_qwen35_moe_and_hybrid_spellings_do_not_collapse() {
+        assert_eq!(
+            ModelArchitecture::from_gguf_architecture("qwen3moe"),
+            Some(ModelArchitecture::Qwen35Moe)
+        );
+        assert_eq!(
+            ModelArchitecture::from_gguf_architecture("qwen3_5"),
+            Some(ModelArchitecture::Qwen35Hybrid)
+        );
+        // The spelling a real Unsloth-converted checkpoint carries. It is not
+        // an alias of the alias: `qwen35` is what the files say, and knowing
+        // only `qwen3_5` refused every one of them at this gate.
+        assert_eq!(
+            ModelArchitecture::from_gguf_architecture("qwen35"),
+            Some(ModelArchitecture::Qwen35Hybrid)
+        );
+        // The MoE sibling under the underscore-less spelling. candle gained a
+        // backend for it, so it resolves now where it used to be refused — but
+        // what this pins is unchanged and is the whole point: it must land on
+        // the mixture, never on the hybrid it shares a prefix with.
+        assert_eq!(
+            ModelArchitecture::from_gguf_architecture("qwen35moe"),
+            Some(ModelArchitecture::Qwen35Moe)
+        );
+        assert_ne!(
+            ModelArchitecture::Qwen35Moe,
+            ModelArchitecture::Qwen35Hybrid
+        );
+
+        // The hybrid is GGUF-only: this runtime has no safetensors loader for
+        // it, and the NVFP4 Qwen 3.5 path is a separate, ModelOpt-specific
+        // runtime that this enum does not route to.
+        assert!(ModelArchitecture::Qwen35Hybrid.supports_format(ModelFormat::Gguf));
+        assert!(!ModelArchitecture::Qwen35Hybrid.supports_format(ModelFormat::Safetensors));
+
+        // And no HF `model_type` resolves to it, so a safetensors directory
+        // cannot reach it by accident.
+        for model_type in ["qwen3_5", "qwen3_5_moe", "qwen3_moe"] {
+            assert_ne!(
+                ModelArchitecture::from_hf_model_type(model_type),
+                Some(ModelArchitecture::Qwen35Hybrid),
+                "`{model_type}` must not resolve to the GGUF-only hybrid"
+            );
+        }
     }
 
     #[test]
@@ -6642,6 +7465,14 @@ mod tests {
                 r#"{"chat_template": "{% if tools %}[TOOL_CALLS]{% endif %}"}"#,
                 Some("mistral"),
             ),
+            // The plural spelling is the same dialect. A template that only
+            // renders `<tool_calls>` used to fall through to `json`, which
+            // cannot read a tagged call, so every call arrived as prose.
+            (
+                "qwen-plural",
+                r#"{"chat_template": "{% if tools %}<tool_calls>{{ tools }}</tool_calls>{% endif %}"}"#,
+                Some("qwen"),
+            ),
             // Tool-aware with no tag convention: the call is a bare JSON
             // object, which is what the `json` parser reads.
             (
@@ -6718,6 +7549,11 @@ mod tests {
     #[test]
     fn every_loadable_gguf_family_passes_the_architecture_gate() {
         for name in quantized_lm::SUPPORTED_ARCHITECTURES {
+            // Resolution is no longer the interesting half: the gate asks
+            // candle, so a name in this list resolves by construction. What is
+            // still worth pinning is the capability table — a family candle
+            // can load but that this host marks `gguf: false` is advertised
+            // and unloadable, which is the failure the whole gate exists for.
             let architecture = ModelArchitecture::from_gguf_architecture(name)
                 .unwrap_or_else(|| panic!("`{name}` is loadable but the gate rejects it"));
             assert!(
@@ -6742,6 +7578,7 @@ mod tests {
             (ModelArchitecture::Qwen2, "qwen2"),
             (ModelArchitecture::Qwen3, "qwen3"),
             (ModelArchitecture::Qwen35Moe, "qwen3moe"),
+            (ModelArchitecture::Qwen35Hybrid, "qwen3_5"),
             (ModelArchitecture::Gemma3, "gemma3"),
             (ModelArchitecture::Phi3, "phi3"),
         ] {
@@ -7309,16 +8146,22 @@ mod tests {
         let (runtime, dir) = load_fixture_with_strategy("deadline-prefill", &strategy);
         let request =
             br#"{"prompt":"hello mesh from tachyon","max_new_tokens":4,"max_generation_ms":1}"#;
-        let error = runtime
+        // Stopping, not failing. The deadline's contract is that it ends
+        // generation and returns what was produced — which for a prompt that
+        // outlasts prefill is nothing. Reporting an error here made a slow node
+        // fail long prompts outright, and contradicted the same contract the
+        // decode loop honours two lines later.
+        let (bytes, usage, finish_reason) = runtime
             .generate(&[&request[..]])
-            .expect_err("an elapsed budget must stop prefill rather than run to completion");
+            .expect("an elapsed budget stops prefill, it does not fail the request");
         assert!(
-            error.to_string().contains("deadline elapsed"),
-            "prefill should name the elapsed deadline, got: {error}"
+            bytes.is_empty(),
+            "prefill never reached decode, so there is no text to return"
         );
-        assert!(
-            error.to_string().contains("prompt tokens"),
-            "the error should say how far prefill got, got: {error}"
+        assert_eq!(usage.completion_tokens, 0);
+        assert_eq!(
+            finish_reason, None,
+            "nothing was truncated against a token budget"
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -8110,9 +8953,13 @@ mod tests {
         let messages = vec![ChatTurn {
             role: "user".to_owned(),
             content: "  hi  ".to_owned(),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            function_call: None,
         }];
         let rendered = reloaded
-            .render_chat(&messages)
+            .render_chat(&messages, None)
             .expect("model template should render");
         assert_eq!(
             rendered, "<s><|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n",
@@ -8167,16 +9014,6 @@ mod tests {
         assert!(stops.len() <= MAX_STOP_SEQUENCES);
         assert!(!stops.iter().any(String::is_empty));
         assert!(!stops.iter().any(|s| s.len() > MAX_STOP_SEQUENCE_BYTES));
-    }
-
-    #[test]
-    fn find_earliest_stop_returns_the_earliest_match() {
-        let stops = vec!["END".to_owned(), "stop".to_owned()];
-        assert_eq!(find_earliest_stop("keep me END drop", &stops), Some(8));
-        // Earliest of several matches wins.
-        assert_eq!(find_earliest_stop("a stop b END c", &stops), Some(2));
-        // No match.
-        assert_eq!(find_earliest_stop("nothing here", &stops), None);
     }
 
     #[test]
@@ -9273,7 +10110,7 @@ mod tests {
     }
 
     #[test]
-    fn flashinfer_attention_strategy_is_rejected_until_decode_attention_is_wired() {
+    fn flashinfer_attention_strategy_is_rejected_on_a_cpu_route() {
         let dir = write_fixture_dir("flashinfer-reject");
         let strategy = HardwareStrategy {
             flashinfer_attention: true,
@@ -9293,9 +10130,8 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    // Holds on every build (with or without candle-cuda/candle-flashinfer):
-    // only a Llama checkpoint on a CUDA device can get flashinfer_attention
-    // wired.
+    // Holds on every build, with or without `candle-cuda`: only a Llama
+    // checkpoint on a CUDA device can get flashinfer_attention wired.
     #[test]
     fn flashinfer_attention_strategy_is_rejected_for_a_non_llama_architecture() {
         let dir = std::env::temp_dir().join(format!(
@@ -9365,10 +10201,10 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    // Reaching the paged-attention conflict message (rather than the "feature
-    // not compiled in" rejection) requires both candle-cuda and
-    // candle-flashinfer, same as the real execution test below.
-    #[cfg(all(feature = "candle-cuda", feature = "candle-flashinfer"))]
+    // Reaching the paged-attention conflict message rather than the
+    // CUDA-baseline rejection needs `candle-cuda`, same as the real execution
+    // test below.
+    #[cfg(feature = "candle-cuda")]
     #[test]
     fn flashinfer_attention_and_paged_attention_combination_is_rejected() {
         let dir = write_fixture_dir("flashinfer-paged-combo-reject");
@@ -9394,7 +10230,7 @@ mod tests {
     // Requires a real CUDA device (`arc-gpu-runners`/`cuda-quality`) — not
     // runnable on this repo's default Windows dev sandbox, same as
     // `single_device_llama_paged_attention_generates_a_real_decode_on_cuda`.
-    #[cfg(all(feature = "candle-cuda", feature = "candle-flashinfer"))]
+    #[cfg(feature = "candle-cuda")]
     #[test]
     fn single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda() {
         let dir = write_fixture_dir("flashinfer-attn-cuda");
@@ -9435,7 +10271,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[cfg(feature = "candle-flashinfer")]
     #[test]
     fn flashinfer_kernel_dependency_runs_reference_decode_attention() {
         use candle_flashinfer_kernels::flashinfer_decode_attention;

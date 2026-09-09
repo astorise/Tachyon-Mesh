@@ -672,7 +672,7 @@ pub(crate) fn execute_component_guest(
         output: GuestExecutionOutput::Http(GuestHttpResponse {
             status,
             headers: response.headers,
-            body: Bytes::from(response.body),
+            body: RouteResponseBody::Buffered(Bytes::from(response.body)),
             trailers: response.trailers,
         }),
         fuel_consumed,
@@ -1290,6 +1290,9 @@ pub(crate) fn execute_streaming_component_guest(
         chunk_tx: chunks_tx,
         consumer_alive: Arc::clone(&consumer_alive),
     });
+    // Also held outside the slot: the slot is consumed by
+    // `get-streaming-response`, while an accelerator stream started later still
+    // needs the same flag.
     state.streaming_consumer_alive = Some(consumer_alive);
 
     let mut store = Store::new(engine, state);
@@ -1614,7 +1617,7 @@ pub(crate) fn execute_system_component_guest(
             output: GuestExecutionOutput::Http(GuestHttpResponse {
                 status,
                 headers: response.headers,
-                body: Bytes::from(response.body),
+                body: RouteResponseBody::Buffered(Bytes::from(response.body)),
                 trailers: response.trailers,
             }),
             fuel_consumed,
@@ -1667,7 +1670,7 @@ pub(crate) fn execute_system_component_guest(
         output: GuestExecutionOutput::Http(GuestHttpResponse {
             status,
             headers: response.headers,
-            body: Bytes::from(response.body),
+            body: RouteResponseBody::Buffered(Bytes::from(response.body)),
             trailers: response.trailers,
         }),
         fuel_consumed,

@@ -403,7 +403,7 @@ fn guest_http_response_into_axum(response: GuestHttpResponse) -> Response {
         builder = builder.header(name, value);
     }
     builder
-        .body(axum::body::Body::from(response.body))
+        .body(response.body.into_body())
         .unwrap_or_else(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

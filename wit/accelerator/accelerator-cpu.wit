@@ -1,10 +1,19 @@
-package tachyon:accelerator@2.0.0;
+package tachyon:accelerator@3.0.0;
 
-// Major, not minor, because `compute`, `embed`, `compute-stream` and
+// 3.0.0 adds a `refusal` case to `stream-event`. A new variant case is a
+// breaking change in the host→guest direction for the same reason the 2.0.0
+// reshape was: a component built against the smaller variant cannot decode a
+// case it has no arm for, and semver-compatible resolution would let it bind
+// anyway and fail at instantiation. The buffered `generation.refusal` had no
+// streaming counterpart, so a provider's safety refusal on `stream: true` was
+// dropped entirely — the stream completed, and the client saw an empty
+// assistant message with an ordinary finish.
+//
+// 2.0.0 was major, not minor, because `compute`, `embed`, `compute-stream` and
 // `token-stream.next` all changed shape: their error type became
-// `generation-error`, and `next` now yields a `stream-event` rather than a
+// `generation-error`, and `next` yields a `stream-event` rather than a
 // string. Wasmtime resolves an import by semver *compatible* name, so shipping
-// this as 1.2.0 would have let a component built against 1.1.0 bind to it and
+// that as 1.2.0 would have let a component built against 1.1.0 bind to it and
 // then fail instantiation with a structural type mismatch. A major bump makes
 // the break a clean unsatisfied import instead.
 //
@@ -33,9 +42,15 @@ interface cpu {
     record generation-error {
         message: string,
         upstream-status: option<u16>,
-        /// Stable host classification: `invalid-request`, `transport`, or
-        /// `malformed-response`; absent for ordinary local failures.
-        class: option<string>,
+        /// The *caller's* request was rejected, before any backend ran it.
+        ///
+        /// Distinct from `upstream-status`, which says a remote provider
+        /// rejected it: a budget above the binding's ceiling, or a prompt that
+        /// cannot fit the context window, is refused locally and has no remote
+        /// status to relay. Without this flag such a failure is indistinguishable
+        /// from a host fault, so a gateway reports it as a retryable 500 and the
+        /// client retries a request that can never succeed.
+        invalid-request: bool,
     }
 
     /// One tool call a backend recognised as *structured* data rather than as
@@ -60,9 +75,12 @@ interface cpu {
     variant stream-event {
         /// Decoded text for the assistant message.
         content(string),
-        /// A provider safety refusal. This is distinct from assistant content
-        /// in the OpenAI stream protocol and must not be silently flattened
-        /// into an empty successful completion.
+        /// A provider's structured safety refusal, on the same terms as
+        /// `generation.refusal`. Kept off the `content` arm because the OpenAI
+        /// stream protocol keeps `delta.refusal` off `delta.content`, and
+        /// flattening it either hands an agent "I can't help with that" as
+        /// data, or — as before this arm existed — drops it and completes the
+        /// stream as an empty successful answer.
         refusal(string),
         /// A tool call, complete. Tool calls arrive on this arm rather than
         /// inside `content` so that offering tools costs nothing in
@@ -99,8 +117,6 @@ interface cpu {
     /// when the backend could measure them.
     record generation {
         text: string,
-        /// A provider safety refusal, distinct from assistant content.
-        refusal: option<string>,
         usage: option<token-usage>,
         /// Why generation stopped, when the backend knows: `stop`, `length`,
         /// or whatever an upstream reported. Absent means "not reported" — a
@@ -111,6 +127,14 @@ interface cpu {
         /// backend that cannot distinguish them, in which case `text` is the
         /// whole answer and any calls in it are the caller's to parse.
         tool-calls: list<tool-call>,
+        /// A provider's structured safety refusal, when it sent one.
+        ///
+        /// Separate from `text` because that is the distinction it exists to
+        /// make: a refusal folded into the answer is an agent parsing "I can't
+        /// help with that" as data, and a refusal dropped entirely is
+        /// indistinguishable from a model that returned nothing. Always absent
+        /// for a local backend, which has no such concept.
+        refusal: option<string>,
     }
 
     load-model: func(name: string) -> result<u32, string>;

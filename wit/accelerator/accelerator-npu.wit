@@ -1,4 +1,4 @@
-package tachyon:accelerator@2.0.0;
+package tachyon:accelerator@3.0.0;
 
 interface npu {
     load-model: func(name: string) -> result<u32, string>;

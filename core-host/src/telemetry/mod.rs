@@ -190,6 +190,64 @@ pub(crate) fn active_requests(handle: &TelemetryHandle) -> usize {
     handle.snapshot.active_requests.load(Ordering::Relaxed)
 }
 
+/// Carries a request's `active_requests` slot and its final `RequestEnd`
+/// event past the point where the handler function returns a `Response`,
+/// so a caller can defer both until whatever actually drains the response
+/// body — not just until headers are ready — finishes or is dropped.
+///
+/// Streaming responses (proxied SSE, mesh-overflow redirects, etc.) hand
+/// this to a body wrapper that calls `finish()` once the underlying body
+/// reports end-of-stream; buffered responses have no need for it and keep
+/// recording `RequestEnd` immediately, as before. `finish()` is idempotent
+/// and also runs on `Drop`, so a body dropped mid-stream (client hang-up)
+/// still releases the slot and emits the event instead of leaking both.
+pub(crate) struct RequestCompletion {
+    telemetry: TelemetryHandle,
+    trace_id: Option<String>,
+    status: u16,
+    fuel_consumed: Option<u64>,
+    active_request: Option<ActiveRequestGuard>,
+}
+
+impl RequestCompletion {
+    pub(crate) fn new(
+        telemetry: TelemetryHandle,
+        active_request: ActiveRequestGuard,
+        trace_id: String,
+        status: u16,
+        fuel_consumed: Option<u64>,
+    ) -> Self {
+        Self {
+            telemetry,
+            trace_id: Some(trace_id),
+            status,
+            fuel_consumed,
+            active_request: Some(active_request),
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(trace_id) = self.trace_id.take() {
+            record_event(
+                &self.telemetry,
+                TelemetryEvent::RequestEnd {
+                    trace_id,
+                    status: self.status,
+                    fuel_consumed: self.fuel_consumed,
+                    timestamp: Instant::now(),
+                },
+            );
+        }
+        self.active_request = None;
+    }
+}
+
+impl Drop for RequestCompletion {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 pub(crate) fn snapshot(handle: &TelemetryHandle) -> TelemetrySnapshot {
     handle.snapshot.snapshot()
 }

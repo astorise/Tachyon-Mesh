@@ -11,7 +11,6 @@ use std::{
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-#[cfg(feature = "nvfp4-cuda")]
 #[path = "modelopt_nvfp4_cuda.rs"]
 pub(crate) mod cuda;
 
@@ -68,62 +67,65 @@ pub(crate) struct Nvfp4FallbackMemoryLimits {
     pub(crate) max_accelerator_bytes: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Nvfp4KernelKind {
-    Dequantize,
-    Matmul,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Nvfp4AcceleratorCapabilities {
-    pub(crate) native_fp4: bool,
-    pub(crate) runtime_available: bool,
-    pub(crate) compiled_kernels: BTreeSet<Nvfp4KernelKind>,
-}
-
-impl Nvfp4AcceleratorCapabilities {
-    pub(crate) fn fallback_only() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn native_fp4(kernels: impl IntoIterator<Item = Nvfp4KernelKind>) -> Self {
-        Self {
-            native_fp4: true,
-            runtime_available: true,
-            compiled_kernels: kernels.into_iter().collect(),
-        }
-    }
-
-    pub(crate) fn supports_native_nvfp4_matmul(&self) -> bool {
-        self.native_fp4
-            && self.runtime_available
-            && self.compiled_kernels.contains(&Nvfp4KernelKind::Dequantize)
-            && self.compiled_kernels.contains(&Nvfp4KernelKind::Matmul)
-    }
-
-    pub(crate) fn cuda_cutlass() -> Self {
-        #[cfg(feature = "nvfp4-cuda")]
-        {
-            cuda::Nvfp4CudaBackend::capabilities()
-        }
-        #[cfg(not(feature = "nvfp4-cuda"))]
-        {
-            Self::fallback_only()
-        }
-    }
-}
-
+/// Whether packed NVFP4 operators can be multiplied through candle's kernel.
+///
+/// One question, and candle is what answers it. This used to be three fields —
+/// `native_fp4`, `runtime_available`, a set of compiled kernel kinds — with
+/// the conjunction re-derived here: a model of the device kept on this side of
+/// the boundary. candle #3831 turned the first of them into a falsehood. The
+/// kernel needs no FP4 tensor cores, so `native_fp4` read true on hardware
+/// that has none, and the name went on promising something the value had
+/// stopped meaning. Describing hardware is candle's job; what belongs here is
+/// only whether the call is reachable from this build.
+/// Deliberately not `Default`. The struct this replaced defaulted to "no
+/// kernel" so that `fallback_only()` could be `Self::default()`, and a default
+/// here would let a caller obtain an answer without asking anyone — which is
+/// the habit the whole change is against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Nvfp4KernelSelectionMode {
-    NativePreferred,
-    NativeRequired,
+pub(crate) enum Nvfp4KernelAvailability {
+    Reachable,
+    Absent,
+}
+
+impl Nvfp4KernelAvailability {
+    /// Ask candle. There is no second arm and no `cfg`: the kernel crate is
+    /// always linked, and whether it can do anything is its answer to give.
+    pub(crate) fn detect() -> Self {
+        cuda::Nvfp4CudaBackend::availability()
+    }
+
+    fn is_reachable(self) -> bool {
+        self == Self::Reachable
+    }
+}
+
+/// Whether unpacking the checkpoint to dense f32 is an acceptable answer.
+///
+/// Not a hardware question, which is why no probe and no environment variable
+/// decides it. On the host path the dense form *is* the runtime — there is
+/// nothing else for a CPU to multiply. On an accelerator it is a development
+/// tool that costs eight times the packed memory, so it happens only when
+/// someone names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Nvfp4FallbackPolicy {
+    Permitted,
+    Refused,
+}
+
+/// The opt-in that turns [`Nvfp4FallbackPolicy::Refused`] back into
+/// `Permitted`. Deliberately awkward to reach, and deliberately a single name:
+/// both NVFP4 loaders read this one variable, so there is one switch with one
+/// meaning rather than two knobs pulling against each other.
+pub(crate) const DEQUANTIZED_FALLBACK_ENV: &str = "TACHYON_QWEN35_DEQUANTIZED_FALLBACK";
+
+/// Whether the operator asked for the dense form by name.
+pub(crate) fn dequantized_fallback_opted_in() -> bool {
+    std::env::var(DEQUANTIZED_FALLBACK_ENV).is_ok_and(|value| value == "1")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Nvfp4ExecutionPlan {
-    Native {
-        required_kernels: Vec<Nvfp4KernelKind>,
-    },
+    Native,
     Fallback(Nvfp4FallbackMemoryEstimate),
 }
 
@@ -210,6 +212,12 @@ impl ModelOptNvfp4Directory {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The checkpoint's shard files, for a loader that maps the whole thing
+    /// rather than reading tensors individually.
+    pub(crate) fn shard_paths(&self) -> Vec<PathBuf> {
+        self.shard_index.shard_paths(&self.root)
     }
 
     pub(crate) fn quantization(&self) -> &ModelOptNvfp4QuantizationLayout {
@@ -401,21 +409,25 @@ impl ModelOptNvfp4Directory {
 
     pub(crate) fn select_execution_plan(
         &self,
-        capabilities: &Nvfp4AcceleratorCapabilities,
+        availability: Nvfp4KernelAvailability,
         output_dtype: Nvfp4OutputDType,
         fallback_scope: Nvfp4FallbackScope,
         fallback_limits: Nvfp4FallbackMemoryLimits,
-        mode: Nvfp4KernelSelectionMode,
+        fallback: Nvfp4FallbackPolicy,
     ) -> Result<Nvfp4ExecutionPlan> {
-        if capabilities.supports_native_nvfp4_matmul() {
-            return Ok(Nvfp4ExecutionPlan::Native {
-                required_kernels: vec![Nvfp4KernelKind::Dequantize, Nvfp4KernelKind::Matmul],
-            });
+        if availability.is_reachable() {
+            return Ok(Nvfp4ExecutionPlan::Native);
         }
-        if mode == Nvfp4KernelSelectionMode::NativeRequired {
+        if fallback == Nvfp4FallbackPolicy::Refused {
             return Err(ModelOptNvfp4LoadError::UnsupportedQuantization {
                 alias: self.alias.clone(),
-                detail: "native NVFP4 execution requires FP4-capable hardware, runtime availability, and compiled dequant+matmul kernels".to_owned(),
+                detail: format!(
+                    "an accelerator was requested but candle reports no usable NVFP4 kernel: \
+                     build with the `candle-cuda` feature and run on a host with a CUDA device, \
+                     or set {DEQUANTIZED_FALLBACK_ENV}=1 to unpack the weights to dense f32 \
+                     instead — eight times the packed size, which is why it is not what happens \
+                     by default"
+                ),
             }
             .into());
         }
@@ -567,6 +579,12 @@ impl SafetensorsShardIndex {
 
     pub(crate) fn shard_count(&self) -> usize {
         self.shards.len()
+    }
+
+    /// Every shard file, in index order. What a `VarBuilder` needs to mmap the
+    /// checkpoint whole, as opposed to reading one tensor at a time.
+    pub(crate) fn shard_paths(&self, root: &Path) -> Vec<PathBuf> {
+        self.shards.iter().map(|shard| root.join(shard)).collect()
     }
 
     pub(crate) fn has_tensor_suffix(&self, suffix: &str) -> bool {
@@ -1012,8 +1030,17 @@ pub(crate) enum PreparedLinear {
         packed: Vec<u8>,
         scales: Vec<u8>,
         tensor_scale: f32,
+        /// The same operator, resident on the device, uploaded on first native
+        /// use. Empty on a build or a device that cannot execute FP4, which is
+        /// what keeps the host path reachable without a second code path.
+        resident: ResidentOperator,
     },
 }
+
+/// A lazily-uploaded device operator. `None` inside the `OnceLock` is a host
+/// that tried and could not — no device, or no CUDA support compiled into the
+/// kernel crate — which is why every construction site can stay free of `cfg`.
+type ResidentOperator = std::sync::OnceLock<Option<cuda::Nvfp4DeviceLinear>>;
 
 impl PreparedLinear {
     pub(crate) fn resident_bytes(&self) -> u64 {
@@ -1084,34 +1111,158 @@ impl PreparedLinear {
         Ok(output)
     }
 
-    pub(crate) fn matvec_native_nvfp4(&self, input: &[f32]) -> Result<Vec<f32>> {
+    /// Apply this operator to `tokens` inputs at once.
+    ///
+    /// `inputs` is `[tokens, cols]` row-major and the result is
+    /// `[tokens, rows]` row-major, so a caller holding a whole prompt can make
+    /// one call where it used to make one per token.
+    ///
+    /// The win is not the call count, it is the decode. `matvec` walks the
+    /// weight once per token, and for a quantized operator each step of that
+    /// walk is an unpack: an E2M1 nibble through a lookup table and a per-block
+    /// E4M3 scale, or an E4M3 byte and a tensor scale. Prefilling a 1024-token
+    /// prompt therefore unpacked every weight in the model 1024 times. Here the
+    /// weight loop is outermost, so each element is unpacked once and applied
+    /// to every token — which is also why this is memory-bandwidth bound rather
+    /// than arithmetic bound, and why the saving grows with the prompt.
+    ///
+    /// Accumulation order per output element is unchanged — rows outermost,
+    /// then blocks, then bytes, high nibble before low — so this returns
+    /// bit-identical results to calling `matvec` per token, not merely close
+    /// ones. `matmul_matches_matvec_for_every_operator_form` pins that.
+    pub(crate) fn matmul(&self, inputs: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        let (rows, cols) = match self {
+            Self::Dense { rows, cols, .. }
+            | Self::Fp8 { rows, cols, .. }
+            | Self::Nvfp4 { rows, cols, .. } => (*rows, *cols),
+        };
+        if tokens == 0 {
+            return Ok(Vec::new());
+        }
+        if inputs.len() != tokens * cols {
+            bail!(
+                "linear input has {} values, expected {tokens} x {cols}",
+                inputs.len()
+            );
+        }
+        let mut output = vec![0.0f32; tokens * rows];
         match self {
+            Self::Dense { weight, .. } => {
+                for row in 0..rows {
+                    let row_weights = &weight[row * cols..(row + 1) * cols];
+                    for (col, weight_value) in row_weights.iter().enumerate() {
+                        for token in 0..tokens {
+                            output[token * rows + row] += weight_value * inputs[token * cols + col];
+                        }
+                    }
+                }
+            }
+            Self::Fp8 { weight, scale, .. } => {
+                for row in 0..rows {
+                    let row_weights = &weight[row * cols..(row + 1) * cols];
+                    for (col, weight_value) in row_weights.iter().enumerate() {
+                        let decoded = e4m3_to_f32(*weight_value) * scale;
+                        for token in 0..tokens {
+                            output[token * rows + row] += decoded * inputs[token * cols + col];
+                        }
+                    }
+                }
+            }
             Self::Nvfp4 {
-                rows,
-                cols,
                 packed,
                 scales,
                 tensor_scale,
+                ..
             } => {
-                #[cfg(feature = "nvfp4-cuda")]
-                {
-                    return cuda::Nvfp4CudaBackend::linear_f32_host(
-                        input,
-                        packed,
-                        scales,
-                        *tensor_scale,
-                        *rows,
-                        *cols,
-                    );
-                }
-                #[cfg(not(feature = "nvfp4-cuda"))]
-                {
-                    let _ = (rows, cols, packed, scales, tensor_scale, input);
-                    bail!("native NVFP4 execution requires the `nvfp4-cuda` feature")
+                let packed_cols = cols / 2;
+                let scale_cols = cols / NVFP4_BLOCK_SIZE;
+                for row in 0..rows {
+                    for block in 0..scale_cols {
+                        let scale = e4m3_to_f32(scales[row * scale_cols + block]) * tensor_scale;
+                        let packed_offset = row * packed_cols + block * (NVFP4_BLOCK_SIZE / 2);
+                        let input_offset = block * NVFP4_BLOCK_SIZE;
+                        for byte_index in 0..NVFP4_BLOCK_SIZE / 2 {
+                            let byte = packed[packed_offset + byte_index];
+                            let high = E2M1_LUT[(byte >> 4) as usize] * scale;
+                            let low = E2M1_LUT[(byte & 0x0f) as usize] * scale;
+                            let value_index = input_offset + byte_index * 2;
+                            for token in 0..tokens {
+                                let base = token * cols;
+                                let out = &mut output[token * rows + row];
+                                *out += high * inputs[base + value_index];
+                                *out += low * inputs[base + value_index + 1];
+                            }
+                        }
+                    }
                 }
             }
-            _ => self.matvec(input),
         }
+        Ok(output)
+    }
+
+    /// The native-kernel counterpart of [`Self::matmul`].
+    ///
+    /// Still one kernel launch per token: `Nvfp4CudaBackend` takes a single
+    /// activation vector, so batching it is a kernel change rather than a
+    /// caller change. This exists so the runtime has one batched entry point
+    /// whichever execution plan is active; it is no slower than the per-token
+    /// calls it replaces, and no faster until the kernel grows a batched form.
+    /// `tokens` activations through this operator, in one kernel launch.
+    ///
+    /// This looped `matvec_native_nvfp4` until `candle-nvfp4-kernels` grew a
+    /// batched entry point (candle #3824). Until then the batched host path
+    /// was doing its work and then handing the result to a per-token kernel,
+    /// so a GPU build saw none of the saving — which is the whole reason the
+    /// batched kernel was asked for upstream rather than worked around here.
+    pub(crate) fn matmul_native_nvfp4(&self, inputs: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        let Self::Nvfp4 {
+            rows,
+            cols,
+            packed,
+            scales,
+            tensor_scale,
+            resident,
+        } = self
+        else {
+            // Dense and FP8 operators have no native kernel; the host path is
+            // already their fastest form.
+            return self.matmul(inputs, tokens);
+        };
+        if tokens == 0 {
+            return Ok(Vec::new());
+        }
+        if inputs.len() != tokens * cols {
+            bail!(
+                "linear input has {} values, expected {tokens} x {cols}",
+                inputs.len()
+            );
+        }
+        // Uploaded once and kept; the host entry point below re-sends the
+        // whole operator on every call, which for anything but a tiny weight
+        // costs more than the activation it is multiplying.
+        let resident = resident.get_or_init(|| {
+            cuda::Nvfp4DeviceLinear::upload(packed, scales, *tensor_scale, *rows, *cols)
+        });
+        match resident {
+            Some(resident) => resident.matmul(inputs, tokens),
+            None => cuda::Nvfp4CudaBackend::linear_f32_host_batched(
+                inputs,
+                packed,
+                scales,
+                *tensor_scale,
+                *rows,
+                *cols,
+                tokens,
+            ),
+        }
+    }
+
+    pub(crate) fn matvec_native_nvfp4(&self, input: &[f32]) -> Result<Vec<f32>> {
+        // One token is the batched path with `tokens = 1`, and going through it
+        // is what lets a decode step reuse the operator a prefill chunk already
+        // uploaded. `matmul` is bit-identical to `matvec` at one token, which
+        // `matmul_matches_matvec_for_every_operator_form` holds to.
+        self.matmul_native_nvfp4(input, 1)
     }
 }
 
@@ -1198,6 +1349,7 @@ impl ModelOptLinearTensors {
                     packed,
                     scales,
                     tensor_scale,
+                    resident: Default::default(),
                 })
             }
             Self::Fp8(linear) => {
@@ -1637,7 +1789,7 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits(value)
 }
 
-fn read_scalar_f32(tensor: &SafetensorsTensorRef) -> Result<f32> {
+pub(crate) fn read_scalar_f32(tensor: &SafetensorsTensorRef) -> Result<f32> {
     let values = tensor.read_f32()?;
     if values.len() != 1 {
         bail!(
@@ -2026,6 +2178,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The batched path must be a pure restructuring, not an approximation.
+    ///
+    /// Bit-identical, not "within epsilon": the loop reorder keeps each output
+    /// element's accumulation sequence exactly as `matvec` had it, so any
+    /// difference at all means the order moved — and a reordering that changes
+    /// results is a reordering that changed the model's output for every
+    /// prompt, silently. An epsilon comparison would hide precisely that.
+    #[test]
+    fn matmul_matches_matvec_for_every_operator_form() {
+        const COLS: usize = NVFP4_BLOCK_SIZE * 2;
+        const ROWS: usize = 3;
+        const TOKENS: usize = 5;
+
+        // Deterministic, and deliberately not smooth: values that vary in
+        // magnitude across the row are what make a changed summation order
+        // show up in the low bits.
+        let inputs: Vec<f32> = (0..TOKENS * COLS)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.37 + (i % 3) as f32 * 1.9)
+            .collect();
+
+        let dense = PreparedLinear::Dense {
+            rows: ROWS,
+            cols: COLS,
+            weight: (0..ROWS * COLS)
+                .map(|i| ((i % 11) as f32 - 5.0) * 0.21)
+                .collect(),
+        };
+        let fp8 = PreparedLinear::Fp8 {
+            rows: ROWS,
+            cols: COLS,
+            weight: (0..ROWS * COLS).map(|i| (i % 251) as u8).collect(),
+            scale: 0.125,
+        };
+        let nvfp4 = PreparedLinear::Nvfp4 {
+            rows: ROWS,
+            cols: COLS,
+            packed: (0..ROWS * COLS / 2).map(|i| (i % 253) as u8).collect(),
+            scales: (0..ROWS * COLS / NVFP4_BLOCK_SIZE)
+                .map(|i| (i % 199) as u8)
+                .collect(),
+            tensor_scale: 0.5,
+            resident: Default::default(),
+        };
+
+        for (name, operator) in [("dense", dense), ("fp8", fp8), ("nvfp4", nvfp4)] {
+            let batched = operator
+                .matmul(&inputs, TOKENS)
+                .unwrap_or_else(|error| panic!("{name} matmul failed: {error}"));
+            assert_eq!(batched.len(), TOKENS * ROWS, "{name} output shape");
+
+            for token in 0..TOKENS {
+                let expected = operator
+                    .matvec(&inputs[token * COLS..(token + 1) * COLS])
+                    .unwrap_or_else(|error| panic!("{name} matvec failed: {error}"));
+                assert_eq!(
+                    &batched[token * ROWS..(token + 1) * ROWS],
+                    expected.as_slice(),
+                    "{name}: batched token {token} differs from the per-token result"
+                );
+            }
+
+            // A single token through the batched path is the per-token path.
+            let one = operator.matmul(&inputs[..COLS], 1).expect("single token");
+            assert_eq!(one, operator.matvec(&inputs[..COLS]).expect("matvec"));
+
+            // And an empty batch is empty rather than an error: a caller with
+            // nothing to prefill should not have to special-case it.
+            assert!(operator.matmul(&[], 0).expect("empty batch").is_empty());
+        }
+    }
+
+    #[test]
+    fn matmul_rejects_an_input_that_is_not_a_whole_number_of_tokens() {
+        let operator = PreparedLinear::Dense {
+            rows: 2,
+            cols: 4,
+            weight: vec![0.0; 8],
+        };
+        let error = operator
+            .matmul(&[1.0, 2.0, 3.0], 2)
+            .expect_err("3 values cannot be 2 tokens of 4");
+        assert!(error.to_string().contains("expected 2 x 4"), "{error}");
+    }
+
     #[test]
     fn e4m3_known_values_convert_to_f32() {
         assert_eq!(e4m3_to_f32(0x00), 0.0);
@@ -2131,6 +2367,7 @@ mod tests {
             packed: vec![0x22; 8],
             scales: vec![0x38],
             tensor_scale: 1.0,
+            resident: Default::default(),
         };
         let dense_output = dense.matvec(&[1.0; 16]).expect("dense");
         let fp8_output = fp8.matvec(&dense_output).expect("fp8");
@@ -2138,7 +2375,6 @@ mod tests {
         assert_eq!(output, vec![16.0]);
     }
 
-    #[cfg(feature = "nvfp4-cuda")]
     #[test]
     fn nvfp4_cuda_host_linear_matches_fallback() {
         if std::env::var("TACHYON_NVFP4_CUDA_SMOKE").as_deref() != Ok("1") {
@@ -2150,6 +2386,7 @@ mod tests {
             packed: vec![0x22; 16],
             scales: vec![0x38; 2],
             tensor_scale: 1.0,
+            resident: Default::default(),
         };
         let input = vec![1.0f32; 16];
         let fallback = linear.matvec(&input).expect("fallback");
@@ -2205,33 +2442,25 @@ mod tests {
     }
 
     #[test]
-    fn native_kernel_plan_is_selected_when_capabilities_are_complete() {
+    fn a_reachable_kernel_is_used_even_when_the_fallback_is_permitted() {
         let root = temp_model_dir("modelopt-native-plan");
         write_minimal_modelopt_nvfp4_dir(&root);
         let model = ModelOptNvfp4Directory::try_load("nvfp4", &root)
             .expect("loader should not error")
             .expect("directory should be detected");
-        let capabilities = Nvfp4AcceleratorCapabilities::native_fp4([
-            Nvfp4KernelKind::Dequantize,
-            Nvfp4KernelKind::Matmul,
-        ]);
-
         let plan = model
             .select_execution_plan(
-                &capabilities,
+                Nvfp4KernelAvailability::Reachable,
                 Nvfp4OutputDType::BF16,
                 Nvfp4FallbackScope::LayerWindow(1),
                 Nvfp4FallbackMemoryLimits::default(),
-                Nvfp4KernelSelectionMode::NativePreferred,
+                Nvfp4FallbackPolicy::Permitted,
             )
             .expect("native plan should be selected");
 
-        assert_eq!(
-            plan,
-            Nvfp4ExecutionPlan::Native {
-                required_kernels: vec![Nvfp4KernelKind::Dequantize, Nvfp4KernelKind::Matmul],
-            }
-        );
+        // Reachable wins over a permitted fallback: the dense form is what a
+        // host without the kernel falls back *to*, never a preference.
+        assert_eq!(plan, Nvfp4ExecutionPlan::Native);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2245,14 +2474,14 @@ mod tests {
 
         let plan = model
             .select_execution_plan(
-                &Nvfp4AcceleratorCapabilities::fallback_only(),
+                Nvfp4KernelAvailability::Absent,
                 Nvfp4OutputDType::BF16,
                 Nvfp4FallbackScope::LayerWindow(1),
                 Nvfp4FallbackMemoryLimits {
                     max_host_ram_bytes: Some(1024),
                     max_accelerator_bytes: Some(1024),
                 },
-                Nvfp4KernelSelectionMode::NativePreferred,
+                Nvfp4FallbackPolicy::Permitted,
             )
             .expect("fallback plan should be selected");
 
@@ -2267,7 +2496,7 @@ mod tests {
     }
 
     #[test]
-    fn native_required_rejects_missing_kernel_support() {
+    fn a_refused_fallback_rejects_a_build_with_no_kernel() {
         let root = temp_model_dir("modelopt-native-required");
         write_minimal_modelopt_nvfp4_dir(&root);
         let model = ModelOptNvfp4Directory::try_load("nvfp4", &root)
@@ -2276,28 +2505,34 @@ mod tests {
 
         let error = model
             .select_execution_plan(
-                &Nvfp4AcceleratorCapabilities::fallback_only(),
+                Nvfp4KernelAvailability::Absent,
                 Nvfp4OutputDType::BF16,
                 Nvfp4FallbackScope::LayerWindow(1),
                 Nvfp4FallbackMemoryLimits::default(),
-                Nvfp4KernelSelectionMode::NativeRequired,
+                Nvfp4FallbackPolicy::Refused,
             )
-            .expect_err("native-required should reject missing kernels");
+            .expect_err("a refused fallback should reject a build with no kernel");
 
-        assert!(error
-            .to_string()
-            .contains("native NVFP4 execution requires"));
+        // The message has to name both ways out, because neither is guessable
+        // from the failure: get a CUDA backend and a device under it, or ask
+        // for the dense form by name.
+        let error = error.to_string();
+        assert!(error.contains("no usable NVFP4 kernel"), "{error}");
+        assert!(error.contains("candle-cuda"), "{error}");
+        assert!(error.contains(DEQUANTIZED_FALLBACK_ENV), "{error}");
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(not(feature = "nvfp4-cuda"))]
+    /// Conditioned on `candle-cuda`, not on a feature of ours: the kernel
+    /// crate is always linked now, and what decides whether it can do anything
+    /// is whether candle's CUDA backend was compiled under it.
+    #[cfg(not(feature = "candle-cuda"))]
     #[test]
-    fn cuda_cutlass_capability_is_unavailable_without_feature() {
-        let capabilities = Nvfp4AcceleratorCapabilities::cuda_cutlass();
-
-        assert!(!capabilities.native_fp4);
-        assert!(!capabilities.runtime_available);
-        assert!(capabilities.compiled_kernels.is_empty());
+    fn a_build_without_the_cuda_backend_reports_the_kernel_absent() {
+        assert_eq!(
+            Nvfp4KernelAvailability::detect(),
+            Nvfp4KernelAvailability::Absent
+        );
     }
 
     #[test]

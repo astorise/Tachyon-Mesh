@@ -63,10 +63,11 @@ pub(crate) fn discover_cluster_topology() -> ClusterTopology {
         free_vram_bytes: 0,
     }];
 
-    // With the `candle-cuda` Cargo feature compiled in (a separate, sibling
-    // feature to `nvfp4-cuda` — enabling `nvfp4-cuda` alone does NOT pull in
-    // `candle-cuda`; see core-host/Cargo.toml), `cuda_if_available` actually
-    // opens devices, so this loop enumerates every real GPU ordinal.
+    // With the `candle-cuda` Cargo feature compiled in — the one switch that
+    // needs a CUDA toolchain, and what turns on `candle-core/cuda` and the
+    // kernel crates' own `cuda` features; see core-host/Cargo.toml —
+    // `cuda_if_available` actually opens devices, so this loop enumerates
+    // every real GPU ordinal.
     // `free_vram_bytes` stays `0` (unknown) until NVML telemetry lands;
     // `validate_parallel_topology` only enforces the VRAM check when the plan
     // declares a non-zero per-shard requirement, so a `0` here never causes a
@@ -601,200 +602,66 @@ pub(crate) fn bind_current_process_to_numa_node(node_id: u32) -> CandleResult<()
 // Tensor parallelism: Megatron-style column/row-parallel linear layers.
 // ---------------------------------------------------------------------------
 
-/// A linear layer whose weight matrix is sharded by output features across
-/// `shards.len()` devices. Each shard computes a disjoint slice of the
-/// output; no communication is required because the slices are concatenated
-/// (gathered), not summed. Used for the first linear in a Megatron-style MLP
-/// block (e.g. the up/gate projection).
-pub(crate) struct ColumnParallelLinear {
-    /// One weight shard per device: shape `[out_features / n, in_features]`.
-    shards: Vec<(Tensor, Device)>,
-}
+/// The Megatron-style sharded linears, from `candle-nn` (candle #3828).
+///
+/// They were written here first, for want of anywhere else to put them, and
+/// they were never mesh-specific: two `Tensor` operations and a device list.
+/// What is mesh-specific is which collective performs the row-parallel
+/// reduction, and upstream leaves exactly that to the caller — see
+/// [`NcclReducer`].
+pub(crate) use candle_nn::{
+    split_for_row_parallel, ColumnParallelLinear, RowParallelLinear, SumReducer, TensorReducer,
+};
 
-impl ColumnParallelLinear {
-    /// Splits `weight` (`[out_features, in_features]`) into `devices.len()`
-    /// equal column shards. `out_features` must be evenly divisible by
-    /// `devices.len()`; an uneven split would silently drop the remainder
-    /// output features rather than computing them on any shard, so it is
-    /// rejected instead.
-    pub(crate) fn shard(weight: &Tensor, devices: &[Device]) -> CandleResult<Self> {
-        let n = devices.len();
-        let out_features = weight.dim(0)?;
-        if out_features % n != 0 {
-            candle_core::bail!(
-                "column-parallel shard requires out_features ({out_features}) to be evenly divisible by the device count ({n})"
-            );
-        }
-        let shard_size = out_features / n;
-        let mut shards = Vec::with_capacity(n);
-        for (i, device) in devices.iter().enumerate() {
-            let shard = weight
-                .narrow(0, i * shard_size, shard_size)?
-                .to_device(device)?;
-            shards.push((shard, device.clone()));
-        }
-        Ok(Self { shards })
-    }
-
-    /// Runs `x @ shard^T` on every device and gathers (concatenates) the
-    /// partial outputs back into one `[batch, out_features]` tensor on
-    /// `gather_device`.
-    pub(crate) fn forward(&self, x: &Tensor, gather_device: &Device) -> CandleResult<Tensor> {
-        let mut parts = Vec::with_capacity(self.shards.len());
-        for (shard, device) in &self.shards {
-            // `narrow`/`to_device` (here) and `t()` (below) both produce
-            // non-contiguous views; candle's CPU matmul tolerates that, but
-            // its CUDA matmul kernel requires contiguous operands.
-            let x_local = x.to_device(device)?.contiguous()?;
-            let out = x_local.matmul(&shard.t()?.contiguous()?)?;
-            parts.push(out.to_device(gather_device)?);
-        }
-        Tensor::cat(&parts, 1)
-    }
-}
-
-/// A linear layer whose weight matrix is sharded by input features across
-/// `shards.len()` devices. Each shard computes a partial sum over its input
-/// slice; the partial sums must be all-reduced (summed) to produce the
-/// correct full output. Used for the second linear in a Megatron-style MLP
-/// block (e.g. the down projection), immediately after a
-/// `ColumnParallelLinear` so the activation is already split along the
-/// dimension this layer shards.
-pub(crate) struct RowParallelLinear {
-    /// One weight shard per device: shape `[out_features, in_features / n]`.
-    shards: Vec<(Tensor, Device)>,
-    /// Real NCCL communicators for this shard group, if one was attached via
-    /// `with_nccl_group`. `None` (the default from `shard`) means every
-    /// `forward` call uses the host-staged sum, matching pre-existing
-    /// behavior exactly.
+/// The reduction strategy a [`RowParallelLinear`] uses, bound to this host's
+/// communicator.
+///
+/// A row-parallel layer's all-reduce is the whole communication cost of tensor
+/// parallelism, and how it travels is a deployment decision rather than a
+/// modelling one: NCCL between GPUs on a node, and a host-staged sum
+/// everywhere else. This is the seam candle asks for, holding the one thing
+/// upstream cannot know.
+pub(crate) struct NcclReducer {
+    /// Real NCCL communicators for this shard group, when one was built.
+    /// `None` — and every non-CUDA build — falls back to the host-staged sum,
+    /// which is `SumReducer` and is what this code did before NCCL existed
+    /// here.
     #[cfg(feature = "candle-cuda")]
-    nccl_group: Option<std::sync::Arc<NcclShardGroup>>,
+    group: Option<std::sync::Arc<NcclShardGroup>>,
 }
 
-impl RowParallelLinear {
-    /// Splits `weight` (`[out_features, in_features]`) into `devices.len()`
-    /// equal row (input-feature) shards. `in_features` must be evenly
-    /// divisible by `devices.len()`; an uneven split would silently drop the
-    /// remainder input features from every shard's partial sum, so it is
-    /// rejected instead.
-    pub(crate) fn shard(weight: &Tensor, devices: &[Device]) -> CandleResult<Self> {
-        let n = devices.len();
-        let in_features = weight.dim(1)?;
-        if in_features % n != 0 {
-            candle_core::bail!(
-                "row-parallel shard requires in_features ({in_features}) to be evenly divisible by the device count ({n})"
-            );
-        }
-        let shard_size = in_features / n;
-        let mut shards = Vec::with_capacity(n);
-        for (i, device) in devices.iter().enumerate() {
-            let shard = weight
-                .narrow(1, i * shard_size, shard_size)?
-                .to_device(device)?;
-            shards.push((shard, device.clone()));
-        }
-        Ok(Self {
-            shards,
-            #[cfg(feature = "candle-cuda")]
-            nccl_group: None,
-        })
-    }
-
-    /// Attaches a real NCCL communicator group to this shard group, so
-    /// subsequent `forward` calls synchronize via NCCL instead of the
-    /// host-staged sum whenever every partial is a CUDA `DType::F32` tensor.
-    /// Passing `None` (or never calling this) preserves pre-existing
-    /// behavior exactly.
+impl NcclReducer {
+    /// One communicator group per tensor-parallel shard group, shared across
+    /// every layer that reduces through it.
     #[cfg(feature = "candle-cuda")]
-    pub(crate) fn with_nccl_group(mut self, group: Option<std::sync::Arc<NcclShardGroup>>) -> Self {
-        self.nccl_group = group;
-        self
+    pub(crate) fn new(group: Option<std::sync::Arc<NcclShardGroup>>) -> Self {
+        Self { group }
     }
 
-    /// `x_shards[i]` is the i-th input slice already resident on
-    /// `self.shards[i]`'s device (typically the gathered output of a
-    /// preceding `ColumnParallelLinear`, re-split). Computes the partial
-    /// matmul per shard, then all-reduces (sums) the partial outputs on
-    /// `reduce_device`.
-    pub(crate) fn forward(
-        &self,
-        x_shards: &[Tensor],
-        reduce_device: &Device,
-    ) -> CandleResult<Tensor> {
-        let mut partials = Vec::with_capacity(self.shards.len());
-        for ((shard, device), x_local) in self.shards.iter().zip(x_shards.iter()) {
-            // `narrow`/`to_device` (caller's `split_for_row_parallel`, and
-            // here) and `t()` (below) both produce non-contiguous views;
-            // candle's CPU matmul tolerates that, but its CUDA matmul kernel
-            // requires contiguous operands.
-            let x_local = x_local.to_device(device)?.contiguous()?;
-            partials.push(x_local.matmul(&shard.t()?.contiguous()?)?);
-        }
-        self.all_reduce(partials, reduce_device)
+    #[cfg(not(feature = "candle-cuda"))]
+    pub(crate) fn new() -> Self {
+        Self {}
     }
+}
 
+impl TensorReducer for NcclReducer {
     /// Real NCCL `AllReduce` when a communicator group is attached and every
-    /// partial is a CUDA `DType::F32` tensor with >1 device participating;
-    /// the existing host-staged manual sum otherwise (no `candle-cuda`,
-    /// single device, `Device::Cpu`, or a non-`F32` dtype not yet wired into
-    /// the NCCL fast path).
-    fn all_reduce(&self, partials: Vec<Tensor>, reduce_device: &Device) -> CandleResult<Tensor> {
+    /// partial is a CUDA `DType::F32` tensor with more than one device
+    /// participating; the host-staged sum otherwise (no `candle-cuda`, single
+    /// device, `Device::Cpu`, or a dtype not wired into the NCCL path).
+    fn all_reduce(&self, shards: &[Tensor], reduce_device: &Device) -> CandleResult<Tensor> {
         #[cfg(feature = "candle-cuda")]
-        if let Some(group) = &self.nccl_group {
-            let eligible = partials.len() > 1
-                && partials
+        if let Some(group) = &self.group {
+            let eligible = shards.len() > 1
+                && shards
                     .iter()
                     .all(|t| matches!(t.device(), Device::Cuda(_)) && t.dtype() == DType::F32);
             if eligible {
-                return group.all_reduce_sum(&partials, reduce_device);
+                return group.all_reduce_sum(shards, reduce_device);
             }
         }
-        self.cpu_staged_sum(partials, reduce_device)
+        SumReducer.all_reduce(shards, reduce_device)
     }
-
-    /// Pre-existing manual sum across devices: moves each partial onto
-    /// `reduce_device` and accumulates. Used as-is when no NCCL group is
-    /// attached, when fewer than 2 CUDA devices participate, or on
-    /// `Device::Cpu` — unchanged from the original implementation.
-    fn cpu_staged_sum(
-        &self,
-        partials: Vec<Tensor>,
-        reduce_device: &Device,
-    ) -> CandleResult<Tensor> {
-        let mut acc: Option<Tensor> = None;
-        for partial in partials {
-            let partial = partial.to_device(reduce_device)?;
-            acc = Some(match acc {
-                Some(prev) => (prev + partial)?,
-                None => partial,
-            });
-        }
-        acc.ok_or_else(|| {
-            candle_core::Error::Msg("row-parallel forward requires at least one shard".into())
-        })
-    }
-}
-
-/// Splits a `[batch, features]` tensor into `devices.len()` equal column
-/// slices, one per device, for handoff from a `ColumnParallelLinear`'s
-/// gathered output into a following `RowParallelLinear`. `features` must be
-/// evenly divisible by `devices.len()`, matching the shard width
-/// `RowParallelLinear::shard` requires; an uneven split would silently drop
-/// the remainder activation features.
-pub(crate) fn split_for_row_parallel(x: &Tensor, devices: &[Device]) -> CandleResult<Vec<Tensor>> {
-    let n = devices.len();
-    let features = x.dim(1)?;
-    if features % n != 0 {
-        candle_core::bail!(
-            "split-for-row-parallel requires features ({features}) to be evenly divisible by the device count ({n})"
-        );
-    }
-    let shard_size = features / n;
-    let mut parts = Vec::with_capacity(n);
-    for (i, device) in devices.iter().enumerate() {
-        parts.push(x.narrow(1, i * shard_size, shard_size)?.to_device(device)?);
-    }
-    Ok(parts)
 }
 
 // ---------------------------------------------------------------------------
@@ -1471,11 +1338,12 @@ mod tests {
         let devices = vec![device.clone(), device1];
         let group = NcclShardGroup::try_new(&devices)
             .expect("NCCL communicator init should succeed with a CUDA device available");
-        let gpu_sharded = RowParallelLinear::shard(&w, &devices)
-            .unwrap()
-            .with_nccl_group(Some(std::sync::Arc::new(group)));
+        let gpu_sharded = RowParallelLinear::shard(&w, &devices).unwrap();
+        let reducer = NcclReducer::new(Some(std::sync::Arc::new(group)));
         let gpu_x_shards = split_for_row_parallel(&x, &devices).unwrap();
-        let reduced = gpu_sharded.forward(&gpu_x_shards, &device).unwrap();
+        let reduced = gpu_sharded
+            .forward_with_reducer(&gpu_x_shards, &device, &reducer)
+            .unwrap();
 
         let reference: Vec<f32> = reference.flatten_all().unwrap().to_vec1().unwrap();
         let reduced: Vec<f32> = reduced

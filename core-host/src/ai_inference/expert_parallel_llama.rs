@@ -33,7 +33,8 @@ use candle_transformers::models::with_tracing::{
 };
 
 use super::parallel::{detect_expert_count, ExpertParallelMlp, ExpertPlacementPlan};
-use super::tensor_parallel_llama::{ReplicatedAttention, TensorParallelCache, TensorParallelMlp};
+use super::tensor_parallel_llama::{TensorParallelCache, TensorParallelMlp};
+use candle_transformers::models::llama::{Block, BlockMlp};
 
 /// A transformer block's MLP: either dense or MoE, selected per-layer at load
 /// time from the checkpoint's own tensor names. The dense variant reuses
@@ -45,7 +46,7 @@ enum ExpertOrDenseBlock {
     Moe(ExpertParallelMlp),
 }
 
-impl ExpertOrDenseBlock {
+impl BlockMlp for ExpertOrDenseBlock {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         match self {
             Self::Dense(mlp) => mlp.forward(x),
@@ -65,72 +66,12 @@ impl ExpertOrDenseBlock {
     }
 }
 
-/// A single expert-parallel transformer block: dense, replicated attention
-/// (unchanged from `TensorParallelBlock`) followed by either a dense or an
-/// MoE MLP.
-struct ExpertParallelBlock {
-    rms_1: RmsNorm,
-    attn: ReplicatedAttention,
-    rms_2: RmsNorm,
-    mlp: ExpertOrDenseBlock,
-}
-
-impl ExpertParallelBlock {
-    fn load(
-        vb: VarBuilder,
-        cfg: &Config,
-        expert_count: Option<usize>,
-        plan: &ExpertPlacementPlan,
-        devices: &[Device],
-    ) -> CandleResult<Self> {
-        let attn = ReplicatedAttention::load(vb.pp("self_attn"), cfg)?;
-        let rms_1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
-        let rms_2 = RmsNorm::new(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            vb.pp("post_attention_layernorm"),
-        )?;
-        let mlp = match expert_count {
-            Some(num_experts) => ExpertOrDenseBlock::Moe(ExpertParallelMlp::load(
-                vb.pp("block_sparse_moe"),
-                cfg.hidden_size,
-                cfg.intermediate_size,
-                num_experts,
-                plan,
-                devices,
-            )?),
-            None => ExpertOrDenseBlock::Dense(TensorParallelMlp::load(vb.pp("mlp"), cfg, devices)?),
-        };
-        Ok(Self {
-            rms_1,
-            attn,
-            rms_2,
-            mlp,
-        })
-    }
-
-    fn forward(
-        &self,
-        x: &Tensor,
-        index_pos: usize,
-        block_idx: usize,
-        cache: &mut TensorParallelCache,
-    ) -> CandleResult<Tensor> {
-        let residual = x;
-        let h = self.rms_1.forward(x)?;
-        let h = (self.attn.forward(&h, index_pos, block_idx, cache)? + residual)?;
-        let residual = &h;
-        let mlp_out = self.mlp.forward(&self.rms_2.forward(&h)?)?;
-        mlp_out + residual
-    }
-}
-
 /// Expert-parallel Llama/Mixtral-style model: identical attention/embedding/
 /// LM-head math to [`super::tensor_parallel_llama::TensorParallelLlama`], with
 /// each layer's MLP independently dense or MoE per [`detect_expert_count`].
 pub(crate) struct ExpertParallelLlama {
     wte: Embedding,
-    blocks: Vec<ExpertParallelBlock>,
+    blocks: Vec<Block>,
     ln_f: RmsNorm,
     lm_head: Linear,
 }
@@ -153,16 +94,33 @@ impl ExpertParallelLlama {
             linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
         let ln_f = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
+        // Upstream blocks throughout: attention, the norms and the residual
+        // structure are candle's, and only the feed-forward differs — which is
+        // the whole of what "expert parallel" means here. The per-layer choice
+        // between dense and MoE is made by the factory, layer by layer, which
+        // is exactly the granularity `detect_expert_count` reports at.
         let blocks = (0..cfg.num_hidden_layers)
             .map(|i| {
                 let expert_count = detect_expert_count(tensor_names.clone(), i);
-                ExpertParallelBlock::load(
-                    vb.pp(format!("model.layers.{i}")),
-                    cfg,
-                    expert_count,
-                    plan,
-                    devices,
-                )
+                let block_vb = vb.pp(format!("model.layers.{i}"));
+                let mlp: Box<dyn BlockMlp> = match expert_count {
+                    Some(num_experts) => {
+                        Box::new(ExpertOrDenseBlock::Moe(ExpertParallelMlp::load(
+                            block_vb.pp("block_sparse_moe"),
+                            cfg.hidden_size,
+                            cfg.intermediate_size,
+                            num_experts,
+                            plan,
+                            devices,
+                        )?))
+                    }
+                    None => Box::new(ExpertOrDenseBlock::Dense(TensorParallelMlp::load(
+                        block_vb.pp("mlp"),
+                        cfg,
+                        devices,
+                    )?)),
+                };
+                Block::load_with_block_mlp(block_vb, cfg, i, mlp)
             })
             .collect::<CandleResult<Vec<_>>>()?;
         Ok(Self {
@@ -182,7 +140,7 @@ impl ExpertParallelLlama {
         let (_b_sz, seq_len) = x.dims2()?;
         let mut x = self.wte.forward(x)?;
         for (block_idx, block) in self.blocks.iter().enumerate() {
-            x = block.forward(&x, index_pos, block_idx, cache)?;
+            x = block.forward(&x, index_pos, block_idx, cache, None)?;
         }
         let x = self.ln_f.forward(&x)?;
         let x = x.i((.., seq_len - 1, ..))?.contiguous()?;

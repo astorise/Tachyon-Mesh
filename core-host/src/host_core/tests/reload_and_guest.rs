@@ -307,18 +307,19 @@ fn execute_guest_returns_component_response_payload() {
     )
     .expect("guest execution should succeed");
 
-    assert_eq!(
-        response,
-        GuestExecutionOutcome {
-            output: GuestExecutionOutput::Http(GuestHttpResponse::new(
-                StatusCode::OK,
-                Bytes::from(expected_guest_example_body(
+    assert_eq!(response.fuel_consumed, None);
+    match response.output {
+        GuestExecutionOutput::Http(http) => {
+            assert_eq!(http.status, StatusCode::OK);
+            assert_eq!(
+                http.body.as_buffered(),
+                Some(&Bytes::from(expected_guest_example_body(
                     "FaaS received: Hello Lean FaaS!"
-                )),
-            )),
-            fuel_consumed: None,
+                )))
+            );
         }
-    );
+        other => panic!("expected Http output, got {other:?}"),
+    }
 }
 
 #[test]
@@ -335,13 +336,13 @@ fn execute_guest_falls_back_to_legacy_stdout_for_non_component_module() {
     )
     .expect("legacy guest execution should succeed");
 
-    assert_eq!(
-        response,
-        GuestExecutionOutcome {
-            output: GuestExecutionOutput::LegacyStdout(Bytes::from("legacy guest stdout\n")),
-            fuel_consumed: None,
+    assert_eq!(response.fuel_consumed, None);
+    match response.output {
+        GuestExecutionOutput::LegacyStdout(stdout) => {
+            assert_eq!(stdout, Bytes::from("legacy guest stdout\n"));
         }
-    );
+        other => panic!("expected LegacyStdout output, got {other:?}"),
+    }
 }
 
 #[test]
@@ -362,13 +363,13 @@ fn execute_legacy_guest_reads_stdin_for_tcp_echo_module() {
     )
     .expect("legacy guest execution should succeed");
 
-    assert_eq!(
-        response,
-        GuestExecutionOutcome {
-            output: GuestExecutionOutput::LegacyStdout(Bytes::from_static(b"ping over tcp")),
-            fuel_consumed: None,
+    assert_eq!(response.fuel_consumed, None);
+    match response.output {
+        GuestExecutionOutput::LegacyStdout(stdout) => {
+            assert_eq!(stdout, Bytes::from_static(b"ping over tcp"));
         }
-    );
+        other => panic!("expected LegacyStdout output, got {other:?}"),
+    }
 }
 
 #[cfg(feature = "ai-inference")]
@@ -439,13 +440,14 @@ fn execute_guest_persists_volume_data_for_component_guest() {
     )
     .expect("volume guest should write successfully");
 
-    assert_eq!(
-        save_response,
-        GuestExecutionOutcome {
-            output: GuestExecutionOutput::Http(GuestHttpResponse::new(StatusCode::OK, "Saved",)),
-            fuel_consumed: None,
+    assert_eq!(save_response.fuel_consumed, None);
+    match save_response.output {
+        GuestExecutionOutput::Http(http) => {
+            assert_eq!(http.status, StatusCode::OK);
+            assert_eq!(http.body.as_buffered(), Some(&Bytes::from("Saved")));
         }
-    );
+        other => panic!("expected Http output, got {other:?}"),
+    }
 
     let read_response = execute_guest(
         &engine,
@@ -456,16 +458,17 @@ fn execute_guest_persists_volume_data_for_component_guest() {
     )
     .expect("volume guest should read successfully");
 
-    assert_eq!(
-        read_response,
-        GuestExecutionOutcome {
-            output: GuestExecutionOutput::Http(GuestHttpResponse::new(
-                StatusCode::OK,
-                "Hello Stateful World",
-            )),
-            fuel_consumed: None,
+    assert_eq!(read_response.fuel_consumed, None);
+    match read_response.output {
+        GuestExecutionOutput::Http(http) => {
+            assert_eq!(http.status, StatusCode::OK);
+            assert_eq!(
+                http.body.as_buffered(),
+                Some(&Bytes::from("Hello Stateful World"))
+            );
         }
-    );
+        other => panic!("expected Http output, got {other:?}"),
+    }
     assert_eq!(
         fs::read_to_string(volume_dir.join("state.txt")).expect("host volume file should exist"),
         "Hello Stateful World"
@@ -483,6 +486,14 @@ fn execute_guest_persists_volume_data_for_component_guest() {
 #[cfg(feature = "ai-inference")]
 #[tokio::test]
 async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
+    // Every host-side way this can fail — a linker mismatch, a component that
+    // will not instantiate, a trap — answers 500 with no headers and no body,
+    // and says why only through `tracing`. Without a subscriber the assertion
+    // below reports the bare status and nothing that explains it.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_test_writer()
+        .try_init();
     let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
     route.models = vec![IntegrityModelBinding {
         alias: "llama3".to_owned(),
@@ -512,7 +523,16 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
 
     let messages = serde_json::json!([{"role": "user", "content": "ping"}]);
 
-    // Helper: run execute_streaming_guest, return (status, headers, body_string).
+    // Helper: run execute_streaming_guest, return (worker, headers, body chunks).
+    //
+    // The worker handle is returned rather than detached, and every call site
+    // joins it once its stream is drained. Draining to EOF only proves the
+    // sender was dropped — the worker is still inside `execute_streaming_guest`
+    // for a moment after that, tearing down a wasmtime store. A detached worker
+    // therefore outlives the test, and under a one-process-per-test runner the
+    // process starts exiting while a guest instance is still being torn down on
+    // another thread. That is the standing explanation for this test reporting
+    // itself as passed and then killing its run process with SIGABRT.
     let run_streaming = |body_json: serde_json::Value, seed: u8| {
         let route_c = route.clone();
         let engine_c = engine.clone();
@@ -524,7 +544,7 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
         );
         let (htx, hrx) = tokio::sync::oneshot::channel::<(StatusCode, GuestHttpFields)>();
         let (ctx, crx) = tokio::sync::mpsc::channel::<Bytes>(64);
-        std::thread::spawn(move || {
+        let worker = std::thread::spawn(move || {
             execute_streaming_guest(
                 &engine_c,
                 &route_c,
@@ -536,14 +556,14 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
                 &test_guest_execution_context(config_c, seed),
             );
         });
-        (hrx, crx)
+        (worker, hrx, crx)
     };
 
     // ── Buffered reference: no `stream` field → fallback path sends JSON body ──
     // The streaming execution path is used for both calls; the buffered case
     // uses the channel-based fallback (guest returns normally without calling
     // get-streaming-response).
-    let (hrx_ref, mut crx_ref) = run_streaming(
+    let (ref_worker, hrx_ref, mut crx_ref) = run_streaming(
         serde_json::json!({"model": "llama3", "messages": messages}),
         91,
     );
@@ -552,6 +572,9 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     while let Some(chunk) = crx_ref.recv().await {
         ref_body_bytes.extend_from_slice(&chunk);
     }
+    ref_worker
+        .join()
+        .expect("the buffered worker should finish");
     assert_eq!(
         ref_status,
         StatusCode::OK,
@@ -589,7 +612,7 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     );
 
     // ── Streaming call: stream: true → SSE path ──────────────────────────
-    let (hrx_s, mut crx_s) = run_streaming(
+    let (stream_worker, hrx_s, mut crx_s) = run_streaming(
         serde_json::json!({"model": "llama3", "messages": messages, "stream": true}),
         92,
     );
@@ -608,6 +631,9 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     while let Some(chunk) = crx_s.recv().await {
         sse_body.push_str(&String::from_utf8_lossy(&chunk));
     }
+    stream_worker
+        .join()
+        .expect("the streaming worker should finish");
 
     assert!(
         sse_body.contains("data: [DONE]"),
@@ -644,7 +670,7 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     }
 
     // ── With it: one trailing chunk, no choices, real counts ─────────────
-    let (hrx_u, mut crx_u) = run_streaming(
+    let (usage_worker, hrx_u, mut crx_u) = run_streaming(
         serde_json::json!({
             "model": "llama3",
             "messages": messages,
@@ -659,6 +685,9 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     while let Some(chunk) = crx_u.recv().await {
         usage_body.push_str(&String::from_utf8_lossy(&chunk));
     }
+    usage_worker
+        .join()
+        .expect("the usage-stream worker should finish");
 
     let frames = sse_data_frames(&usage_body);
     let carrying_usage: Vec<&Value> = frames

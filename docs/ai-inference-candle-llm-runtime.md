@@ -117,8 +117,9 @@ decode matches now, not that a future token cannot rewrite text before the
 anchor, which a decoder applying a regex replacement can do. Unbounded decoders
 degrade to whole-sequence decoding rather than corrupting output.
 
-This runtime shipped that implementation first and then upstreamed it, so what
-remains here is the seam: `IncrementalDecoder::from_tokenizer(&self.tokenizer)`
+This runtime shipped that implementation first and then upstreamed it (candle
+PR #3789, merged into the fork, still under review upstream), so what remains
+here is the seam: `IncrementalDecoder::from_tokenizer(&self.tokenizer)`
 in each of the three generation loops, `push(token)` per step, and `text()` —
 which is always equal to a whole-sequence decode — fed to the stop-sequence scan
 and the delta emitter. Emission accounting stays local because the loops hold
@@ -142,6 +143,39 @@ Stop-sequence scanning is deliberately left as a full-text search per step: it
 is also O(n²), but it is a `memchr`-backed substring search over bytes, orders of
 magnitude cheaper per byte than tokenizer work, and keeping it whole-text avoids
 any question about missing an earlier match.
+
+## Stop Criteria and the Finish Reason
+
+The scan itself, the held-back tail that keeps a stop sequence split across two
+tokens matchable, and the rule for naming why generation ended, all come from
+`candle_transformers::generation::{StopCriteria, FinishReason}` — upstreamed for
+the same reason as the decoder, and adopted here the same way.
+
+Four decode loops had grown a copy of that logic: the ordinary one, the
+speculative one, the continuous-batch one, and Qwen 3.5's. A review pass found
+the same class of defect in every one of them, and differently in each — which
+is the signature of logic that should exist once. Two are worth naming, because
+they are what the shared version prevents:
+
+- **The finish reason inferred from the token count alone.** `completion_tokens
+  >= max_new_tokens` means `length` — except exactly at the boundary, where an
+  answer whose EOS or stop sequence lands on the budget's last token has both
+  spent its budget and ended normally. `StopCriteria::finish_reason` takes the
+  token, the text and whether the budget is spent, and gives a
+  model-controlled ending precedence over the count.
+- **Qwen 3.5 held nothing back.** It emitted up to `text.len()` on every step,
+  so a stop sequence straddling two tokens had its first half streamed before
+  the match was ever found — bytes the buffered response does not contain.
+  `safe_emit_end` withholds `hold()` bytes, one short of the longest stop
+  sequence, which is conservative by construction: any prefix of a stop
+  sequence necessarily lies inside them.
+
+`FinishReason::Stop` is deliberately *not* named on the wire. `guest-openai`
+resolves an absent reason to `stop`, so reporting it would say the same thing
+twice; only `length` has to be named, because that is the case an absent reason
+would misreport as a clean finish. A loop that ended for a reason outside the
+criteria — the wall-clock deadline, a departed consumer — records nothing and
+falls back to the count, exactly as before.
 
 ## Mock and Unsupported Bindings
 
@@ -502,20 +536,16 @@ something to send. A sink also answers `is_live()` — backed by a flag the
 per SSE frame, so a stream of role-only openings, usage frames or keep-alives
 cannot run to completion for a client that has already left.
 
-That still left one window, and closing it is why this backend no longer uses
-`reqwest::blocking`. A frame-by-frame probe cannot help before the *first*
-frame: a client leaving while the upstream is still thinking was noticed only
-once a frame arrived, and until then the request held its admission permit —
-for up to the binding's whole `timeout_ms`, of which the node has 32 to give.
-The blocking client has no per-read deadline (`read_timeout` exists only on the
-async builder), so there was no way to wake the read periodically.
-
-So the backend owns a current-thread tokio runtime and drives the async client
-through it. The buffered and embedding paths simply `block_on`, exactly as the
-blocking wrapper did internally, and share one connection pool. The streaming
-path gets what it actually needed: each poll of the socket is wrapped in a
-`LIVENESS_POLL_INTERVAL` (500 ms) timeout, and when that elapses the loop asks
-the sink whether anyone is still listening before going back to waiting.
+A frame-by-frame probe still cannot help before the *first* frame, and that is
+the window `SseLineReader` closes. `BufRead::read_line` is uninterruptible and
+`reqwest::blocking` exposes no per-read deadline, so a client leaving while the
+upstream was still thinking went unnoticed until a frame arrived — for up to the
+binding's whole `timeout_ms`, holding one of the node's few admission permits
+throughout. The blocking read therefore moves to a dedicated
+`tachyon-upstream-sse` thread, which hands lines back over a depth-one channel,
+and the request thread polls that channel with a `SSE_LIVENESS_POLL` (250 ms)
+timeout. When the poll elapses it asks the sink whether anyone is still
+listening and goes back to waiting if so.
 
 The interval is emphatically **not** a deadline. Exceeding it is the normal case
 for a model still generating its first token, and only the binding's `timeout_ms`
@@ -524,18 +554,15 @@ several intervals, because getting this wrong would cut off every slow
 generation. What the interval buys is that an *abandoned* request releases its
 permit within a poll or two instead of holding it for the timeout.
 
-`BufRead::read_line` had to go with the blocking client, since the whole point
-is that a quiet socket must hand control back. `SseReader` frames lines over
-`Response::chunk()` and keeps both size caps the old reader enforced, for the
-same reasons: `MAX_SSE_FRAME_BYTES` bounds one line, because a stream that never
-sends a newline would otherwise grow the buffer without limit, and
-`MAX_STREAM_BYTES` bounds the whole response, because a stream that never ends
-would otherwise run forever.
-
-One invariant is now stated where it is relied upon rather than assumed:
-`block_on` cannot be re-entrant, so this backend must never run inside a tokio
-worker. It does not — inference executes on the scheduler's dedicated OS thread
-— and that was already the requirement `reqwest::blocking` imposed.
+The reader thread normally ends when the request thread drops the receiver: its
+next send fails, the response is dropped, the socket closes. Normally, and not
+always — that send only happens once a line has been *read*, so a reader parked
+on a silent upstream cannot observe the closed channel at all, and wakes only
+when the upstream finally speaks or the request timeout fires. `SseReaderSlot`
+is what keeps those parked readers accounted for: a ceiling of twice the
+admitted upstream concurrency, so a client connecting and disconnecting in a
+loop against a silent upstream meets a refusal rather than growing a thread and
+a socket per attempt.
 
 One consequence is worth stating because it is easy to get wrong: with nothing
 enqueued on the `Network` lane, its scheduler queue depth would be permanently
@@ -650,10 +677,17 @@ streams unconditionally.
 
 ### Versioning the accelerator interface
 
-The interface is `tachyon:accelerator@2.0.0`. The bump is **major** rather than
-minor because `compute`, `embed`, `compute-stream` and `token-stream.next` all
-changed shape — their error type became `generation-error`, and `next` yields a
-`stream-event` instead of a string.
+The interface is `tachyon:accelerator@3.0.0`. 3.0.0 adds a `refusal` case to
+`stream-event`, and a new variant case is breaking in the host→guest direction:
+a component built against the smaller variant has no arm to decode it into. The
+gap it closes is that `generation.refusal` had no streaming counterpart, so a
+provider's safety refusal on a `stream: true` request was dropped and the stream
+completed as an empty assistant message with an ordinary finish.
+
+2.0.0 was likewise **major** rather than minor, because `compute`, `embed`,
+`compute-stream` and `token-stream.next` all changed shape — their error type
+became `generation-error`, and `next` yields a `stream-event` instead of a
+string.
 
 That distinction is load-bearing, not bookkeeping. Wasmtime resolves a component
 import by semver-*compatible* name, so a component built against 1.1.0 would
@@ -867,11 +901,11 @@ Model bindings can opt in with:
 
 The pinned `astorise/candle` fork carries an additive `use_flashinfer_attention`
 seam on `candle_transformers::models::llama::Config` (mirroring the existing
-`use_flash_attn` flag), wired to the optional `candle-flashinfer-kernels`
-crate's `flashinfer_decode_attention`.
+`use_flash_attn` flag), wired to the `candle-flashinfer-kernels` crate's
+`flashinfer_decode_attention`. The crate comes in with `ai-inference` and
+builds without CUDA; `candle-cuda` is what gives it a device.
 
-A Llama model binding on a CUDA device with the `candle-flashinfer` Cargo
-feature compiled in can opt in with:
+A Llama model binding on a CUDA device can opt in with:
 
 ```json
 {
@@ -891,8 +925,8 @@ block-size or head-dim alignment requirement. `flashinfer_attention` cannot be
 combined with `paged_attention` in the same deployment (they select different
 decode-attention kernels over different KV cache layouts) — that combination
 is rejected with a typed error rather than silently picking one. Every other
-combination (non-Llama architecture, non-CUDA device, or a build without
-`candle-flashinfer` compiled in) keeps the existing typed rejection. See
+combination (non-Llama architecture, non-Safetensors format, or non-CUDA
+device) keeps the existing typed rejection. See
 `openspec/changes/wire-flashinfer-decode-attention`.
 
 ## CUDA Graph Decode Status

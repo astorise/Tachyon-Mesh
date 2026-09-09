@@ -117,6 +117,9 @@ impl ComponentHostState {
                 }
             }
         };
+        // Computed before the struct literal, which moves `runtime_config`.
+        #[cfg(feature = "ai-inference")]
+        let listable = listable_model_aliases(route, &runtime_config);
         Ok(Self {
             ctx: build_component_wasi_ctx(route, host_identity.as_ref(), s3_preps)?,
             table: ResourceTable::new(),
@@ -148,6 +151,8 @@ impl ComponentHostState {
                 .iter()
                 .map(|binding| binding.alias.clone())
                 .collect(),
+            #[cfg(feature = "ai-inference")]
+            listable_model_aliases: listable,
             #[cfg(feature = "ai-inference")]
             adapter_id: route.adapter_id.clone(),
             #[cfg(feature = "ai-inference")]
@@ -428,6 +433,12 @@ impl ComponentHostState {
         // already reports a departed consumer, but only when there is something
         // to send; this is the same answer available *between* sends, which is
         // what a backend needs while it is waiting on a slow upstream.
+        //
+        // Adopted from the HTTP response body when the guest is running on the
+        // streaming route, so a client that hangs up while the guest is parked
+        // inside `next()` is observed too. Nothing on the guest path can report
+        // that: the `token-stream` drop needs the guest to get control back
+        // first, and it does not until a frame arrives.
         let consumer_alive = self
             .streaming_consumer_alive
             .as_ref()
@@ -436,6 +447,8 @@ impl ComponentHostState {
         let generation_alive = Arc::clone(&consumer_alive);
         let budget = Arc::new(StreamQueueBudget::default());
         let generation_budget = Arc::clone(&budget);
+        let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let generation_stalled = Arc::clone(&stalled);
         std::thread::Builder::new()
             .name("tachyon-stream-gen".to_owned())
             .spawn(move || {
@@ -450,6 +463,8 @@ impl ComponentHostState {
                     sender: &sender,
                     consumer_alive: &generation_alive,
                     budget: &generation_budget,
+                    stalled: &generation_stalled,
+                    reported_stall: false,
                 };
                 match ai_runtime.stream_component_prompt(
                     &alias,
@@ -483,6 +498,7 @@ impl ComponentHostState {
             outcome,
             consumer_alive,
             budget,
+            stalled,
         })
     }
 }
@@ -1805,9 +1821,32 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        res.core_store
-            .kv_partition_set(&res.table_name, &key, &value)
-            .map_err(|e| format!("{e:#}"))
+        crate::system_storage::apply_guest_registry_write(
+            &res.core_store,
+            &res.table_name,
+            &key,
+            Some(value),
+        )
+    }
+
+    fn delete(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            component_bindings::tachyon::mesh::kv_partition::Table,
+        >,
+        key: String,
+    ) -> std::result::Result<(), String> {
+        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
+        crate::system_storage::apply_guest_registry_write(
+            &res.core_store,
+            &res.table_name,
+            &key,
+            None,
+        )
     }
 
     fn compare_and_set(
@@ -1824,9 +1863,13 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        res.core_store
-            .kv_partition_compare_and_set(&res.table_name, &key, expected.as_deref(), &value)
-            .map_err(|e| format!("{e:#}"))
+        crate::system_storage::apply_guest_registry_compare_and_set(
+            &res.core_store,
+            &res.table_name,
+            &key,
+            expected,
+            value,
+        )
     }
 
     fn compare_and_delete(
@@ -1842,26 +1885,12 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        res.core_store
-            .kv_partition_compare_and_delete(&res.table_name, &key, &expected)
-            .map_err(|e| format!("{e:#}"))
-    }
-
-    fn delete(
-        &mut self,
-        self_: wasmtime::component::Resource<
-            component_bindings::tachyon::mesh::kv_partition::Table,
-        >,
-        key: String,
-    ) -> std::result::Result<(), String> {
-        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
-        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
-        if let Some(ref denial) = res.scope_denial {
-            return Err(denial.clone());
-        }
-        res.core_store
-            .kv_partition_delete(&res.table_name, &key)
-            .map_err(|e| format!("{e:#}"))
+        crate::system_storage::apply_guest_registry_compare_and_delete(
+            &res.core_store,
+            &res.table_name,
+            &key,
+            expected,
+        )
     }
 
     fn batch_set(
@@ -1876,9 +1905,15 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        res.core_store
-            .kv_partition_batch_set(&res.table_name, &entries)
-            .map_err(|e| format!("{e:#}"))
+        // `batch_set` must not be the way around the ownership rule `set`
+        // enforces — a table this guarded cannot have a second door — and it
+        // must stay atomic, which is what this interface promises. Both hold
+        // only if the check happens inside the one transaction.
+        crate::system_storage::apply_guest_registry_batch(
+            &res.core_store,
+            &res.table_name,
+            &entries,
+        )
     }
 
     fn get_range(
@@ -1896,9 +1931,65 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        res.core_store
+        // The model registry is one table for the whole node, but a component
+        // may only see the aliases its own routes seal — and
+        // `load_accelerator_model` enforces exactly that for execution.
+        // Handing the full table back made `GET /ai/v1/models` advertise
+        // models belonging to other components, which a client can see,
+        // select, and then be refused for, with nothing in the listing to say
+        // why.
+        //
+        // `limit` and `offset` count *scoped* rows, which is the only sequence
+        // the caller can observe. Letting the store apply them first and
+        // filtering afterwards looked equivalent and was not: on a table past
+        // one page, a component whose aliases sort late received an empty list
+        // while its models sat registered and executable a page further in.
+        // The store's own reconciliation pages beyond 10 000 rows, so that size
+        // is reachable rather than theoretical.
+        #[cfg(feature = "ai-inference")]
+        if res.table_name == crate::system_storage::AI_MODELS_REGISTRY_TABLE {
+            /// Raw rows per store read while collecting a scoped page.
+            const SCAN_PAGE: u32 = 10_000;
+
+            let mut scoped = Vec::new();
+            let mut skipped = 0u32;
+            let mut scanned = 0u32;
+            loop {
+                let page = res
+                    .core_store
+                    .kv_partition_get_range(
+                        &res.table_name,
+                        &start_key,
+                        &end_key,
+                        SCAN_PAGE,
+                        scanned,
+                    )
+                    .map_err(|e| format!("{e:#}"))?;
+                let read = page.len() as u32;
+                for row in page {
+                    if !self.listable_model_aliases.contains(&row.0) {
+                        continue;
+                    }
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+                    scoped.push(row);
+                    if scoped.len() as u32 >= limit {
+                        return Ok(scoped);
+                    }
+                }
+                if read < SCAN_PAGE {
+                    return Ok(scoped);
+                }
+                scanned = scanned.saturating_add(read);
+            }
+        }
+        let rows = res
+            .core_store
             .kv_partition_get_range(&res.table_name, &start_key, &end_key, limit, offset)
-            .map_err(|e| format!("{e:#}"))
+            .map_err(|e| format!("{e:#}"))?;
+        Ok(rows)
     }
 
     fn drop(
@@ -1978,9 +2069,32 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        res.core_store
-            .kv_partition_set(&res.table_name, &key, &value)
-            .map_err(|e| format!("{e:#}"))
+        crate::system_storage::apply_guest_registry_write(
+            &res.core_store,
+            &res.table_name,
+            &key,
+            Some(value),
+        )
+    }
+
+    fn delete(
+        &mut self,
+        self_: wasmtime::component::Resource<
+            control_plane_component_bindings::tachyon::mesh::kv_partition::Table,
+        >,
+        key: String,
+    ) -> std::result::Result<(), String> {
+        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
+        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
+        if let Some(ref denial) = res.scope_denial {
+            return Err(denial.clone());
+        }
+        crate::system_storage::apply_guest_registry_write(
+            &res.core_store,
+            &res.table_name,
+            &key,
+            None,
+        )
     }
 
     fn compare_and_set(
@@ -1997,9 +2111,13 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        res.core_store
-            .kv_partition_compare_and_set(&res.table_name, &key, expected.as_deref(), &value)
-            .map_err(|e| format!("{e:#}"))
+        crate::system_storage::apply_guest_registry_compare_and_set(
+            &res.core_store,
+            &res.table_name,
+            &key,
+            expected,
+            value,
+        )
     }
 
     fn compare_and_delete(
@@ -2015,26 +2133,12 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        res.core_store
-            .kv_partition_compare_and_delete(&res.table_name, &key, &expected)
-            .map_err(|e| format!("{e:#}"))
-    }
-
-    fn delete(
-        &mut self,
-        self_: wasmtime::component::Resource<
-            control_plane_component_bindings::tachyon::mesh::kv_partition::Table,
-        >,
-        key: String,
-    ) -> std::result::Result<(), String> {
-        let handle = wasmtime::component::Resource::<RedbTableResource>::new_borrow(self_.rep());
-        let res = self.table.get(&handle).map_err(|e| format!("{e:#}"))?;
-        if let Some(ref denial) = res.scope_denial {
-            return Err(denial.clone());
-        }
-        res.core_store
-            .kv_partition_delete(&res.table_name, &key)
-            .map_err(|e| format!("{e:#}"))
+        crate::system_storage::apply_guest_registry_compare_and_delete(
+            &res.core_store,
+            &res.table_name,
+            &key,
+            expected,
+        )
     }
 
     fn batch_set(
@@ -2049,9 +2153,15 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        res.core_store
-            .kv_partition_batch_set(&res.table_name, &entries)
-            .map_err(|e| format!("{e:#}"))
+        // `batch_set` must not be the way around the ownership rule `set`
+        // enforces — a table this guarded cannot have a second door — and it
+        // must stay atomic, which is what this interface promises. Both hold
+        // only if the check happens inside the one transaction.
+        crate::system_storage::apply_guest_registry_batch(
+            &res.core_store,
+            &res.table_name,
+            &entries,
+        )
     }
 
     fn get_range(
@@ -2106,7 +2216,7 @@ fn wit_generation_error(error: ai_inference::GenerationError) -> WitGenerationEr
     WitGenerationError {
         message: error.message,
         upstream_status: error.upstream_status,
-        class: error.class,
+        invalid_request: error.invalid_request,
     }
 }
 
@@ -2128,6 +2238,80 @@ fn wit_tool_call(
 /// build a backlog the client has not asked for, which is the memory this bound
 /// exists to cap.
 #[cfg(feature = "ai-inference")]
+/// Narrow a table read to the aliases the reading route may execute.
+///
+/// The model registry is one table for the whole node, but a route may only
+/// execute the aliases its own manifest entry seals — which is what
+/// `load_accelerator_model` enforces. Handing back the full table made
+/// `GET /ai/v1/models` advertise models belonging to other routes: a client
+/// could see one, select it, and be refused, with nothing in the listing to
+/// say why. Reading through the same set the execution check uses keeps the
+/// two answers consistent.
+///
+/// Every other table is returned untouched; this rule is about the registry,
+/// not about tables in general.
+///
+/// The caller's `limit` bounds the rows *read*, not the rows returned, as it
+/// does for any filtered view. The listing asks for one large page, so it
+/// costs nothing there.
+/// The registry aliases a route's component may read.
+///
+/// Sealing the *read* with the route's own bindings was wrong for the shape
+/// the OpenAI surface actually takes: `/ai/v1/models` lists and seals nothing,
+/// `/ai/v1/chat/completions` executes and seals the models, and one component
+/// serves both. The listing route's set was therefore empty, and the filter
+/// removed every row — `GET /ai/v1/models` answered `{"data": []}` on a node
+/// with models loaded and answering, which is worse than the over-advertising
+/// the filter was written to stop.
+///
+/// The union is taken over routes sharing a *module* with this one, so the
+/// boundary is the component rather than the node: a second, unrelated guest on
+/// the same host still cannot read this one's aliases. Execution is unaffected —
+/// `load_accelerator_model` keeps checking the per-route set — so this widens
+/// what a component can see, never what it can run.
+///
+/// A route with no targets is named by `route.name`, matching how
+/// `select_stream_route_module` resolves a module for one.
+#[cfg(feature = "ai-inference")]
+fn listable_model_aliases(
+    route: &IntegrityRoute,
+    config: &IntegrityConfig,
+) -> std::collections::BTreeSet<String> {
+    let modules = |route: &IntegrityRoute| -> std::collections::BTreeSet<String> {
+        if route.targets.is_empty() {
+            return std::iter::once(route.name.clone()).collect();
+        }
+        route
+            .targets
+            .iter()
+            .map(|target| target.module.clone())
+            .collect()
+    };
+    let own = modules(route);
+    config
+        .routes
+        .iter()
+        .filter(|candidate| !modules(candidate).is_disjoint(&own))
+        .flat_map(|candidate| candidate.models.iter())
+        .map(|binding| binding.alias.clone())
+        .collect()
+}
+
+#[cfg(feature = "ai-inference")]
+fn scope_registry_rows_to_route(
+    table_name: &str,
+    rows: Vec<(String, Vec<u8>)>,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Vec<(String, Vec<u8>)> {
+    if table_name != crate::system_storage::AI_MODELS_REGISTRY_TABLE {
+        return rows;
+    }
+    rows.into_iter()
+        .filter(|(alias, _)| allowed.contains(alias))
+        .collect()
+}
+
+#[cfg(feature = "ai-inference")]
 const STREAM_CHANNEL_CAPACITY: usize = 64;
 
 /// Bytes of decoded output allowed to sit between the generation thread and the
@@ -2141,6 +2325,30 @@ const STREAM_CHANNEL_CAPACITY: usize = 64;
 /// flood of tiny deltas, this stops a handful of enormous ones.
 #[cfg(feature = "ai-inference")]
 const STREAM_QUEUE_BUDGET_BYTES: usize = 256 * 1024;
+
+/// How often a producer re-checks for a free channel slot while the consumer is
+/// behind. Short enough that a resuming client is served promptly, long enough
+/// that a stalled one costs almost nothing.
+#[cfg(feature = "ai-inference")]
+const STREAM_SLOT_POLL: Duration = Duration::from_millis(25);
+
+/// How long a producer waits for the consumer to drain before treating it as
+/// gone.
+///
+/// A client that disconnects wakes [`StreamBudget::consumer_gone`]; one that
+/// stays connected and simply stops reading wakes nothing. The guest then
+/// stops calling `token-stream.next`, and the producer used to wait on the
+/// condition variable forever — generation deadlines and upstream HTTP
+/// timeouts are only consulted by the backend *between* sink calls, so none of
+/// them can reach a thread parked inside one. The stream thread, the route
+/// permit, the model execution and any upstream admission permit stayed held
+/// with it.
+///
+/// Measured from the last drain rather than from the start of the stream, so a
+/// slow but progressing consumer is never cut off. Nothing draining for this
+/// long is a consumer in name only.
+#[cfg(feature = "ai-inference")]
+const STREAM_BACKPRESSURE_STALL_LIMIT: Duration = Duration::from_secs(120);
 
 /// The queued-bytes budget for one stream.
 ///
@@ -2159,6 +2367,15 @@ struct StreamQueueBudget {
 struct StreamQueueState {
     queued: usize,
     consumer_gone: bool,
+    /// Set when the consumer was declared gone by the *stall timeout* rather
+    /// than by actually going away.
+    ///
+    /// The producer's unwind is the same either way, which is why one flag used
+    /// to serve both. The client's outcome is not: a consumer that dropped is
+    /// nobody to report to, while one that merely stopped draining is still
+    /// connected, still reading, and — with no distinction here — was handed a
+    /// truncated answer under a clean `stop`.
+    stalled: bool,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -2168,12 +2385,19 @@ impl StreamQueueBudget {
     /// `false` means the consumer has gone and the caller should stop — the
     /// same answer a failed `send` gives, available while merely waiting.
     fn reserve(&self, len: usize) -> bool {
+        self.reserve_until(len, Instant::now() + STREAM_BACKPRESSURE_STALL_LIMIT)
+    }
+
+    /// [`Self::reserve`] with the stall deadline supplied, so a test can prove
+    /// the timeout path without sitting out the production limit.
+    fn reserve_until(&self, len: usize, deadline: Instant) -> bool {
         let mut state = match self.state.lock() {
             Ok(state) => state,
             // A poisoned lock means the peer panicked; treat it as a departed
             // consumer rather than panicking this thread too.
             Err(_) => return false,
         };
+        let mut remaining = deadline.saturating_duration_since(Instant::now());
         loop {
             if state.consumer_gone {
                 return false;
@@ -2185,10 +2409,21 @@ impl StreamQueueBudget {
                 state.queued += len;
                 return true;
             }
-            state = match self.drained.wait(state) {
-                Ok(state) => state,
+            let (next, timed_out) = match self.drained.wait_timeout(state, remaining) {
+                Ok((next, result)) => (next, result.timed_out()),
                 Err(_) => return false,
             };
+            state = next;
+            if timed_out {
+                // Unwound like a departed consumer — the producer's job is the
+                // same — but recorded as what it was, so the caller can tell a
+                // client that is still there why its answer stopped.
+                state.consumer_gone = true;
+                state.stalled = true;
+                self.drained.notify_all();
+                return false;
+            }
+            remaining = deadline.saturating_duration_since(Instant::now());
         }
     }
 
@@ -2196,6 +2431,25 @@ impl StreamQueueBudget {
     fn release(&self, len: usize) {
         if let Ok(mut state) = self.state.lock() {
             state.queued = state.queued.saturating_sub(len);
+        }
+        self.drained.notify_all();
+    }
+
+    /// Whether the consumer was declared gone by the stall timeout.
+    fn stalled(&self) -> bool {
+        self.state.lock().is_ok_and(|state| state.stalled)
+    }
+
+    /// Declare a stall observed somewhere other than the byte budget.
+    ///
+    /// The channel's slot count is the other way a producer can be held: 64
+    /// slots fill long before 256 KiB of ordinary token fragments do, so a
+    /// blocking `send` parked without the byte budget ever being consulted.
+    /// Recording it here keeps one answer to "why did this stream stop".
+    fn consumer_stalled(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.consumer_gone = true;
+            state.stalled = true;
         }
         self.drained.notify_all();
     }
@@ -2221,6 +2475,11 @@ struct GuestStreamSink<'a> {
     >,
     consumer_alive: &'a Arc<std::sync::atomic::AtomicBool>,
     budget: &'a Arc<StreamQueueBudget>,
+    /// Set for the consumer's side, so a report that could not fit in the
+    /// channel is still there to be found at EOF.
+    stalled: &'a Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the stall has already been reported down the channel.
+    reported_stall: bool,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -2236,11 +2495,36 @@ impl ai_inference::StreamSink for GuestStreamSink<'_> {
         // the number of them.
         let charged = payload.queued_bytes();
         if !self.budget.reserve(charged) {
+            // A stall is not a departure. The receiver is still there, so it
+            // will see this error and the guest turns it into an SSE error
+            // frame; without it the channel simply closed and a client that had
+            // merely paused was handed a truncated answer under a clean `stop`,
+            // with nothing to distinguish it from a complete one.
+            //
+            if self.budget.stalled() {
+                self.report_stall();
+            }
             return ai_inference::StreamControl::Stop;
         }
-        match self.sender.send(Ok(payload)) {
-            Ok(()) => ai_inference::StreamControl::Continue,
-            Err(_) => {
+        // Timed, not blocking. The byte budget is only one of the two ways a
+        // producer can be held: the channel's 64 slots fill long before 256 KiB
+        // of ordinary token fragments do, so this used to park forever on the
+        // common case — holding the model, the route permit and the upstream
+        // admission permit — while the stall limit added just above never came
+        // near being consulted.
+        match Self::send_before(
+            self.sender,
+            Ok(payload),
+            Instant::now() + STREAM_BACKPRESSURE_STALL_LIMIT,
+        ) {
+            SlotSend::Sent => ai_inference::StreamControl::Continue,
+            SlotSend::Stalled => {
+                self.budget.release(charged);
+                self.budget.consumer_stalled();
+                self.report_stall();
+                ai_inference::StreamControl::Stop
+            }
+            SlotSend::Disconnected => {
                 // Nothing was queued, so the reservation must not outlive the
                 // failure — otherwise a later send would wait on bytes that
                 // will never be drained.
@@ -2254,6 +2538,78 @@ impl ai_inference::StreamSink for GuestStreamSink<'_> {
         self.consumer_alive
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+#[cfg(feature = "ai-inference")]
+impl GuestStreamSink<'_> {
+    /// Tell a client that is still there why its stream stopped.
+    ///
+    /// Timed rather than blocking, and for the same reason the event send is:
+    /// the channel may be exactly what filled. A slot frees the moment the
+    /// client resumes reading, which is precisely when there is somebody to
+    /// tell; if it never resumes, the send times out or disconnects and there
+    /// was nobody to tell anyway.
+    ///
+    /// Sent once. After the first stall every later `reserve` refuses
+    /// immediately, and repeating the error would only fill the channel the
+    /// client is trying to drain.
+    fn report_stall(&mut self) {
+        if std::mem::replace(&mut self.reported_stall, true) {
+            return;
+        }
+        // Recorded before the send is attempted, because the send is the part
+        // that can fail: the channel being full is often exactly what stalled
+        // the stream. `next` reads this at EOF, where a slot is guaranteed.
+        self.stalled
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = Self::send_before(
+            self.sender,
+            Err(ai_inference::GenerationError::local(
+                "the client stopped reading this stream for longer than the backpressure limit \
+                 allows, so generation was cancelled",
+            )),
+            Instant::now() + STREAM_BACKPRESSURE_STALL_LIMIT,
+        );
+    }
+
+    /// `SyncSender::send`, bounded by a deadline.
+    ///
+    /// std's `send_timeout` is still unstable for a `SyncSender`, and `try_send`
+    /// hands the payload back on a full channel, so the wait is spelled out:
+    /// poll for a slot until the deadline. Only ever entered when the channel
+    /// is already full — a consumer keeping up never sleeps here.
+    fn send_before(
+        sender: &std::sync::mpsc::SyncSender<
+            std::result::Result<StreamPayload, ai_inference::GenerationError>,
+        >,
+        mut payload: std::result::Result<StreamPayload, ai_inference::GenerationError>,
+        deadline: Instant,
+    ) -> SlotSend {
+        loop {
+            match sender.try_send(payload) {
+                Ok(()) => return SlotSend::Sent,
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    return SlotSend::Disconnected
+                }
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    if Instant::now() >= deadline {
+                        return SlotSend::Stalled;
+                    }
+                    payload = returned;
+                    std::thread::sleep(STREAM_SLOT_POLL);
+                }
+            }
+        }
+    }
+}
+
+/// How a bounded send ended.
+#[cfg(feature = "ai-inference")]
+enum SlotSend {
+    Sent,
+    /// The channel stayed full for the whole stall limit.
+    Stalled,
+    Disconnected,
 }
 
 /// One item the generation thread pushes down the stream channel. The owned
@@ -2289,6 +2645,7 @@ pub(crate) struct StreamedGeneration {
     outcome: Arc<Mutex<ai_inference::StreamOutcome>>,
     consumer_alive: Arc<std::sync::atomic::AtomicBool>,
     budget: Arc<StreamQueueBudget>,
+    stalled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[cfg(feature = "ai-inference")]
@@ -2303,6 +2660,16 @@ pub(crate) struct HostTokenStream {
     /// Cleared on drop, so a backend blocked between frames can see that this
     /// caller has gone without having to emit something first.
     consumer_alive: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the producer gave up on a stalled consumer and could not get
+    /// the error into the channel.
+    ///
+    /// The report is a bounded send, and the thing that filled the channel is
+    /// often the same thing that stalls it — so a client resuming after the
+    /// second timeout drained the queued fragments and then saw a plain EOF,
+    /// and the guest emitted a normal final chunk and `[DONE]` for a truncated
+    /// answer. `next` consults this at EOF and synthesizes the error there,
+    /// which is the one moment a slot is guaranteed.
+    stalled: Arc<std::sync::atomic::AtomicBool>,
     /// Whether `next` has reported the end of the stream to this caller.
     ///
     /// The generation thread can finish while fragments are still queued, so
@@ -2311,6 +2678,25 @@ pub(crate) struct HostTokenStream {
     /// still unread, stop reading, and truncate the response. Counts are
     /// withheld until the caller has actually observed EOF.
     saw_eof: bool,
+}
+
+/// Cancel the producer whenever this value goes away.
+///
+/// This lives in `Drop` rather than in the WIT `drop` hook because the hook
+/// only runs for a stream that was successfully *registered*. A
+/// `ResourceTable::push` that fails — a guest that has exhausted its resource
+/// table — drops this value on the error path instead, where the hook never
+/// fires: dropping the receiver alone makes the next `send` fail, but a
+/// generation thread already parked on the byte budget is asleep on a condvar
+/// that a closed channel does not wake, so it would hold its thread and its
+/// upstream admission permit until the request timed out.
+#[cfg(feature = "ai-inference")]
+impl Drop for HostTokenStream {
+    fn drop(&mut self) {
+        self.consumer_alive
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.budget.consumer_gone();
+    }
 }
 
 #[cfg(feature = "ai-inference")]
@@ -2343,7 +2729,6 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
         Ok(
             accelerator_component_bindings::tachyon::accelerator::cpu::Generation {
                 text: generation.text,
-                refusal: generation.refusal,
                 finish_reason: generation.finish_reason,
                 usage: generation.usage.map(|usage| {
                     accelerator_component_bindings::tachyon::accelerator::cpu::TokenUsage {
@@ -2351,6 +2736,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
                         completion_tokens: usage.completion_tokens,
                     }
                 }),
+                refusal: generation.refusal,
                 tool_calls: generation
                     .tool_calls
                     .into_iter()
@@ -2384,6 +2770,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
             outcome,
             consumer_alive,
             budget,
+            stalled,
         } = self
             .stream_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
             .map_err(wit_generation_error)?;
@@ -2394,6 +2781,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
                 outcome,
                 consumer_alive,
                 budget,
+                stalled,
                 saw_eof: false,
             })
             .map_err(|error| {
@@ -2451,6 +2839,19 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
             )),
             Ok(Err(error)) => Err(wit_generation_error(error)),
             Err(_) => {
+                // A stall whose error could not be enqueued surfaces here, at
+                // the one moment there is room for it. Without this the client
+                // drained the queued fragments, saw a plain EOF, and the guest
+                // finished a truncated answer with an ordinary `[DONE]`.
+                if stream
+                    .stalled
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
+                    return Err(wit_generation_error(ai_inference::GenerationError::local(
+                        "the client stopped reading this stream for longer than the backpressure \
+                         limit allows, so generation was cancelled",
+                    )));
+                }
                 stream.saw_eof = true;
                 Ok(None)
             }
@@ -2507,16 +2908,13 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
                     rep.rep(),
                 ))?;
         // Deleting the entry drops the receiver, which already makes the next
-        // `send` fail. This says the same thing to a backend that is *waiting*
-        // rather than sending — the case a slow upstream leaves it in, holding
-        // an admission permit for a client that has gone.
-        stream
-            .consumer_alive
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        // And wake a producer parked on the byte budget. Dropping the receiver
-        // unblocks a `send`, but a thread waiting for *room* is asleep on the
-        // condvar, where a closed channel is not a signal it can see.
-        stream.budget.consumer_gone();
+        // `send` fail, and `HostTokenStream::drop` says the same thing to a
+        // backend that is *waiting* rather than sending — clearing
+        // `consumer_alive` for one parked between frames, and waking one parked
+        // on the byte budget, where a closed channel is not a signal it can
+        // see. Both live in `Drop` so the failed-registration path gets them
+        // too.
+        drop(stream);
         Ok(())
     }
 }
@@ -3385,7 +3783,15 @@ impl ComponentHostState {
                 background_component_bindings::tachyon::mesh::outbound_http::Response {
                     status: response.status.as_u16(),
                     headers: response.headers,
-                    body: response.body.to_vec(),
+                    // The mesh-fetch path only ever produces buffered bodies:
+                    // a guest's `wasi:http` response handle is fed from
+                    // bytes, never a live stream.
+                    body: response
+                        .body
+                        .as_buffered()
+                        .cloned()
+                        .unwrap_or_default()
+                        .to_vec(),
                 },
             ),
             LocalMeshDispatchAttempt::Fallback(reason) => {
@@ -3745,8 +4151,177 @@ impl component_bindings::tachyon::mesh::response_body::HostStreamingResponse
 }
 
 #[cfg(all(test, feature = "ai-inference"))]
+mod registry_scope_tests {
+    use super::*;
+
+    /// The listing and the execution check must agree.
+    ///
+    /// A route may only run the aliases its manifest entry seals, and
+    /// `load_accelerator_model` refuses the rest. A listing built from the
+    /// whole node's registry therefore offered clients models they would be
+    /// refused for, with nothing in the row to say so.
+    #[test]
+    fn the_registry_view_shows_only_what_this_route_may_execute() {
+        let rows = || {
+            vec![
+                ("mine".to_owned(), b"{}".to_vec()),
+                ("someone-elses".to_owned(), b"{}".to_vec()),
+            ]
+        };
+        let allowed: std::collections::BTreeSet<String> = ["mine".to_owned()].into_iter().collect();
+
+        let scoped = scope_registry_rows_to_route(
+            crate::system_storage::AI_MODELS_REGISTRY_TABLE,
+            rows(),
+            &allowed,
+        );
+        assert_eq!(
+            scoped
+                .into_iter()
+                .map(|(alias, _)| alias)
+                .collect::<Vec<_>>(),
+            vec!["mine".to_owned()],
+            "another route's model must not be advertised by this one"
+        );
+
+        // An empty set filters everything. Which set gets passed matters more
+        // than this arithmetic does — see the test below: feeding it the
+        // *executing* set emptied the public listing outright.
+        let scoped = scope_registry_rows_to_route(
+            crate::system_storage::AI_MODELS_REGISTRY_TABLE,
+            rows(),
+            &std::collections::BTreeSet::new(),
+        );
+        assert!(scoped.is_empty());
+
+        // The rule is about the registry, not about tables in general.
+        let untouched = scope_registry_rows_to_route("some-other-table", rows(), &allowed);
+        assert_eq!(untouched.len(), 2, "an unrelated table is returned whole");
+    }
+
+    /// A listing route seals no bindings, and still has to list.
+    ///
+    /// `/ai/v1/models` lists while `/ai/v1/chat/completions` executes, and one
+    /// component serves both — the shape both shipped manifests use. Scoping
+    /// the read by the listing route's own (empty) bindings filtered every row,
+    /// so `GET /ai/v1/models` answered with an empty list on a node with models
+    /// loaded and answering.
+    #[test]
+    fn a_listing_route_sees_the_models_its_component_can_execute() {
+        let route = |name: &str, path: &str, module: &str, models: &[&str]| IntegrityRoute {
+            path: path.to_owned(),
+            name: name.to_owned(),
+            targets: vec![RouteTarget {
+                module: module.to_owned(),
+                weight: 100,
+                websocket: false,
+                match_header: None,
+                requires: Vec::new(),
+            }],
+            models: models
+                .iter()
+                .map(
+                    |alias| crate::host_core::domain_types::IntegrityModelBinding {
+                        alias: (*alias).to_owned(),
+                        path: String::new(),
+                        device: Default::default(),
+                        qos: Default::default(),
+                        dynamic: true,
+                        hardware_strategy: Default::default(),
+                    },
+                )
+                .collect(),
+            ..IntegrityRoute::default()
+        };
+        let listing = route("openai-models", "/ai/v1/models", "guest-openai", &[]);
+        let config = IntegrityConfig {
+            routes: vec![
+                listing.clone(),
+                route(
+                    "openai-chat",
+                    "/ai/v1/chat/completions",
+                    "guest-openai",
+                    &["coder"],
+                ),
+                // A different component's models stay invisible: the boundary
+                // is the component, not the node.
+                route("other", "/other", "guest-other", &["not-ours"]),
+            ],
+            ..IntegrityConfig::default()
+        };
+
+        assert_eq!(
+            listable_model_aliases(&listing, &config),
+            ["coder".to_owned()].into_iter().collect(),
+            "the listing route must see what its own component executes, and nothing further"
+        );
+        // Execution is untouched: the listing route still seals nothing, so
+        // `load_accelerator_model` refuses it every alias.
+        assert!(listing.models.is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "ai-inference"))]
 mod stream_budget_tests {
     use super::*;
+
+    /// A consumer that stops reading without disconnecting must not park the
+    /// producer forever.
+    ///
+    /// Disconnecting wakes `consumer_gone`; going quiet wakes nothing, and the
+    /// generation deadline and upstream timeouts are only consulted between
+    /// sink calls, so none of them can reach a thread parked inside one. The
+    /// stall limit is what makes that case terminate, and the producer reports
+    /// it exactly as it reports a departure — from its side the two are the
+    /// same situation.
+    #[test]
+    fn a_consumer_that_stops_draining_releases_the_producer_at_the_stall_limit() {
+        let budget = StreamQueueBudget::default();
+        assert!(
+            budget.reserve(STREAM_QUEUE_BUDGET_BYTES),
+            "the first event fits"
+        );
+
+        let started = Instant::now();
+        let admitted = budget.reserve_until(
+            STREAM_QUEUE_BUDGET_BYTES,
+            Instant::now() + Duration::from_millis(50),
+        );
+
+        assert!(
+            !admitted,
+            "a stalled consumer must refuse the reservation, not hold the producer"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait must end on its own deadline, not on the production limit"
+        );
+        assert!(
+            !budget.reserve(1),
+            "once the stall is called, later events take the same answer rather than \
+             re-waiting the whole limit each time"
+        );
+        // The producer unwinds the same way either time, but the *client*'s
+        // outcome differs: a receiver that dropped is nobody to report to,
+        // while one that merely paused is still connected and was being handed
+        // a truncated answer under a clean `stop`. The sink reads this flag to
+        // send an error down the channel instead.
+        assert!(
+            budget.stalled(),
+            "a timeout must be distinguishable from a departure"
+        );
+
+        let departed = StreamQueueBudget::default();
+        departed.consumer_gone();
+        assert!(
+            !departed.reserve(1),
+            "a departed consumer still refuses the reservation"
+        );
+        assert!(
+            !departed.stalled(),
+            "but it is not a stall, and must not be reported to a caller that has gone"
+        );
+    }
 
     #[test]
     fn the_budget_admits_until_it_is_spent_and_again_once_drained() {

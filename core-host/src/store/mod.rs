@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1203,77 +1203,6 @@ impl CoreStore {
             .context("kv_partition_set: failed to commit")
     }
 
-    pub(crate) fn kv_partition_compare_and_set(
-        &self,
-        table_name: &str,
-        key: &str,
-        expected: Option<&[u8]>,
-        value: &[u8],
-    ) -> Result<bool> {
-        let table_key = kv_partition_table_key(table_name);
-        let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
-        let write_txn = self
-            .db
-            .begin_write()
-            .context("kv_partition_compare_and_set: begin")?;
-        let changed = {
-            let mut table = write_txn
-                .open_table(table_def)
-                .context("kv_partition_compare_and_set: open")?;
-            let current = table
-                .get(key)
-                .context("kv_partition_compare_and_set: get")?
-                .map(|entry| entry.value().to_vec());
-            if current.as_deref() != expected {
-                false
-            } else {
-                table
-                    .insert(key, value)
-                    .context("kv_partition_compare_and_set: insert")?;
-                true
-            }
-        };
-        write_txn
-            .commit()
-            .context("kv_partition_compare_and_set: commit")?;
-        Ok(changed)
-    }
-
-    pub(crate) fn kv_partition_compare_and_delete(
-        &self,
-        table_name: &str,
-        key: &str,
-        expected: &[u8],
-    ) -> Result<bool> {
-        let table_key = kv_partition_table_key(table_name);
-        let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
-        let write_txn = self
-            .db
-            .begin_write()
-            .context("kv_partition_compare_and_delete: begin")?;
-        let changed = {
-            let mut table = write_txn
-                .open_table(table_def)
-                .context("kv_partition_compare_and_delete: open")?;
-            let current = table
-                .get(key)
-                .context("kv_partition_compare_and_delete: get")?
-                .map(|entry| entry.value().to_vec());
-            if current.as_deref() == Some(expected) {
-                table
-                    .remove(key)
-                    .context("kv_partition_compare_and_delete: remove")?;
-                true
-            } else {
-                false
-            }
-        };
-        write_txn
-            .commit()
-            .context("kv_partition_compare_and_delete: commit")?;
-        Ok(changed)
-    }
-
     /// Insert `value` only if `key` is absent, in a single write transaction.
     /// Returns whether the insert happened.
     ///
@@ -1386,6 +1315,55 @@ impl CoreStore {
     }
 
     #[allow(dead_code)] // reached via WIT host bindings (component_hosts.rs)
+    /// Apply a whole batch in one write transaction, with a per-key veto read
+    /// from inside it.
+    ///
+    /// `kv_partition_batch_set` cannot express "refuse the batch if a row is
+    /// already spoken for", and checking outside is both racy and *not atomic*:
+    /// a per-key loop commits every entry before the one it rejects, leaving a
+    /// half-applied batch — precisely what the `batch-set` contract promises
+    /// callers it will never do. A veto here aborts the transaction, so the
+    /// batch either lands whole or not at all.
+    #[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
+    pub(crate) fn kv_partition_batch_update<F>(
+        &self,
+        table_name: &str,
+        entries: &[(String, Vec<u8>)],
+        mut accept: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&str, Option<&[u8]>) -> std::result::Result<(), String>,
+    {
+        let table_key = kv_partition_table_key(table_name);
+        let table_def: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new(&table_key);
+        let write_txn = self
+            .db
+            .begin_write()
+            .context("kv_partition_batch_update: failed to begin write transaction")?;
+        {
+            let mut table = write_txn
+                .open_table(table_def)
+                .context("kv_partition_batch_update: failed to open table")?;
+            for (key, value) in entries {
+                let current = table
+                    .get(key.as_str())
+                    .context("kv_partition_batch_update: get failed")?
+                    .map(|value| value.value().to_vec());
+                if let Err(detail) = accept(key, current.as_deref()) {
+                    // Returning without committing drops the transaction, and
+                    // with it every insert already made inside it.
+                    return Err(anyhow!("{detail}"));
+                }
+                table
+                    .insert(key.as_str(), value.as_slice())
+                    .context("kv_partition_batch_update: insert failed")?;
+            }
+        }
+        write_txn
+            .commit()
+            .context("kv_partition_batch_update: failed to commit")
+    }
+
     pub(crate) fn kv_partition_batch_set(
         &self,
         table_name: &str,

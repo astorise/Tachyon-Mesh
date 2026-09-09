@@ -114,6 +114,7 @@ pub(crate) async fn enforce_distributed_rate_limit(
             None,
             false,
             None,
+            false,
         )),
     )
     .await;
@@ -146,7 +147,11 @@ pub(crate) fn distributed_rate_limit_decision(
         return None;
     }
 
-    let value = match serde_json::from_slice::<Value>(&response.body) {
+    let Some(body) = response.body.as_buffered() else {
+        record_distributed_rate_limit_bypass(&route.path, "limiter returned a streaming response");
+        return None;
+    };
+    let value = match serde_json::from_slice::<Value>(body) {
         Ok(value) => value,
         Err(error) => {
             record_distributed_rate_limit_bypass(
@@ -460,6 +465,7 @@ pub(crate) async fn export_metering_batch(
         None,
         false,
         None,
+        false,
     )
     .await
     .map_err(|(status, message)| format!("metering route failed with {status}: {message}"))?;
@@ -684,6 +690,7 @@ pub(crate) async fn export_log_batch(
         None,
         false,
         None,
+        false,
     )
     .await
     .map_err(|(status, message)| format!("logger route failed with {status}: {message}"))?;
@@ -834,15 +841,26 @@ pub(crate) fn build_guest_response(
         Some(trailers)
     };
 
+    let is_streaming = matches!(response.body, RouteResponseBody::Streaming(_));
+    let body = match response.body {
+        RouteResponseBody::Buffered(bytes) => {
+            Body::new(GuestResponseBody::new(bytes, trailer_map, completion_guard))
+        }
+        // A peer-forwarded stream on a saturation path: trailers and the
+        // completion guard have nowhere to attach mid-stream, but neither
+        // client-facing overflow site produces either (see
+        // `forward_request_to_override_as_streaming_response`).
+        RouteResponseBody::Streaming(body) => body,
+    };
+
     let mut built = Response::builder()
         .status(response.status)
-        .body(Body::new(GuestResponseBody::new(
-            response.body,
-            trailer_map,
-            completion_guard,
-        )))
+        .body(body)
         .map_err(|error| format!("failed to construct guest HTTP response: {error}"))?;
     built.headers_mut().extend(response_headers);
+    if is_streaming {
+        built.extensions_mut().insert(StreamingResponseMarker);
+    }
     Ok(built)
 }
 
@@ -890,15 +908,19 @@ pub(crate) async fn forward_request_to_override(
     })?;
     let status = response.status();
     let response_headers = response.headers().clone();
-    let response_body = response.bytes().await.map_err(|error| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("failed to read override response body from `{destination}`: {error}"),
-        )
-    })?;
+    // Streamed through rather than read whole. `bytes()` waited for the peer to
+    // finish before this node sent anything, so a redirected SSE generation
+    // arrived as one blob at the end: time-to-first-token became total
+    // generation time, and an agentic client watching for deltas saw nothing
+    // until the answer was already complete. Mesh QoS redirects exactly the
+    // requests a node is too busy to serve, so this hit hardest when the
+    // stream mattered most.
+    //
+    // A buffered response streams just as correctly — one chunk — so this needs
+    // no branch on content type.
     let mut built = Response::builder()
         .status(status)
-        .body(Body::from(response_body))
+        .body(Body::from_stream(response.bytes_stream()))
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -911,6 +933,7 @@ pub(crate) async fn forward_request_to_override(
         }
         built.headers_mut().append(name.clone(), value.clone());
     }
+    built.extensions_mut().insert(StreamingResponseMarker);
     Ok(built)
 }
 
@@ -947,9 +970,174 @@ pub(crate) async fn forward_request_to_override_as_guest_response(
     Ok(GuestHttpResponse {
         status,
         headers,
-        body,
+        body: RouteResponseBody::Buffered(body),
         trailers: Vec::new(),
     })
+}
+
+/// Like `forward_request_to_override_as_guest_response`, but streams the
+/// peer's body through instead of buffering it whole. Used only by the two
+/// client-facing overflow sites (`RoutePermitError::TimedOut` with
+/// `allow_overflow`, and the `AdmissionStrategy::MeshRetry` branch) so an SSE
+/// generation redirected under load still delivers its first chunk before
+/// the peer has finished generating.
+///
+/// Never call this for a response that will be handed to a WASM guest —
+/// `try_peer_overflow_dispatch` (the mesh-fetch path) must keep using the
+/// buffered variant above.
+///
+/// `idle_timeout`, when the route configures `resiliency.timeout_ms`, bounds
+/// the gap between chunks so a peer that stalls mid-generation is still cut
+/// off — see `TimeoutBoundedStreamBody` for why the surrounding
+/// `TimeoutLayer` cannot do this on its own once the body is streaming.
+pub(crate) async fn forward_request_to_override_as_streaming_response(
+    http_client: &Client,
+    destination: &str,
+    headers: &HeaderMap,
+    method: &Method,
+    body: &Bytes,
+    hop_limit: HopLimit,
+    idle_timeout: Option<Duration>,
+) -> std::result::Result<GuestHttpResponse, (StatusCode, String)> {
+    let mut request = http_client.request(method.clone(), destination);
+    for (name, value) in headers {
+        if name == "host" || name == "content-length" || name == "connection" {
+            continue;
+        }
+        request = request.header(name, value);
+    }
+    request = request.header(HOP_LIMIT_HEADER, hop_limit.decremented().to_string());
+    let response = request.body(body.clone()).send().await.map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("mesh-overlay forward to `{destination}` failed: {error}"),
+        )
+    })?;
+    let status = response.status();
+    let headers = header_map_to_guest_fields(response.headers())
+        .into_iter()
+        .filter(|(name, _)| {
+            let name = name.to_ascii_lowercase();
+            name != "content-length" && name != "connection" && name != "transfer-encoding"
+        })
+        .collect();
+    let body = match idle_timeout {
+        Some(idle_timeout) => Body::new(stream_response_with_idle_timeout(response, idle_timeout)),
+        None => Body::from_stream(response.bytes_stream()),
+    };
+    Ok(GuestHttpResponse {
+        status,
+        headers,
+        body: RouteResponseBody::Streaming(body),
+        trailers: Vec::new(),
+    })
+}
+
+/// The idle-chunk deadline a streaming peer forward should use, or `None` to
+/// leave the stream unbounded.
+///
+/// Gated on the `resiliency` feature so a build that omits it behaves like
+/// every other resiliency knob in that configuration: `route.resiliency` is
+/// still accepted and stored, but has no effect. Without this gate, a
+/// `resiliency`-less build would apply `timeout_ms` to overflow streams while
+/// silently ignoring the same field for local/buffered execution — the two
+/// code paths disagreeing about whether resiliency config does anything.
+#[cfg(feature = "resiliency")]
+pub(crate) fn route_stream_idle_timeout(route: &IntegrityRoute) -> Option<Duration> {
+    route
+        .resiliency
+        .as_ref()
+        .and_then(|resiliency| resiliency.timeout_ms)
+        .map(Duration::from_millis)
+}
+
+#[cfg(not(feature = "resiliency"))]
+pub(crate) fn route_stream_idle_timeout(_route: &IntegrityRoute) -> Option<Duration> {
+    None
+}
+
+/// The status-based retry budget a streaming peer forward should use:
+/// `(retries_remaining, retry_on_statuses)`, or `None` to never retry.
+///
+/// Only used by `handle_streaming_http_request` (the SSE path), which never
+/// goes through `execute_route_with_resiliency`/`StatusRetryPolicy` — every
+/// other overflow response gets its `retry_on` behavior from that shared
+/// machinery for free by virtue of running inside it. Each retry here
+/// re-resolves the destination and re-forwards from scratch, matching
+/// `StatusRetryPolicy`'s "safe to retry" reasoning: no response bytes have
+/// reached the client yet at the point a streaming overflow response's
+/// status is inspected. Gated on the `resiliency` feature for the same
+/// reason as `route_stream_idle_timeout`.
+#[cfg(feature = "resiliency")]
+#[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
+pub(crate) fn route_stream_retry_budget(
+    route: &IntegrityRoute,
+) -> Option<(u32, std::collections::BTreeSet<u16>)> {
+    let policy = route.resiliency.as_ref()?.retry_policy.as_ref()?;
+    if policy.max_retries == 0 || policy.retry_on.is_empty() {
+        return None;
+    }
+    Some((
+        policy.max_retries,
+        policy.retry_on.iter().copied().collect(),
+    ))
+}
+
+#[cfg(not(feature = "resiliency"))]
+#[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
+pub(crate) fn route_stream_retry_budget(
+    _route: &IntegrityRoute,
+) -> Option<(u32, std::collections::BTreeSet<u16>)> {
+    None
+}
+
+/// Like `forward_request_to_override_as_streaming_response`, but also bounds
+/// the wait for the peer to accept the connection and return headers with
+/// `idle_timeout`.
+///
+/// `forward_request_to_override_as_streaming_response`'s own `idle_timeout`
+/// only takes effect once `TimeoutBoundedStreamBody` starts reading the body
+/// — the handshake (`send().await`, waiting for status + headers) happens
+/// before that and is otherwise unbounded. The two call sites inside
+/// `execute_route_request`/`enforce_resource_admission` get handshake
+/// coverage for free from the surrounding `execute_route_with_resiliency`
+/// `TimeoutLayer`, so wrapping here is redundant-but-harmless for them; for
+/// `handle_streaming_http_request` (the SSE path, which never goes through
+/// that layer) this is the only thing bounding the handshake at all.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forward_request_to_override_as_streaming_response_with_handshake_timeout(
+    http_client: &Client,
+    destination: &str,
+    headers: &HeaderMap,
+    method: &Method,
+    body: &Bytes,
+    hop_limit: HopLimit,
+    idle_timeout: Option<Duration>,
+    route_path: &str,
+) -> std::result::Result<GuestHttpResponse, (StatusCode, String)> {
+    let forward = forward_request_to_override_as_streaming_response(
+        http_client,
+        destination,
+        headers,
+        method,
+        body,
+        hop_limit,
+        idle_timeout,
+    );
+    match idle_timeout {
+        Some(idle_timeout) => tokio::time::timeout(idle_timeout, forward)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!(
+                        "route `{route_path}` peer handshake timed out after {}ms",
+                        idle_timeout.as_millis()
+                    ),
+                )
+            })?,
+        None => forward.await,
+    }
 }
 
 pub(crate) fn requested_model_alias(
@@ -997,11 +1185,18 @@ pub(crate) fn requested_model_alias(
 /// mesh QoS then watched an idle local queue while the upstream the request
 /// actually targeted was saturated.
 ///
-/// Only the last segment is taken, and only when the prefix is a plain engine
-/// label, so an alias is never invented from an arbitrary slashed string.
+/// The engine prefix is the part before the *first* slash, because that is
+/// where the id puts it. Taking the part after the last one instead truncated
+/// any alias that contains a slash — `gguf/Qwen/Qwen3-Coder` yielded
+/// `Qwen3-Coder`, which matches nothing, while the full string does not match
+/// either. A model named the way Hugging Face names them was therefore
+/// unreachable through the qualified id this route advertises for it.
+///
+/// The unqualified form is still tried first, so an alias that genuinely
+/// contains a slash wins before anything is stripped.
 fn model_alias_candidates(requested: &str) -> [&str; 2] {
     let tail = requested
-        .rsplit_once('/')
+        .split_once('/')
         .map(|(_engine, alias)| alias)
         .unwrap_or(requested);
     [requested, tail]
@@ -1035,6 +1230,56 @@ fn resolve_requested_model_alias(route: &IntegrityRoute, alias: Option<String>) 
 #[cfg(test)]
 mod requested_model_alias_tests {
     use super::*;
+
+    /// A model named the way Hugging Face names them stays reachable.
+    ///
+    /// The engine prefix is the part before the *first* slash, because that is
+    /// where `{engine}/{alias}` puts it. Stripping from the last slash instead
+    /// truncated any alias containing one, so `gguf/Qwen/Qwen3-Coder` produced
+    /// `Qwen3-Coder` — which matches nothing — while the full string matched
+    /// nothing either.
+    #[test]
+    fn a_qualified_id_keeps_the_slashes_inside_the_alias() {
+        assert_eq!(
+            model_alias_candidates("gguf/Qwen/Qwen3-Coder"),
+            ["gguf/Qwen/Qwen3-Coder", "Qwen/Qwen3-Coder"]
+        );
+        // The ordinary case is unchanged.
+        assert_eq!(
+            model_alias_candidates("gguf/coder"),
+            ["gguf/coder", "coder"]
+        );
+        // And an unqualified alias offers itself twice rather than inventing a
+        // second candidate.
+        assert_eq!(model_alias_candidates("coder"), ["coder", "coder"]);
+    }
+
+    /// The unqualified form is tried first, so an alias that really does
+    /// contain a slash wins before anything is stripped.
+    #[test]
+    fn an_alias_containing_a_slash_matches_before_any_prefix_is_removed() {
+        let route = IntegrityRoute {
+            path: "/ai".to_owned(),
+            models: vec![IntegrityModelBinding {
+                alias: "Qwen/Qwen3-Coder".to_owned(),
+                path: "/models/qwen".to_owned(),
+                device: ModelDevice::Cpu,
+                qos: RouteQos::Standard,
+                dynamic: false,
+                hardware_strategy: HardwareStrategy::default(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_requested_model_alias(&route, Some("Qwen/Qwen3-Coder".to_owned())),
+            Some("Qwen/Qwen3-Coder".to_owned())
+        );
+        assert_eq!(
+            resolve_requested_model_alias(&route, Some("gguf/Qwen/Qwen3-Coder".to_owned())),
+            Some("Qwen/Qwen3-Coder".to_owned()),
+            "the qualified id this route advertises has to resolve back to it"
+        );
+    }
 
     fn model_binding(alias: &str) -> IntegrityModelBinding {
         IntegrityModelBinding {
@@ -1084,6 +1329,12 @@ mod requested_model_alias_tests {
         local.device = ModelDevice::Cuda;
         let mut upstream = model_binding("qwen3-coder");
         upstream.path = "openai:http://127.0.0.1:8080/v1".to_owned();
+        // Non-dynamic, because that is what makes the path a destination: the
+        // broker overwrites a `dynamic` binding's path with the directory its
+        // upload landed in, so one written `openai:…` still runs locally. The
+        // shared fixture above is dynamic for the alias-resolution test, which
+        // needs no paths at all.
+        upstream.dynamic = false;
         route.models = vec![local, upstream];
 
         let requested =
@@ -1158,11 +1409,12 @@ pub(crate) fn route_mesh_qos_profile(
     // scheduled on `Network`; reading its declared `cpu`/`cuda` here made mesh
     // admission watch an idle local queue while the network queue filled, so a
     // saturated upstream never redirected a request to a healthier peer.
-    let accelerator = if binding
-        .path
-        .trim()
-        .starts_with(ai_inference::UPSTREAM_SCHEME)
-    {
+    //
+    // `binding_runs_upstream` rather than the prefix: a `dynamic` binding's
+    // path is a placeholder the broker overwrites, so one written
+    // `openai:…` still runs its uploaded checkpoint locally, and calling that
+    // `Network` hid a real GPU queue from admission.
+    let accelerator = if ai_inference::binding_runs_upstream(binding) {
         ai_inference::AcceleratorKind::Network
     } else {
         ai_inference::AcceleratorKind::from_model_device(&binding.device)
@@ -1251,6 +1503,7 @@ pub(crate) async fn execute_route_override(
                     Some(trace_id),
                     sampled_execution,
                     None,
+                    true,
                 )
                 .await
                 {
@@ -1302,7 +1555,7 @@ pub(crate) async fn faas_handler(
     let trailers = collected.trailers().cloned().unwrap_or_default();
     let body = collected.to_bytes();
     let trailer_fields = header_map_to_guest_fields(&trailers);
-    let _active_request = telemetry::begin_request(&state.telemetry);
+    let active_request = telemetry::begin_request(&state.telemetry);
     let runtime = state.runtime.load_full();
     let normalized_path = normalize_route_path(uri.path());
     if is_reserved_system_path(&normalized_path) {
@@ -1498,48 +1751,63 @@ pub(crate) async fn faas_handler(
                             )
                         } else {
                             #[cfg(feature = "ai-inference")]
-                            if is_streaming_accept_request(&headers) {
-                                let request = GuestRequest {
+                            let streaming_route =
+                                is_streaming_accept_request(&headers).then(|| GuestRequest {
                                     method: method.to_string(),
                                     uri: uri.to_string(),
                                     headers: header_map_to_guest_fields(&headers),
                                     body: body.clone(),
                                     trailers: trailer_fields.clone(),
-                                };
-                                return match network::handle_streaming_http_request(
+                                });
+                            #[cfg(not(feature = "ai-inference"))]
+                            let streaming_route: Option<()> = None;
+
+                            match streaming_route {
+                                #[cfg(feature = "ai-inference")]
+                                Some(request) => match network::handle_streaming_http_request(
                                     state.clone(),
                                     Arc::clone(&runtime),
                                     Arc::clone(&route),
                                     selected_target.module.clone(),
                                     request,
+                                    &headers,
+                                    &method,
+                                    hop_limit,
                                 )
                                 .await
                                 {
-                                    Ok(response) => response,
-                                    Err((status, message)) => (status, message).into_response(),
-                                };
-                            }
-                            match execute_route_arc_with_middleware(
-                                &state,
-                                &runtime,
-                                Arc::clone(&route),
-                                &headers,
-                                &method,
-                                &uri,
-                                &body,
-                                &trailer_fields,
-                                hop_limit,
-                                Some(&trace_id),
-                                sampled_execution,
-                                Some(selected_target.module.as_str()),
-                            )
-                            .await
-                            {
-                                Ok(result) => {
-                                    let fuel_consumed = result.fuel_consumed;
-                                    (guest_response_into_response(result), fuel_consumed)
-                                }
-                                Err((status, message)) => ((status, message).into_response(), None),
+                                    Ok(response) => (response, None),
+                                    Err((status, message)) => {
+                                        ((status, message).into_response(), None)
+                                    }
+                                },
+                                #[cfg(not(feature = "ai-inference"))]
+                                Some(()) => unreachable!(),
+                                None => match execute_route_arc_with_middleware(
+                                    &state,
+                                    &runtime,
+                                    Arc::clone(&route),
+                                    &headers,
+                                    &method,
+                                    &uri,
+                                    &body,
+                                    &trailer_fields,
+                                    hop_limit,
+                                    Some(&trace_id),
+                                    sampled_execution,
+                                    Some(selected_target.module.as_str()),
+                                    true,
+                                )
+                                .await
+                                {
+                                    Ok(result) => {
+                                        let fuel_consumed = result.fuel_consumed;
+                                        (guest_response_into_response(result), fuel_consumed)
+                                    }
+                                    Err((status, message)) => {
+                                        ((status, message).into_response(), None)
+                                    }
+                                },
                             }
                         }
                     }
@@ -1577,48 +1845,63 @@ pub(crate) async fn faas_handler(
                             )
                         } else {
                             #[cfg(feature = "ai-inference")]
-                            if is_streaming_accept_request(&headers) {
-                                let request = GuestRequest {
+                            let streaming_route =
+                                is_streaming_accept_request(&headers).then(|| GuestRequest {
                                     method: method.to_string(),
                                     uri: uri.to_string(),
                                     headers: header_map_to_guest_fields(&headers),
                                     body: body.clone(),
                                     trailers: trailer_fields.clone(),
-                                };
-                                return match network::handle_streaming_http_request(
+                                });
+                            #[cfg(not(feature = "ai-inference"))]
+                            let streaming_route: Option<()> = None;
+
+                            match streaming_route {
+                                #[cfg(feature = "ai-inference")]
+                                Some(request) => match network::handle_streaming_http_request(
                                     state.clone(),
                                     Arc::clone(&runtime),
                                     Arc::clone(&route),
                                     selected_target.module.clone(),
                                     request,
+                                    &headers,
+                                    &method,
+                                    hop_limit,
                                 )
                                 .await
                                 {
-                                    Ok(response) => response,
-                                    Err((status, message)) => (status, message).into_response(),
-                                };
-                            }
-                            match execute_route_arc_with_middleware(
-                                &state,
-                                &runtime,
-                                Arc::clone(&route),
-                                &headers,
-                                &method,
-                                &uri,
-                                &body,
-                                &trailer_fields,
-                                hop_limit,
-                                Some(&trace_id),
-                                sampled_execution,
-                                Some(selected_target.module.as_str()),
-                            )
-                            .await
-                            {
-                                Ok(result) => {
-                                    let fuel_consumed = result.fuel_consumed;
-                                    (guest_response_into_response(result), fuel_consumed)
-                                }
-                                Err((status, message)) => ((status, message).into_response(), None),
+                                    Ok(response) => (response, None),
+                                    Err((status, message)) => {
+                                        ((status, message).into_response(), None)
+                                    }
+                                },
+                                #[cfg(not(feature = "ai-inference"))]
+                                Some(()) => unreachable!(),
+                                None => match execute_route_arc_with_middleware(
+                                    &state,
+                                    &runtime,
+                                    Arc::clone(&route),
+                                    &headers,
+                                    &method,
+                                    &uri,
+                                    &body,
+                                    &trailer_fields,
+                                    hop_limit,
+                                    Some(&trace_id),
+                                    sampled_execution,
+                                    Some(selected_target.module.as_str()),
+                                    true,
+                                )
+                                .await
+                                {
+                                    Ok(result) => {
+                                        let fuel_consumed = result.fuel_consumed;
+                                        (guest_response_into_response(result), fuel_consumed)
+                                    }
+                                    Err((status, message)) => {
+                                        ((status, message).into_response(), None)
+                                    }
+                                },
                             }
                         }
                     }
@@ -1627,17 +1910,41 @@ pub(crate) async fn faas_handler(
         },
     };
 
-    telemetry::record_event(
-        &state.telemetry,
-        TelemetryEvent::RequestEnd {
+    // A streaming response's body may still be draining long after this
+    // function returns it, so its `active_requests` slot and `RequestEnd`
+    // duration must track the body's own lifetime rather than "the handler
+    // returned" — see `TelemetryCompletionBody`. Buffered responses have no
+    // such lag: the whole body is already known here, so `RequestEnd` is
+    // recorded immediately, as it always has been.
+    if response
+        .extensions()
+        .get::<StreamingResponseMarker>()
+        .is_some()
+    {
+        let completion = RequestCompletion::new(
+            state.telemetry.clone(),
+            active_request,
             trace_id,
-            status: response.status().as_u16(),
+            response.status().as_u16(),
             fuel_consumed,
-            timestamp: Instant::now(),
-        },
-    );
-
-    response
+        );
+        let (parts, body) = response.into_parts();
+        Response::from_parts(
+            parts,
+            Body::new(TelemetryCompletionBody::new(body, completion)),
+        )
+    } else {
+        telemetry::record_event(
+            &state.telemetry,
+            TelemetryEvent::RequestEnd {
+                trace_id,
+                status: response.status().as_u16(),
+                fuel_consumed,
+                timestamp: Instant::now(),
+            },
+        );
+        response
+    }
 }
 
 fn is_reserved_system_path(path: &str) -> bool {
@@ -1658,6 +1965,7 @@ pub(crate) async fn execute_route_with_middleware(
     trace_id: Option<&str>,
     sampled_execution: bool,
     selected_module: Option<&str>,
+    allow_streaming_overflow: bool,
 ) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
     execute_route_arc_with_middleware(
         state,
@@ -1672,6 +1980,7 @@ pub(crate) async fn execute_route_with_middleware(
         trace_id,
         sampled_execution,
         selected_module,
+        allow_streaming_overflow,
     )
     .await
 }
@@ -1690,6 +1999,7 @@ pub(crate) async fn execute_route_arc_with_middleware(
     trace_id: Option<&str>,
     sampled_execution: bool,
     selected_module: Option<&str>,
+    allow_streaming_overflow: bool,
 ) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
     let invocation = RouteInvocation {
         state: state.clone(),
@@ -1704,6 +2014,7 @@ pub(crate) async fn execute_route_arc_with_middleware(
         trace_id: trace_id.map(str::to_owned),
         sampled_execution,
         selected_module: selected_module.map(str::to_owned),
+        allow_streaming_overflow,
     };
 
     resiliency::execute_route_with_resiliency(invocation).await
@@ -1756,6 +2067,13 @@ pub(crate) async fn execute_route_with_middleware_inner(
             trace_id,
             sampled_execution,
             None,
+            // Always buffered, regardless of the outer invocation: on success
+            // this body is never read (see the status check below) — a
+            // still-open peer stream would just get dropped before it
+            // finishes, and streaming a response nobody consumes buys
+            // nothing while adding exactly the completion-ordering risk
+            // flagged in review.
+            false,
         )
         .await?;
         if middleware_response.response.status != StatusCode::OK {
@@ -1777,6 +2095,7 @@ pub(crate) async fn execute_route_with_middleware_inner(
         trace_id,
         sampled_execution,
         selected_module,
+        invocation.allow_streaming_overflow,
     )
     .await?;
     result.fuel_consumed = merge_fuel_samples(accumulated_fuel, result.fuel_consumed);
@@ -1814,6 +2133,17 @@ pub(crate) fn spawn_shadow_traffic_task(
     if route.path == SYSTEM_SHADOW_PROXY_ROUTE {
         return;
     }
+    // `system-faas-shadow-proxy` hashes the primary body to compare it against
+    // the shadow target's response; a streaming primary (peer overflow) was
+    // never buffered on this host, so there is nothing to hash and no
+    // meaningful byte-for-byte comparison to make. The shadow-proxy guest's
+    // `primary_body_sha256` field is a required `String`, so sending it a
+    // streaming event would fail deserialization rather than degrade
+    // gracefully — skip the comparison instead of emitting a request the
+    // guest cannot parse.
+    let Some(primary_body) = primary_response.body.as_buffered() else {
+        return;
+    };
     let Some(shadow_route) = runtime
         .route_registry
         .sealed_route(SYSTEM_SHADOW_PROXY_ROUTE)
@@ -1834,7 +2164,7 @@ pub(crate) fn spawn_shadow_traffic_task(
         "body_hex": hex::encode(body),
         "primary_status": primary_response.status.as_u16(),
         "primary_headers": primary_response.headers,
-        "primary_body_sha256": sha256_hex(&primary_response.body),
+        "primary_body_sha256": sha256_hex(primary_body),
         "trace_id": trace_id,
     })) else {
         tracing::warn!(route = %route.path, "failed to encode shadow traffic event");
@@ -1860,6 +2190,7 @@ pub(crate) fn spawn_shadow_traffic_task(
             None,
             false,
             None,
+            false,
         )
         .await
         {
@@ -1891,6 +2222,7 @@ pub(crate) async fn execute_route_request(
     trace_id: Option<&str>,
     sampled_execution: bool,
     selected_module: Option<&str>,
+    allow_streaming_overflow: bool,
 ) -> std::result::Result<RouteExecutionResult, (StatusCode, String)> {
     if route.role == RouteRole::System && should_shed_system_route(&state.telemetry) {
         return Err((
@@ -1936,8 +2268,17 @@ pub(crate) async fn execute_route_request(
         }
     };
 
-    if let Some(rejection) =
-        enforce_resource_admission(state, route, headers, method, body, hop_limit, runtime).await?
+    if let Some(rejection) = enforce_resource_admission(
+        state,
+        route,
+        headers,
+        method,
+        body,
+        hop_limit,
+        runtime,
+        allow_streaming_overflow,
+    )
+    .await?
     {
         return Ok(rejection);
     }
@@ -2007,15 +2348,30 @@ pub(crate) async fn execute_route_request(
                         .required_capability_mask,
                     requested_model.as_deref(),
                 ) {
-                    let response = forward_request_to_override_as_guest_response(
-                        &state.http_client,
-                        &destination,
-                        headers,
-                        method,
-                        body,
-                        hop_limit,
-                    )
-                    .await?;
+                    let response = if allow_streaming_overflow {
+                        let idle_timeout = route_stream_idle_timeout(route);
+                        forward_request_to_override_as_streaming_response_with_handshake_timeout(
+                            &state.http_client,
+                            &destination,
+                            headers,
+                            method,
+                            body,
+                            hop_limit,
+                            idle_timeout,
+                            &route.path,
+                        )
+                        .await?
+                    } else {
+                        forward_request_to_override_as_guest_response(
+                            &state.http_client,
+                            &destination,
+                            headers,
+                            method,
+                            body,
+                            hop_limit,
+                        )
+                        .await?
+                    };
                     return Ok(RouteExecutionResult {
                         response,
                         fuel_consumed: None,
@@ -2083,6 +2439,7 @@ pub(crate) async fn execute_route_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn enforce_resource_admission(
     state: &AppState,
     route: &IntegrityRoute,
@@ -2091,6 +2448,7 @@ pub(crate) async fn enforce_resource_admission(
     body: &Bytes,
     hop_limit: HopLimit,
     runtime: &Arc<RuntimeState>,
+    allow_streaming_overflow: bool,
 ) -> std::result::Result<Option<RouteExecutionResult>, (StatusCode, String)> {
     let Some(policy) = route.resource_policy.as_ref() else {
         return Ok(None);
@@ -2116,15 +2474,30 @@ pub(crate) async fn enforce_resource_admission(
             target.required_capability_mask,
             requested_model.as_deref(),
         ) {
-            let response = forward_request_to_override_as_guest_response(
-                &state.http_client,
-                &destination,
-                headers,
-                method,
-                body,
-                hop_limit,
-            )
-            .await?;
+            let response = if allow_streaming_overflow {
+                let idle_timeout = route_stream_idle_timeout(route);
+                forward_request_to_override_as_streaming_response_with_handshake_timeout(
+                    &state.http_client,
+                    &destination,
+                    headers,
+                    method,
+                    body,
+                    hop_limit,
+                    idle_timeout,
+                    &route.path,
+                )
+                .await?
+            } else {
+                forward_request_to_override_as_guest_response(
+                    &state.http_client,
+                    &destination,
+                    headers,
+                    method,
+                    body,
+                    hop_limit,
+                )
+                .await?
+            };
             return Ok(Some(RouteExecutionResult {
                 response,
                 fuel_consumed: None,
@@ -2152,6 +2525,105 @@ pub(crate) async fn enforce_resource_admission(
     }))
 }
 
+/// Whether every model this route can run lives behind an `openai:` upstream.
+///
+/// Deliberately "every", not "the first": a route mixing an upstream with a
+/// local checkpoint still has something on the local device, and exempting it
+/// would let that model bypass the admission its neighbours obey. A route with
+/// no models at all is not upstream-only — it has nothing to be upstream about,
+/// and the ordinary path already ignores it.
+#[cfg(all(test, feature = "ai-inference"))]
+mod vram_admission_scope_tests {
+    use super::*;
+
+    fn route_with(paths: &[&str]) -> IntegrityRoute {
+        IntegrityRoute {
+            path: "/ai".to_owned(),
+            models: paths
+                .iter()
+                .map(|path| IntegrityModelBinding {
+                    alias: "coder".to_owned(),
+                    path: (*path).to_owned(),
+                    device: ModelDevice::Cpu,
+                    qos: RouteQos::Standard,
+                    dynamic: false,
+                    hardware_strategy: HardwareStrategy::default(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Local VRAM pressure says nothing about a route served from upstreams.
+    ///
+    /// Rejecting one with `vram-saturated` invents a failure: the provider is
+    /// healthy, the request would have succeeded, and the client is handed a
+    /// 503 naming a resource its request never touches.
+    #[test]
+    fn only_a_route_served_entirely_from_upstreams_skips_vram_admission() {
+        assert!(route_is_entirely_upstream(&route_with(&[
+            "openai:http://a.invalid/v1"
+        ])));
+        assert!(route_is_entirely_upstream(&route_with(&[
+            "openai:http://a.invalid/v1",
+            "openai:http://b.invalid/v1",
+        ])));
+
+        // One local checkpoint is enough to keep the check: exempting a mixed
+        // route would let that model bypass the admission its neighbours obey.
+        assert!(!route_is_entirely_upstream(&route_with(&[
+            "openai:http://a.invalid/v1",
+            "/models/local",
+        ])));
+        assert!(!route_is_entirely_upstream(&route_with(&["/models/local"])));
+
+        // A route with no models is not upstream-only — it has nothing to be
+        // upstream about, and the ordinary path already ignores it.
+        assert!(!route_is_entirely_upstream(&route_with(&[])));
+    }
+
+    /// A `dynamic` binding's path is a placeholder, not a destination.
+    ///
+    /// The broker overwrites it: `ensure_model_loaded` swaps it for the
+    /// directory the upload landed in, so the checkpoint runs locally on the
+    /// device the binding seals. Reading the `openai:` prefix alone therefore
+    /// exempted a route holding real VRAM from the refusal that protects it,
+    /// and pointed mesh QoS at an idle network lane while a GPU queue filled.
+    #[test]
+    fn a_dynamic_binding_is_local_however_its_path_reads() {
+        let mut route = route_with(&["openai:http://a.invalid/v1"]);
+        route.models[0].dynamic = true;
+        route.models[0].device = ModelDevice::Cuda;
+
+        assert!(
+            !route_is_entirely_upstream(&route),
+            "a dynamic binding runs its uploaded checkpoint locally, so the VRAM refusal applies"
+        );
+        assert_eq!(
+            route_mesh_qos_profile(&route, None).map(|profile| profile.accelerator),
+            Some(ai_inference::AcceleratorKind::Gpu),
+            "and it queues on the device it sealed, not on the network lane"
+        );
+
+        // The non-dynamic case is unchanged: that path *is* where requests go.
+        route.models[0].dynamic = false;
+        assert!(route_is_entirely_upstream(&route));
+        assert_eq!(
+            route_mesh_qos_profile(&route, None).map(|profile| profile.accelerator),
+            Some(ai_inference::AcceleratorKind::Network)
+        );
+    }
+}
+
+#[cfg(feature = "ai-inference")]
+fn route_is_entirely_upstream(route: &IntegrityRoute) -> bool {
+    // Not the `openai:` prefix: a `dynamic` binding carrying one still runs an
+    // uploaded checkpoint on a local device, so a route made entirely of those
+    // would have skipped the critical-VRAM refusal while holding the very VRAM
+    // the refusal exists to protect.
+    !route.models.is_empty() && route.models.iter().all(ai_inference::binding_runs_upstream)
+}
+
 /// Returns a rejection `RouteExecutionResult` when VRAM pressure is critical
 /// for routes that drive AI inference, or `None` to allow the request through.
 ///
@@ -2166,6 +2638,16 @@ pub(crate) fn enforce_vram_admission(
     state: &AppState,
     route: &IntegrityRoute,
 ) -> Option<RouteExecutionResult> {
+    // A route served entirely from upstreams holds no local VRAM, so local
+    // pressure says nothing about whether it can run. Rejecting it with
+    // `vram-saturated` invented a failure: the remote provider was healthy, the
+    // request would have succeeded, and the client got a 503 naming a resource
+    // its request never touches. Local models on the same route keep the check,
+    // which is why this asks about every binding rather than the first.
+    #[cfg(feature = "ai-inference")]
+    if route_is_entirely_upstream(route) {
+        return None;
+    }
     match state.memory_governor.vram_pressure() {
         memory_governor::MemoryPressure::Critical => {
             tracing::warn!(
@@ -2644,7 +3126,7 @@ async fn invoke_enarx_tee_backend(
     let mut guest_response = GuestHttpResponse {
         status,
         headers: tee_response.headers,
-        body: Bytes::from(tee_response.body),
+        body: RouteResponseBody::Buffered(Bytes::from(tee_response.body)),
         trailers: tee_response.trailers,
     };
     annotate_tee_response(&mut guest_response, "enarx");
@@ -2875,6 +3357,10 @@ pub(crate) async fn try_dispatch_local_mesh_request(
         None,
         false,
         Some(selected_target.module.as_str()),
+        // This response is fed to a WASM guest's outbound-HTTP import
+        // (see component_hosts.rs), never to a client socket — it must
+        // stay `RouteResponseBody::Buffered`.
+        false,
     ))
     .await
     .map_err(|(status, message)| {

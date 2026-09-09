@@ -1,311 +1,45 @@
 //! Tensor-parallel (Megatron-style) Llama forward pass.
 //!
-//! Mirrors `candle_transformers::models::llama::Llama`'s forward math exactly,
-//! with one substitution: the MLP's up/gate (column-parallel) and down
-//! (row-parallel) projections are sharded across `devices`, with a single
-//! all-reduce per transformer block — the scope `design.md` §2 describes.
-//! Attention, embeddings, and the LM head are replicated (not sharded) and
-//! always run on `devices[0]` ("the primary device"); only the MLP's compute
-//! and memory footprint are actually split across the node's accelerators.
+//! One substitution on top of `candle_transformers::models::llama::Llama`: the
+//! MLP's up/gate (column-parallel) and down (row-parallel) projections are
+//! sharded across `devices`, with a single all-reduce per transformer block —
+//! the scope `design.md` §2 describes. Attention, embeddings and the LM head
+//! are replicated (not sharded) and always run on `devices[0]` ("the primary
+//! device"); only the MLP's compute and memory footprint are actually split
+//! across the node's accelerators.
 //!
-//! `candle_transformers::models::llama::{Llama, Block, Mlp,
-//! CausalSelfAttention, Cache}` are private to that crate, so this module
-//! reimplements the same forward math (verified bit-for-bit against it by
-//! `tensor_parallel_llama_matches_dense_reference_on_a_real_checkpoint`
-//! below) with `TensorParallelMlp` standing in for its `Mlp`.
+//! This module used to reimplement the whole forward pass — cache, rotary
+//! tables, causal mask, attention, block — because `Block`, `Mlp`,
+//! `CausalSelfAttention` and `Cache` were private upstream. They are not any
+//! more (candle #3809, #3817), so what remains here is the shard: an
+//! implementation of `BlockMlp` and the loaders that build a `Llama` or a run
+//! of `Block`s around it. The ~270 lines of copied attention math are gone, and
+//! with them the risk that they drift from the reference they were copied from.
 
-use std::collections::HashMap;
-use std::f32::consts::PI;
-
-use candle_core::{DType, Device, IndexOp, Result as CandleResult, Tensor, D};
-use candle_nn::{Module, VarBuilder};
-use candle_transformers::models::llama::{Config, Llama3RopeConfig, Llama3RopeType};
-use candle_transformers::models::with_tracing::{
-    linear_no_bias as linear, Embedding, Linear, RmsNorm,
-};
-use candle_transformers::utils::{build_causal_mask, repeat_kv};
+use candle_core::{Device, Result as CandleResult, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::llama::{BlockMlp, Config, Llama};
 
 #[cfg(feature = "candle-cuda")]
 use super::parallel::NcclShardGroup;
-use super::parallel::{split_for_row_parallel, ColumnParallelLinear, RowParallelLinear};
+use super::parallel::{
+    split_for_row_parallel, ColumnParallelLinear, NcclReducer, RowParallelLinear,
+};
 
-/// External KV cache + precomputed rotary tables for [`TensorParallelLlama`].
-/// Functionally identical to `candle_transformers::models::llama::Cache`,
-/// reimplemented here because its fields and `mask()` helper are private to
-/// the upstream crate.
-pub(crate) struct TensorParallelCache {
-    masks: HashMap<(usize, usize), Tensor>,
-    use_kv_cache: bool,
-    kvs: Vec<Option<(Tensor, Tensor)>>,
-    cos: Tensor,
-    sin: Tensor,
-    device: Device,
-}
-
-fn calculate_default_inv_freq(cfg: &Config) -> Vec<f32> {
-    let head_dim = cfg.hidden_size / cfg.num_attention_heads;
-    (0..head_dim)
-        .step_by(2)
-        .map(|i| 1f32 / cfg.rope_theta.powf(i as f32 / head_dim as f32))
-        .collect()
-}
-
-impl TensorParallelCache {
-    pub(crate) fn new(
-        use_kv_cache: bool,
-        dtype: DType,
-        config: &Config,
-        device: &Device,
-    ) -> CandleResult<Self> {
-        let theta = match &config.rope_scaling {
-            None
-            | Some(Llama3RopeConfig {
-                rope_type: Llama3RopeType::Default,
-                ..
-            }) => calculate_default_inv_freq(config),
-            Some(rope_scaling) => {
-                let low_freq_wavelen = rope_scaling.original_max_position_embeddings as f32
-                    / rope_scaling.low_freq_factor;
-                let high_freq_wavelen = rope_scaling.original_max_position_embeddings as f32
-                    / rope_scaling.high_freq_factor;
-
-                calculate_default_inv_freq(config)
-                    .into_iter()
-                    .map(|freq| {
-                        let wavelen = 2. * PI / freq;
-                        if wavelen < high_freq_wavelen {
-                            freq
-                        } else if wavelen > low_freq_wavelen {
-                            freq / rope_scaling.factor
-                        } else {
-                            let smooth = (rope_scaling.original_max_position_embeddings as f32
-                                / wavelen
-                                - rope_scaling.low_freq_factor)
-                                / (rope_scaling.high_freq_factor - rope_scaling.low_freq_factor);
-                            (1. - smooth) * freq / rope_scaling.factor + smooth * freq
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            }
-        };
-
-        let theta = Tensor::new(theta, device)?;
-        let idx_theta = Tensor::arange(0, config.max_position_embeddings as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((config.max_position_embeddings, 1))?
-            .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-        let cos = idx_theta.cos()?.to_dtype(dtype)?;
-        let sin = idx_theta.sin()?.to_dtype(dtype)?;
-        Ok(Self {
-            masks: HashMap::new(),
-            use_kv_cache,
-            kvs: vec![None; config.num_hidden_layers],
-            device: device.clone(),
-            cos,
-            sin,
-        })
-    }
-
-    fn mask(&mut self, seq_len: usize, index_pos: usize) -> CandleResult<Tensor> {
-        let kv_len = index_pos + seq_len;
-        if let Some(mask) = self.masks.get(&(seq_len, kv_len)) {
-            Ok(mask.clone())
-        } else {
-            let mask = build_causal_mask(seq_len, index_pos, &self.device)?;
-            self.masks.insert((seq_len, kv_len), mask.clone());
-            Ok(mask)
-        }
-    }
-}
-
-fn masked_fill(on_false: &Tensor, mask: &Tensor, on_true: f32) -> CandleResult<Tensor> {
-    let shape = mask.shape();
-    let on_true = Tensor::new(on_true, on_false.device())?.broadcast_as(shape.dims())?;
-    mask.where_cond(&on_true, on_false)
-}
-
-/// Replicated (unsharded) causal self-attention, run entirely on the
-/// "primary" device. Identical math to upstream
-/// `candle_transformers::models::llama::CausalSelfAttention::forward`, with
-/// the Flash Attention path enabled by `core-host/candle-cuda` on CUDA tensors
-/// (F32 activations are narrowed to F16 for the fused kernel).
+/// The KV cache and rotary tables every parallel variant here shares.
 ///
-/// `pub(crate)` (rather than module-private) so `expert_parallel_llama.rs`
-/// can build MoE blocks that reuse this exact attention implementation
-/// instead of reimplementing it (see that module's doc comment).
-pub(crate) struct ReplicatedAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
-    num_attention_heads: usize,
-    num_key_value_heads: usize,
-    head_dim: usize,
-    use_flash_attn: bool,
-    max_position_embeddings: usize,
-}
+/// Upstream's own, now that it is reachable: a `Block` indexes it by
+/// `block_idx`, which is exactly what a tensor-parallel model, a pipeline stage
+/// holding a contiguous layer range, and a mixed dense/MoE stack all need.
+pub(crate) type TensorParallelCache = candle_transformers::models::llama::Cache;
 
-#[cfg(feature = "candle-cuda")]
-fn flash_attn(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    softmax_scale: f32,
-    causal: bool,
-) -> CandleResult<Tensor> {
-    candle_flash_attn::flash_attn(q, k, v, softmax_scale, causal)
-}
-
-impl ReplicatedAttention {
-    pub(crate) fn load(vb: VarBuilder, cfg: &Config) -> CandleResult<Self> {
-        let size_in = cfg.hidden_size;
-        let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
-        let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
-        Ok(Self {
-            q_proj: linear(size_in, size_q, vb.pp("q_proj"))?,
-            k_proj: linear(size_in, size_kv, vb.pp("k_proj"))?,
-            v_proj: linear(size_in, size_kv, vb.pp("v_proj"))?,
-            o_proj: linear(size_q, size_in, vb.pp("o_proj"))?,
-            num_attention_heads: cfg.num_attention_heads,
-            num_key_value_heads: cfg.num_key_value_heads,
-            head_dim: cfg.hidden_size / cfg.num_attention_heads,
-            use_flash_attn: cfg.use_flash_attn,
-            max_position_embeddings: cfg.max_position_embeddings,
-        })
-    }
-
-    fn apply_rotary_emb(
-        &self,
-        x: &Tensor,
-        index_pos: usize,
-        cache: &TensorParallelCache,
-    ) -> CandleResult<Tensor> {
-        let (_b_sz, _, seq_len, _hidden_size) = x.dims4()?;
-        let cos = cache.cos.narrow(0, index_pos, seq_len)?;
-        let sin = cache.sin.narrow(0, index_pos, seq_len)?;
-        candle_nn::rotary_emb::rope(x, &cos, &sin)
-    }
-
-    fn flash_attn_dtype(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Option<DType> {
-        if !self.use_flash_attn
-            || !cfg!(feature = "candle-cuda")
-            || q.device().is_cpu()
-            || q.dtype() != k.dtype()
-            || q.dtype() != v.dtype()
-        {
-            return None;
-        }
-        match q.dtype() {
-            DType::F16 | DType::BF16 => Some(q.dtype()),
-            DType::F32 => Some(DType::F16),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn forward(
-        &self,
-        x: &Tensor,
-        index_pos: usize,
-        block_idx: usize,
-        cache: &mut TensorParallelCache,
-    ) -> CandleResult<Tensor> {
-        let (b_sz, seq_len, hidden_size) = x.dims3()?;
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
-
-        let q = q
-            .reshape((b_sz, seq_len, self.num_attention_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let k = k
-            .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let mut v = v
-            .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        let q = self.apply_rotary_emb(&q, index_pos, cache)?;
-        let mut k = self.apply_rotary_emb(&k, index_pos, cache)?;
-
-        if cache.use_kv_cache {
-            if let Some((cache_k, cache_v)) = &cache.kvs[block_idx] {
-                k = Tensor::cat(&[cache_k, &k], 2)?.contiguous()?;
-                v = Tensor::cat(&[cache_v, &v], 2)?.contiguous()?;
-                let k_seq_len = k.dims()[1];
-                if k_seq_len > self.max_position_embeddings {
-                    k = k
-                        .narrow(
-                            D::Minus1,
-                            k_seq_len - self.max_position_embeddings,
-                            self.max_position_embeddings,
-                        )?
-                        .contiguous()?
-                }
-                let v_seq_len = v.dims()[1];
-                if v_seq_len > 2 * self.max_position_embeddings {
-                    v = v
-                        .narrow(
-                            D::Minus1,
-                            v_seq_len - self.max_position_embeddings,
-                            self.max_position_embeddings,
-                        )?
-                        .contiguous()?
-                }
-            }
-            cache.kvs[block_idx] = Some((k.clone(), v.clone()))
-        }
-
-        let k = repeat_kv(k, self.num_attention_heads / self.num_key_value_heads)?;
-        let v = repeat_kv(v, self.num_attention_heads / self.num_key_value_heads)?;
-
-        let y = if let Some(flash_dtype) = self.flash_attn_dtype(&q, &k, &v) {
-            #[cfg(feature = "candle-cuda")]
-            {
-                let in_dtype = q.dtype();
-                let q = q.to_dtype(flash_dtype)?.transpose(1, 2)?;
-                let k = k.to_dtype(flash_dtype)?.transpose(1, 2)?;
-                let v = v.to_dtype(flash_dtype)?.transpose(1, 2)?;
-                let softmax_scale = 1f32 / (self.head_dim as f32).sqrt();
-                flash_attn(&q, &k, &v, softmax_scale, seq_len > 1)?
-                    .transpose(1, 2)?
-                    .to_dtype(in_dtype)?
-            }
-            #[cfg(not(feature = "candle-cuda"))]
-            {
-                let _ = flash_dtype;
-                unreachable!("flash_attn_dtype is None without core-host/candle-cuda")
-            }
-        } else {
-            let in_dtype = q.dtype();
-            let q = q.to_dtype(DType::F32)?;
-            let k = k.to_dtype(DType::F32)?;
-            let v = v.to_dtype(DType::F32)?;
-            let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-            let att = if seq_len == 1 {
-                att
-            } else {
-                let mask = cache.mask(seq_len, index_pos)?.broadcast_as(att.shape())?;
-                masked_fill(&att, &mask, f32::NEG_INFINITY)?
-            };
-            let att = candle_nn::ops::softmax_last_dim(&att)?;
-            att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?
-        };
-        let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, hidden_size])?;
-        self.o_proj.forward(&y)
-    }
-}
-
-/// Megatron-style MLP: column-parallel gate/up projections, row-parallel down
-/// projection, one all-reduce (the `RowParallelLinear` partial-sum) per call.
-/// Requires `devices.len() >= 2` (enforced by
-/// `parallel_topology::validate_plan_shape` before a plan reaches this
-/// loader).
 pub(crate) struct TensorParallelMlp {
     gate: ColumnParallelLinear,
     up: ColumnParallelLinear,
     down: RowParallelLinear,
+    /// How `down`'s single per-layer all-reduce travels. Defaults to the
+    /// host-staged sum; `with_nccl_group` swaps in the real collective.
+    reducer: NcclReducer,
     devices: Vec<Device>,
     primary: Device,
 }
@@ -328,6 +62,10 @@ impl TensorParallelMlp {
             gate: ColumnParallelLinear::shard(&gate_w, devices)?,
             up: ColumnParallelLinear::shard(&up_w, devices)?,
             down: RowParallelLinear::shard(&down_w, devices)?,
+            #[cfg(feature = "candle-cuda")]
+            reducer: NcclReducer::new(None),
+            #[cfg(not(feature = "candle-cuda"))]
+            reducer: NcclReducer::new(),
             devices: devices.to_vec(),
             primary: devices[0].clone(),
         })
@@ -338,7 +76,7 @@ impl TensorParallelMlp {
     /// across every layer) to this MLP's `down` projection.
     #[cfg(feature = "candle-cuda")]
     fn with_nccl_group(mut self, group: Option<std::sync::Arc<NcclShardGroup>>) -> Self {
-        self.down = self.down.with_nccl_group(group);
+        self.reducer = NcclReducer::new(group);
         self
     }
 
@@ -354,7 +92,9 @@ impl TensorParallelMlp {
         let up_out = self.up.forward(&x_2d, &self.primary)?;
         let hidden = (gate_out * up_out)?;
         let x_shards = split_for_row_parallel(&hidden, &self.devices)?;
-        let out_2d = self.down.forward(&x_shards, &self.primary)?;
+        let out_2d = self
+            .down
+            .forward_with_reducer(&x_shards, &self.primary, &self.reducer)?;
 
         let mut out_dims = in_shape.dims().to_vec();
         *out_dims.last_mut().expect("hidden_size dim exists") = out_2d.dim(1)?;
@@ -362,117 +102,57 @@ impl TensorParallelMlp {
     }
 }
 
-/// A single tensor-parallel transformer block. Also reused, unmodified, as
-/// the per-stage local unit of work for pipeline parallelism
-/// (`pipeline_parallel_llama.rs`): a pipeline stage is just a contiguous run
-/// of these blocks loaded with a single-device `devices` slice (which
-/// degenerates `TensorParallelMlp`'s sharding to the dense case), with stage
-/// boundaries handled by the caller via `PipelineStageExecutor`/`StageTransport`.
-pub(crate) struct TensorParallelBlock {
-    rms_1: RmsNorm,
-    attn: ReplicatedAttention,
-    rms_2: RmsNorm,
-    mlp: TensorParallelMlp,
+/// The shard, as upstream's `Block` sees it.
+///
+/// A single-device `devices` slice degenerates the sharding to a plain dense
+/// SwiGLU MLP, which is what a pipeline stage and an expert-parallel stack's
+/// dense layers both rely on — one implementation covers all three.
+impl BlockMlp for TensorParallelMlp {
+    fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        TensorParallelMlp::forward(self, xs)
+    }
 }
 
-impl TensorParallelBlock {
-    pub(crate) fn load(vb: VarBuilder, cfg: &Config, devices: &[Device]) -> CandleResult<Self> {
-        Ok(Self {
-            attn: ReplicatedAttention::load(vb.pp("self_attn"), cfg)?,
-            mlp: TensorParallelMlp::load(vb.pp("mlp"), cfg, devices)?,
-            rms_1: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
-            rms_2: RmsNorm::new(
-                cfg.hidden_size,
-                cfg.rms_norm_eps,
-                vb.pp("post_attention_layernorm"),
-            )?,
-        })
-    }
-
-    /// Attaches a shared NCCL communicator group (built once per
-    /// tensor-parallel shard group by `TensorParallelLlama::load`) to this
-    /// block's MLP.
+/// Build one block's sharded MLP, ready to hand to
+/// [`candle_transformers::models::llama::Block::load_with_block_mlp`].
+///
+/// `vb` must be rooted at the block, not at its MLP: the `mlp` prefix is
+/// applied here so every caller — this module, pipeline stages, the dense
+/// layers of an expert-parallel stack — agrees on it.
+pub(crate) fn shard_block_mlp(
+    vb: &VarBuilder,
+    cfg: &Config,
+    devices: &[Device],
+    #[cfg(feature = "candle-cuda")] nccl_group: Option<std::sync::Arc<NcclShardGroup>>,
+) -> CandleResult<Box<dyn BlockMlp>> {
+    let mlp = TensorParallelMlp::load(vb.pp("mlp"), cfg, devices)?;
     #[cfg(feature = "candle-cuda")]
-    pub(crate) fn with_nccl_group(mut self, group: Option<std::sync::Arc<NcclShardGroup>>) -> Self {
-        self.mlp = self.mlp.with_nccl_group(group);
-        self
-    }
-
-    pub(crate) fn forward(
-        &self,
-        x: &Tensor,
-        index_pos: usize,
-        block_idx: usize,
-        cache: &mut TensorParallelCache,
-    ) -> CandleResult<Tensor> {
-        let residual = x;
-        let x = self.rms_1.forward(x)?;
-        let x = (self.attn.forward(&x, index_pos, block_idx, cache)? + residual)?;
-        let residual = &x;
-        let x = (self.mlp.forward(&self.rms_2.forward(&x)?)? + residual)?;
-        Ok(x)
-    }
+    let mlp = mlp.with_nccl_group(nccl_group);
+    Ok(Box::new(mlp))
 }
 
-/// Tensor-parallel Llama: identical outputs to
-/// `candle_transformers::models::llama::Llama::load`/`forward` on the same
-/// weights, but the MLP of every block is sharded across `devices`.
-pub(crate) struct TensorParallelLlama {
-    wte: Embedding,
-    blocks: Vec<TensorParallelBlock>,
-    ln_f: RmsNorm,
-    lm_head: Linear,
-}
-
-impl TensorParallelLlama {
-    /// `devices` must have at least 2 entries; shape validation
-    /// (`parallel_topology::validate_plan_shape`) rejects tensor-parallel
-    /// plans with fewer before they reach this loader.
-    pub(crate) fn load(vb: VarBuilder, cfg: &Config, devices: &[Device]) -> CandleResult<Self> {
-        let wte = Embedding::new(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
-        let lm_head = if cfg.tie_word_embeddings {
-            Linear::from_weights(wte.embeddings().clone(), None)
-        } else {
-            linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
-        };
-        let ln_f = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
-        // One NCCL communicator group per tensor-parallel shard group,
-        // shared (via `Arc`) across every layer's `RowParallelLinear`
-        // instead of paying communicator-init cost per layer.
+/// Tensor-parallel Llama: identical outputs to `Llama::load`/`forward` on the
+/// same weights, with every block's MLP sharded across `devices`.
+///
+/// `devices` must have at least 2 entries; shape validation
+/// (`parallel_topology::validate_plan_shape`) rejects tensor-parallel plans
+/// with fewer before they reach this loader.
+pub(crate) fn load_tensor_parallel_llama(
+    vb: VarBuilder,
+    cfg: &Config,
+    devices: &[Device],
+) -> CandleResult<Llama> {
+    // One NCCL communicator group per tensor-parallel shard group, shared (via
+    // `Arc`) across every layer's `RowParallelLinear` instead of paying
+    // communicator-init cost per layer.
+    #[cfg(feature = "candle-cuda")]
+    let nccl_group = NcclShardGroup::try_new(devices).map(std::sync::Arc::new);
+    Llama::load_with_mlp_factory(vb, cfg, |_layer_idx, mlp_vb| {
+        let mlp = TensorParallelMlp::load(mlp_vb, cfg, devices)?;
         #[cfg(feature = "candle-cuda")]
-        let nccl_group = NcclShardGroup::try_new(devices).map(std::sync::Arc::new);
-        let blocks = (0..cfg.num_hidden_layers)
-            .map(|i| {
-                let block =
-                    TensorParallelBlock::load(vb.pp(format!("model.layers.{i}")), cfg, devices)?;
-                #[cfg(feature = "candle-cuda")]
-                let block = block.with_nccl_group(nccl_group.clone());
-                Ok(block)
-            })
-            .collect::<CandleResult<Vec<_>>>()?;
-        Ok(Self {
-            wte,
-            blocks,
-            ln_f,
-            lm_head,
-        })
-    }
-
-    pub(crate) fn forward(
-        &self,
-        x: &Tensor,
-        index_pos: usize,
-        cache: &mut TensorParallelCache,
-    ) -> CandleResult<Tensor> {
-        let (_b_sz, seq_len) = x.dims2()?;
-        let mut x = self.wte.forward(x)?;
-        for (block_idx, block) in self.blocks.iter().enumerate() {
-            x = block.forward(&x, index_pos, block_idx, cache)?;
-        }
-        let x = self.ln_f.forward(&x)?;
-        let x = x.i((.., seq_len - 1, ..))?.contiguous()?;
-        self.lm_head.forward(&x)?.to_dtype(DType::F32)
-    }
+        let mlp = mlp.with_nccl_group(nccl_group.clone());
+        Ok(Box::new(mlp) as Box<dyn BlockMlp>)
+    })
 }
 
 #[cfg(test)]
@@ -480,6 +160,7 @@ impl TensorParallelLlama {
 mod tests {
     use super::*;
     use crate::ai_inference::candle_llm_runtime::write_tachyon_tiny_fixture;
+    use candle_core::DType;
     use candle_transformers::models::llama::{
         Cache as DenseCache, Llama as DenseLlama, LlamaConfig,
     };
@@ -511,7 +192,7 @@ mod tests {
             VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &tp_devices[0])
         }
         .unwrap();
-        let tp_model = TensorParallelLlama::load(tp_vb, &config, &tp_devices).unwrap();
+        let tp_model = load_tensor_parallel_llama(tp_vb, &config, &tp_devices).unwrap();
         let mut tp_cache =
             TensorParallelCache::new(false, DType::F32, &config, &tp_devices[0]).unwrap();
 
@@ -528,46 +209,29 @@ mod tests {
         }
     }
 
+    /// The flag and the kernel must be enabled together.
+    ///
+    /// This used to assert something else: that setting `use_flash_attn` on a
+    /// build without the kernel quietly fell back to naive attention. That
+    /// leniency was a property of the attention this module reimplemented, and
+    /// upstream deliberately does not have it — `flash_attn` is
+    /// `unimplemented!()` when the feature is off, so a request for a kernel
+    /// that was never compiled fails loudly instead of silently running
+    /// something slower than asked for.
+    ///
+    /// Which is the better behaviour, and unreachable here: `candle-cuda`
+    /// enables `candle-transformers/flash-attn` in the same feature list that
+    /// flips this constant, so the two cannot disagree. That is the invariant
+    /// worth pinning, and it is now checkable directly rather than through a
+    /// forward pass.
     #[test]
-    fn tensor_parallel_llama_cuda_flash_attn_flag_keeps_naive_fallback_on_cpu_f32() {
-        let dir = tempfile::tempdir().unwrap();
-        write_tachyon_tiny_fixture(dir.path()).unwrap();
-        let mut config = load_config(dir.path());
-        config.use_flash_attn = true;
-
-        let weight_paths = vec![dir.path().join("model.safetensors")];
-
-        let mut dense_config = config.clone();
-        dense_config.use_flash_attn = false;
-        let dense_device = Device::Cpu;
-        let dense_vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &dense_device)
-        }
-        .unwrap();
-        let dense_model = DenseLlama::load(dense_vb, &dense_config).unwrap();
-        let mut dense_cache =
-            DenseCache::new(false, DType::F32, &dense_config, &dense_device).unwrap();
-
-        let tp_devices = vec![Device::Cpu, Device::Cpu];
-        let tp_vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &tp_devices[0])
-        }
-        .unwrap();
-        let tp_model = TensorParallelLlama::load(tp_vb, &config, &tp_devices).unwrap();
-        let mut tp_cache =
-            TensorParallelCache::new(false, DType::F32, &config, &tp_devices[0]).unwrap();
-
-        let input = Tensor::from_vec(vec![1u32, 2, 3], (1, 3), &dense_device).unwrap();
-
-        let dense_logits = dense_model.forward(&input, 0, &mut dense_cache).unwrap();
-        let tp_logits = tp_model.forward(&input, 0, &mut tp_cache).unwrap();
-
-        let dense_logits: Vec<f32> = dense_logits.flatten_all().unwrap().to_vec1().unwrap();
-        let tp_logits: Vec<f32> = tp_logits.flatten_all().unwrap().to_vec1().unwrap();
-        assert_eq!(dense_logits.len(), tp_logits.len());
-        for (a, b) in dense_logits.iter().zip(tp_logits.iter()) {
-            assert!((a - b).abs() < 1e-3, "{a} != {b}");
-        }
+    fn the_parallel_flash_attn_flag_tracks_the_compiled_kernel() {
+        assert_eq!(
+            crate::ai_inference::candle_llm_runtime::PARALLEL_LLAMA_USE_FLASH_ATTN,
+            cfg!(feature = "candle-cuda"),
+            "the flag must be set exactly when `candle-cuda` — and with it \
+             `candle-transformers/flash-attn` — is compiled in"
+        );
     }
 
     #[test]
@@ -595,7 +259,7 @@ mod tests {
             VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &tp_devices[0])
         }
         .unwrap();
-        let tp_model = TensorParallelLlama::load(tp_vb, &config, &tp_devices).unwrap();
+        let tp_model = load_tensor_parallel_llama(tp_vb, &config, &tp_devices).unwrap();
         let mut tp_cache =
             TensorParallelCache::new(false, DType::F32, &config, &tp_devices[0]).unwrap();
 
@@ -632,7 +296,7 @@ mod tests {
             VarBuilder::from_mmaped_safetensors(&weight_paths, DType::F32, &tp_devices[0])
         }
         .unwrap();
-        let tp_model = TensorParallelLlama::load(tp_vb, &config, &tp_devices).unwrap();
+        let tp_model = load_tensor_parallel_llama(tp_vb, &config, &tp_devices).unwrap();
         let mut tp_cache =
             TensorParallelCache::new(true, DType::F32, &config, &tp_devices[0]).unwrap();
 

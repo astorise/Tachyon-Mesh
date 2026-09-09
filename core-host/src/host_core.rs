@@ -98,8 +98,8 @@ pub(crate) use std::{
     time::{Duration, Instant, SystemTime},
 };
 pub(crate) use telemetry::{
-    push_custom_metric, CustomMetric, CustomMetricType, TelemetryEvent, TelemetryHandle,
-    TelemetrySnapshot,
+    push_custom_metric, CustomMetric, CustomMetricType, RequestCompletion, TelemetryEvent,
+    TelemetryHandle, TelemetrySnapshot,
 };
 #[cfg(unix)]
 pub(crate) use tokio::net::UnixListener;

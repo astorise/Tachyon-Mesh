@@ -26,7 +26,7 @@
 //! `TACHYON_UPSTREAM_API_KEY`. Absent both, the request is sent unauthenticated
 //! — the common case for a llama.cpp server on a trusted mesh link.
 
-use std::{env, time::Duration};
+use std::{env, sync::Arc, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -94,7 +94,6 @@ pub(crate) enum UpstreamError {
         alias: String,
         endpoint: String,
         detail: String,
-        timed_out: bool,
     },
     #[error("upstream `{alias}` at `{endpoint}` returned HTTP {status}: {body}")]
     Status {
@@ -108,18 +107,27 @@ pub(crate) enum UpstreamError {
 }
 
 impl UpstreamError {
-    /// The HTTP status the remote provider returned, when the failure *was* a
-    /// remote response. Every other variant yields `None`: a transport failure
-    /// never reached a server, and a rejected request never left this node, so
-    /// attributing a status to either would report a local fault as the
-    /// provider's.
+    /// The status this node should answer with when an upstream call fails.
+    ///
+    /// A remote response keeps its own status: a 401, a 404 or a 429 means
+    /// something specific and actionable, and flattening it loses that.
+    ///
+    /// A transport failure and an unusable body used to yield `None`, on the
+    /// reasoning that no server had answered so no status was the provider's to
+    /// attribute. But `None` is rendered as 500 `server_error`, which says
+    /// *this* node broke — and an agent retrying a 500 against a node that is
+    /// working fine retries forever against an upstream that is not. Serving
+    /// this alias makes the node a gateway, and 502 is exactly what HTTP has
+    /// for a gateway whose upstream did not answer usably. That is a truthful
+    /// answer, not an attribution.
+    ///
+    /// The two genuinely local faults keep `None`: a malformed binding is this
+    /// deployment's own configuration, and a rejected request never left.
     pub(crate) fn http_status(&self) -> Option<u16> {
         match self {
             Self::Status { status, .. } => Some(*status),
-            Self::InvalidBinding { .. }
-            | Self::InvalidRequest { .. }
-            | Self::Transport { .. }
-            | Self::MalformedResponse { .. } => None,
+            Self::Transport { .. } | Self::MalformedResponse { .. } => Some(502),
+            Self::InvalidBinding { .. } | Self::InvalidRequest { .. } => None,
         }
     }
 }
@@ -416,6 +424,17 @@ struct HostGenerationRequest {
     /// for 1 ms could hold a network slot for the binding's full timeout.
     #[serde(default)]
     max_generation_ms: Option<u64>,
+    /// Whether the caller asked for token counts on the stream.
+    ///
+    /// Not read from the wire unprompted: OpenAI only emits streamed `usage`
+    /// when `stream_options.include_usage` is set, and volunteering that field
+    /// to an upstream that does not know it risks a 400 that breaks streaming
+    /// outright — a bad trade for a reporting field nobody requested. When a
+    /// client *did* request it the trade reverses: dropping the option leaves
+    /// `read_usage` with nothing to read, and the caller is silently denied the
+    /// trailing usage chunk it explicitly asked for.
+    #[serde(default)]
+    include_usage: Option<bool>,
 }
 
 /// A completed upstream generation: its bytes, the counts the upstream
@@ -426,10 +445,16 @@ struct HostGenerationRequest {
 #[derive(Debug)]
 pub(crate) struct UpstreamGeneration {
     pub(crate) bytes: Vec<u8>,
-    pub(crate) refusal: Option<String>,
     pub(crate) usage: Option<TokenUsage>,
     pub(crate) finish_reason: Option<String>,
     pub(crate) tool_calls: Vec<ToolCall>,
+    /// The provider's structured safety refusal, when it sent one.
+    ///
+    /// OpenAI puts a refusal on its own field precisely so a caller can tell
+    /// one from an answer. Dropping it made a refusal indistinguishable from a
+    /// model that returned nothing: `content: null`, `finish_reason: "stop"`,
+    /// and an agent treating the empty string as the reply.
+    pub(crate) refusal: Option<String>,
 }
 
 /// An OpenAI-compatible upstream bound to one mesh alias.
@@ -437,36 +462,409 @@ pub(crate) struct UpstreamOpenAiRuntime {
     alias: String,
     endpoint: UpstreamEndpoint,
     api_key: Option<String>,
-    client: reqwest::Client,
-    /// Drives the async client from this backend's synchronous entry points.
-    ///
-    /// `reqwest::blocking` used to do exactly this behind the scenes, on a
-    /// thread of its own. The reason for owning it here instead is that the
-    /// blocking wrapper exposes no per-read deadline: a client that leaves
-    /// before the upstream's first SSE frame could not be noticed until a frame
-    /// arrived, and the request held its admission permit meanwhile. Owning the
-    /// runtime lets the read loop wrap each poll in a timeout and ask the sink
-    /// whether anyone is still listening.
-    runtime: Option<tokio::runtime::Runtime>,
+    client: reqwest::blocking::Client,
+    /// Used only for the streaming route. Its body is driven inside the
+    /// reader thread's own current-thread runtime, so a parked read is a
+    /// future in a `tokio::select!` rather than an uninterruptible
+    /// `read_line` — see [`SseLineReader`].
+    client_async: reqwest::Client,
 }
 
-/// How long the stream reader waits on the socket before checking whether the
-/// consumer is still there.
-///
-/// Not a timeout on the request — the binding's `timeout_ms` remains that, and
-/// exceeding this interval is not an error. It is only how often a *silent*
-/// upstream lets the loop come up for air. Short enough that an abandoned
-/// request releases its permit promptly, long enough that an idle stream costs
-/// a handful of wakeups a minute rather than a spin.
-const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How long a silent upstream is given before this side re-checks that anyone
+/// is still listening. Short enough that an abandoned request frees its
+/// admission permit promptly, long enough that a busy stream is not paying for
+/// a wakeup per frame.
+const SSE_LIVENESS_POLL: Duration = Duration::from_millis(250);
 
-impl UpstreamOpenAiRuntime {
-    fn runtime(&self) -> &tokio::runtime::Runtime {
-        self.runtime
-            .as_ref()
-            .expect("upstream runtime is available until the backend is dropped")
+/// What one poll of the reader thread found.
+enum SseRead {
+    Line(String),
+    /// Nothing within the poll window — the upstream is thinking, not gone.
+    Idle,
+    Eof,
+    Failed(UpstreamError),
+}
+
+/// How many reader threads may exist at once, across every upstream binding.
+///
+/// A reader outlives its request when the client disconnects while the upstream
+/// is silent: `read_line` is uninterruptible and reqwest's blocking client has
+/// no per-read timeout, so the thread cannot observe the closed channel until
+/// the upstream speaks or the request timeout fires. Its admission permit is
+/// already released by then, so nothing else was counting these — a client that
+/// connects and disconnects in a loop against a silent upstream accumulated a
+/// thread and a socket per attempt, past any concurrency bound.
+///
+/// Derived from the admission gate rather than fixed. A constant 64 silently
+/// capped streaming at its own number: raising
+/// `TACHYON_UPSTREAM_MAX_CONCURRENCY` scaled buffered generation and embeddings
+/// while the 65th *stream* was refused with a gateway error even though every
+/// live reader belonged to a healthy request. The headroom is what the ceiling
+/// is actually for — parked readers whose requests have already ended — so it
+/// is expressed as a multiple of the admitted concurrency instead of replacing
+/// it.
+fn max_live_sse_readers() -> usize {
+    super::upstream_max_concurrency().saturating_mul(2)
+}
+
+/// Reader threads currently alive, including ones parked past their request.
+static LIVE_SSE_READERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Decrements the live-reader count however its thread ends — a clean EOF, a
+/// read error, or a send to a receiver that has gone away.
+struct SseReaderSlot {
+    /// Lets a test observe *this specific* slot's release directly, instead
+    /// of diffing the shared `LIVE_SSE_READERS` counter across two instants
+    /// — which every other streaming test in this file also mutates, so a
+    /// diff can be thrown off by unrelated concurrent activity that has
+    /// nothing to do with the slot under test. Never set outside tests.
+    #[cfg(test)]
+    on_drop: Option<std::sync::mpsc::SyncSender<()>>,
+}
+
+impl SseReaderSlot {
+    /// `None` when the ceiling is reached, which the caller reports as an
+    /// overloaded upstream rather than spawning a thread it cannot account for.
+    fn claim() -> Option<Self> {
+        claim_below(&LIVE_SSE_READERS, max_live_sse_readers()).then_some(Self {
+            #[cfg(test)]
+            on_drop: None,
+        })
     }
 
+    /// Attach a channel that fires the instant this slot is released,
+    /// wherever that happens — including inside the reader thread's closure,
+    /// well before the thread itself finishes exiting.
+    #[cfg(test)]
+    fn notify_drop(mut self, tx: std::sync::mpsc::SyncSender<()>) -> Self {
+        self.on_drop = Some(tx);
+        self
+    }
+}
+
+/// Increment `counter` unless doing so would reach `ceiling`.
+///
+/// Split out from [`SseReaderSlot::claim`] so the ceiling can be exercised
+/// against a local counter: exhausting the process-wide one would refuse the
+/// streams every other test in this file opens.
+fn claim_below(counter: &std::sync::atomic::AtomicUsize, ceiling: usize) -> bool {
+    let mut live = counter.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        if live >= ceiling {
+            return false;
+        }
+        match counter.compare_exchange_weak(
+            live,
+            live + 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(observed) => live = observed,
+        }
+    }
+}
+
+impl Drop for SseReaderSlot {
+    fn drop(&mut self) {
+        LIVE_SSE_READERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        #[cfg(test)]
+        if let Some(tx) = self.on_drop.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Issues the streaming request and reads SSE lines on a dedicated thread, so
+/// the caller can keep answering for itself while a read is in flight.
+///
+/// Everything from the connect onward runs inside a current-thread tokio
+/// runtime on that thread, racing each await against `cancel` in a
+/// `tokio::select!`. That is the piece a blocking `read_line` could never do:
+/// `reqwest::blocking::Client` has no per-read timeout, so a reader parked on
+/// a silent upstream could not observe a caller that had already left — it
+/// woke only when the upstream spoke or the request timed out, up to an hour,
+/// with its admission permit held the whole time. Racing the read against a
+/// `Notify` lets [`Drop`] cancel it the moment the caller stops polling.
+struct SseLineReader {
+    lines: std::sync::mpsc::Receiver<Result<String, UpstreamError>>,
+    cancel: Arc<tokio::sync::Notify>,
+}
+
+/// Wakes the reader thread out of whatever await it is parked in, however the
+/// caller stopped polling — a normal `break`, an early `return`, or a panic
+/// unwinding through this scope all drop `SseLineReader` the same way.
+impl Drop for SseLineReader {
+    fn drop(&mut self) {
+        self.cancel.notify_one();
+    }
+}
+
+impl SseLineReader {
+    /// `slot` is held for the thread's whole life, so the live-reader count
+    /// falls on every exit — including a read cancelled mid-connect.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn(
+        client: reqwest::Client,
+        alias: String,
+        url: String,
+        body: Value,
+        timeout: Duration,
+        bearer: Option<String>,
+        slot: SseReaderSlot,
+    ) -> Self {
+        // Depth one: the reader stays one line ahead and then parks. Buffering
+        // more would let a fast upstream race ahead of a consumer that has
+        // already gone away, which is the situation this whole seam exists to
+        // end early.
+        let (tx, lines) = std::sync::mpsc::sync_channel(1);
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        let cancel_thread = Arc::clone(&cancel);
+        let spawned = std::thread::Builder::new()
+            .name("tachyon-upstream-sse".to_owned())
+            .spawn(move || {
+                let _slot = slot;
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                rt.block_on(Self::drive(
+                    client,
+                    alias,
+                    url,
+                    body,
+                    timeout,
+                    bearer,
+                    tx,
+                    cancel_thread,
+                ));
+                // DNS resolution runs on tokio's blocking pool and, once
+                // started, cannot be aborted by dropping its future — a
+                // stalled `getaddrinfo` keeps that pool thread busy well
+                // past `cancel.notified()` firing. An ordinary drop of `rt`
+                // blocks this thread until every such task finishes, which
+                // would hold `_slot` for however long DNS takes instead of
+                // releasing it the moment `drive` returns. Shutting down in
+                // the background lets this thread — and the slot — go free
+                // immediately, leaving the runtime's own cleanup to finish
+                // on its own time.
+                rt.shutdown_background();
+            });
+        // A host that cannot spawn is already failing; report it as an empty
+        // stream rather than panicking inside a request.
+        match spawned {
+            Ok(_handle) => Self { lines, cancel },
+            Err(_) => Self {
+                lines: std::sync::mpsc::channel().1,
+                cancel,
+            },
+        }
+    }
+
+    /// Send the request, reject a non-2xx the same way the buffered path
+    /// does, then split the body into SSE lines as they arrive. Every await
+    /// races `cancel`, so a caller that leaves mid-connect, mid-status-check
+    /// or mid-frame is noticed immediately rather than at the next line.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive(
+        client: reqwest::Client,
+        alias: String,
+        url: String,
+        body: Value,
+        timeout: Duration,
+        bearer: Option<String>,
+        tx: std::sync::mpsc::SyncSender<Result<String, UpstreamError>>,
+        cancel: Arc<tokio::sync::Notify>,
+    ) {
+        let mut response = {
+            let mut request = client.post(&url).timeout(timeout).json(&body);
+            if let Some(key) = &bearer {
+                request = request.bearer_auth(key);
+            }
+            let sent = tokio::select! {
+                sent = request.send() => sent,
+                () = cancel.notified() => return,
+            };
+            match sent {
+                Ok(response) => response,
+                Err(error) => {
+                    let _ = tx.send(Err(UpstreamError::Transport {
+                        alias,
+                        endpoint: url,
+                        detail: error.to_string(),
+                    }));
+                    return;
+                }
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            // Bound the read itself, not just the excerpt: reading the whole
+            // body first would let a broken upstream returning a huge error
+            // page exhaust host memory before the truncation below ever ran.
+            let mut raw = Vec::new();
+            let mut remaining = MAX_ERROR_BODY_BYTES;
+            while remaining > 0 {
+                let chunk = tokio::select! {
+                    chunk = response.chunk() => chunk,
+                    () = cancel.notified() => return,
+                };
+                let Ok(Some(bytes)) = chunk else { break };
+                let take = (bytes.len() as u64).min(remaining) as usize;
+                raw.extend_from_slice(&bytes[..take]);
+                remaining -= take as u64;
+                if take < bytes.len() {
+                    break;
+                }
+            }
+            let body = String::from_utf8_lossy(&raw).chars().collect::<String>();
+            let _ = tx.send(Err(UpstreamError::Status {
+                alias,
+                endpoint: url,
+                status: status.as_u16(),
+                body,
+            }));
+            return;
+        }
+
+        // Bound the whole stream, so an upstream that never terminates cannot
+        // grow the reader without limit.
+        let mut budget = MAX_STREAM_BYTES;
+        let mut line = Vec::new();
+        // How much of `line`, from the start, is already known to contain no
+        // newline. Without this, a frame arriving as many small chunks
+        // rescanned the whole accumulated buffer from byte zero on every
+        // chunk — quadratic in the frame's length, cheap enough to pin a
+        // reader thread's CPU until the request timeout on nothing more than
+        // an upstream that writes one byte at a time. Reset to zero whenever
+        // a line is drained, since the leftover after the split has never
+        // been scanned.
+        let mut scanned = 0usize;
+        loop {
+            let chunk = tokio::select! {
+                chunk = response.chunk() => chunk,
+                () = cancel.notified() => return,
+            };
+            let bytes = match chunk {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    Self::flush_tail(&mut line, &tx, &alias, &url);
+                    return;
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(UpstreamError::Transport {
+                        alias,
+                        endpoint: url,
+                        detail: format!("failed to read the upstream stream: {error}"),
+                    }));
+                    return;
+                }
+            };
+            let take = (bytes.len() as u64).min(budget) as usize;
+            budget -= take as u64;
+            line.extend_from_slice(&bytes[..take]);
+
+            loop {
+                let found = line[scanned..]
+                    .iter()
+                    .position(|&byte| byte == b'\n')
+                    .map(|relative| scanned + relative);
+                let Some(newline) = found else {
+                    // A plain accumulate-until-newline would grow without
+                    // bound if the upstream never sends one — and several
+                    // concurrent streams would multiply that. This is the
+                    // tighter of the two risks, so it is checked before the
+                    // whole-stream budget above would ever catch it.
+                    if line.len() > MAX_SSE_FRAME_BYTES {
+                        let _ = tx.send(Err(UpstreamError::MalformedResponse {
+                            alias,
+                            detail: format!(
+                                "upstream SSE frame exceeds the {MAX_SSE_FRAME_BYTES}-byte limit"
+                            ),
+                        }));
+                        return;
+                    }
+                    scanned = line.len();
+                    break;
+                };
+                let split = line.split_off(newline + 1);
+                let text = match String::from_utf8(std::mem::replace(&mut line, split)) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        let _ = tx.send(Err(UpstreamError::Transport {
+                            alias,
+                            endpoint: url,
+                            detail: format!("failed to read the upstream stream: {error}"),
+                        }));
+                        return;
+                    }
+                };
+                scanned = 0;
+                // A closed receiver means the caller has stopped caring.
+                // Returning drops the response, which closes the socket.
+                if tx.send(Ok(text)).is_err() {
+                    return;
+                }
+            }
+
+            // The whole-stream cap is now exhausted, whether this chunk ran
+            // past it or landed exactly on it: either way the remaining
+            // bytes were never read, so what has been buffered is all there
+            // is — the same shape `Read::take` left behind for the old
+            // blocking reader, and the outer frame loop already treats a
+            // stream that ends without `[DONE]` as truncated. Checking only
+            // `take < bytes.len()` missed the exact-boundary case: `budget`
+            // still landed on zero, but the loop went on to call
+            // `response.chunk()` again and blocked on a silent upstream
+            // until the request timeout, holding the reader slot the whole
+            // time.
+            if budget == 0 {
+                Self::flush_tail(&mut line, &tx, &alias, &url);
+                return;
+            }
+        }
+    }
+
+    /// Send whatever incomplete line is left when the body ends without a
+    /// trailing newline — `BufRead::read_line` did the same for a final
+    /// unterminated line at EOF.
+    fn flush_tail(
+        line: &mut Vec<u8>,
+        tx: &std::sync::mpsc::SyncSender<Result<String, UpstreamError>>,
+        alias: &str,
+        url: &str,
+    ) {
+        if line.is_empty() {
+            return;
+        }
+        match String::from_utf8(std::mem::take(line)) {
+            Ok(text) => {
+                let _ = tx.send(Ok(text));
+            }
+            Err(error) => {
+                let _ = tx.send(Err(UpstreamError::Transport {
+                    alias: alias.to_owned(),
+                    endpoint: url.to_owned(),
+                    detail: format!("failed to read the upstream stream: {error}"),
+                }));
+            }
+        }
+    }
+
+    fn next_line(&mut self, poll: Duration) -> SseRead {
+        match self.lines.recv_timeout(poll) {
+            Ok(Ok(line)) => SseRead::Line(line),
+            Ok(Err(error)) => SseRead::Failed(error),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => SseRead::Idle,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => SseRead::Eof,
+        }
+    }
+}
+
+impl UpstreamOpenAiRuntime {
     /// Claim a binding whose `path` uses the `openai:` scheme.
     ///
     /// `Ok(None)` means "not mine" — the caller keeps probing the on-disk
@@ -477,33 +875,55 @@ impl UpstreamOpenAiRuntime {
         let Some(endpoint) = UpstreamEndpoint::parse(alias, path)? else {
             return Ok(None);
         };
-        // A current-thread runtime, driven by whichever thread makes the call.
-        // Inference executes on the scheduler's dedicated OS thread
-        // (`AcceleratorScheduler::new`'s `tachyon-*-dispatcher`) and never
-        // inside a tokio worker, so `block_on` here cannot be re-entrant — the
-        // same invariant `reqwest::blocking` required, now stated where it is
-        // relied upon. One current-thread runtime also costs less than the
-        // background thread the blocking wrapper span up per client.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+        // Built on a thread of its own, because `reqwest::blocking`'s builder
+        // *panics* when called from inside a tokio runtime — and this runs at
+        // manifest-load time, not at request time. An earlier comment here
+        // claimed the opposite, reasoning from where inference executes (the
+        // scheduler's dedicated OS thread) rather than from where loading does:
+        // `serve_host` is `async`, and it calls `build_runtime_state`
+        // synchronously, so any manifest carrying an `openai:` binding took the
+        // host down during boot.
+        //
+        // A thread per upstream binding, once, at load. The alternative —
+        // building lazily on first use — would move a TLS or resolver failure
+        // from boot to an arbitrary later request, which is the wrong end to
+        // discover it.
+        let timeout = endpoint.timeout;
+        let (client, client_async) = std::thread::Builder::new()
+            .name("tachyon-upstream-client-build".to_owned())
+            .spawn(move || {
+                (
+                    reqwest::blocking::Client::builder()
+                        .timeout(timeout)
+                        .build(),
+                    reqwest::Client::builder().timeout(timeout).build(),
+                )
+            })
             .map_err(|error| UpstreamError::InvalidBinding {
                 alias: alias.to_owned(),
-                detail: format!("could not build the upstream HTTP runtime: {error}"),
-            })?;
-        let client = reqwest::Client::builder()
-            .timeout(endpoint.timeout)
-            .build()
-            .map_err(|error| UpstreamError::InvalidBinding {
+                detail: format!(
+                    "could not start a thread to build the upstream HTTP client: {error}"
+                ),
+            })?
+            .join()
+            .map_err(|_| UpstreamError::InvalidBinding {
                 alias: alias.to_owned(),
-                detail: format!("could not build the upstream HTTP client: {error}"),
+                detail: "the thread building the upstream HTTP client panicked".to_owned(),
             })?;
+        let client = client.map_err(|error| UpstreamError::InvalidBinding {
+            alias: alias.to_owned(),
+            detail: format!("could not build the upstream HTTP client: {error}"),
+        })?;
+        let client_async = client_async.map_err(|error| UpstreamError::InvalidBinding {
+            alias: alias.to_owned(),
+            detail: format!("could not build the upstream async HTTP client: {error}"),
+        })?;
         Ok(Some(Self {
             alias: alias.to_owned(),
             api_key: api_key_for(alias),
             endpoint,
             client,
-            runtime: Some(runtime),
+            client_async,
         }))
     }
 
@@ -612,6 +1032,16 @@ impl UpstreamOpenAiRuntime {
         body.insert("model".to_owned(), json!(self.endpoint.model));
         body.insert("messages".to_owned(), Value::Array(messages));
         body.insert("stream".to_owned(), json!(stream));
+        // Only on a stream, and only when asked: a buffered response reports
+        // usage unconditionally, so the option would be noise there, and an
+        // upstream that rejects the unknown field should only ever see it on
+        // behalf of a caller who wanted what it buys.
+        if stream && request.include_usage == Some(true) {
+            body.insert(
+                "stream_options".to_owned(),
+                json!({ "include_usage": true }),
+            );
+        }
         body.insert("max_tokens".to_owned(), json!(max_new_tokens));
         if let Some(temperature) = request.temperature {
             body.insert("temperature".to_owned(), json!(temperature));
@@ -656,12 +1086,12 @@ impl UpstreamOpenAiRuntime {
         Ok((Value::Object(body), timeout))
     }
 
-    async fn post(
+    fn post(
         &self,
         suffix: &str,
         body: &Value,
         timeout: Duration,
-    ) -> Result<reqwest::Response, UpstreamError> {
+    ) -> Result<reqwest::blocking::Response, UpstreamError> {
         let url = self.endpoint.url(suffix);
         // Per request, not per client: the binding's `timeout_ms` is the
         // ceiling, and a caller's `max_generation_ms` tightens it for this call
@@ -670,15 +1100,11 @@ impl UpstreamOpenAiRuntime {
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);
         }
-        let mut response = request
-            .send()
-            .await
-            .map_err(|error| UpstreamError::Transport {
-                alias: self.alias.clone(),
-                endpoint: url.clone(),
-                detail: error.to_string(),
-                timed_out: error.is_timeout(),
-            })?;
+        let response = request.send().map_err(|error| UpstreamError::Transport {
+            alias: self.alias.clone(),
+            endpoint: url.clone(),
+            detail: error.to_string(),
+        })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -686,7 +1112,11 @@ impl UpstreamOpenAiRuntime {
             // would allocate the whole error page first, so a broken upstream
             // returning a huge body could exhaust host memory before the
             // truncation below ever ran.
-            let raw = read_bounded(&mut response, MAX_ERROR_BODY_BYTES).await;
+            let mut raw = Vec::new();
+            let _ = std::io::copy(
+                &mut std::io::Read::take(response, MAX_ERROR_BODY_BYTES),
+                &mut raw,
+            );
             let body = String::from_utf8_lossy(&raw).chars().collect::<String>();
             return Err(UpstreamError::Status {
                 alias: self.alias.clone(),
@@ -709,23 +1139,85 @@ impl UpstreamOpenAiRuntime {
     /// volunteer it (and every upstream on the buffered path) are reported;
     /// the rest report nothing, which the caller renders as an absent `usage`
     /// rather than as zeros.
-    fn read_usage(payload: &Value) -> Option<TokenUsage> {
-        let usage = payload.get("usage").filter(|usage| !usage.is_null())?;
-        let field = |name: &str| {
-            usage
-                .get(name)
-                .and_then(Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
+    /// An absent or null counter is genuinely unreported and reads as zero. A
+    /// *present* one that is not a non-negative integer, or one too large for
+    /// the `u32` the counters cross the WIT boundary as, is a malformed
+    /// response and says so. Both used to be swallowed: `as_u64().unwrap_or(0)`
+    /// turned `"100"` into an authoritative zero, and the unchecked cast turned
+    /// `4294967297` into `1` — client-visible billing figures, quietly wrong,
+    /// with the other counter lending them credibility.
+    fn read_usage(payload: &Value) -> Result<Option<TokenUsage>, String> {
+        let Some(usage) = payload.get("usage").filter(|usage| !usage.is_null()) else {
+            return Ok(None);
+        };
+        // Present but not an object is a malformed response, not an absent one.
+        // Every `usage.get(...)` below answers `None` for a string as readily as
+        // for a missing key, so `"usage":"unavailable"` reported both counters
+        // as unmeasured and the generation as successful — the one shape where
+        // accounting data goes missing without anything saying so.
+        if !usage.is_object() {
+            return Err(format!(
+                "`usage` is {}, expected an object",
+                json_type_name(usage)
+            ));
+        }
+        // `None` for absent, so a counter the upstream did not report stays
+        // distinguishable from one it reported as zero.
+        let field = |name: &str| -> Result<Option<u32>, String> {
+            match usage.get(name) {
+                None | Some(Value::Null) => Ok(None),
+                Some(value) => {
+                    let count = value.as_u64().ok_or_else(|| {
+                        format!(
+                            "`usage.{name}` must be a non-negative integer, got {}",
+                            json_type_name(value)
+                        )
+                    })?;
+                    u32::try_from(count).map(Some).map_err(|_| {
+                        format!("`usage.{name}` is {count}, beyond the range a token count carries")
+                    })
+                }
+            }
         };
         let prompt_tokens = field("prompt_tokens")?;
         let completion_tokens = field("completion_tokens")?;
+        // Both or neither. Defaulting a missing counter to zero published an
+        // authoritative "0 prompt tokens" next to a real completion count —
+        // a figure that reaches the client's usage object and the node's
+        // billing telemetry as though it had been measured. A half-reported
+        // usage object says less than no usage object at all, and the caller
+        // already renders absent usage as unmeasured rather than as free.
+        let (Some(prompt_tokens), Some(completion_tokens)) = (prompt_tokens, completion_tokens)
+        else {
+            return Ok(None);
+        };
         if prompt_tokens == 0 && completion_tokens == 0 {
-            return None;
+            return Ok(None);
         }
-        Some(TokenUsage {
+        Ok(Some(TokenUsage {
             prompt_tokens,
             completion_tokens,
-        })
+        }))
+    }
+
+    /// The choice's `finish_reason`, or why it cannot be read.
+    ///
+    /// Absent, null and empty all mean "not reported yet" — a streamed frame
+    /// carries one only at the end. A present non-string does not: `as_str`
+    /// used to turn it into that same absence, and `guest-openai` renders an
+    /// absent reason as `stop`, so an upstream that truncated at its own token
+    /// limit could report the answer complete. A client then runs half a
+    /// function believing it read the whole one.
+    fn read_finish_reason(choice: Option<&Value>) -> Result<Option<String>, String> {
+        match choice.and_then(|choice| choice.get("finish_reason")) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(reason)) if reason.is_empty() => Ok(None),
+            Some(Value::String(reason)) => Ok(Some(reason.clone())),
+            Some(other) => Err(format!(
+                "`choices[0].finish_reason` must be a string, got {}",
+                json_type_name(other)
+            )),
+        }
     }
 
     pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<UpstreamGeneration, UpstreamError> {
@@ -739,22 +1231,27 @@ impl UpstreamOpenAiRuntime {
             });
         };
         let (body, timeout) = self.chat_body(prompt, false)?;
-        let payload: Value = self.runtime().block_on(async {
-            let mut response = self.post("/chat/completions", &body, timeout).await?;
-            read_json(&self.alias, &mut response).await
-        })?;
+        let response = self.post("/chat/completions", &body, timeout)?;
+        let payload: Value = read_json(&self.alias, response)?;
         // Every OpenAI-shaped upstream returns `usage` on the buffered route,
         // so unlike the streaming path this is reliably populated.
-        let usage = Self::read_usage(&payload);
+        let usage =
+            Self::read_usage(&payload).map_err(|detail| UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail,
+            })?;
         // `length` means the upstream hit its own token limit, so the answer is
         // truncated. Reporting it as `stop` let a client run half a function.
-        let finish_reason = payload
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("finish_reason"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let finish_reason = Self::read_finish_reason(
+            payload
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first()),
+        )
+        .map_err(|detail| UpstreamError::MalformedResponse {
+            alias: self.alias.clone(),
+            detail,
+        })?;
         let message = payload
             .get("choices")
             .and_then(Value::as_array)
@@ -764,11 +1261,64 @@ impl UpstreamOpenAiRuntime {
                 alias: self.alias.clone(),
                 detail: "response has no `choices[0].message` object".to_owned(),
             })?;
-        let content = message.get("content").and_then(Value::as_str);
-        let refusal = message
-            .get("refusal")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        // Present but not an object is not the same as absent, and only the
+        // absent case was refused. Every read below goes through `get`, which
+        // answers `None` for a string or an array alike, so a corrupted message
+        // produced no content, no tool calls and no error — a successful,
+        // empty completion.
+        if !message.is_object() {
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: format!(
+                    "response has a `choices[0].message` that is {}, not an object",
+                    json_type_name(message)
+                ),
+            });
+        }
+        // Absent and `null` both mean "this message carried no text", which is
+        // the normal shape beside `tool_calls`. A *present* non-string — an
+        // object, an array — is neither: reading it with `as_str` alone
+        // reported it as absent, so the tool-call branch below returned empty
+        // bytes while reporting a successful structured call, and the caller
+        // had no way to know an assistant message had been discarded. The
+        // streamed path draws exactly this line on `delta.content`; the
+        // buffered one has to draw it too, or the same response is rejected or
+        // silently emptied depending on which path served it.
+        let content = match message.get("content") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                Some(
+                    value
+                        .as_str()
+                        .ok_or_else(|| UpstreamError::MalformedResponse {
+                            alias: self.alias.clone(),
+                            detail: format!(
+                                "response has a non-string `choices[0].message.content` of type {}",
+                                json_type_name(value)
+                            ),
+                        })?,
+                )
+            }
+        };
+
+        // Read alongside `content`, not instead of it: the two are separate
+        // fields and a provider may send both. A non-string present value is
+        // refused for the same reason `content` is — reading it with `as_str`
+        // alone would report a corrupted field as absent.
+        let refusal = match message.get("refusal") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) if text.trim().is_empty() => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(other) => {
+                return Err(UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "response has a non-string `choices[0].message.refusal` of type {}",
+                        json_type_name(other)
+                    ),
+                })
+            }
+        };
 
         // A tool call carries `content: null`, so requiring a content string
         // would turn every successful tool call into a malformed-response
@@ -782,43 +1332,70 @@ impl UpstreamOpenAiRuntime {
         {
             return Ok(UpstreamGeneration {
                 bytes: content.unwrap_or_default().as_bytes().to_vec(),
-                refusal,
                 usage,
                 finish_reason,
                 tool_calls: tool_calls_from_value(&self.alias, tool_calls)?,
-            });
-        }
-
-        if finish_reason.as_deref() == Some("tool_calls") {
-            return Err(UpstreamError::MalformedResponse {
-                alias: self.alias.clone(),
-                detail: "upstream reported `finish_reason: tool_calls` without a tool call"
-                    .to_owned(),
-            });
-        }
-
-        if refusal.is_some()
-            || (content.is_none() && finish_reason.as_deref() == Some("content_filter"))
-        {
-            return Ok(UpstreamGeneration {
-                bytes: Vec::new(),
                 refusal,
+            });
+        }
+
+        // The shape OpenAI-compatible providers used before `tool_calls`, and
+        // still the only one some of them emit. It carries a single call with
+        // no id. Recognising it costs one branch; not recognising it made every
+        // buffered request to such a provider fail as malformed, since neither
+        // content nor `tool_calls` is present.
+        if let Some(legacy) = message
+            .get("function_call")
+            .filter(|call| !is_empty_json(call))
+        {
+            let calls = tool_calls_from_value(
+                &self.alias,
+                &Value::Array(vec![json!({
+                    "type": "function",
+                    "function": legacy,
+                })]),
+            )?;
+            return Ok(UpstreamGeneration {
+                bytes: content.unwrap_or_default().as_bytes().to_vec(),
                 usage,
                 finish_reason,
-                tool_calls: Vec::new(),
+                tool_calls: calls,
+                refusal,
             });
         }
-        let text = content.ok_or_else(|| UpstreamError::MalformedResponse {
-            alias: self.alias.clone(),
-            detail: "response has no `choices[0].message.content` string and no `tool_calls`"
-                .to_owned(),
-        })?;
+
+        // A reported finish reason makes an absent content an *answer* — an
+        // empty one. A safety filter returning `content_filter` with
+        // `content: null` is the common case, and rejecting it handed the
+        // client a 500 in place of the result the upstream actually reached.
+        // Only a response with no content, no calls and no reason is shapeless
+        // enough to have nothing to report.
+        let Some(text) = content else {
+            // A refusal counts too: it is the message's substance, and a
+            // provider that sends one without a finish reason has still said
+            // what happened.
+            if finish_reason.is_some() || refusal.is_some() {
+                return Ok(UpstreamGeneration {
+                    bytes: Vec::new(),
+                    usage,
+                    finish_reason,
+                    tool_calls: Vec::new(),
+                    refusal,
+                });
+            }
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: "response has no `choices[0].message.content` string, no `tool_calls`, no \
+                     `refusal` and no `finish_reason`"
+                    .to_owned(),
+            });
+        };
         Ok(UpstreamGeneration {
             bytes: text.as_bytes().to_vec(),
-            refusal,
             usage,
             finish_reason,
             tool_calls: Vec::new(),
+            refusal,
         })
     }
 
@@ -846,28 +1423,60 @@ impl UpstreamOpenAiRuntime {
         // emitted after streamed prose is unparseable — so offering tools cost
         // the whole time-to-first-token even on the requests that never
         // produced a call.
-        // The whole read runs inside one `block_on`, so the sink is borrowed
-        // across await points on a single thread — which is exactly why the
-        // runtime is current-thread. Nothing here needs to be `Send`.
-        self.runtime()
-            .block_on(self.stream_response(body, timeout, sink))
-    }
-
-    async fn stream_response(
-        &self,
-        body: Value,
-        timeout: Duration,
-        sink: &mut dyn StreamSink,
-    ) -> Result<StreamOutcome, UpstreamError> {
-        let mut response = self.post("/chat/completions", &body, timeout).await?;
-
-        // Bound the whole stream, so an upstream that never terminates cannot
-        // grow the reader without limit.
-        let mut reader = SseReader::default();
+        // Claimed before the request goes out: a node already holding parked
+        // readers should refuse rather than open another socket it cannot
+        // account for, and refusing costs the upstream nothing if we never
+        // asked.
+        let Some(slot) = SseReaderSlot::claim() else {
+            return Err(UpstreamError::Transport {
+                alias: self.alias.clone(),
+                endpoint: self.endpoint.url("/chat/completions"),
+                detail: format!(
+                    "{} upstream stream readers are already live on this node, some of them \
+                     parked on silent upstreams; refusing to open another",
+                    max_live_sse_readers()
+                ),
+            });
+        };
+        // Read on its own thread so this loop can answer for itself while the
+        // upstream says nothing.
+        //
+        // The request is issued from inside that thread too, on an async
+        // client whose body read races a cancellation `Notify` in a
+        // `tokio::select!` — see [`SseLineReader::drive`]. A blocking
+        // `read_line` could not do this: `reqwest::blocking::Client` has no
+        // per-read timeout, so a reader parked on a silent upstream never
+        // observed the closed channel at all; it woke only when the upstream
+        // spoke or the request timed out, up to an hour, with the admission
+        // permit held the whole time. `SseLineReader`'s `Drop` now notifies
+        // that same reader the moment this loop decides nobody is listening,
+        // so the thread, the socket and the permit are freed within the
+        // liveness poll window instead.
+        let mut lines = SseLineReader::spawn(
+            self.client_async.clone(),
+            self.alias.clone(),
+            self.endpoint.url("/chat/completions"),
+            body,
+            timeout,
+            self.api_key.clone(),
+            slot,
+        );
+        let mut line = String::new();
         let mut saw_done = false;
+        // Whether the upstream ever sent anything a caller can use: content, a
+        // tool call, or a terminal reason. A stream of nothing but `[DONE]` —
+        // or keep-alives and a usage frame before it — parsed cleanly and
+        // returned success, so the guest turned a provider that said nothing at
+        // all into an empty assistant message with a clean `stop`. That is the
+        // same silent-empty-answer failure the buffered path refuses.
+        //
+        // Tracked on *substance*, not on the presence of a choice: an opening
+        // `{"delta":{"role":"assistant"}}` frame is structurally a choice and
+        // carries no result, so counting choices let the ordinary role-only
+        // preamble followed by `[DONE]` slip past the guard it was written for.
+        let mut saw_result = false;
         let mut usage = None;
         let mut finish_reason = None;
-        let mut saw_choice = false;
         // Set when the sink asks to stop — the client went away. The read loop
         // then abandons the upstream response instead of draining it to
         // `[DONE]`, which is what releases the socket, the thread and the
@@ -875,57 +1484,38 @@ impl UpstreamOpenAiRuntime {
         let mut abandoned = false;
         let mut streamed_tool_calls = StreamedToolCalls::default();
         loop {
-            // The cancellable read. Each poll waits at most
-            // `LIVENESS_POLL_INTERVAL` for socket activity; when it elapses the
-            // loop asks the sink whether anyone is still listening and goes
-            // back to waiting if so. That is what closes the window a blocking
-            // `read_line` left open: a client that leaves before the upstream's
-            // *first* frame used to go unnoticed until a frame arrived, holding
-            // an admission permit for up to the binding's whole `timeout_ms`.
-            //
-            // The interval is not a deadline. Exceeding it is the normal case
-            // for a model still thinking, and only the binding's timeout ends
-            // the request.
-            let payload = match reader.next_event(&mut response).await {
-                Ok(Some(line)) => line,
-                Ok(None) => break,
-                Err(SseReadError::Idle) => {
-                    if sink.is_live() {
-                        continue;
+            line.clear();
+            let next = loop {
+                match lines.next_line(SSE_LIVENESS_POLL) {
+                    SseRead::Line(line) => break Some(line),
+                    SseRead::Eof => break None,
+                    SseRead::Failed(error) => return Err(error),
+                    // Nothing yet. The only question worth asking while an
+                    // upstream is silent is whether anyone is still waiting for
+                    // it.
+                    SseRead::Idle => {
+                        if !sink.is_live() {
+                            abandoned = true;
+                            break None;
+                        }
                     }
-                    abandoned = true;
-                    break;
                 }
-                Err(SseReadError::FrameTooLarge) => {
-                    return Err(UpstreamError::MalformedResponse {
-                        alias: self.alias.clone(),
-                        detail: format!(
-                            "upstream SSE frame exceeds the {MAX_SSE_FRAME_BYTES}-byte limit"
-                        ),
-                    })
-                }
-                Err(SseReadError::StreamTooLarge) => {
-                    return Err(UpstreamError::MalformedResponse {
-                        alias: self.alias.clone(),
-                        detail: format!(
-                            "upstream SSE stream exceeds the {MAX_STREAM_BYTES}-byte limit"
-                        ),
-                    })
-                }
-                Err(SseReadError::Transport { detail, timed_out }) => {
-                    return Err(UpstreamError::Transport {
-                        alias: self.alias.clone(),
-                        endpoint: self.endpoint.url("/chat/completions"),
-                        detail: format!("failed to read the upstream stream: {detail}"),
-                        timed_out,
-                    })
-                }
-                Err(SseReadError::InvalidUtf8(detail)) => {
-                    return Err(UpstreamError::MalformedResponse {
-                        alias: self.alias.clone(),
-                        detail,
-                    });
-                }
+            };
+            let Some(next) = next else {
+                break;
+            };
+            line.push_str(&next);
+            if line.len() > MAX_SSE_FRAME_BYTES {
+                return Err(UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "upstream SSE frame exceeds the {MAX_SSE_FRAME_BYTES}-byte limit"
+                    ),
+                });
+            }
+            let Some(payload) = line.trim().strip_prefix("data:") else {
+                // Blank separator lines and SSE comments carry no delta.
+                continue;
             };
             let payload = payload.trim();
             if payload == "[DONE]" {
@@ -941,6 +1531,19 @@ impl UpstreamOpenAiRuntime {
                     detail: format!("upstream sent an SSE data frame that is not JSON: {error}"),
                 }
             })?;
+            // Valid JSON is not yet a frame. A scalar or an array parses, and
+            // then every `.get(...)` below answers `None` — so `data: "answer"`
+            // read as a usage-only event, its text vanished, and a following
+            // `[DONE]` completed the request successfully.
+            if !frame.is_object() {
+                return Err(UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail: format!(
+                        "upstream SSE data frame must be a JSON object, got {}",
+                        json_type_name(&frame)
+                    ),
+                });
+            }
             // An upstream that committed HTTP 200 and then failed reports it
             // in-band. Without this the frame carries no delta, gets skipped,
             // and `[DONE]` makes the whole request look successful — so the
@@ -968,26 +1571,103 @@ impl UpstreamOpenAiRuntime {
                 abandoned = true;
                 break;
             }
-            if let Some(reported) = Self::read_usage(&frame) {
+            if let Some(reported) =
+                Self::read_usage(&frame).map_err(|detail| UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail,
+                })?
+            {
                 usage = Some(reported);
             }
-            let choice = frame
-                .get("choices")
-                .and_then(Value::as_array)
-                .and_then(|choices| choices.first());
-            saw_choice |= choice.is_some();
+            // Absent is a usage-only frame and an empty array is a legal
+            // keep-alive, so neither is an error. A *present* non-array is:
+            // `as_array` alone turned `{"choices":{"delta":{"content":"…"}}}`
+            // into no choice at all, so the frame's content was dropped and a
+            // following `[DONE]` still completed the stream successfully with
+            // the guest reporting an ordinary `stop`. Silently losing part of
+            // an answer is worse than failing the request.
+            let choices = match frame.get("choices") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    Some(
+                        value
+                            .as_array()
+                            .ok_or_else(|| UpstreamError::MalformedResponse {
+                                alias: self.alias.clone(),
+                                detail: format!(
+                                    "streamed frame has a non-array `choices` of type {}",
+                                    json_type_name(value)
+                                ),
+                            })?,
+                    )
+                }
+            };
+            // Same rule one level in: an empty array is a legal keep-alive, but
+            // a present entry that is not an object is not a choice. Kept, it
+            // read as one that merely omitted `delta` and `finish_reason`, so
+            // `{"choices":[42]}` was discarded whole and `[DONE]` still
+            // completed the stream on an ordinary `stop`.
+            let choice = match choices.and_then(|choices| choices.first()) {
+                None => None,
+                Some(choice) if choice.is_object() => Some(choice),
+                Some(other) => {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "streamed `choices[0]` must be an object, got {}",
+                            json_type_name(other)
+                        ),
+                    })
+                }
+            };
             // Sent on the last content-bearing frame, before `[DONE]`. Keeping
             // it is what lets the caller tell a completion that finished from
             // one the upstream truncated at its own token limit.
-            if let Some(reported) = choice
-                .and_then(|choice| choice.get("finish_reason"))
-                .and_then(Value::as_str)
-                .filter(|reason| !reason.is_empty())
-            {
-                finish_reason = Some(reported.to_owned());
+            if let Some(reported) = Self::read_finish_reason(choice).map_err(|detail| {
+                UpstreamError::MalformedResponse {
+                    alias: self.alias.clone(),
+                    detail,
+                }
+            })? {
+                // Two different reasons for one choice is not a stream this
+                // side can reconcile. Last-write-wins let a `length` — the
+                // answer was truncated — be overwritten by a later `stop`,
+                // which is precisely the direction that loses information the
+                // caller acts on.
+                if finish_reason
+                    .as_deref()
+                    .is_some_and(|earlier| earlier != reported)
+                {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "upstream reported conflicting finish reasons for one choice: \
+                             `{}` then `{reported}`",
+                            finish_reason.unwrap_or_default()
+                        ),
+                    });
+                }
+                saw_result = true;
+                finish_reason = Some(reported);
             }
-            let Some(delta) = choice.and_then(|choice| choice.get("delta")) else {
-                continue;
+            // The same rule one level up: a frame legitimately carries no
+            // `delta` — a final frame that only reports `finish_reason` does —
+            // but a *present* non-object is not that. Accepting it left every
+            // `delta.get(...)` below reading it as neither content nor tool
+            // call, so `{"choices":[{"delta":"answer"}]}` was discarded whole
+            // and `[DONE]` still completed the stream on an ordinary `stop`.
+            let delta = match choice.and_then(|choice| choice.get("delta")) {
+                None | Some(Value::Null) => continue,
+                Some(delta) if delta.is_object() => delta,
+                Some(delta) => {
+                    return Err(UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail: format!(
+                            "streamed frame has a non-object `delta` of type {}",
+                            json_type_name(delta)
+                        ),
+                    });
+                }
             };
             // Absent and `null` both mean "this frame carried no text" — the
             // normal shape of a tool-call or role-only frame. A *present*
@@ -999,9 +1679,12 @@ impl UpstreamOpenAiRuntime {
             match delta.get("content") {
                 None | Some(Value::Null) => {}
                 Some(Value::String(content)) => {
-                    if !content.is_empty() && sink.emit(StreamEvent::Content(content)).is_stop() {
-                        abandoned = true;
-                        break;
+                    if !content.is_empty() {
+                        saw_result = true;
+                        if sink.emit(StreamEvent::Content(content)).is_stop() {
+                            abandoned = true;
+                            break;
+                        }
                     }
                 }
                 Some(other) => {
@@ -1014,12 +1697,22 @@ impl UpstreamOpenAiRuntime {
                     })
                 }
             }
+            // A streamed safety refusal, on its own field for the same reason
+            // the buffered path reads one there: it is the message's substance,
+            // not its content. Dropped, a `content_filter` stream reached the
+            // client as an empty assistant message with an ordinary finish —
+            // the exact failure the buffered path already refuses. Validated
+            // like `content`, so a non-string is a malformed frame rather than
+            // a silently missing refusal.
             match delta.get("refusal") {
                 None | Some(Value::Null) => {}
                 Some(Value::String(refusal)) => {
-                    if !refusal.is_empty() && sink.emit(StreamEvent::Refusal(refusal)).is_stop() {
-                        abandoned = true;
-                        break;
+                    if !refusal.is_empty() {
+                        saw_result = true;
+                        if sink.emit(StreamEvent::Refusal(refusal)).is_stop() {
+                            abandoned = true;
+                            break;
+                        }
                     }
                 }
                 Some(other) => {
@@ -1056,6 +1749,7 @@ impl UpstreamOpenAiRuntime {
                                 json_type_name(fragments)
                             ),
                         })?;
+                saw_result = true;
                 for fragment in fragments {
                     streamed_tool_calls.absorb(fragment).map_err(|detail| {
                         UpstreamError::MalformedResponse {
@@ -1065,28 +1759,45 @@ impl UpstreamOpenAiRuntime {
                     })?;
                 }
             }
+            // The pre-`tool_calls` shape, streamed. The buffered path has
+            // always recognised it; reading only `delta.tool_calls` here turned
+            // a provider that speaks it into one that answers with silence.
+            if let Some(legacy) = delta
+                .get("function_call")
+                .filter(|value| !is_empty_json(value))
+            {
+                saw_result = true;
+                streamed_tool_calls
+                    .absorb_legacy(legacy)
+                    .map_err(|detail| UpstreamError::MalformedResponse {
+                        alias: self.alias.clone(),
+                        detail,
+                    })?;
+            }
         }
 
-        if !saw_done && !abandoned {
-            return Err(UpstreamError::MalformedResponse {
-                alias: self.alias.clone(),
-                detail: "upstream stream ended before the `[DONE]` sentinel".to_owned(),
-            });
-        }
-        if saw_done && !saw_choice {
-            return Err(UpstreamError::MalformedResponse {
-                alias: self.alias.clone(),
-                detail: "upstream SSE stream completed without a choice".to_owned(),
-            });
-        }
-
-        if !abandoned {
+        // Emitted only once the stream is known to have finished. A tool call
+        // is an instruction the caller acts on, and this used to hand them over
+        // before the missing-sentinel check below could refuse the stream — so
+        // an upstream that died mid-generation, after its call fragments but
+        // before `[DONE]`, got its half-finished intent dispatched and *then*
+        // reported the request as failed. The caller had already run it.
+        //
+        // `abandoned` keeps its own exemption: nobody is left to receive the
+        // calls, so there is nothing to be premature about.
+        if !abandoned && saw_done {
             let calls = streamed_tool_calls.finish().map_err(|detail| {
                 UpstreamError::MalformedResponse {
                     alias: self.alias.clone(),
                     detail,
                 }
             })?;
+            // The upstream said the generation stopped to call something, and
+            // sent nothing to call. `saw_result` is satisfied by the finish
+            // reason alone, so the stream completed successfully with an empty
+            // `tool_calls` list — and an agent that branches on the reason
+            // rather than on the list waits for a call that will never arrive,
+            // or dispatches an empty one.
             if finish_reason.as_deref() == Some("tool_calls") && calls.is_empty() {
                 return Err(UpstreamError::MalformedResponse {
                     alias: self.alias.clone(),
@@ -1096,6 +1807,7 @@ impl UpstreamOpenAiRuntime {
             }
             for call in calls {
                 if sink.emit(StreamEvent::ToolCall(call)).is_stop() {
+                    abandoned = true;
                     break;
                 }
             }
@@ -1109,6 +1821,23 @@ impl UpstreamOpenAiRuntime {
         // An abandoned stream is exempt: nobody is left to receive the answer,
         // so stopping short is the intended outcome rather than a truncation to
         // report.
+        // A sentinel with nothing before it is not a completed generation
+        // either. Same exemption for an abandoned stream, and the same reason:
+        // nobody is left to be told.
+        if saw_done && !saw_result && !abandoned {
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: "upstream stream ended at `[DONE]` without sending any content, tool call \
+                         or finish reason"
+                    .to_owned(),
+            });
+        }
+        if !saw_done && !abandoned {
+            return Err(UpstreamError::MalformedResponse {
+                alias: self.alias.clone(),
+                detail: "upstream stream ended before the `[DONE]` sentinel".to_owned(),
+            });
+        }
         // Absence stays absence: an upstream that volunteers no usage frame
         // has told us nothing, and zeros would read to the client as a
         // generation that cost nothing.
@@ -1120,13 +1849,25 @@ impl UpstreamOpenAiRuntime {
 
     /// Forward a single embedding request to the upstream `/embeddings` route.
     pub(crate) fn embed(&self, input: &str) -> Result<Vec<f32>, UpstreamError> {
+        // The same bounded-input contract `chat_body` enforces, for the same
+        // reason. Nothing between the public embeddings route and here imposed
+        // one, so a component could hand over an arbitrarily large string and
+        // have it serialised into a request body — an allocation this node pays
+        // for on every co-batched thread before the upstream ever sees it.
+        // Checked before building the body, so the oversized copy is never
+        // made.
+        if input.len() > MAX_PROMPT_BYTES_CEILING {
+            return Err(UpstreamError::InvalidRequest {
+                alias: self.alias.clone(),
+                detail: format!(
+                    "embedding input bytes {} exceed limit {MAX_PROMPT_BYTES_CEILING}",
+                    input.len()
+                ),
+            });
+        }
         let body = json!({"model": self.endpoint.model, "input": input});
-        let payload: Value = self.runtime().block_on(async {
-            let mut response = self
-                .post("/embeddings", &body, self.endpoint.timeout)
-                .await?;
-            read_json(&self.alias, &mut response).await
-        })?;
+        let response = self.post("/embeddings", &body, self.endpoint.timeout)?;
+        let payload: Value = read_json(&self.alias, response)?;
         let embedding = payload
             .get("data")
             .and_then(Value::as_array)
@@ -1186,17 +1927,6 @@ impl UpstreamOpenAiRuntime {
             detail,
         })?;
         Ok(vector)
-    }
-}
-
-impl Drop for UpstreamOpenAiRuntime {
-    fn drop(&mut self) {
-        // Reload reaping happens from Tokio tasks. Dropping a Runtime there
-        // panics because its shutdown may block; consume it with Tokio's
-        // non-blocking shutdown instead.
-        if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_background();
-        }
     }
 }
 
@@ -1268,18 +1998,58 @@ fn tool_calls_from_value(alias: &str, tool_calls: &Value) -> Result<Vec<ToolCall
                     "`choices[0].message.tool_calls[{index}]` has no `function.name`"
                 )));
             }
+            // The guest hardcodes `"function"` back onto whatever it echoes, so
+            // an upstream naming a different kind here would have that kind
+            // silently relabelled and dispatched as a function call. Absent and
+            // null are fine — the field is optional and `function` is its only
+            // defined value — but anything else present is a call this backend
+            // does not know how to carry.
+            //
+            // Read structurally rather than through `as_str`: that answers
+            // `None` for `"type": 42` exactly as it does for a missing key, so
+            // a non-string slipped past the check it was written for. The
+            // streamed assembler carried the same bypass.
+            if !tool_call_type_is_function(call.get("type")) {
+                return Err(malformed(format!(
+                    "`choices[0].message.tool_calls[{index}].type` is {}, and only the string \
+                     `function` can be carried",
+                    describe_tool_call_type(call.get("type"))
+                )));
+            }
             let arguments = tool_call_arguments(function.and_then(|f| f.get("arguments")))
                 .ok_or_else(|| {
                     malformed(format!(
                         "`choices[0].message.tool_calls[{index}].function.arguments` is neither a JSON string nor a JSON object"
                     ))
                 })?;
+            // The string form is the one the OpenAI schema specifies, and it is
+            // the one nothing has checked: a truncated or non-object payload
+            // travels to the client as a dispatchable call whose arguments
+            // cannot be parsed. The streamed assembler already refuses exactly
+            // this, so without the same check here whether a broken call is
+            // caught depends on which route served the request.
+            match serde_json::from_str::<Value>(&arguments) {
+                Ok(Value::Object(_)) => {}
+                Ok(other) => {
+                    return Err(malformed(format!(
+                        "`choices[0].message.tool_calls[{index}].function.arguments` is a JSON {}, \
+                         not an object",
+                        json_type_name(&other)
+                    )))
+                }
+                Err(error) => {
+                    return Err(malformed(format!(
+                        "`choices[0].message.tool_calls[{index}].function.arguments` is not valid \
+                         JSON: {error}"
+                    )))
+                }
+            }
             Ok(ToolCall {
-                id: call
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned),
+                id: tool_call_id(call.get("id")).map_err(|detail| {
+                    malformed(format!(
+                        "`choices[0].message.tool_calls[{index}]`: {detail}"
+                    ))
+                })?,
                 name: name.to_owned(),
                 arguments: arguments.to_owned(),
             })
@@ -1319,6 +2089,54 @@ fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
+/// A tool call's `id`, or why it cannot be carried.
+///
+/// `Ok(None)` only for genuinely absent, null or empty — the shapes that mean
+/// "this provider mints no ids", where the guest is right to synthesize one.
+/// A *present* non-string is neither: `and_then(Value::as_str)` read `"id": 42`
+/// as absent, so the guest minted an id the provider had never issued, and a
+/// tool-result turn echoing it back could not be correlated with the call it
+/// answered — an agentic conversation that silently loses its thread.
+fn tool_call_id(id: Option<&Value>) -> Result<Option<String>, String> {
+    match id {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(id)) if id.is_empty() => Ok(None),
+        Some(Value::String(id)) => Ok(Some(id.clone())),
+        Some(other) => Err(format!(
+            "tool-call `id` is {}, expected a string",
+            json_type_name(other)
+        )),
+    }
+}
+
+/// Whether a tool call's `type` is one this backend can carry.
+///
+/// Absent and null both mean "unstated", which the OpenAI schema allows and
+/// which `function` is the only defined value for. Everything else present has
+/// to be the exact string: `and_then(Value::as_str)` answered `None` for
+/// `"type": 42` just as it does for a missing key, so a non-string was read as
+/// unstated and the guest relabelled the call as a dispatchable `function`.
+fn tool_call_type_is_function(kind: Option<&Value>) -> bool {
+    match kind {
+        None | Some(Value::Null) => true,
+        Some(Value::String(kind)) => kind == "function",
+        Some(_) => false,
+    }
+}
+
+/// How to name a rejected `type` in an error.
+///
+/// The offending *value* for a string — `custom` is what an operator greps for
+/// — and the type name for anything else, where the value is rarely the useful
+/// half and may be arbitrarily large.
+fn describe_tool_call_type(kind: Option<&Value>) -> String {
+    match kind {
+        Some(Value::String(kind)) => format!("`{kind}`"),
+        Some(other) => json_type_name(other).to_owned(),
+        None => "absent".to_owned(),
+    }
+}
+
 fn is_empty_json(value: &Value) -> bool {
     match value {
         Value::Null => true,
@@ -1352,6 +2170,20 @@ struct StreamedToolCalls {
     /// In first-seen order, so the emitted list preserves the upstream's own
     /// ordering.
     calls: Vec<StreamedToolCall>,
+    /// The single call a provider streaming the pre-`tool_calls` shape is
+    /// building, accumulated separately because that shape carries no `index`
+    /// to key on and no id to echo.
+    legacy: Option<StreamedToolCall>,
+    /// `index` to its slot in `calls`.
+    ///
+    /// The order has to come from a `Vec`, but finding a slot by scanning it
+    /// made every fragment cost a walk of everything seen so far. One call
+    /// streamed in many pieces is the ordinary case and stays cheap either way;
+    /// many *distinct* indices is the one that does not, and the 64 MiB stream
+    /// bound leaves room for hundreds of thousands of small fragments — so a
+    /// broken or hostile upstream could spend this node's CPU quadratically for
+    /// the price of its own bandwidth.
+    by_index: std::collections::HashMap<u64, usize>,
 }
 
 impl StreamedToolCalls {
@@ -1384,9 +2216,22 @@ impl StreamedToolCalls {
                 )
             }
         };
-        let slot = match self.calls.iter_mut().find(|call| call.index == index) {
-            Some(slot) => slot,
+        // The guest hardcodes `"function"` back onto whatever it echoes, so a
+        // fragment naming a different kind would have that kind silently
+        // relabelled and dispatched as a function call. The buffered parser
+        // already refuses this; checked before the slot is created so a refused
+        // fragment leaves nothing half-absorbed behind it.
+        if !tool_call_type_is_function(fragment.get("type")) {
+            return Err(format!(
+                "streamed tool call at index {index} has a type of {}, and only the string \
+                 `function` can be carried",
+                describe_tool_call_type(fragment.get("type"))
+            ));
+        }
+        let slot = match self.by_index.get(&index).copied() {
+            Some(at) => &mut self.calls[at],
             None => {
+                self.by_index.insert(index, self.calls.len());
                 self.calls.push(StreamedToolCall {
                     index,
                     ..StreamedToolCall::default()
@@ -1394,14 +2239,38 @@ impl StreamedToolCalls {
                 self.calls.last_mut().expect("just pushed")
             }
         };
-        if let Some(id) = fragment.get("id").and_then(Value::as_str) {
-            slot.id = id.to_owned();
+        // An id or a name is sent once, on the opening fragment. A *second*,
+        // different one for the same index is not an update — it means two
+        // calls are being merged under one slot, and every argument fragment
+        // seen so far belongs to whichever one this is not. Overwriting kept
+        // the accumulated arguments and swapped the identity on top of them, so
+        // the caller dispatched a call that never existed: one function's name
+        // with another's arguments, echoed back under an id the upstream never
+        // paired with them.
+        if let Some(id) = tool_call_id(fragment.get("id"))
+            .map_err(|detail| format!("streamed tool call at index {index}: {detail}"))?
+        {
+            if !slot.id.is_empty() && slot.id != id {
+                return Err(format!(
+                    "streamed tool call at index {index} was given a second id: `{}` then `{id}`",
+                    slot.id
+                ));
+            }
+            slot.id = id;
         }
         let function = fragment.get("function");
         if let Some(name) = function
             .and_then(|function| function.get("name"))
             .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
         {
+            if !slot.name.is_empty() && slot.name != name {
+                return Err(format!(
+                    "streamed tool call at index {index} was given a second function name: \
+                     `{}` then `{name}`",
+                    slot.name
+                ));
+            }
             slot.name = name.to_owned();
         }
         // A streamed call's arguments arrive as string slices that concatenate,
@@ -1423,6 +2292,50 @@ impl StreamedToolCalls {
         Ok(())
     }
 
+    /// Absorb one `delta.function_call` fragment.
+    ///
+    /// The shape OpenAI-compatible providers used before `tool_calls`, and
+    /// still the only one some of them stream. The buffered path already
+    /// recognises it; the streaming path read only `delta.tool_calls`, so every
+    /// name and argument fragment was dropped and a stream that ended on
+    /// `finish_reason: "function_call"` reached the client as an empty ordinary
+    /// answer — the model's whole intent gone, with nothing marking its
+    /// absence.
+    ///
+    /// It carries one call, no id and no index: `name` arrives once, then
+    /// `arguments` in string pieces, exactly like the modern shape one level
+    /// deeper. Accumulating into the same slot type means `finish` validates it
+    /// identically — a name is required, and the assembled arguments must parse
+    /// as a JSON object.
+    fn absorb_legacy(&mut self, fragment: &Value) -> Result<(), String> {
+        let slot = self.legacy.get_or_insert_with(StreamedToolCall::default);
+        if let Some(name) = fragment
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+        {
+            // Same rule as the keyed shape: a second, different name means two
+            // calls are being merged, and the arguments accumulated so far
+            // belong to whichever one this is not.
+            if !slot.name.is_empty() && slot.name != name {
+                return Err(format!(
+                    "streamed `function_call` was given a second function name: `{}` then `{name}`",
+                    slot.name
+                ));
+            }
+            slot.name = name.to_owned();
+        }
+        match fragment.get("arguments") {
+            Some(Value::String(raw)) => slot.arguments.push_str(raw),
+            Some(value @ (Value::Object(_) | Value::Array(_))) => {
+                slot.arguments = value.to_string();
+            }
+            None | Some(Value::Null) => {}
+            Some(_) => slot.unusable_arguments = true,
+        }
+        Ok(())
+    }
+
     /// Assemble the accumulated fragments, or fail if any of them never named
     /// its function or carried arguments in an unusable shape.
     ///
@@ -1431,7 +2344,18 @@ impl StreamedToolCalls {
     /// recorded a healthy generation, so an agent simply saw the model decline
     /// to act. Once fragments have been observed the upstream has committed to
     /// a call, and an incomplete one means the stream was truncated.
-    fn finish(self) -> Result<Vec<ToolCall>, String> {
+    fn finish(mut self) -> Result<Vec<ToolCall>, String> {
+        // The keyed shape wins when a stream carried both, which is the same
+        // precedence the buffered path applies: `tool_calls` is strictly more
+        // expressive, and a provider emitting both is repeating one call in two
+        // dialects rather than announcing two. The legacy accumulator is only
+        // consulted when nothing keyed arrived, and from there it is validated
+        // like any other slot.
+        if let Some(legacy) = self.legacy.take() {
+            if self.calls.is_empty() {
+                self.calls.push(legacy);
+            }
+        }
         if let Some(call) = self.calls.iter().find(|call| call.name.trim().is_empty()) {
             return Err(format!(
                 "upstream streamed tool-call fragments for index {} but never sent a function name",
@@ -1446,6 +2370,37 @@ impl StreamedToolCalls {
                 "upstream streamed `function.arguments` for index {} that is neither a JSON string nor a JSON object",
                 call.index
             ));
+        }
+        // Concatenating string fragments is how a streamed call's arguments
+        // arrive, so a stream that ends mid-value leaves something like
+        // `{"path":` behind — syntactically a string, semantically half a call.
+        // Passed through, it reaches the client as a successful, dispatchable
+        // invocation whose arguments cannot be parsed; whether that surfaces as
+        // a crash or as a silently skipped tool depends on the client. The
+        // assembled text has to be a JSON object, which is what the OpenAI
+        // schema promises and what every caller assumes.
+        for call in &self.calls {
+            if call.arguments.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Value>(&call.arguments) {
+                Ok(Value::Object(_)) => {}
+                Ok(other) => {
+                    return Err(format!(
+                        "upstream streamed `function.arguments` for index {} that is a JSON {}, \
+                         not an object",
+                        call.index,
+                        json_type_name(&other)
+                    ))
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "upstream streamed `function.arguments` for index {} that is not valid \
+                         JSON: {error}",
+                        call.index
+                    ))
+                }
+            }
         }
         Ok(self
             .calls
@@ -1468,197 +2423,16 @@ impl StreamedToolCalls {
 
 /// Read a bounded JSON body, so a hostile or broken upstream cannot pull the
 /// host into an unbounded allocation.
-/// Why a poll of the SSE stream produced no line.
-#[derive(Debug)]
-enum SseReadError {
-    /// The socket was quiet for `LIVENESS_POLL_INTERVAL`. Not a failure — the
-    /// caller checks whether its consumer is still there and resumes.
-    Idle,
-    FrameTooLarge,
-    StreamTooLarge,
-    Transport {
-        detail: String,
-        timed_out: bool,
-    },
-    InvalidUtf8(String),
-}
-
-/// Line framing over an async response body.
-///
-/// Replaces `BufRead::read_line`, which cannot be interrupted: the whole point
-/// is that a *quiet* socket must still hand control back so the caller can ask
-/// whether anyone is listening.
-///
-/// The two size caps that the blocking reader enforced are kept, and for the
-/// same reasons. `MAX_SSE_FRAME_BYTES` bounds one line, because a stream that
-/// never sends a newline would otherwise grow the buffer without limit;
-/// `MAX_STREAM_BYTES` bounds the whole response, because a stream that never
-/// ends would otherwise run forever.
-struct SseReader {
-    /// Bytes received but not yet consumed as a complete line.
-    buffered: Vec<u8>,
-    /// Total bytes taken off the socket, against `MAX_STREAM_BYTES`.
-    consumed: u64,
-    /// Set once the body is exhausted, so a trailing line with no newline is
-    /// still delivered exactly once.
-    eof: bool,
-    /// `data:` fields collected for the current SSE event. SSE joins multiple
-    /// fields with a newline and dispatches only at the blank separator.
-    event_data: String,
-    /// The UTF-8 BOM is permitted only at the beginning of a text stream.
-    first_line: bool,
-}
-
-impl Default for SseReader {
-    fn default() -> Self {
-        Self {
-            buffered: Vec::new(),
-            consumed: 0,
-            eof: false,
-            event_data: String::new(),
-            first_line: true,
-        }
-    }
-}
-
-impl SseReader {
-    async fn next_event(
-        &mut self,
-        response: &mut reqwest::Response,
-    ) -> Result<Option<String>, SseReadError> {
-        loop {
-            match self.next_line(response).await? {
-                Some(line) if line.is_empty() || line == "\r" => {
-                    if !self.event_data.is_empty() {
-                        return Ok(Some(std::mem::take(&mut self.event_data)));
-                    }
-                }
-                Some(mut line) => {
-                    if self.first_line {
-                        self.first_line = false;
-                        line = line.strip_prefix('\u{feff}').unwrap_or(&line).to_owned();
-                    }
-                    if let Some(data) = line.trim_end_matches('\r').strip_prefix("data:") {
-                        if !self.event_data.is_empty() {
-                            self.event_data.push('\n');
-                        }
-                        self.event_data
-                            .push_str(data.strip_prefix(' ').unwrap_or(data));
-                        if self.event_data.len() > MAX_SSE_FRAME_BYTES {
-                            return Err(SseReadError::FrameTooLarge);
-                        }
-                    }
-                }
-                None if self.event_data.is_empty() => return Ok(None),
-                None => return Ok(Some(std::mem::take(&mut self.event_data))),
-            }
-        }
-    }
-
-    /// The next complete line, or `Ok(None)` at end of stream.
-    ///
-    /// `Err(Idle)` means only that nothing arrived within the poll interval.
-    async fn next_line(
-        &mut self,
-        response: &mut reqwest::Response,
-    ) -> Result<Option<String>, SseReadError> {
-        loop {
-            if let Some(line) = self.take_line()? {
-                return Ok(Some(line));
-            }
-            if self.eof {
-                return Ok(None);
-            }
-            // A quiet socket returns control to the caller rather than parking
-            // here until the request timeout.
-            let chunk = match tokio::time::timeout(LIVENESS_POLL_INTERVAL, response.chunk()).await {
-                Err(_elapsed) => return Err(SseReadError::Idle),
-                Ok(Ok(Some(chunk))) => chunk,
-                Ok(Ok(None)) => {
-                    self.eof = true;
-                    continue;
-                }
-                Ok(Err(error)) => {
-                    return Err(SseReadError::Transport {
-                        detail: error.to_string(),
-                        timed_out: error.is_timeout(),
-                    })
-                }
-            };
-            self.consumed = self.consumed.saturating_add(chunk.len() as u64);
-            if self.consumed > MAX_STREAM_BYTES {
-                return Err(SseReadError::StreamTooLarge);
-            }
-            self.buffered.extend_from_slice(&chunk);
-        }
-    }
-
-    /// Split one line out of the buffer, if a whole one is there.
-    fn take_line(&mut self) -> Result<Option<String>, SseReadError> {
-        let Some(end) = self
-            .buffered
-            .iter()
-            .position(|byte| matches!(*byte, b'\n' | b'\r'))
-        else {
-            // No newline yet. The buffer is a partial line, so it is bounded by
-            // the frame cap rather than by the stream cap — several concurrent
-            // streams each holding a near-`MAX_STREAM_BYTES` partial line is
-            // the allocation this prevents.
-            if self.buffered.len() > MAX_SSE_FRAME_BYTES {
-                return Err(SseReadError::FrameTooLarge);
-            }
-            if self.eof && !self.buffered.is_empty() {
-                // A final line the upstream never terminated. Delivered once,
-                // then the buffer is empty and the next call reports EOF.
-                let line = std::mem::take(&mut self.buffered);
-                return String::from_utf8(line).map(Some).map_err(|error| {
-                    SseReadError::InvalidUtf8(format!("SSE frame is not UTF-8: {error}"))
-                });
-            }
-            return Ok(None);
-        };
-        // A CR at the current buffer boundary may be the first half of CRLF.
-        // Wait for one more byte so the following LF is not mistaken for a
-        // separate blank event separator. At EOF it is definitively bare CR.
-        if self.buffered[end] == b'\r' && end + 1 == self.buffered.len() && !self.eof {
-            return Ok(None);
-        }
-        if end > MAX_SSE_FRAME_BYTES {
-            return Err(SseReadError::FrameTooLarge);
-        }
-        let mut line: Vec<u8> = self.buffered.drain(..=end).collect();
-        let terminator = line.pop();
-        if terminator == Some(b'\r') && self.buffered.first() == Some(&b'\n') {
-            self.buffered.remove(0);
-        }
-        String::from_utf8(line)
-            .map(Some)
-            .map_err(|error| SseReadError::InvalidUtf8(format!("SSE frame is not UTF-8: {error}")))
-    }
-}
-
-/// Read at most `limit` bytes of a response body, stopping as soon as the cap
-/// is reached rather than buffering the whole thing and truncating after.
-///
-/// A partial read is deliberately not an error: every caller wants "as much as
-/// is safe to hold", and a transport failure partway through an error page is
-/// still worth reporting what arrived.
-async fn read_bounded(response: &mut reqwest::Response, limit: u64) -> Vec<u8> {
+fn read_json(alias: &str, response: reqwest::blocking::Response) -> Result<Value, UpstreamError> {
     let mut body = Vec::new();
-    while (body.len() as u64) < limit {
-        match response.chunk().await {
-            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
-            Ok(None) | Err(_) => break,
-        }
-    }
-    body.truncate(limit as usize);
-    body
-}
-
-async fn read_json(alias: &str, response: &mut reqwest::Response) -> Result<Value, UpstreamError> {
-    // One byte past the cap, so a body sitting exactly on it is still accepted
-    // while anything larger is detectable.
-    let body = read_bounded(response, MAX_RESPONSE_BYTES + 1).await;
+    std::io::copy(
+        &mut std::io::Read::take(response, MAX_RESPONSE_BYTES + 1),
+        &mut body,
+    )
+    .map_err(|error| UpstreamError::MalformedResponse {
+        alias: alias.to_owned(),
+        detail: format!("failed to read the upstream response body: {error}"),
+    })?;
     if body.len() as u64 > MAX_RESPONSE_BYTES {
         return Err(UpstreamError::MalformedResponse {
             alias: alias.to_owned(),
@@ -1763,9 +2537,8 @@ impl FakeUpstream {
     ///
     /// Chunked, with no chunk ever sent, so the client is committed to a
     /// successful response and then left waiting. This is the case a blocking
-    /// `read_line` could not escape: the socket is open, the upstream is alive,
-    /// and no byte of body will arrive for `hold`.
-    #[cfg(test)]
+    /// `read_line` on this thread could not escape: the socket is open, the
+    /// upstream is alive, and no byte of body will arrive for `hold`.
     pub(crate) fn start_silent(hold: Duration) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port should bind");
         let base_url = format!(
@@ -1808,9 +2581,13 @@ impl FakeUpstream {
             let _ = stream.flush();
             // Hold the connection open without sending a single chunk.
             std::thread::sleep(hold);
-            // Then finish with a valid terminal choice followed by `[DONE]`.
-            // The silent period is what these tests measure; a malformed empty
-            // completion would instead exercise stream validation.
+            // Then finish the way a real upstream does: a terminal choice, the
+            // `[DONE]` sentinel, then the terminating chunk. All three matter —
+            // a truncated body surfaces as a transport error, a missing
+            // sentinel as a malformed one, and a stream with no choice at all
+            // trips the "said nothing usable" guard. Any of those would mask
+            // what these tests measure, which is *when* the reader gave up
+            // rather than how it failed.
             let completion = concat!(
                 "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
                 "data: [DONE]\n\n",
@@ -1822,6 +2599,71 @@ impl FakeUpstream {
         });
 
         Self { base_url, requests }
+    }
+
+    /// A chunked SSE response whose body is written from the test's own
+    /// commands rather than canned up front. Real bytes over a real socket,
+    /// so `SseLineReader::drive`'s `Idle`/`Line`/`Eof` transitions are
+    /// exercised the way the actual reader thread sees them, one chunk at a
+    /// time until the sender drops.
+    pub(crate) fn start_scripted() -> (Self, std::sync::mpsc::Sender<Vec<u8>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("port should bind");
+        let base_url = format!(
+            "http://{}/v1",
+            listener
+                .local_addr()
+                .expect("listener should have an address")
+        );
+        let (tx, requests) = std::sync::mpsc::channel();
+        let (feed, fed) = std::sync::mpsc::channel::<Vec<u8>>();
+
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Read, Write};
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = std::io::BufReader::new(stream);
+            let mut target = String::new();
+            let mut content_length = 0usize;
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if line == "\r\n" {
+                    break;
+                }
+                if target.is_empty() {
+                    target = line.trim().to_owned();
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+                line.clear();
+            }
+            let mut body = vec![0u8; content_length];
+            let _ = reader.read_exact(&mut body);
+            let _ = tx.send((target, String::from_utf8_lossy(&body).into_owned()));
+
+            let mut stream = reader.into_inner();
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            );
+            let _ = stream.flush();
+            while let Ok(chunk) = fed.recv() {
+                let _ = stream.write_all(format!("{:x}\r\n", chunk.len()).as_bytes());
+                let _ = stream.write_all(&chunk);
+                let _ = stream.write_all(b"\r\n");
+                let _ = stream.flush();
+            }
+            let _ = stream.write_all(b"0\r\n\r\n");
+            let _ = stream.flush();
+        });
+
+        (Self { base_url, requests }, feed)
+    }
+
+    /// Base URL with no `openai:` scheme prefix, for building a route
+    /// directly rather than through [`UpstreamEndpoint::parse`].
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     pub(crate) fn binding(&self) -> String {
@@ -2158,6 +3000,66 @@ mod tests {
 
         let (_, body) = upstream.received();
         assert_eq!(body["stream"], true);
+        assert!(
+            body.get("stream_options").is_none(),
+            "the option is one an upstream may reject; a caller that never asked for usage \
+             gains nothing from that risk"
+        );
+    }
+
+    #[test]
+    fn a_requested_stream_usage_option_reaches_the_upstream() {
+        // OpenAI-compatible providers emit streamed `usage` only when the
+        // option is present. Dropping it left `read_usage` with nothing to
+        // read, so the trailing usage chunk the client explicitly asked for
+        // never arrived — the option is only sent on behalf of a caller who
+        // wanted what it buys.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#,
+                "\n\n",
+                r#"data: {"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let outcome = backend
+            .generate_streaming(
+                &[br#"{"prompt":"go","include_usage":true}"#],
+                &mut captured.sink(),
+            )
+            .expect("streaming should complete");
+        assert_eq!(
+            outcome.usage.expect("usage is reported").completion_tokens,
+            1
+        );
+
+        let (_, body) = upstream.received();
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn a_buffered_request_does_not_carry_the_stream_usage_option() {
+        // A buffered response reports usage unconditionally, so the option
+        // would be noise on that route — and noise an upstream may 400 on.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        backend
+            .generate(&[br#"{"prompt":"go","include_usage":true}"#])
+            .expect("buffered generation should succeed");
+
+        let (_, body) = upstream.received();
+        assert_eq!(body["stream"], false);
+        assert!(body.get("stream_options").is_none());
     }
 
     #[test]
@@ -2209,6 +3111,485 @@ mod tests {
             "unexpected request line: {target}"
         );
         assert_eq!(body["input"], "hello");
+    }
+
+    /// A silent source must report `Idle`, not hold the caller.
+    ///
+    /// This is the seam the cancellation fix turns on: `read_line` is
+    /// uninterruptible, so the read moved to its own thread and the stream loop
+    /// polls `is_live` between frames. Exercised directly rather than through a
+    /// real socket — a round trip adds a connect that can fail under load for
+    /// reasons that have nothing to do with the mechanism, and a test that
+    /// fails for the wrong reason is worse than no test. The end-to-end
+    /// behaviour is covered by
+    /// `a_stream_carrying_no_content_still_notices_a_departed_client`.
+    #[test]
+    fn a_reader_with_nothing_to_give_reports_idle_rather_than_blocking() {
+        let (upstream, feed) = FakeUpstream::start_scripted();
+        let mut reader = SseLineReader::spawn(
+            reqwest::Client::new(),
+            "coder".to_owned(),
+            format!("{}/chat/completions", upstream.base_url()),
+            json!({}),
+            Duration::from_secs(30),
+            None,
+            SseReaderSlot::claim().expect("a fresh node has reader slots"),
+        );
+
+        let started = std::time::Instant::now();
+        assert!(
+            matches!(reader.next_line(Duration::from_millis(50)), SseRead::Idle),
+            "a source with nothing to give must yield the caller, not hold it"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the poll must return on its own window; took {:?}",
+            started.elapsed()
+        );
+
+        feed.send(b"data: hi\n".to_vec()).expect("fixture feed");
+        let line = loop {
+            match reader.next_line(Duration::from_millis(250)) {
+                SseRead::Line(line) => break line,
+                SseRead::Idle => continue,
+                other => panic!("expected the fed line, got {}", sse_read_name(&other)),
+            }
+        };
+        assert_eq!(
+            line, "data: hi\n",
+            "a fed line arrives intact after the idle poll"
+        );
+
+        drop(feed);
+        loop {
+            match reader.next_line(Duration::from_millis(250)) {
+                SseRead::Eof => break,
+                SseRead::Idle => continue,
+                other => panic!(
+                    "a closed source must read as EOF, got {}",
+                    sse_read_name(&other)
+                ),
+            }
+        }
+    }
+
+    fn sse_read_name(read: &SseRead) -> &'static str {
+        match read {
+            SseRead::Line(_) => "a line",
+            SseRead::Idle => "idle",
+            SseRead::Eof => "eof",
+            SseRead::Failed(_) => "a failure",
+        }
+    }
+
+    /// A gateway answers 502 when its upstream does not answer usably.
+    ///
+    /// `None` renders as 500 `server_error` — this node broke — and an agent
+    /// retrying that against a healthy node retries forever against an upstream
+    /// that is not. The two genuinely local faults keep `None`, because neither
+    /// ever reached a provider.
+    #[test]
+    fn an_upstream_that_cannot_answer_is_reported_as_a_gateway_failure() {
+        let status = |error: UpstreamError| error.http_status();
+
+        assert_eq!(
+            status(UpstreamError::Transport {
+                alias: "coder".to_owned(),
+                endpoint: "http://gone.invalid/v1".to_owned(),
+                detail: "connection refused".to_owned(),
+            }),
+            Some(502)
+        );
+        assert_eq!(
+            status(UpstreamError::MalformedResponse {
+                alias: "coder".to_owned(),
+                detail: "not JSON".to_owned(),
+            }),
+            Some(502)
+        );
+        // A remote status is specific and actionable; flattening it loses that.
+        assert_eq!(
+            status(UpstreamError::Status {
+                alias: "coder".to_owned(),
+                endpoint: "http://up.invalid/v1".to_owned(),
+                status: 429,
+                body: "slow down".to_owned(),
+            }),
+            Some(429)
+        );
+        assert_eq!(
+            status(UpstreamError::InvalidRequest {
+                alias: "coder".to_owned(),
+                detail: "no prompt".to_owned(),
+            }),
+            None,
+            "a request that never left this node is not the provider's failure"
+        );
+        assert_eq!(
+            status(UpstreamError::InvalidBinding {
+                alias: "coder".to_owned(),
+                detail: "bad url".to_owned(),
+            }),
+            None,
+            "a malformed binding is this deployment's own configuration"
+        );
+    }
+
+    /// The pre-`tool_calls` shape some providers still emit.
+    ///
+    /// It carries neither content nor `tool_calls`, so every buffered request
+    /// to such a provider used to fail as malformed.
+    #[test]
+    fn a_legacy_function_call_response_is_carried_as_a_tool_call() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,
+                "function_call":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}},
+                "finish_reason":"function_call"}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let generation = backend.generate(&[b"go"]).expect("legacy call round trip");
+        assert_eq!(generation.tool_calls.len(), 1);
+        assert_eq!(generation.tool_calls[0].name, "read_file");
+        assert_eq!(generation.tool_calls[0].arguments, r#"{"path":"a.rs"}"#);
+        assert!(
+            generation.tool_calls[0].id.is_none(),
+            "the legacy shape carries no id, and one must not be invented"
+        );
+    }
+
+    /// A filtered completion is a result, not a malformed response.
+    #[test]
+    fn a_content_filtered_completion_without_content_is_an_empty_answer() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null},"finish_reason":"content_filter"}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let generation = backend
+            .generate(&[b"go"])
+            .expect("a filtered completion is a result the client must see");
+        assert!(generation.bytes.is_empty());
+        assert_eq!(generation.finish_reason.as_deref(), Some("content_filter"));
+    }
+
+    /// With no content, no calls and no reason there is nothing to report, and
+    /// that stays an error.
+    #[test]
+    fn a_message_with_nothing_at_all_is_still_malformed() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null}}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) = backend.generate(&[b"go"]) else {
+            panic!("a message with no content, no calls and no reason reports nothing");
+        };
+        assert!(error.to_string().contains("no `finish_reason`"), "{error}");
+    }
+
+    /// The guest relabels whatever it echoes as `function`, so a different kind
+    /// would be dispatched as one.
+    #[test]
+    fn a_tool_call_of_another_type_is_refused_rather_than_relabelled() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[
+                {"id":"c1","type":"custom","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) = backend.generate(&[b"go"]) else {
+            panic!("a non-function call type must not be silently relabelled");
+        };
+        let error = error.to_string();
+        assert!(
+            error.contains("`custom`"),
+            "the value is what to grep for: {error}"
+        );
+        assert!(error.contains("only the string `function`"), "{error}");
+    }
+
+    /// The map and the order have to agree.
+    ///
+    /// The lookup moved off a linear scan, and the risk of that is a slot found
+    /// by index that is not the slot the order puts it in — fragments landing
+    /// on the wrong call, which is silent and produces a dispatchable result.
+    /// So this interleaves indices rather than filling them in turn, and checks
+    /// both the grouping and the first-seen ordering.
+    #[test]
+    fn fragments_reach_their_own_call_whatever_order_the_indices_arrive_in() {
+        let fragment = |index: u64, name: Option<&str>, args: &str| {
+            let mut value = serde_json::json!({ "index": index });
+            let function = value
+                .as_object_mut()
+                .expect("object")
+                .entry("function")
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(name) = name {
+                function["name"] = serde_json::json!(name);
+            }
+            function["arguments"] = serde_json::json!(args);
+            value
+        };
+
+        let mut calls = StreamedToolCalls::default();
+        // Opened out of order, then continued out of order.
+        calls
+            .absorb(&fragment(2, Some("second"), "{\"b\":"))
+            .expect("open 2");
+        calls
+            .absorb(&fragment(0, Some("first"), "{\"a\":"))
+            .expect("open 0");
+        calls.absorb(&fragment(2, None, "2}")).expect("continue 2");
+        calls.absorb(&fragment(0, None, "1}")).expect("continue 0");
+
+        let finished = calls.finish().expect("both calls are complete");
+        assert_eq!(
+            finished
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"],
+            "the emitted order is first-seen, not index order"
+        );
+        assert_eq!(finished[0].arguments, r#"{"b":2}"#);
+        assert_eq!(finished[1].arguments, r#"{"a":1}"#);
+    }
+
+    /// An embedding input is bounded like a prompt is.
+    ///
+    /// Nothing between the public embeddings route and the backend imposed a
+    /// ceiling, so a component could hand over an arbitrarily large string and
+    /// have this node serialise it into a request body — an allocation paid on
+    /// every co-batched thread before the upstream ever sees it.
+    #[test]
+    fn an_oversized_embedding_input_is_refused_before_it_is_serialized() {
+        // No fixture server: the refusal has to happen before anything is sent,
+        // so a reachable upstream would prove less than an unreachable one.
+        let backend = runtime("coder", "openai:http://127.0.0.1:9/v1");
+        let oversized = "x".repeat(MAX_PROMPT_BYTES_CEILING + 1);
+
+        let Err(error) = backend.embed(&oversized) else {
+            panic!("an input past the ceiling must not reach the wire");
+        };
+        let error = error.to_string();
+        assert!(error.contains("embedding input bytes"), "{error}");
+
+        // The boundary itself is allowed: the ceiling is a limit, not a margin.
+        let at_limit = "x".repeat(MAX_PROMPT_BYTES_CEILING);
+        let Err(error) = backend.embed(&at_limit) else {
+            panic!("the unreachable fixture endpoint cannot answer");
+        };
+        assert!(
+            !error.to_string().contains("exceed limit"),
+            "an input exactly at the ceiling is refused by the network, not by the bound: {error}"
+        );
+    }
+
+    /// A call is an instruction, so it waits for the stream to finish.
+    ///
+    /// An upstream that dies after its tool-call fragments but before `[DONE]`
+    /// used to have its half-finished intent dispatched, and *then* the request
+    /// reported as failed — by which time the caller had already run it. The
+    /// stream still fails; what changes is that nothing was handed over first.
+    #[test]
+    fn a_tool_call_is_not_emitted_by_a_stream_that_never_finished() {
+        let emitted = std::cell::RefCell::new(Vec::<String>::new());
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            // Complete fragments, no sentinel: the shape a restart leaves.
+            &[
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"apply_patch","arguments":"{\"path\":\"a.rs\"}"}}]}}]}"#,
+                "",
+            ]
+            .join("\n\n"),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let Err(error) = backend.generate_streaming(&[b"go"], &mut |event: StreamEvent<'_>| {
+            if let StreamEvent::ToolCall(call) = event {
+                emitted.borrow_mut().push(call.name.clone());
+            }
+            StreamControl::Continue
+        }) else {
+            panic!("a stream ending before `[DONE]` is truncated, not complete");
+        };
+        assert!(error.to_string().contains("[DONE]"), "{error}");
+        assert!(
+            emitted.borrow().is_empty(),
+            "nothing may be dispatched from a stream that then fails: {:?}",
+            emitted.borrow()
+        );
+    }
+
+    /// A present-but-wrong counter is a malformed response, not a zero.
+    #[test]
+    fn a_malformed_usage_counter_fails_the_response_instead_of_reading_as_zero() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"hi"}}],
+                "usage":{"prompt_tokens":"100","completion_tokens":5}}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) = backend.generate(&[b"go"]) else {
+            panic!("a non-integer usage counter must not be reported as measured");
+        };
+        let error = error.to_string();
+        assert!(error.contains("usage.prompt_tokens"), "{error}");
+    }
+
+    /// The counters cross the WIT boundary as `u32`; an unchecked cast turned
+    /// `4294967297` into `1`, which is worse than refusing it.
+    #[test]
+    fn a_usage_counter_beyond_u32_fails_rather_than_wrapping() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"hi"}}],
+                "usage":{"prompt_tokens":4294967297,"completion_tokens":5}}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) = backend.generate(&[b"go"]) else {
+            panic!("a usage counter beyond u32 must not wrap into a plausible one");
+        };
+        let error = error.to_string();
+        assert!(error.contains("beyond the range"), "{error}");
+    }
+
+    /// `guest-openai` renders an absent finish reason as `stop`, so silently
+    /// dropping a malformed one reports a truncated answer as complete.
+    #[test]
+    fn a_non_string_finish_reason_fails_rather_than_reading_as_absent() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"hi"},"finish_reason":42}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) = backend.generate(&[b"go"]) else {
+            panic!("a non-string finish reason must not be read as absence");
+        };
+        let error = error.to_string();
+        assert!(error.contains("finish_reason"), "{error}");
+    }
+
+    /// Last-write-wins let a `length` be overwritten by a later `stop` — the
+    /// one direction that turns a truncated answer into a complete-looking one.
+    #[test]
+    fn conflicting_streamed_finish_reasons_fail_the_stream() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            &[
+                r#"data: {"choices":[{"delta":{"content":"half"},"finish_reason":"length"}]}"#,
+                r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+                "data: [DONE]",
+                "",
+            ]
+            .join("\n\n"),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) =
+            backend.generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+        else {
+            panic!("two different finish reasons for one choice must fail the stream");
+        };
+        let error = error.to_string();
+        assert!(error.contains("conflicting finish reasons"), "{error}");
+    }
+
+    /// Two identities under one index means two calls merged into one slot, and
+    /// the arguments accumulated so far belong to whichever this is not.
+    #[test]
+    fn a_second_identity_for_one_streamed_tool_call_index_fails_the_stream() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            &[
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c2","function":{"arguments":"\"a.rs\"}"}}]}}]}"#,
+                "data: [DONE]",
+                "",
+            ]
+            .join("\n\n"),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) =
+            backend.generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+        else {
+            panic!("a second id for one tool-call index must fail the stream");
+        };
+        let error = error.to_string();
+        assert!(error.contains("second id"), "{error}");
+    }
+
+    /// A stream that ends mid-value leaves `{"path":` behind — a string, and
+    /// half a call. Passed through it dispatches as a successful invocation
+    /// whose arguments no client can parse.
+    #[test]
+    fn streamed_tool_call_arguments_that_are_not_a_json_object_fail_the_stream() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            &[
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#,
+                "data: [DONE]",
+                "",
+            ]
+            .join("\n\n"),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) =
+            backend.generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+        else {
+            panic!("incomplete argument JSON must not dispatch as a usable call");
+        };
+        let error = error.to_string();
+        assert!(error.contains("not valid"), "{error}");
+    }
+
+    /// A scalar frame parses as JSON and then answers `None` to every lookup,
+    /// so its text vanished and `[DONE]` completed the request successfully.
+    #[test]
+    fn a_non_object_sse_frame_fails_rather_than_reading_as_empty() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            &["data: \"answer\"", "data: [DONE]", ""].join("\n\n"),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) =
+            backend.generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+        else {
+            panic!("a scalar data frame must not read as an empty event");
+        };
+        let error = error.to_string();
+        assert!(error.contains("must be a JSON object"), "{error}");
+    }
+
+    /// Same one level in: `{"choices":[42]}` read as a choice that merely
+    /// omitted its delta.
+    #[test]
+    fn a_non_object_streamed_choice_fails_rather_than_reading_as_empty() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            &["data: {\"choices\":[42]}", "data: [DONE]", ""].join("\n\n"),
+        );
+        let backend = runtime("coder", &upstream.binding());
+        let Err(error) =
+            backend.generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+        else {
+            panic!("a non-object choice must not read as an empty one");
+        };
+        let error = error.to_string();
+        assert!(error.contains("must be an object"), "{error}");
     }
 
     #[test]
@@ -2426,6 +3807,395 @@ mod tests {
         );
     }
 
+    /// Parked readers are counted, so they cannot accumulate without bound.
+    ///
+    /// A reader outlives its request when the client disconnects while the
+    /// upstream is silent: `read_line` is uninterruptible, so the thread cannot
+    /// see the closed channel until the upstream speaks or the request times
+    /// out. Its admission permit is released long before that, so nothing else
+    /// was counting these — a connect/disconnect loop against a silent upstream
+    /// added a thread and a socket per attempt.
+    #[test]
+    fn live_stream_readers_are_bounded() {
+        // Against a local counter: taking every slot of the process-wide one
+        // would refuse the streams the other tests here open.
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        assert!(claim_below(&counter, 2));
+        assert!(claim_below(&counter, 2));
+        assert!(
+            !claim_below(&counter, 2),
+            "at the ceiling a node must refuse rather than open a socket it cannot account for"
+        );
+
+        // A slot returns on drop, whichever way its thread ended, so a node
+        // that sheds parked readers can serve again.
+        counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        assert!(claim_below(&counter, 2));
+
+        // And the real slot uses the real counter, releasing on drop.
+        let live = || LIVE_SSE_READERS.load(std::sync::atomic::Ordering::Relaxed);
+        let before = live();
+        let slot = SseReaderSlot::claim().expect("a node below its ceiling has slots");
+        assert_eq!(live(), before + 1);
+        drop(slot);
+        assert_eq!(live(), before);
+    }
+
+    #[test]
+    fn a_legacy_streamed_function_call_is_reassembled() {
+        // The pre-`tool_calls` shape, streamed: name once, then argument
+        // pieces, all on `delta.function_call`. Reading only `delta.tool_calls`
+        // dropped every fragment, so a stream ending on
+        // `finish_reason: "function_call"` reached the client as an empty
+        // ordinary answer — the buffered path has always understood it.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"function_call":{"name":"read_file","arguments":""}}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"function_call":{"arguments":"{\"path\":"}}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"function_call":{"arguments":"\"a.rs\"}"}}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{},"finish_reason":"function_call"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        backend
+            .generate_streaming(&[b"read a.rs"], &mut captured.sink())
+            .expect("streaming should complete");
+        assert_eq!(
+            captured.tool_calls,
+            vec![ToolCall {
+                // The legacy shape carries no id, and one must not be invented
+                // here — the guest mints it, matching the buffered path.
+                id: None,
+                name: "read_file".to_owned(),
+                arguments: "{\"path\":\"a.rs\"}".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_streamed_tool_call_finish_reason_with_no_call_is_refused() {
+        // The upstream said the generation stopped to call something and sent
+        // nothing to call. The terminal reason alone satisfies the
+        // "said something usable" guard, so this completed successfully with an
+        // empty call list — and an agent branching on the reason rather than on
+        // the list waits for a call that never arrives.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+            .expect_err("a promised tool call that never arrived is not a completed stream");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+    }
+
+    #[test]
+    fn a_streamed_refusal_reaches_the_sink_instead_of_vanishing() {
+        // The streaming counterpart of the buffered case below. `delta.refusal`
+        // was not read at all, so a `content_filter` stream carried no content,
+        // no tool call and no refusal — and because `finish_reason` alone
+        // counts as substance, it completed *successfully* as an empty
+        // assistant message. Exactly the silent-empty-answer failure the
+        // buffered path refuses.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"refusal":"I can't help with that."}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let outcome = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect("a refusal is a result, not a malformed response");
+
+        assert_eq!(
+            captured.refusals,
+            vec!["I can't help with that.".to_owned()],
+            "the refusal must reach the sink on its own arm"
+        );
+        assert!(
+            captured.content.is_empty(),
+            "a refusal is not assistant content and must not be folded into it"
+        );
+        assert_eq!(outcome.finish_reason.as_deref(), Some("content_filter"));
+    }
+
+    #[test]
+    fn a_streamed_non_string_refusal_is_a_malformed_frame() {
+        // Same rule as `delta.content`: reading it with `as_str` alone would
+        // report a structured refusal as absent, dropping it and completing the
+        // stream successfully.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"refusal":{"text":"no"}}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate_streaming(&[b"go"], &mut |_: StreamEvent<'_>| StreamControl::Continue)
+            .expect_err("a structured refusal field is not a refusal string");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+    }
+
+    /// A safety refusal is a result, and a distinguishable one.
+    ///
+    /// The structured shape is `content: null`, a non-empty `refusal`, and an
+    /// ordinary finish reason. Dropping the field made that indistinguishable
+    /// from a model that returned nothing: the guest emitted `content: null`
+    /// with `finish_reason: "stop"`, and an agent read the empty string as the
+    /// reply.
+    #[test]
+    fn an_upstream_refusal_survives_instead_of_reading_as_an_empty_answer() {
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,"refusal":"I can't help with that."},
+                "finish_reason":"stop"}]}"#,
+        );
+        let generation = runtime("coder", &upstream.binding())
+            .generate(&[b"go"])
+            .expect("a refusal is a result, not a malformed response");
+        assert_eq!(
+            generation.refusal.as_deref(),
+            Some("I can't help with that.")
+        );
+        assert!(
+            generation.bytes.is_empty(),
+            "and it is not folded into the answer, which is the whole point of the field"
+        );
+        assert_eq!(generation.finish_reason.as_deref(), Some("stop"));
+
+        // A refusal with no finish reason is still a message that said what
+        // happened, so it is an answer rather than a shapeless response.
+        let bare = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,"refusal":"no"}}]}"#,
+        );
+        assert_eq!(
+            runtime("coder", &bare.binding())
+                .generate(&[b"go"])
+                .expect("a refusal alone is still a report")
+                .refusal
+                .as_deref(),
+            Some("no")
+        );
+
+        // A present non-string is corruption, refused like a bad `content`.
+        let broken = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,"refusal":{"text":"no"}},"finish_reason":"stop"}]}"#,
+        );
+        let error = runtime("coder", &broken.binding())
+            .generate(&[b"go"])
+            .expect_err("a structured refusal field is not a refusal string");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+    }
+
+    #[test]
+    fn a_stream_that_only_says_done_is_not_a_generation() {
+        // Keep-alives and a usage frame followed by the sentinel parse
+        // perfectly and used to return success, so the guest turned a provider
+        // that said nothing at all into an empty assistant message with a
+        // clean `stop` — the same silent-empty-answer failure the buffered
+        // path refuses, on the other route.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                ": keep-alive\n\n",
+                r#"data: {"usage":{"prompt_tokens":3,"completion_tokens":0}}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let mut captured = CapturedStream::default();
+        let error = runtime("coder", &upstream.binding())
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("a sentinel with nothing before it is not a completed generation");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("without sending any content"),
+            "{error}"
+        );
+        assert!(captured.content.is_empty());
+
+        // A role-only opening delta is structurally a choice and carries no
+        // result, so a guard counting *choices* let the ordinary preamble
+        // followed by the sentinel slip straight through it.
+        let preamble = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let mut captured = CapturedStream::default();
+        let error = runtime("coder", &preamble.binding())
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("an opening frame is not an answer");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(captured.content.is_empty());
+
+        // And the ordinary shape still completes: a preamble, then substance.
+        let real = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let mut captured = CapturedStream::default();
+        runtime("coder", &real.binding())
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect("a preamble followed by content is an ordinary stream");
+        assert_eq!(captured.content.concat(), "hi");
+
+        // A finish reason alone counts too: an upstream that stops on a filter
+        // said what happened, and that is a result rather than silence.
+        let filtered = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{},"finish_reason":"content_filter"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let mut captured = CapturedStream::default();
+        let outcome = runtime("coder", &filtered.binding())
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect("a terminal reason is a result");
+        assert_eq!(outcome.finish_reason.as_deref(), Some("content_filter"));
+    }
+
+    #[test]
+    fn a_non_string_tool_call_type_is_refused_on_both_routes() {
+        // `and_then(Value::as_str)` answers `None` for `"type": 42` exactly as
+        // it does for a missing key, so the check added for a *different*
+        // string slipped past on a number — and the guest relabels whatever it
+        // echoes as a dispatchable `function`.
+        assert!(tool_call_type_is_function(None));
+        assert!(tool_call_type_is_function(Some(&Value::Null)));
+        assert!(tool_call_type_is_function(Some(&json!("function"))));
+        assert!(!tool_call_type_is_function(Some(&json!(42))));
+        assert!(!tool_call_type_is_function(Some(&json!("custom"))));
+        assert!(!tool_call_type_is_function(Some(
+            &json!({"kind": "function"})
+        )));
+
+        let buffered = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[
+                {"id":"c1","type":42,"function":{"name":"f","arguments":"{}"}}]}}]}"#,
+        );
+        let error = runtime("coder", &buffered.binding())
+            .generate(&[b"go"])
+            .expect_err("a numeric type is not an unstated one");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+
+        let streamed = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":42,"function":{"name":"f","arguments":"{}"}}]}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let mut captured = CapturedStream::default();
+        let error = runtime("coder", &streamed.binding())
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("the assembler carried the same bypass");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(captured.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn a_streamed_tool_call_type_other_than_function_fails_the_stream() {
+        // The guest hardcodes `"function"` back onto whatever it echoes, so a
+        // fragment naming another kind would have that kind relabelled and
+        // dispatched as a function call. The buffered parser refuses the same
+        // payload; leaving the assembler open made the verdict depend on which
+        // route served the request.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"custom","function":{"name":"f","arguments":"{}"}}]}}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let error = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("only `function` calls can be carried");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(error.to_string().contains("custom"), "{error}");
+        assert!(captured.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn a_non_object_usage_value_fails_instead_of_reading_as_unmeasured() {
+        // `usage.get(...)` answers `None` for a string as readily as for a
+        // missing key, so a malformed provider payload reported both counters
+        // as unmeasured and the generation as successful — accounting data
+        // dropped with nothing saying so.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":{"content":"hi"}}],"usage":"unavailable"}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate(&[b"go"])
+            .expect_err("a scalar `usage` is malformed, not absent");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(error.to_string().contains("expected an object"), "{error}");
+    }
+
     #[test]
     fn tool_call_arguments_survive_an_upstream_that_sends_an_object() {
         // OpenAI specifies `function.arguments` as a JSON *string*, but several
@@ -2509,6 +4279,222 @@ mod tests {
         assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
         assert!(
             error.to_string().contains("must be an array"),
+            "the error should name the shape problem, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_streamed_choices_value_that_is_not_an_array_fails_the_stream() {
+        // `as_array` alone turned a present object into *no choice at all*, so
+        // the frame's content was dropped, `[DONE]` still completed the stream,
+        // and the guest reported an ordinary `stop` over a truncated answer.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":{"delta":{"content":"answer"}}}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let error = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("a non-array `choices` is not an absent one");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("non-array `choices`"),
+            "the error should name the shape problem, got: {error}"
+        );
+        assert!(
+            captured.content.is_empty(),
+            "nothing may be emitted from a frame that could not be read"
+        );
+    }
+
+    #[test]
+    fn a_streamed_delta_that_is_not_an_object_fails_the_stream() {
+        // One level below the `choices` case: a present non-object `delta` was
+        // accepted, and every `get` below it then read neither content nor tool
+        // call, so the frame was discarded whole and `[DONE]` still completed
+        // the stream on an ordinary `stop`.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":"answer"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let error = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect_err("a non-object delta is not an absent one");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("non-object `delta`"),
+            "the error should name the shape problem, got: {error}"
+        );
+        assert!(captured.content.is_empty());
+    }
+
+    #[test]
+    fn a_final_frame_without_a_delta_is_not_an_error() {
+        // The other side: a frame that only reports `finish_reason` carries no
+        // `delta` at all, and rejecting it would fail ordinary streams.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#,
+                "\n\n",
+                r#"data: {"choices":[{"finish_reason":"stop"}]}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let outcome = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect("a final frame carries no delta and is not malformed");
+        assert_eq!(captured.content.concat(), "hi");
+        assert_eq!(outcome.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn a_usage_only_frame_without_choices_is_not_an_error() {
+        // The other side of the rule: absent `choices` is the normal shape of a
+        // usage frame, and rejecting it would fail every stream that reports
+        // token counts.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "text/event-stream",
+            concat!(
+                r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#,
+                "\n\n",
+                r#"data: {"usage":{"prompt_tokens":3,"completion_tokens":1}}"#,
+                "\n\n",
+                "data: [DONE]\n\n",
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let mut captured = CapturedStream::default();
+        let outcome = backend
+            .generate_streaming(&[b"go"], &mut captured.sink())
+            .expect("a usage frame carries no choices and is not malformed");
+        assert_eq!(captured.content.concat(), "hi");
+        assert_eq!(
+            outcome.usage.expect("usage is reported").completion_tokens,
+            1
+        );
+    }
+
+    #[test]
+    fn a_buffered_content_value_that_is_not_a_string_fails_beside_tool_calls() {
+        // With valid `tool_calls` present, `as_str` reported a *present* object
+        // as absent and the branch returned empty bytes while reporting a
+        // successful structured call — the assistant's message silently gone.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            concat!(
+                r#"{"choices":[{"message":{"content":{"text":"hi"},"tool_calls":"#,
+                r#"[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]"#,
+                r#"}}]}"#,
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate(&[b"go"])
+            .expect_err("a non-string content value is not an absent one");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("non-string"),
+            "the error should name the shape problem, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_buffered_message_that_is_not_an_object_fails() {
+        // Present but not an object is not the same as absent, and only absent
+        // was refused. Every read below the check goes through `get`, which
+        // answers `None` for a string as readily as for a missing key, so a
+        // corrupted message produced no content, no tool calls and no error.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            r#"{"choices":[{"message":"hi"}]}"#,
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate(&[b"go"])
+            .expect_err("a scalar message is not a completion");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("not an object"),
+            "the error should name the shape problem, got: {error}"
+        );
+    }
+
+    #[test]
+    fn buffered_tool_call_arguments_that_are_not_a_json_object_fail() {
+        // The string form is the one OpenAI specifies and the one nothing
+        // checked: a truncated payload travelled to the client as a
+        // dispatchable call whose arguments cannot be parsed. The streamed
+        // assembler already refuses this, so leaving the buffered path open
+        // made the verdict depend on which route served the request.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            concat!(
+                r#"{"choices":[{"message":{"content":null,"tool_calls":"#,
+                r#"[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]"#,
+                r#"}}]}"#,
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate(&[b"go"])
+            .expect_err("half an argument object is not a dispatchable call");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("not valid JSON"),
+            "the error should name the parse failure, got: {error}"
+        );
+    }
+
+    #[test]
+    fn buffered_tool_call_arguments_that_are_a_json_scalar_fail() {
+        // Valid JSON, but not an argument set. Passed through, the caller
+        // dispatches the right function against `7` and reports success.
+        let upstream = FakeUpstream::start(
+            "HTTP/1.1 200 OK",
+            "application/json",
+            concat!(
+                r#"{"choices":[{"message":{"content":null,"tool_calls":"#,
+                r#"[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"7"}}]"#,
+                r#"}}]}"#,
+            ),
+        );
+        let backend = runtime("coder", &upstream.binding());
+
+        let error = backend
+            .generate(&[b"go"])
+            .expect_err("a bare number is not an argument set");
+        assert!(matches!(error, UpstreamError::MalformedResponse { .. }));
+        assert!(
+            error.to_string().contains("not an object"),
             "the error should name the shape problem, got: {error}"
         );
     }
@@ -2677,9 +4663,9 @@ mod tests {
     fn a_silent_upstream_still_notices_a_client_that_already_left() {
         // The window the per-frame liveness probe could not close: the client
         // leaves *before* the upstream's first frame, so there is no frame to
-        // probe on. A blocking `read_line` parked here until the binding's
-        // whole `timeout_ms` — up to an hour — holding an admission permit the
-        // node only has 32 of.
+        // probe on. A `read_line` on this thread parked here until the
+        // binding's whole `timeout_ms` — up to an hour — holding an admission
+        // permit the node only has a few dozen of.
         let upstream = FakeUpstream::start_silent(Duration::from_secs(30));
         // A 30s binding timeout, so "returned because it was cancelled" and
         // "returned because the request timed out" cannot be confused.
@@ -2705,12 +4691,123 @@ mod tests {
         );
     }
 
+    /// This is the actual fix, not just its externally visible symptom: the
+    /// previous test already returned promptly even before this change,
+    /// because `generate_streaming` itself gives up once the sink reports the
+    /// client gone. What that older version could not do is free the *reader
+    /// thread's* slot before the upstream spoke or the request timed out —
+    /// `read_line` was blocked inside the socket read, with no way to notice
+    /// its receiver had been dropped. A connect/disconnect loop against a
+    /// silent upstream therefore still accumulated parked readers up to the
+    /// ceiling, one per abandoned request, even though every caller had long
+    /// since moved on.
+    #[test]
+    fn an_abandoned_reader_frees_its_slot_without_waiting_for_the_upstream() {
+        // Built directly against `SseLineReader` rather than through
+        // `generate_streaming`, with the slot wired to `notify_drop` so the
+        // test learns the instant *this specific* slot is released. An
+        // earlier version of this test diffed the shared `LIVE_SSE_READERS`
+        // counter across two instants instead — racy in a suite that runs
+        // tests in parallel, since every other streaming test in this file
+        // claims and releases slots on that same counter between those two
+        // instants, for reasons that have nothing to do with the reader
+        // under test here. `notify_drop` sidesteps the shared counter
+        // entirely: the signal fires from inside the slot's own `Drop`.
+        let (upstream, _feed) = FakeUpstream::start_scripted();
+        let client = reqwest::Client::new();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
+        let slot = SseReaderSlot::claim()
+            .expect("a fresh node has reader slots")
+            .notify_drop(dropped_tx);
+
+        let mut reader = SseLineReader::spawn(
+            client,
+            "coder".to_owned(),
+            format!("{}/chat/completions", upstream.base_url()),
+            json!({}),
+            Duration::from_secs(30),
+            None,
+            slot,
+        );
+
+        // Confirm it is genuinely parked — mid-connect, here, since the
+        // fixture never answers — before asking it to give up. Otherwise a
+        // reader that happened to exit on its own for an unrelated reason
+        // would make this test pass for the wrong reason.
+        assert!(
+            matches!(reader.next_line(Duration::from_millis(50)), SseRead::Idle),
+            "the reader must still be waiting on the fixture, not already done"
+        );
+
+        drop(reader);
+
+        assert!(
+            dropped_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the parked reader must release its slot once cancelled, not hold it for the \
+             binding's timeout"
+        );
+    }
+
+    /// A chunk that lands exactly on `MAX_STREAM_BYTES`, with the upstream
+    /// left open and silent afterward.
+    ///
+    /// `take` is computed as `bytes.len().min(budget)`, so a chunk that
+    /// exactly exhausts the remaining budget has `take == bytes.len()` —
+    /// the same shape as an ordinary chunk that stayed under the cap.
+    /// Checking only `take < bytes.len()` (true when a chunk runs *past*
+    /// the cap) missed this boundary: `budget` reached zero, but the loop
+    /// still went on to await another `response.chunk()` from an upstream
+    /// that never spoke again, parking until the request timeout instead of
+    /// treating the cap as this side's own end of stream.
+    #[test]
+    fn the_whole_stream_budget_is_enforced_exactly_at_the_boundary() {
+        let (upstream, feed) = FakeUpstream::start_scripted();
+        let backend = runtime("coder", &format!("{}?timeout_ms=30000", upstream.binding()));
+
+        // 1024 frames of 64 KiB each, every one a valid content delta well
+        // under the per-frame cap, summing to exactly `MAX_STREAM_BYTES` —
+        // so the very last byte read is also the byte that exhausts the
+        // budget, regardless of how the transport happens to split it into
+        // `response.chunk()` calls.
+        let prefix = r#"data: {"choices":[{"delta":{"content":""#;
+        let suffix = "\"}}]}\n\n";
+        let frame_len = 65536usize;
+        let payload_len = frame_len - prefix.len() - suffix.len();
+        let frame = format!("{prefix}{}{suffix}", "x".repeat(payload_len));
+        assert_eq!(frame.len(), frame_len);
+        let frames = MAX_STREAM_BYTES as usize / frame_len;
+        assert_eq!(
+            frames * frame_len,
+            MAX_STREAM_BYTES as usize,
+            "the frame size must evenly divide the cap for this test to land on it exactly"
+        );
+        feed.send(frame.repeat(frames).into_bytes())
+            .expect("fixture feed");
+        // Left open on purpose: no `[DONE]`, no close. A silent upstream
+        // past the cap is exactly the case that used to hang.
+
+        let started = std::time::Instant::now();
+        let mut captured = CapturedStream::default();
+        let outcome = backend.generate_streaming(&[b"go"], &mut captured.sink());
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the reader must stop at the whole-stream cap rather than waiting on a chunk \
+             from a since-silent upstream; took {elapsed:?}"
+        );
+        assert!(
+            outcome.is_err(),
+            "a stream cut off at the cap without `[DONE]` is truncated, not complete: {outcome:?}"
+        );
+    }
+
     #[test]
     fn a_silent_upstream_is_not_abandoned_while_the_client_is_still_there() {
         // The other half of the contract: the poll interval is not a deadline.
         // A model that thinks for longer than one interval must not be treated
         // as an abandoned request, or every slow generation would be cut off.
-        let upstream = FakeUpstream::start_silent(LIVENESS_POLL_INTERVAL * 4);
+        let upstream = FakeUpstream::start_silent(SSE_LIVENESS_POLL * 4);
         let backend = runtime("coder", &format!("{}?timeout_ms=30000", upstream.binding()));
 
         let started = std::time::Instant::now();
@@ -2723,7 +4820,7 @@ mod tests {
             "a quiet socket is not an error: {outcome:?}"
         );
         assert!(
-            elapsed >= LIVENESS_POLL_INTERVAL * 3,
+            elapsed >= SSE_LIVENESS_POLL * 3,
             "a live consumer must keep waiting across poll intervals, not be cut off at the \
              first one; took {elapsed:?}"
         );
