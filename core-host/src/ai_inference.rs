@@ -695,15 +695,15 @@ fn execute_model(
             let result = runtime
                 .generate(&[prompt])
                 .map_err(|error| GenerationError::local(error.to_string()))
-                .and_then(|mut outputs| {
+                .map(|mut outputs| {
                     let (bytes, usage) = outputs.remove(0);
-                    Ok(ModelOutput {
+                    ModelOutput {
                         bytes,
                         usage: Some(usage),
                         finish_reason: None,
                         tool_calls: Vec::new(),
                         refusal: None,
-                    })
+                    }
                 });
             record_execution(&model.alias, runtime.executed_on(), result.is_ok());
             result
