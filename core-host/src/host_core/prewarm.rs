@@ -745,7 +745,7 @@ pub(crate) fn prewarm_legacy_route(
     add_route_environment(&mut wasi, route, host_identity.as_ref())?;
 
     if let Some(module_dir) = module_path.parent() {
-        wasi.preopened_dir(module_dir, ".", DirPerms::READ, FilePerms::READ)
+        wasi.preopened_dir(module_dir, ".", FsPerms::ReadOnly)
             .map_err(|error| {
                 guest_execution_error(
                     error,

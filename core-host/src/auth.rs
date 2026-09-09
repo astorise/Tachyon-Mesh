@@ -20,9 +20,7 @@ use wasmtime::{
     component::{Component, Linker as ComponentLinker},
     Engine, Store,
 };
-use wasmtime_wasi::{
-    DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
-};
+use wasmtime_wasi::{FsPerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 mod authn_bindings {
     wasmtime::component::bindgen!({
@@ -762,18 +760,13 @@ impl AuthManager {
         let mut wasi = WasiCtxBuilder::new();
         wasi.env(JWT_SECRET_ENV, &self.jwt_secret);
         wasi.env(AUTH_STATE_DIR_ENV, ".");
-        wasi.preopened_dir(
-            &self.state_dir,
-            ".",
-            DirPerms::READ | DirPerms::MUTATE,
-            FilePerms::READ | FilePerms::WRITE,
-        )
-        .map_err(|error| {
-            anyhow!(
-                "failed to preopen auth state directory `{}`: {error}",
-                self.state_dir.display()
-            )
-        })?;
+        wasi.preopened_dir(&self.state_dir, ".", FsPerms::ReadWrite)
+            .map_err(|error| {
+                anyhow!(
+                    "failed to preopen auth state directory `{}`: {error}",
+                    self.state_dir.display()
+                )
+            })?;
 
         let mut store = Store::new(
             engine,

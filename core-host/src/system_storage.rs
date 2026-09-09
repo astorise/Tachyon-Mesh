@@ -13,9 +13,7 @@ use std::{
     sync::Arc,
 };
 use wasmtime::{component::Linker as ComponentLinker, Engine, Store};
-use wasmtime_wasi::{
-    DirPerms, FilePerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
-};
+use wasmtime_wasi::{FsPerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 const ASSET_URI_PREFIX: &str = "tachyon://sha256:";
 const REGISTRY_MODULE_NAME: &str = "system-faas-registry";
@@ -269,12 +267,7 @@ fn invoke_storage_component(
 
     let mut builder = WasiCtxBuilder::new();
     builder
-        .preopened_dir(
-            root_dir,
-            ".",
-            DirPerms::READ | DirPerms::MUTATE,
-            FilePerms::READ | FilePerms::WRITE,
-        )
+        .preopened_dir(root_dir, ".", FsPerms::ReadWrite)
         .map_err(|error| {
             anyhow!(
                 "failed to preopen storage component root directory `{}`: {error}",
