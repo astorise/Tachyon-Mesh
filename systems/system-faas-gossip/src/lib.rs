@@ -183,6 +183,9 @@ fn local_snapshot() -> TelemetrySnapshot {
         tpu_rt_load: snapshot.tpu_rt_load,
         tpu_standard_load: snapshot.tpu_standard_load,
         tpu_batch_load: snapshot.tpu_batch_load,
+        network_rt_load: snapshot.network_rt_load,
+        network_standard_load: snapshot.network_standard_load,
+        network_batch_load: snapshot.network_batch_load,
         hot_models: snapshot.hot_models,
         dropped_events: snapshot.dropped_events,
         last_status: snapshot.last_status,
@@ -198,6 +201,7 @@ enum TargetAccelerator {
     Gpu,
     Npu,
     Tpu,
+    Network,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,6 +242,7 @@ fn parse_target_accelerator(value: &str) -> Result<TargetAccelerator, String> {
         "gpu" => Ok(TargetAccelerator::Gpu),
         "npu" => Ok(TargetAccelerator::Npu),
         "tpu" => Ok(TargetAccelerator::Tpu),
+        "network" => Ok(TargetAccelerator::Network),
         _ => Err(format!(
             "unsupported `{TARGET_ACCELERATOR_ENV}` value `{value}`"
         )),
@@ -267,6 +272,9 @@ fn queue_load(snapshot: &TelemetrySnapshot, accelerator: TargetAccelerator, qos:
         (TargetAccelerator::Tpu, TargetQos::RealTime) => snapshot.tpu_rt_load,
         (TargetAccelerator::Tpu, TargetQos::Standard) => snapshot.tpu_standard_load,
         (TargetAccelerator::Tpu, TargetQos::Batch) => snapshot.tpu_batch_load,
+        (TargetAccelerator::Network, TargetQos::RealTime) => snapshot.network_rt_load,
+        (TargetAccelerator::Network, TargetQos::Standard) => snapshot.network_standard_load,
+        (TargetAccelerator::Network, TargetQos::Batch) => snapshot.network_batch_load,
     }
 }
 
@@ -630,6 +638,12 @@ struct TelemetrySnapshot {
     #[serde(default)]
     tpu_batch_load: u32,
     #[serde(default)]
+    network_rt_load: u32,
+    #[serde(default)]
+    network_standard_load: u32,
+    #[serde(default)]
+    network_batch_load: u32,
+    #[serde(default)]
     hot_models: Vec<String>,
     dropped_events: u64,
     last_status: u16,
@@ -676,6 +690,9 @@ mod tests {
             tpu_rt_load: 0,
             tpu_standard_load: 0,
             tpu_batch_load: 0,
+            network_rt_load: 0,
+            network_standard_load: 0,
+            network_batch_load: 0,
             hot_models: Vec::new(),
             dropped_events: 0,
             last_status: 0,
@@ -770,6 +787,9 @@ mod tests {
             tpu_rt_load: 0,
             tpu_standard_load: 0,
             tpu_batch_load: 0,
+            network_rt_load: 0,
+            network_standard_load: 0,
+            network_batch_load: 0,
             hot_models: vec!["llama3".to_owned()],
             dropped_events: 0,
             last_status: 200,

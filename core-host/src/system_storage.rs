@@ -393,7 +393,10 @@ pub(crate) fn binding_tool_call_parser(path: &str) -> Option<&'static str> {
         if path.starts_with(crate::ai_inference::UPSTREAM_SCHEME) {
             return None;
         }
-        crate::ai_inference::detect_tool_call_parser(std::path::Path::new(path))
+        let metadata_path = path
+            .strip_prefix(crate::ai_inference::MAGNETAR_PATH_PREFIX)
+            .unwrap_or(path);
+        crate::ai_inference::detect_tool_call_parser(std::path::Path::new(metadata_path))
     }
     #[cfg(not(feature = "ai-inference"))]
     {
@@ -791,6 +794,98 @@ pub(crate) fn apply_guest_registry_write(
         ));
     }
     Ok(())
+}
+
+pub(crate) fn apply_guest_registry_compare_and_set(
+    core_store: &crate::store::CoreStore,
+    table: &str,
+    key: &str,
+    expected: Option<Vec<u8>>,
+    value: Vec<u8>,
+) -> std::result::Result<bool, String> {
+    if table != AI_MODELS_REGISTRY_TABLE {
+        let mut applied = false;
+        core_store
+            .kv_partition_update(table, key, |current| {
+                if current == expected.as_deref() {
+                    applied = true;
+                    crate::store::KvPartitionUpdate::Set(value)
+                } else {
+                    crate::store::KvPartitionUpdate::Keep
+                }
+            })
+            .map_err(|error| format!("{error:#}"))?;
+        return Ok(applied);
+    }
+
+    reject_forged_config_marker(key, Some(&value))?;
+    let mut alias_taken = false;
+    let mut applied = false;
+    core_store
+        .kv_partition_update(AI_MODELS_REGISTRY_TABLE, key, |current| {
+            if row_is_config_owned(current) {
+                alias_taken = true;
+                crate::store::KvPartitionUpdate::Keep
+            } else if current == expected.as_deref() {
+                applied = true;
+                crate::store::KvPartitionUpdate::Set(value)
+            } else {
+                crate::store::KvPartitionUpdate::Keep
+            }
+        })
+        .map_err(|error| format!("{error:#}"))?;
+    if alias_taken {
+        return Err(format!(
+            "{GUEST_REGISTRY_ALIAS_TAKEN}: model alias `{key}` is claimed by a configured \
+             binding in the sealed manifest"
+        ));
+    }
+    Ok(applied)
+}
+
+pub(crate) fn apply_guest_registry_compare_and_delete(
+    core_store: &crate::store::CoreStore,
+    table: &str,
+    key: &str,
+    expected: Vec<u8>,
+) -> std::result::Result<bool, String> {
+    if table != AI_MODELS_REGISTRY_TABLE {
+        let mut applied = false;
+        core_store
+            .kv_partition_update(table, key, |current| {
+                if current == Some(expected.as_slice()) {
+                    applied = true;
+                    crate::store::KvPartitionUpdate::Delete
+                } else {
+                    crate::store::KvPartitionUpdate::Keep
+                }
+            })
+            .map_err(|error| format!("{error:#}"))?;
+        return Ok(applied);
+    }
+
+    let mut alias_taken = false;
+    let mut applied = false;
+    core_store
+        .kv_partition_update(AI_MODELS_REGISTRY_TABLE, key, |current| {
+            if row_is_config_owned(current) {
+                alias_taken = true;
+                crate::store::KvPartitionUpdate::Keep
+            } else if current == Some(expected.as_slice()) {
+                applied = true;
+                crate::store::KvPartitionUpdate::Delete
+            } else {
+                crate::store::KvPartitionUpdate::Keep
+            }
+        })
+        .map_err(|error| format!("{error:#}"))?;
+    if alias_taken {
+        return Err(format!(
+            "{GUEST_REGISTRY_ALIAS_TAKEN}: model alias `{key}` is claimed by a configured \
+             binding in the sealed manifest"
+        ));
+    }
+    Ok(applied)
 }
 
 /// Apply a guest's `batch-set` to the model registry, all-or-nothing.
@@ -1681,6 +1776,33 @@ mod configured_binding_registry_tests {
             row["withdrawn"], true,
             "a row that no longer describes what the path holds must not stay advertised"
         );
+    }
+
+    #[test]
+    fn configured_magnetar_binding_strips_scheme_before_parser_probe() {
+        let (store, dir) = temp_store();
+        let model_dir = dir.join("local-coder");
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        std::fs::write(model_dir.join("config.json"), br#"{"model_type":"qwen3"}"#)
+            .expect("config");
+
+        let config = config_with(vec![binding(
+            "local-coder",
+            &format!("magnetar:{}", model_dir.display()),
+            false,
+        )]);
+        publish_configured_model_bindings(&store, &config);
+
+        let published = store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "local-coder")
+            .expect("read")
+            .expect("the binding publishes a row");
+        let published: serde_json::Value = serde_json::from_slice(&published).expect("row json");
+        assert_eq!(
+            published["toolCallParser"], "qwen",
+            "the publisher must probe the real filesystem path, not `magnetar:<path>`"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// The converse: an untouched directory costs no availability.

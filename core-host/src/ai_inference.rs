@@ -1,196 +1,102 @@
-#[path = "ai_inference/accelerator_backend.rs"]
-mod accelerator_backend;
-#[path = "ai_inference/architecture_registry.rs"]
-mod architecture_registry;
-#[path = "ai_inference/candle_embedding_runtime.rs"]
-mod candle_embedding_runtime;
-#[path = "ai_inference/candle_llm_runtime.rs"]
-mod candle_llm_runtime;
-#[path = "ai_inference/candle_onnx_backend.rs"]
-mod candle_onnx_backend;
-#[path = "ai_inference/expert_parallel_llama.rs"]
-pub(crate) mod expert_parallel_llama;
-#[path = "ai_inference/modelopt_nvfp4.rs"]
-mod modelopt_nvfp4;
-#[path = "ai_inference/paged_kv.rs"]
-mod paged_kv;
-#[path = "ai_inference/parallel.rs"]
-pub(crate) mod parallel;
-#[path = "ai_inference/pipeline_parallel_llama.rs"]
-pub(crate) mod pipeline_parallel_llama;
-#[cfg(test)]
-mod qwen35_fixture;
-mod qwen35_profile;
-mod qwen35_upstream;
-#[path = "ai_inference/samplers.rs"]
-mod samplers;
-#[path = "ai_inference/tensor_parallel_llama.rs"]
-pub(crate) mod tensor_parallel_llama;
+#[path = "ai_inference/magnetar_runtime.rs"]
+mod magnetar_runtime;
 #[path = "ai_inference/upstream_openai.rs"]
 mod upstream_openai;
 
-pub(crate) use candle_llm_runtime::{detect_tool_call_parser, TokenUsage};
-pub(crate) use upstream_openai::{assert_no_credential_collisions, UPSTREAM_SCHEME};
-#[path = "ai_inference/vendor_accelerator.rs"]
-mod vendor_accelerator;
-#[path = "ai_inference/vram_manager.rs"]
-pub(crate) mod vram_manager;
-
-use anyhow::{anyhow, bail, Context, Result};
-use candle_core::{
-    bail as candle_bail, CpuStorage, CustomOp2, DType, Device, Layout, Shape,
-    Tensor as CandleTensor,
-};
+use anyhow::{anyhow, Result};
+use serde::Deserialize;
 use std::{
-    any::Any,
-    cmp::Ordering as CmpOrdering,
-    collections::{BinaryHeap, HashMap},
-    fs,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, Condvar, Mutex, OnceLock, RwLock,
-    },
-    thread,
+    sync::{Arc, Condvar, Mutex, OnceLock, RwLock},
     time::Duration,
 };
-use tokio::sync::mpsc as tokio_mpsc;
 use wasmtime_wasi_nn::{
     witx::WasiNnCtx, Graph as WasiGraph, GraphRegistry, Registry as WasiRegistry,
 };
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TensorType {
-    U8,
-    Fp32,
-}
 
-use crate::{
-    IntegrityConfig, IntegrityModelBinding, RouteQos, SchedulerConfig, SchedulerSpillTier,
-};
+use crate::{IntegrityConfig, IntegrityModelBinding, RouteQos};
 
+pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
+pub(crate) use magnetar_runtime::MAGNETAR_PATH_PREFIX;
+const MODEL_META_JSON: &str = ".tachyon-model.json";
 const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
-const DEFAULT_BATCH_SIZE: usize = 32;
-const ACCELERATOR_QUEUE_CAPACITY: usize = 256;
-const MODEL_BROKER_DIR_ENV: &str = "MODEL_BROKER_DIR";
-const MODEL_BROKER_ADAPTERS_DIR: &str = "adapters";
-const SAFETENSORS_EXTENSION: &str = "safetensors";
-/// How many upstream (`openai:`) round trips this node keeps in flight at once.
-/// Sized for a relay, not for an accelerator: the cost of an in-flight upstream
-/// request here is one blocking thread and one socket, and the real limit is the
-/// provider's own rate limit. Overridable per deployment.
-const DEFAULT_UPSTREAM_MAX_CONCURRENCY: usize = 32;
-/// The configured upstream concurrency, for callers that must size their own
-/// bounds against it rather than against a constant that drifts from it.
-pub(crate) fn upstream_max_concurrency() -> usize {
-    node_upstream_admission().capacity
-}
-const UPSTREAM_MAX_CONCURRENCY_ENV: &str = "TACHYON_UPSTREAM_MAX_CONCURRENCY";
-/// How long a caller waits for an upstream permit before the node sheds it.
-/// Bounded on purpose: an unbounded wait converts provider slowness into an
-/// ever-growing queue of held threads, and the caller would rather be told to
-/// retry (or be routed to a peer by the mesh QoS override) than sit behind a
-/// backlog it cannot see.
 const UPSTREAM_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bounded admission gate for upstream (`openai:`) work.
-///
-/// Upstream bindings deliberately do not run on an [`AcceleratorScheduler`].
-/// The batch scheduler exists to amortise a GPU forward pass over co-batched
-/// sequences; an HTTP round trip gains nothing from batching and loses two
-/// things to it — the dispatcher thread is shared with every local model on the
-/// node, and the batch barrier makes each caller wait for the slowest peer in
-/// its batch. What upstream work does need is a cap on how much of it runs at
-/// once, which is what this gate is: a counting semaphore with a bounded wait,
-/// shared by the buffered, streaming, and embedding paths so the cap is a
-/// property of the node rather than of one entry point.
+pub(crate) fn binding_runs_upstream(binding: &IntegrityModelBinding) -> bool {
+    !binding.dynamic && binding.path.trim().starts_with(UPSTREAM_SCHEME)
+}
+
+pub(crate) fn upstream_max_concurrency() -> usize {
+    std::env::var("TACHYON_UPSTREAM_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(32)
+}
+
+static HOST_UPSTREAM_ADMISSION: OnceLock<Arc<UpstreamAdmission>> = OnceLock::new();
+
+fn host_upstream_admission() -> Arc<UpstreamAdmission> {
+    Arc::clone(HOST_UPSTREAM_ADMISSION.get_or_init(|| Arc::new(UpstreamAdmission::from_env())))
+}
+
 struct UpstreamAdmission {
     state: Mutex<UpstreamAdmissionState>,
     released: Condvar,
     capacity: usize,
-    /// How deep the queue for a permit may get before new callers are refused
-    /// outright instead of parked.
-    ///
-    /// `capacity` bounds the requests in flight; on its own it bounds nothing
-    /// else. A streaming caller has already spawned its dedicated OS thread by
-    /// the time it reaches [`Self::acquire`], so a burst against a full gate
-    /// parks an unbounded number of threads, each for up to
-    /// [`UPSTREAM_ADMISSION_TIMEOUT`], and exhausts thread stacks or the
-    /// process limit while only `capacity` requests are actually being served.
-    /// Refusing past this depth turns that into the overload error it always
-    /// was.
-    max_waiting: usize,
+    max_waiters: usize,
 }
 
 #[derive(Default)]
 struct UpstreamAdmissionState {
     in_flight: usize,
-    /// Callers currently blocked on a permit. This — not `in_flight` — is the
-    /// node's upstream backlog, and it is what the mesh QoS admission check
-    /// reads for the `Network` lane: an in-flight request is being served, a
-    /// waiting one is work this node cannot start.
     waiting: usize,
 }
 
-/// Queued callers allowed per permit before [`UpstreamAdmission::acquire`]
-/// refuses rather than parks. Four is a backlog a burst can drain within the
-/// admission timeout at any realistic upstream latency, without letting the
-/// parked-thread count run away from the work in flight.
-const UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT: usize = 4;
+#[derive(Debug)]
+enum UpstreamAdmissionError {
+    QueueFull { waiting: usize, limit: usize },
+    TimedOut { in_flight: usize, limit: usize },
+}
 
-/// The node's one upstream admission gate.
-///
-/// Built per runtime, the cap was a property of a *generation* rather than of
-/// the node. A hot reload constructs a new runtime while the previous one is
-/// still draining its requests, so for the length of that overlap each had its
-/// own gate and the node allowed twice the configured concurrency against the
-/// same upstream — which is precisely when a provider is least able to absorb
-/// it, since a reload is often what a saturated node is being restarted for.
-///
-/// Read from the environment once. A reload cannot change the cap, and that is
-/// the honest behaviour: the value bounds sockets held by this process, so
-/// re-reading it mid-flight would leave permits outstanding against a limit
-/// nothing had counted them under.
-fn node_upstream_admission() -> Arc<UpstreamAdmission> {
-    static GATE: OnceLock<Arc<UpstreamAdmission>> = OnceLock::new();
-    Arc::clone(GATE.get_or_init(|| Arc::new(UpstreamAdmission::from_env())))
+impl std::fmt::Display for UpstreamAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull { waiting, limit } => write!(
+                f,
+                "upstream request queue is full ({waiting} waiting, limit {limit})"
+            ),
+            Self::TimedOut { in_flight, limit } => write!(
+                f,
+                "upstream request queue is saturated ({in_flight} in flight, limit {limit}): retry, or raise `TACHYON_UPSTREAM_MAX_CONCURRENCY`"
+            ),
+        }
+    }
 }
 
 impl UpstreamAdmission {
     fn new(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
         Self {
             state: Mutex::new(UpstreamAdmissionState::default()),
             released: Condvar::new(),
-            capacity,
-            // Deep enough that a normal burst still queues and is served —
-            // refusing a caller that would have waited a moment is its own kind
-            // of failure — and shallow enough that the parked threads stay a
-            // multiple of the work actually in flight.
-            max_waiting: capacity.saturating_mul(UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT),
+            capacity: capacity.max(1),
+            max_waiters: capacity.max(1),
         }
     }
 
     fn from_env() -> Self {
-        let capacity = std::env::var(UPSTREAM_MAX_CONCURRENCY_ENV)
-            .ok()
-            .and_then(|raw| raw.trim().parse::<usize>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_UPSTREAM_MAX_CONCURRENCY);
-        Self::new(capacity)
+        Self::new(upstream_max_concurrency())
     }
 
-    /// Blocks until a permit is free, or until [`UPSTREAM_ADMISSION_TIMEOUT`]
-    /// elapses. The permit is held for the whole upstream interaction — for a
-    /// stream, that is the lifetime of the stream, not just its first byte.
-    fn acquire(&self) -> Result<UpstreamPermit<'_>, String> {
+    fn acquire(&self) -> std::result::Result<UpstreamPermit<'_>, UpstreamAdmissionError> {
         let mut state = self.state.lock().expect("upstream admission lock poisoned");
         if state.in_flight >= self.capacity {
-            if state.waiting >= self.max_waiting {
-                return Err(format!(
-                    "upstream request queue is saturated ({} in flight, {} already queued, limit \
-                     {}): retry, or raise `{UPSTREAM_MAX_CONCURRENCY_ENV}`",
-                    state.in_flight, state.waiting, self.capacity
-                ));
+            if state.waiting >= self.max_waiters {
+                return Err(UpstreamAdmissionError::QueueFull {
+                    waiting: state.waiting,
+                    limit: self.max_waiters,
+                });
             }
             state.waiting += 1;
             let deadline = std::time::Instant::now() + UPSTREAM_ADMISSION_TIMEOUT;
@@ -201,10 +107,10 @@ impl UpstreamAdmission {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
                     state.waiting -= 1;
-                    return Err(format!(
-                        "upstream request queue is saturated ({} in flight, limit {}): retry, or raise `{UPSTREAM_MAX_CONCURRENCY_ENV}`",
-                        state.in_flight, self.capacity
-                    ));
+                    return Err(UpstreamAdmissionError::TimedOut {
+                        in_flight: state.in_flight,
+                        limit: self.capacity,
+                    });
                 }
                 let (next, _) = self
                     .released
@@ -241,8 +147,6 @@ impl UpstreamAdmission {
     }
 }
 
-/// Releases its permit on drop, so an upstream error, a panic, or an early
-/// `?` return cannot leak capacity.
 struct UpstreamPermit<'a> {
     gate: &'a UpstreamAdmission,
 }
@@ -253,53 +157,6 @@ impl Drop for UpstreamPermit<'_> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct InferenceExecutionTelemetry {
-    pub(crate) alias: String,
-    pub(crate) executed_on: String,
-    pub(crate) succeeded: bool,
-}
-
-static INFERENCE_TELEMETRY: OnceLock<Mutex<Vec<InferenceExecutionTelemetry>>> = OnceLock::new();
-
-fn record_execution(alias: impl Into<String>, executed_on: impl Into<String>, succeeded: bool) {
-    let records = INFERENCE_TELEMETRY.get_or_init(|| Mutex::new(Vec::new()));
-    let mut records = records.lock().expect("inference telemetry lock poisoned");
-    records.push(InferenceExecutionTelemetry {
-        alias: alias.into(),
-        executed_on: executed_on.into(),
-        succeeded,
-    });
-    if records.len() > 1024 {
-        records.remove(0);
-    }
-}
-
-/// Whether requests for this binding actually leave the node.
-///
-/// The `openai:` prefix alone does not decide it. A `dynamic` binding's path is
-/// a placeholder the broker overwrites: `ensure_model_loaded` swaps it for the
-/// directory the upload landed in, so the checkpoint runs *locally*, on the
-/// device the binding seals, whatever the manifest wrote there.
-///
-/// This module already drew that line for credential collisions. Mesh QoS and
-/// VRAM admission each re-derived it from the path alone, and so classified
-/// such a binding as `Network`: its real CPU or GPU queue became invisible to
-/// admission, and a route made entirely of them skipped the critical-VRAM
-/// refusal while running local checkpoints on a saturated device. One predicate
-/// now, so the three answers cannot drift again.
-pub(crate) fn binding_runs_upstream(binding: &IntegrityModelBinding) -> bool {
-    !binding.dynamic && binding.path.trim().starts_with(UPSTREAM_SCHEME)
-}
-
-pub(crate) fn inference_execution_telemetry() -> Vec<InferenceExecutionTelemetry> {
-    INFERENCE_TELEMETRY
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .expect("inference telemetry lock poisoned")
-        .clone()
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum AcceleratorKind {
     #[default]
@@ -307,24 +164,12 @@ pub(crate) enum AcceleratorKind {
     Gpu,
     Npu,
     Tpu,
-    /// Not a local accelerator: the queue for work executed by another process
-    /// entirely (an `openai:` upstream binding).
-    ///
-    /// It has its own scheduler because its cost profile is nothing like a
-    /// local lane's. An upstream request holds its dispatcher slot for a
-    /// network round trip — up to the binding's timeout — while consuming no
-    /// local compute. Sharing the CPU lane would let one slow remote server
-    /// stall every CPU-resident model on the node.
     Network,
 }
 
 impl AcceleratorKind {
-    const ALL: [Self; 5] = [Self::Cpu, Self::Gpu, Self::Npu, Self::Tpu, Self::Network];
+    pub(crate) const ALL: [Self; 5] = [Self::Cpu, Self::Gpu, Self::Npu, Self::Tpu, Self::Network];
 
-    /// `Network` is deliberately unreachable here: it is chosen by the backend
-    /// that claimed a binding, never declared by an operator. `device` on an
-    /// upstream binding describes the *remote* server, which this node does not
-    /// schedule.
     pub(crate) fn from_model_device(device: &crate::ModelDevice) -> Self {
         match device {
             crate::ModelDevice::Cpu => Self::Cpu,
@@ -350,41 +195,213 @@ pub(crate) enum AcceleratorMemoryResidency {
     HostRam,
     Vram,
     Sram,
+    MagnetarArena,
 }
 
-#[derive(Clone)]
-struct BackendModelSource {
-    alias: String,
-    path: String,
-    requested_target: String,
-    accelerator: AcceleratorKind,
-    qos: RouteQos,
-    /// On-disk size of the model artifact, in bytes. Used only for telemetry of
-    /// the resident weight footprint — the weights themselves are streamed/mmaped
-    /// by the concrete backend (e.g. `CandleLlmRuntime`), so we deliberately do
-    /// not buffer the whole file in host RAM here.
-    model_size_bytes: u64,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InferenceExecutionTelemetry {
+    pub(crate) alias: String,
+    pub(crate) executed_on: String,
+    pub(crate) succeeded: bool,
 }
 
-fn model_file_size_bytes(path: &str) -> u64 {
-    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+static INFERENCE_TELEMETRY: OnceLock<Mutex<Vec<InferenceExecutionTelemetry>>> = OnceLock::new();
+
+fn record_execution(alias: impl Into<String>, executed_on: impl Into<String>, succeeded: bool) {
+    let records = INFERENCE_TELEMETRY.get_or_init(|| Mutex::new(Vec::new()));
+    let mut records = records.lock().expect("inference telemetry lock poisoned");
+    records.push(InferenceExecutionTelemetry {
+        alias: alias.into(),
+        executed_on: executed_on.into(),
+        succeeded,
+    });
+    if records.len() > 1024 {
+        records.remove(0);
+    }
 }
 
-// Guests load ONNX models directly via graph_load(bytes). No pre-registered
-// named graphs are needed; the WASI-NN registry is intentionally empty.
+pub(crate) fn inference_execution_telemetry() -> Vec<InferenceExecutionTelemetry> {
+    INFERENCE_TELEMETRY
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("inference telemetry lock poisoned")
+        .clone()
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TokenUsage {
+    pub(crate) prompt_tokens: u32,
+    pub(crate) completion_tokens: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ToolCall {
+    pub(crate) id: Option<String>,
+    pub(crate) name: String,
+    pub(crate) arguments: String,
+}
+
+pub(crate) enum StreamEvent<'a> {
+    Content(&'a str),
+    Refusal(&'a str),
+    ToolCall(ToolCall),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamControl {
+    Continue,
+    Stop,
+}
+
+impl StreamControl {
+    pub(crate) fn is_stop(self) -> bool {
+        matches!(self, Self::Stop)
+    }
+}
+
+pub(crate) trait StreamSink {
+    fn emit(&mut self, event: StreamEvent<'_>) -> StreamControl;
+
+    fn is_live(&mut self) -> bool {
+        true
+    }
+}
+
+impl<F> StreamSink for F
+where
+    F: FnMut(StreamEvent<'_>) -> StreamControl + ?Sized,
+{
+    fn emit(&mut self, event: StreamEvent<'_>) -> StreamControl {
+        self(event)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StreamOutcome {
+    pub(crate) usage: Option<TokenUsage>,
+    pub(crate) finish_reason: Option<String>,
+}
+
+impl StreamOutcome {
+    fn usage(usage: Option<TokenUsage>) -> Self {
+        Self {
+            usage,
+            finish_reason: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GenerationError {
+    pub(crate) message: String,
+    pub(crate) upstream_status: Option<u16>,
+    pub(crate) class: Option<String>,
+    pub(crate) invalid_request: bool,
+}
+
+impl GenerationError {
+    pub(crate) fn local(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            upstream_status: None,
+            class: None,
+            invalid_request: false,
+        }
+    }
+
+    pub(crate) fn invalid_request(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            upstream_status: None,
+            class: None,
+            invalid_request: true,
+        }
+    }
+}
+
+impl From<upstream_openai::UpstreamError> for GenerationError {
+    fn from(error: upstream_openai::UpstreamError) -> Self {
+        let upstream_status = error.http_status();
+        let invalid_request =
+            matches!(error, upstream_openai::UpstreamError::InvalidRequest { .. });
+        Self {
+            message: error.to_string(),
+            upstream_status,
+            class: None,
+            invalid_request,
+        }
+    }
+}
+
+impl From<UpstreamAdmissionError> for GenerationError {
+    fn from(error: UpstreamAdmissionError) -> Self {
+        Self {
+            message: error.to_string(),
+            upstream_status: Some(429),
+            class: Some("upstream-admission".to_owned()),
+            invalid_request: false,
+        }
+    }
+}
+
+impl std::fmt::Display for GenerationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for GenerationError {
+    fn from(message: String) -> Self {
+        Self::local(message)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ComponentGeneration {
+    pub(crate) text: String,
+    pub(crate) refusal: Option<String>,
+    pub(crate) usage: Option<TokenUsage>,
+    pub(crate) finish_reason: Option<String>,
+    pub(crate) tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct QueueTierSnapshot {
+    pub(crate) realtime: u32,
+    pub(crate) standard: u32,
+    pub(crate) batch: u32,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SchedulerSnapshot {
+    pub(crate) batches_processed: usize,
+    pub(crate) requests_processed: usize,
+    pub(crate) max_batch_size: usize,
+    pub(crate) prefill_steps_processed: usize,
+    pub(crate) decode_steps_processed: usize,
+    pub(crate) max_active_sequences: usize,
+    pub(crate) queued_requests: usize,
+    pub(crate) realtime_queued: usize,
+    pub(crate) standard_queued: usize,
+    pub(crate) batch_queued: usize,
+    pub(crate) kv_recompute_preemptions: usize,
+    pub(crate) kv_swap_preemptions: usize,
+    pub(crate) completed_aliases: Vec<String>,
+}
+
 struct EmptyGraphRegistry;
+
 impl GraphRegistry for EmptyGraphRegistry {
     fn get(&self, _name: &str) -> Option<&WasiGraph> {
         None
     }
+
     fn get_mut(&mut self, _name: &str) -> Option<&mut WasiGraph> {
         None
     }
 }
 
-// Test-only: pre-populate named graph aliases with a mock graph that always
-// returns MOCK_LLM_RESPONSE, allowing WASM guests that call build_from_cache()
-// to succeed in CI without actual model files on disk.
 #[cfg(test)]
 struct MockPreloadedGraphRegistry {
     graphs: HashMap<String, WasiGraph>,
@@ -414,12 +431,14 @@ impl MockPreloadedGraphRegistry {
             fn set_input(&mut self, _id: Id, _tensor: &WasiTensor) -> Result<(), BackendError> {
                 Ok(())
             }
+
             fn compute(
                 &mut self,
                 _named: Option<Vec<NamedTensor>>,
             ) -> Result<Option<Vec<NamedTensor>>, BackendError> {
                 Ok(None)
             }
+
             fn get_output(&mut self, _id: Id) -> Result<WasiTensor, BackendError> {
                 Ok(WasiTensor {
                     dimensions: vec![MOCK_INFERENCE_RESPONSE.len() as u32],
@@ -445,632 +464,67 @@ impl GraphRegistry for MockPreloadedGraphRegistry {
     fn get(&self, name: &str) -> Option<&WasiGraph> {
         self.graphs.get(name)
     }
+
     fn get_mut(&mut self, name: &str) -> Option<&mut WasiGraph> {
         self.graphs.get_mut(name)
     }
 }
 
 #[derive(Clone)]
-struct SharedInputTensor {
-    dimensions: Vec<u32>,
-    ty: TensorType,
-    data: Arc<[u8]>,
+enum ModelRuntime {
+    Mock { accelerator: AcceleratorKind },
+    Magnetar(Arc<magnetar_runtime::MagnetarRuntime>),
+    Upstream(Arc<upstream_openai::UpstreamOpenAiRuntime>),
 }
 
-impl SharedInputTensor {
-    fn byte_len(&self) -> usize {
-        self.data.len().max(1)
-    }
+#[derive(Clone)]
+struct LoadedModel {
+    alias: String,
+    qos: RouteQos,
+    runtime: ModelRuntime,
 }
 
-/// One inference result: the decoded output bytes, plus the token counts when
-/// the backend could measure them.
-///
-/// `usage` is `None` rather than zero for a backend that cannot count (a mock,
-/// a vendor runner returning text over a pipe). The distinction is load-bearing
-/// downstream: a zero `usage` claims the generation cost nothing, which a
-/// client doing context-window accounting will believe.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct InferenceOutput {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) usage: Option<TokenUsage>,
-    /// Why generation stopped, when the backend knows. `None` means "not
-    /// reported": the caller then infers one rather than being handed `stop`
-    /// for a completion the upstream actually truncated at its token limit,
-    /// which is the difference between running generated code and rejecting
-    /// it.
-    pub(crate) finish_reason: Option<String>,
-    /// Tool calls the backend recognised as structured data. Empty for a
-    /// backend that only produces text — a local model emitting a
-    /// `[TOOL_CALLS]` envelope leaves this empty and the envelope in `bytes`,
-    /// because recognising it is a property of the model's chat template, which
-    /// the caller resolves and the backend does not.
-    pub(crate) tool_calls: Vec<ToolCall>,
-    /// A provider's structured safety refusal, when it sent one.
-    ///
-    /// Its own field rather than folded into `bytes`, because that is exactly
-    /// the distinction it exists to make: a refusal read as content is an
-    /// agent parsing "I can't help with that" as data. Always `None` for a
-    /// local backend, which has no such concept.
-    pub(crate) refusal: Option<String>,
-}
-
-impl InferenceOutput {
-    /// A local backend's buffered result.
-    ///
-    /// `finish_reason` comes from the decode loop rather than being left
-    /// `None`: a generation that spent its whole `max_new_tokens` budget is
-    /// truncated, and `guest-openai` resolves an absent reason to `stop`. So a
-    /// local completion cut off mid-function used to be reported as having
-    /// finished normally, while the same request against an upstream reported
-    /// `length` — the client could avoid running incomplete code on one
-    /// backend and not the other.
-    fn measured(bytes: Vec<u8>, usage: TokenUsage, finish_reason: Option<&'static str>) -> Self {
-        Self {
-            bytes,
-            usage: Some(usage),
-            finish_reason: finish_reason.map(str::to_owned),
-            tool_calls: Vec::new(),
-            refusal: None,
-        }
-    }
-}
-
-/// Output from a backend that reports no counts. Explicit rather than a blanket
-/// `From` so that "this backend cannot measure" is a decision at each call site
-/// instead of a silent default.
-impl From<Vec<u8>> for InferenceOutput {
-    fn from(bytes: Vec<u8>) -> Self {
-        Self {
-            bytes,
-            usage: None,
-            finish_reason: None,
-            tool_calls: Vec::new(),
-            refusal: None,
-        }
-    }
-}
-
-/// One tool call a backend recognised as structured data.
-///
-/// Carries what the model actually said — an id, a function name, a JSON
-/// argument object — and nothing about how a caller will encode it. The OpenAI
-/// `tool_calls` shape is `guest-openai`'s business; putting it here would make
-/// every other consumer of the accelerator interface decode a wire format it
-/// does not speak.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ToolCall {
-    /// Provider-assigned call id, when there was one. `None` means the caller
-    /// mints its own rather than passing off a synthesised id as the
-    /// provider's.
-    pub(crate) id: Option<String>,
-    pub(crate) name: String,
-    /// The call's arguments as a JSON object string, exactly as received.
-    pub(crate) arguments: String,
-}
-
-/// One item a streaming backend produces.
-///
-/// Tool calls travel on their own arm rather than inside the text, which is
-/// what lets a backend stream content the moment it has any. Folding calls into
-/// the text channel forces the opposite: the backend cannot emit a single byte
-/// of prose until it knows no call is coming, so merely *offering* tools costs
-/// the whole time-to-first-token.
-pub(crate) enum StreamEvent<'a> {
-    Content(&'a str),
-    /// A provider's structured safety refusal, on the same terms as
-    /// [`UpstreamGeneration::refusal`] on the buffered path: distinct from
-    /// content, because folding it in hands an agent a refusal as data and
-    /// dropping it makes one indistinguishable from a model that said nothing.
-    Refusal(&'a str),
-    ToolCall(ToolCall),
-}
-
-/// What a sink tells the backend to do after an event.
-///
-/// `Stop` is how a disconnected client reaches the backend. Without it the sink
-/// can only drop what it is handed, and the generation runs to completion for
-/// nobody: on the upstream path that is a socket, a thread and — since upstream
-/// work is admitted by permit — a slice of the node's outbound capacity held
-/// for up to the binding's timeout. A handful of abandoned streams would then
-/// starve live requests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StreamControl {
-    Continue,
-    Stop,
-}
-
-impl StreamControl {
-    fn is_stop(self) -> bool {
-        matches!(self, Self::Stop)
-    }
-}
-
-/// Where a streaming backend sends its events, and how it asks whether anyone
-/// is still listening.
-///
-/// A trait rather than a bare callback because cancellation needs two distinct
-/// questions. `emit` answers "did that reach a consumer"; `is_live` answers
-/// "is there still a consumer" *without* producing anything — which is the only
-/// form available between frames that carry no content, and the only one a
-/// backend can ask while it is waiting rather than emitting.
-pub(crate) trait StreamSink {
-    fn emit(&mut self, event: StreamEvent<'_>) -> StreamControl;
-
-    /// Whether the consumer is still there. The default answers "yes": only a
-    /// sink with a real consumer channel can know better, and a wrongly
-    /// pessimistic answer would truncate a healthy generation.
-    fn is_live(&mut self) -> bool {
-        true
-    }
-}
-
-/// Every plain callback is a sink, so a caller that has nothing to say about
-/// liveness — a test, a buffered adapter — keeps passing a closure.
-///
-/// `?Sized` so that `dyn FnMut(..)` is itself a sink: a closure written inline
-/// infers a single concrete lifetime for its argument and then fails the
-/// higher-ranked bound, while coercing it to `&mut dyn FnMut` first pins the
-/// `for<'a>` signature the trait needs.
-impl<F> StreamSink for F
-where
-    F: FnMut(StreamEvent<'_>) -> StreamControl + ?Sized,
-{
-    fn emit(&mut self, event: StreamEvent<'_>) -> StreamControl {
-        self(event)
-    }
-}
-
-/// What a streaming generation reports once it ends.
-///
-/// Both fields are known only at the end — the counts because decoding has to
-/// finish, the reason because it is the *last* thing an upstream sends — so
-/// they come back beside the event stream rather than through it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct StreamOutcome {
-    pub(crate) usage: Option<TokenUsage>,
-    /// Why generation stopped, when the backend knows. Absent means "not
-    /// reported"; it is never synthesised, because `stop` for a completion the
-    /// upstream truncated at its token limit is exactly the report that makes a
-    /// client run half a function.
-    pub(crate) finish_reason: Option<String>,
-}
-
-impl StreamOutcome {
-    fn usage(usage: Option<TokenUsage>) -> Self {
-        Self {
-            usage,
-            finish_reason: None,
-        }
-    }
-
-    /// Attach the backend's own reason, when it reported one. `None` leaves the
-    /// outcome saying "not reported" rather than overwriting it with a guess.
-    fn with_finish_reason(mut self, finish_reason: Option<&str>) -> Self {
-        self.finish_reason = finish_reason.map(str::to_owned);
-        self
-    }
-}
-
-/// A failed generation, with the remote status when the failure came from one.
-///
-/// The status is what makes a relay honest. Collapsed into a string, a
-/// provider's 429 and its 400 reach the client as the same opaque server error:
-/// one should be retried after a backoff, the other never, and the client can
-/// no longer tell which it has.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GenerationError {
-    pub(crate) message: String,
-    /// The HTTP status this node should answer with, when the failure has one.
-    ///
-    /// Usually the status a remote provider returned. Two cases are this
-    /// node's own and still carry one, because they describe *its* role rather
-    /// than inventing a remote fault: an upstream that could not be reached or
-    /// answered unusably is a gateway failure, and a saturated admission queue
-    /// is an overload. `None` stays the answer for a genuine local fault — a
-    /// decode error, an unknown alias — where any status would be a fiction.
-    pub(crate) upstream_status: Option<u16>,
-    /// The caller's request was rejected before any backend ran it. Carried
-    /// separately from `upstream_status` because a locally refused request has
-    /// no remote status to relay, yet is just as much the caller's to fix —
-    /// and reporting it as a server fault sends clients into retry loops over
-    /// requests that cannot succeed.
-    pub(crate) invalid_request: bool,
-}
-
-/// One input's share of a failure the whole batch suffered.
-///
-/// The scheduler fans a single backend failure out to every input in its batch,
-/// which means re-materialising an error that cannot be cloned. Doing that with
-/// `to_string()` keeps the words and loses the type — and the type is what
-/// decides whether the caller sees 400 or 500, so a request the runtime refused
-/// came out the far side of a batch as an opaque host fault. Carrying the
-/// classification explicitly is what survives the fan-out.
-#[derive(Clone, Debug, thiserror::Error)]
-#[error("{message}")]
-pub(crate) struct BatchFailure {
-    message: String,
-    invalid_request: bool,
-}
-
-impl BatchFailure {
-    /// Flatten an error into a form each input can carry, keeping both the full
-    /// message chain and the classification the chain encoded.
-    fn from_anyhow(error: &anyhow::Error) -> Self {
-        let classified = GenerationError::from_anyhow(error);
-        Self {
-            message: classified.message,
-            invalid_request: classified.invalid_request,
-        }
-    }
-
-    fn local(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            invalid_request: false,
-        }
-    }
-}
-
-impl GenerationError {
-    pub(crate) fn local(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            upstream_status: None,
-            invalid_request: false,
-        }
-    }
-
-    /// A local rejection of what the caller asked for.
-    pub(crate) fn invalid_request(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            upstream_status: None,
-            invalid_request: true,
-        }
-    }
-
-    /// Recover the remote status from an error that has already been erased
-    /// into `anyhow`. The upstream backend attaches its `UpstreamError`
-    /// unmodified, so the typed cause survives the trip through the scheduler
-    /// and the backend trait and can be read back here.
-    fn from_anyhow(error: &anyhow::Error) -> Self {
-        // Both typed errors survive the trip through `anyhow`, so the
-        // classification is read from the cause rather than guessed from the
-        // message: a request the local runtime refused and one a provider
-        // refused are both the caller's to fix, and neither is a host fault.
-        let invalid_request = error.chain().any(|cause| {
-            // A failure that crossed a batch fan-out carries its own verdict:
-            // the typed cause is gone by then, and re-deriving it from the
-            // message would be guessing.
-            cause
-                .downcast_ref::<BatchFailure>()
-                .is_some_and(|failure| failure.invalid_request)
-                || matches!(
-                    cause.downcast_ref::<candle_llm_runtime::CandleLlmError>(),
-                    Some(candle_llm_runtime::CandleLlmError::InvalidRequest { .. })
-                )
-                || matches!(
-                    cause.downcast_ref::<upstream_openai::UpstreamError>(),
-                    Some(upstream_openai::UpstreamError::InvalidRequest { .. })
-                )
-        });
-        Self {
-            // The whole chain, not just its outermost context. The wrappers
-            // that used to format the cause into their message now attach it
-            // as context — which is what lets the classification above see the
-            // typed error at all — so rendering only the top line would trade
-            // one regression for another and drop the detail the caller needs.
-            message: format!("{error:#}"),
-            upstream_status: error
-                .chain()
-                .find_map(|cause| cause.downcast_ref::<upstream_openai::UpstreamError>())
-                .and_then(upstream_openai::UpstreamError::http_status),
-            invalid_request,
-        }
-    }
-}
-
-impl std::fmt::Display for GenerationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl GenerationError {
-    /// This node is at capacity for the alias, not broken.
-    ///
-    /// Without a status the caller sees 500 `server_error` — a node that has
-    /// failed — and an agent retries against it immediately, adding to the
-    /// queue that refused it. 503 is what says "come back", which is the whole
-    /// content of an admission refusal, and it is the one answer that makes a
-    /// client's backoff correct rather than harmful.
-    fn overloaded(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            upstream_status: Some(503),
-            invalid_request: false,
-        }
-    }
-}
-
-impl From<String> for GenerationError {
-    fn from(message: String) -> Self {
-        Self::local(message)
-    }
-}
-
-/// A completed generation as a WASM component sees it.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ComponentGeneration {
-    pub(crate) text: String,
-    pub(crate) usage: Option<TokenUsage>,
-    pub(crate) finish_reason: Option<String>,
-    pub(crate) tool_calls: Vec<ToolCall>,
-    pub(crate) refusal: Option<String>,
-}
-
-trait BackendModel: Send + Sync {
-    fn residency(&self) -> AcceleratorMemoryResidency;
-    /// Lane this backend must run on, overriding the lane implied by the
-    /// binding's `device`. `None` keeps the declared device's lane.
-    ///
-    /// Only the upstream backend overrides it: its `device` describes a remote
-    /// server, so honouring it would park network waits on a local accelerator
-    /// queue and stall unrelated local inference. The `Network` lane it selects
-    /// has no batch scheduler at all — it is served by `UpstreamAdmission`.
-    fn scheduling_lane(&self) -> Option<AcceleratorKind> {
-        None
-    }
-    fn as_any(&self) -> &dyn Any;
-    /// Executes one or more independent requests and returns exactly one
-    /// output per input, in the same order — never a single shared output
-    /// broadcast across the whole batch (see `process_batch`, which routes
-    /// `outputs[i]` back to `inputs[i]`'s own caller).
-    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>>;
-    fn execute_with_adapter(
-        &self,
-        inputs: &[SharedInputTensor],
-        adapter: &ResolvedLoraAdapter,
-    ) -> Result<Vec<InferenceOutput>> {
-        let _ = inputs;
-        bail!(
-            "LoRA adapter `{}` was resolved, but this backend does not support adapter injection",
-            adapter.id
-        )
-    }
-    fn execute_with_adapters(
-        &self,
-        inputs: &[SharedInputTensor],
-        adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Result<Vec<InferenceOutput>> {
-        self.execute_with_adapter_results(inputs, adapters)
-            .into_iter()
-            .collect()
-    }
-
-    fn execute_with_adapter_results(
-        &self,
-        inputs: &[SharedInputTensor],
-        adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Vec<Result<InferenceOutput>> {
-        if inputs.len() != adapters.len() {
-            let message = format!(
-                "adapter assignment count {} does not match input count {}",
-                adapters.len(),
-                inputs.len()
-            );
-            return repeat_batch_error(
-                inputs.len().max(adapters.len()),
-                BatchFailure::local(message),
-            );
-        }
-        let mut results = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
-        for group in adapter_assignment_groups(adapters) {
-            let adapter = adapters[group[0]].as_ref();
-            let group_inputs = group
-                .iter()
-                .map(|index| inputs[*index].clone())
-                .collect::<Vec<_>>();
-            let outputs = match adapter {
-                Some(adapter) => self.execute_with_adapter(&group_inputs, adapter),
-                None => self.execute(&group_inputs),
-            };
-            let outputs = match outputs {
-                Ok(outputs) => outputs,
-                Err(error) => {
-                    let failure = BatchFailure::from_anyhow(&error);
-                    for index in group {
-                        results[index] = Some(Err(anyhow::Error::new(failure.clone())));
-                    }
-                    continue;
+impl LoadedModel {
+    fn accelerator(&self) -> AcceleratorKind {
+        match &self.runtime {
+            ModelRuntime::Mock { accelerator } => *accelerator,
+            ModelRuntime::Magnetar(runtime) => {
+                if runtime.provider().device_id.starts_with("CUDA") {
+                    AcceleratorKind::Gpu
+                } else {
+                    AcceleratorKind::Cpu
                 }
-            };
-            if outputs.len() != group.len() {
-                let message = format!(
-                    "backend returned {} output(s) for an adapter group of {} input(s)",
-                    outputs.len(),
-                    group.len()
-                );
-                let failure = BatchFailure::local(message);
-                for index in group {
-                    results[index] = Some(Err(anyhow::Error::new(failure.clone())));
-                }
-                continue;
             }
-            for (index, output) in group.into_iter().zip(outputs) {
-                results[index] = Some(Ok(output));
-            }
+            ModelRuntime::Upstream(_) => AcceleratorKind::Network,
         }
-        results
-            .into_iter()
-            .map(|output| output.expect("adapter groups cover every input"))
-            .collect()
     }
 
-    /// Stream generation events through `sink` as they are produced. The
-    /// default implementation runs `execute` and emits the entire output as a
-    /// single fragment — a correct, non-incremental fallback for backends that
-    /// cannot stream (mock, NVFP4). Backends that can decode token-by-token
-    /// override this for real time-to-first-token. Only ever called with a
-    /// single input (streaming is inherently one request, one client).
-    fn stream_text(
-        &self,
-        inputs: &[SharedInputTensor],
-        sink: &mut dyn StreamSink,
-    ) -> Result<StreamOutcome> {
-        let mut outputs = self.execute(inputs)?;
-        if outputs.len() != 1 {
-            bail!(
-                "stream_text expects exactly one input, got {} output(s) for {} input(s)",
-                outputs.len(),
-                inputs.len()
-            );
-        }
-        let output = outputs.remove(0);
-        let text = String::from_utf8(output.bytes)
-            .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
-        // Nothing to cancel: this fallback has already produced the whole
-        // generation before the first event, so `Stop` only stops the emitting.
-        let mut stopped = text.is_empty();
-        if !stopped {
-            stopped = sink.emit(StreamEvent::Content(&text)).is_stop();
-        }
-        for call in output.tool_calls {
-            if stopped {
-                break;
+    fn memory_residency(&self) -> AcceleratorMemoryResidency {
+        match self.runtime {
+            ModelRuntime::Mock {
+                accelerator: AcceleratorKind::Gpu,
+            } => AcceleratorMemoryResidency::Vram,
+            ModelRuntime::Mock {
+                accelerator: AcceleratorKind::Npu | AcceleratorKind::Tpu,
+            } => AcceleratorMemoryResidency::Sram,
+            ModelRuntime::Mock { .. } | ModelRuntime::Upstream(_) => {
+                AcceleratorMemoryResidency::HostRam
             }
-            stopped = sink.emit(StreamEvent::ToolCall(call)).is_stop();
+            ModelRuntime::Magnetar(_) => AcceleratorMemoryResidency::MagnetarArena,
         }
-        Ok(StreamOutcome {
-            usage: output.usage,
-            finish_reason: output.finish_reason,
-        })
-    }
-
-    /// `stream_text`, with a resolved LoRA adapter applied. The default refuses
-    /// rather than silently streaming the base model: a route that pins an
-    /// adapter is asking for a specific tenant's behaviour, and answering with
-    /// the unadapted model would be wrong in a way nothing downstream can see.
-    fn stream_text_with_adapter(
-        &self,
-        inputs: &[SharedInputTensor],
-        adapter: &ResolvedLoraAdapter,
-        sink: &mut dyn StreamSink,
-    ) -> Result<StreamOutcome> {
-        let _ = (inputs, sink);
-        bail!(
-            "LoRA adapter `{}` was resolved, but this backend does not support adapter injection",
-            adapter.id
-        )
-    }
-
-    fn embed_text(&self, input: &SharedInputTensor) -> Result<Vec<f32>> {
-        let _ = input;
-        bail!("this backend does not expose dense text embeddings")
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct AiInferenceRuntime {
-    schedulers: HashMap<AcceleratorKind, AcceleratorScheduler>,
-    /// Loaded models, keyed by alias. Behind an `Arc<RwLock<_>>` so broker-uploaded
-    /// models can be lazily registered at runtime (see `ensure_model_loaded`)
-    /// while clones of the runtime share one registry.
-    models: Arc<RwLock<HashMap<String, Arc<CandleModel>>>>,
-    /// Root directory of broker-uploaded models (`{tachyon_data}/models`). When
-    /// set, an inference request for an alias absent from the sealed config is
-    /// lazily loaded from `{root}/{alias}` — gated upstream by the route's sealed
-    /// `allowed_model_aliases`. `None` disables lazy loading (tests, no broker).
+    models: Arc<RwLock<HashMap<String, LoadedModel>>>,
     dynamic_models_root: Option<PathBuf>,
-    /// Sealed metadata for the `dynamic` bindings, keyed by alias.
-    ///
-    /// A dynamic binding is skipped at boot because its files do not exist yet,
-    /// but the rest of what the manifest said about it — the device, the
-    /// hardware strategy, the QoS class — is a sealed deployment decision that
-    /// outlives the upload. Discarding it and rebuilding a bare CPU binding at
-    /// first use meant a deployment that asked for `cuda` silently got CPU:
-    /// the model still answered, just on the wrong hardware, at RAM cost and
-    /// a fraction of the speed, with nothing in the response to say so.
-    dynamic_bindings: Arc<HashMap<String, IntegrityModelBinding>>,
-    /// One in-flight first load per alias.
-    ///
-    /// Without it, two requests that miss the registry together both load the
-    /// whole checkpoint before either inserts, and `or_insert` drops the loser
-    /// only once both finished. On CPU that wastes a load; on an accelerator
-    /// both copies are resident at the same moment, so peak VRAM approaches
-    /// twice the model and a checkpoint sized to fit turns into an OOM.
-    ///
-    /// Keyed per alias so unrelated models still load in parallel. Entries are
-    /// left behind after a load — one empty mutex per alias ever loaded, which
-    /// is bounded by the alias count and cheaper than the bookkeeping needed to
-    /// retire one safely while another caller may still be waiting on it.
-    loading: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    /// Bounded concurrency for `openai:` bindings, which run off the batch
-    /// scheduler entirely. Shared across clones of the runtime *and* across
-    /// runtime generations, so the cap is a property of the node rather than of
-    /// whichever manifest is loaded — see [`node_upstream_admission`].
+    queue_snapshots: Arc<RwLock<HashMap<AcceleratorKind, QueueTierSnapshot>>>,
     upstream_admission: Arc<UpstreamAdmission>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct SchedulerSnapshot {
-    pub(crate) batches_processed: usize,
-    pub(crate) requests_processed: usize,
-    pub(crate) max_batch_size: usize,
-    pub(crate) prefill_steps_processed: usize,
-    pub(crate) decode_steps_processed: usize,
-    pub(crate) max_active_sequences: usize,
-    pub(crate) queued_requests: usize,
-    pub(crate) realtime_queued: usize,
-    pub(crate) standard_queued: usize,
-    pub(crate) batch_queued: usize,
-    pub(crate) kv_recompute_preemptions: usize,
-    pub(crate) kv_swap_preemptions: usize,
-    pub(crate) completed_aliases: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct QueueTierSnapshot {
-    pub(crate) realtime: u32,
-    pub(crate) standard: u32,
-    pub(crate) batch: u32,
 }
 
 impl AiInferenceRuntime {
     pub(crate) fn from_config(config: &IntegrityConfig) -> Result<Self> {
-        // One dispatcher thread per *local* accelerator lane. `Network` is
-        // absent by construction: upstream bindings are the only thing that
-        // lands there, and they run under `UpstreamAdmission` instead of the
-        // batch scheduler, so spawning a dispatcher for that lane would spawn a
-        // thread that never receives a job.
-        let schedulers = AcceleratorKind::ALL
-            .into_iter()
-            .filter(|accelerator| !matches!(accelerator, AcceleratorKind::Network))
-            .map(|accelerator| {
-                (
-                    accelerator,
-                    AcceleratorScheduler::new(
-                        accelerator,
-                        DEFAULT_BATCH_SIZE,
-                        config.scheduler.clone(),
-                    ),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        // Before any binding is built: two upstream aliases whose credential
-        // variables collide would each send the other's API key to a
-        // third-party server. Nothing at request time can see the collision,
-        // so this fails the boot instead.
-        //
-        // Only bindings that can actually load as upstreams. A `dynamic` one
-        // never does — `ensure_model_loaded` replaces its path with the broker
-        // directory the upload landed in — so its declared path is not a
-        // statement about where requests go. Counting it meant two dynamic
-        // aliases that normalise to the same suffix, `vendor-a` and
-        // `vendor_a`, could refuse the whole boot over a credential neither
-        // would ever read.
         assert_no_credential_collisions(
             config
                 .routes
@@ -1082,9 +536,7 @@ impl AiInferenceRuntime {
         .map_err(|detail| anyhow!("Integrity Validation Failed: {detail}"))?;
 
         let mut models = HashMap::new();
-        let mut dynamic_bindings = HashMap::new();
-        let mut sealed_aliases = std::collections::HashSet::new();
-
+        let mut sealed_aliases = HashSet::new();
         for route in &config.routes {
             for binding in &route.models {
                 if !sealed_aliases.insert(binding.alias.clone()) {
@@ -1094,57 +546,31 @@ impl AiInferenceRuntime {
                     ));
                 }
                 if binding.dynamic {
-                    // Sealed but not present at boot. The alias is authorised for
-                    // the route (scope is enforced from `route.models`), and the
-                    // model is lazily materialised from `{dynamic_models_root}/{alias}`
-                    // by `ensure_model_loaded` on first use. Skipping eager load
-                    // here lets the host boot before the model has been uploaded.
-                    //
-                    // The binding is kept, though: `ensure_model_loaded` needs
-                    // its device and strategy to honour what the manifest
-                    // sealed. Only `path` is ignored, because the upload root
-                    // decides where the files land.
-                    dynamic_bindings.insert(binding.alias.clone(), binding.clone());
                     continue;
                 }
-                if binding.path.is_empty() {
+                if binding.path.trim().is_empty() {
                     return Err(anyhow!(
                         "Integrity Validation Failed: static model alias `{}` requires a non-empty `path` (set `dynamic: true` for broker-uploaded models)",
                         binding.alias
                     ));
                 }
-                let backend_model: Arc<dyn BackendModel> =
-                    Arc::new(CandleBackendModel::load(binding)?);
-                models.insert(
-                    binding.alias.clone(),
-                    Arc::new(CandleModel::load_mock_with_backend(binding, backend_model)?),
-                );
+                let model = load_binding(binding)?;
+                models.insert(binding.alias.clone(), model);
             }
         }
-
         Ok(Self {
-            schedulers,
             models: Arc::new(RwLock::new(models)),
-            dynamic_bindings: Arc::new(dynamic_bindings),
-            loading: Arc::new(Mutex::new(HashMap::new())),
             dynamic_models_root: None,
-            upstream_admission: node_upstream_admission(),
+            queue_snapshots: Arc::new(RwLock::new(HashMap::new())),
+            upstream_admission: host_upstream_admission(),
         })
     }
 
-    /// Set the root directory from which broker-uploaded models are lazily loaded
-    /// on first use. Production wires this to `{tachyon_data}/models`; tests and
-    /// hosts without a broker leave it unset.
     pub(crate) fn with_dynamic_models_root(mut self, root: Option<PathBuf>) -> Self {
         self.dynamic_models_root = root;
         self
     }
 
-    /// Ensure `alias` is loaded, lazily materializing a broker-uploaded model from
-    /// `{dynamic_models_root}/{alias}` on a registry miss. The format (GGUF or
-    /// safetensors) is resolved from the directory's `.tachyon-model.json` sidecar
-    /// by the backend loader. This runs only after the caller's sealed-alias scope
-    /// check, so it cannot widen what a route may execute.
     fn ensure_model_loaded(&self, alias: &str) -> Result<(), String> {
         if self
             .models
@@ -1161,50 +587,15 @@ impl AiInferenceRuntime {
         if !model_dir.is_dir() {
             return Err(format!("model alias `{alias}` is not loaded"));
         }
-        // Past here a checkpoint is about to be read onto a device, so only one
-        // caller per alias may proceed. The gate is taken before any loading
-        // work and released once the model is registered.
-        let gate = {
-            let mut loading = self.loading.lock().expect("model load gate poisoned");
-            Arc::clone(loading.entry(alias.to_owned()).or_default())
-        };
-        let _loading = gate.lock().expect("model load gate poisoned");
-        // Re-checked under the gate: whoever held it before us may have just
-        // finished this exact load, and repeating it is the cost this whole
-        // gate exists to avoid.
-        if self
-            .models
-            .read()
-            .expect("model registry lock poisoned")
-            .contains_key(alias)
-        {
-            return Ok(());
-        }
-        // The sealed binding decides everything except where the files are —
-        // that is the upload root's to say. An alias with no dynamic binding at
-        // all is a bare broker upload, which has no manifest opinion to honour
-        // and gets the conservative CPU default.
-        let sealed = self.dynamic_bindings.get(alias);
         let binding = IntegrityModelBinding {
             alias: alias.to_owned(),
-            path: model_dir.to_string_lossy().into_owned(),
-            device: sealed.map_or(crate::ModelDevice::Cpu, |binding| binding.device.clone()),
-            qos: sealed.map_or(RouteQos::Standard, |binding| binding.qos),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: crate::ModelDevice::Cpu,
+            qos: RouteQos::Standard,
             dynamic: false,
-            hardware_strategy: sealed
-                .map(|binding| binding.hardware_strategy.clone())
-                .unwrap_or_default(),
+            hardware_strategy: Default::default(),
         };
-        let backend_model: Arc<dyn BackendModel> =
-            Arc::new(CandleBackendModel::load(&binding).map_err(|error| error.to_string())?);
-        let model = Arc::new(
-            CandleModel::load_mock_with_backend(&binding, backend_model)
-                .map_err(|error| error.to_string())?,
-        );
-        // `or_insert` rather than `insert`: the gate above makes a concurrent
-        // first-use race for this alias impossible, but a model registered by
-        // some other path in the meantime is still its own truth and must not
-        // be replaced.
+        let model = load_binding(&binding).map_err(|error| error.to_string())?;
         self.models
             .write()
             .expect("model registry lock poisoned")
@@ -1226,7 +617,6 @@ impl AiInferenceRuntime {
     }
 
     pub(crate) fn build_wasi_nn_ctx(&self) -> WasiNnCtx {
-        let backends = [candle_onnx_backend::candle_onnx_backend()];
         #[cfg(test)]
         let registry = WasiRegistry::from(MockPreloadedGraphRegistry::from_aliases(
             self.models
@@ -1238,51 +628,21 @@ impl AiInferenceRuntime {
         ));
         #[cfg(not(test))]
         let registry = WasiRegistry::from(EmptyGraphRegistry);
-        WasiNnCtx::new(backends, registry)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn scheduler_snapshot(&self, accelerator: AcceleratorKind) -> SchedulerSnapshot {
-        self.scheduler_for(accelerator)
-            .map(|scheduler| scheduler.snapshot())
-            .unwrap_or_default()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_queue_depth_for_test(
-        &self,
-        accelerator: AcceleratorKind,
-        qos: RouteQos,
-        depth: usize,
-    ) {
-        if let Some(scheduler) = self.scheduler_for(accelerator) {
-            scheduler.set_queue_depth_for_test(qos, depth);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn model_memory_residency(&self, alias: &str) -> Option<AcceleratorMemoryResidency> {
-        self.models
-            .read()
-            .expect("model registry lock poisoned")
-            .get(alias)
-            .map(|model| model.memory_residency)
+        WasiNnCtx::new([], registry)
     }
 
     pub(crate) fn supports_accelerator(&self, accelerator: AcceleratorKind) -> bool {
-        // `Network` has no dispatcher of its own — it is served by the upstream
-        // admission gate — but it is still a lane this node can run work on.
-        matches!(accelerator, AcceleratorKind::Network)
-            || self.schedulers.contains_key(&accelerator)
+        matches!(accelerator, AcceleratorKind::Cpu)
+            || self
+                .models
+                .read()
+                .expect("model registry lock poisoned")
+                .values()
+                .any(|model| model.accelerator() == accelerator)
     }
 
     pub(crate) fn queue_tier_snapshot(&self, accelerator: AcceleratorKind) -> QueueTierSnapshot {
         if matches!(accelerator, AcceleratorKind::Network) {
-            // Upstream work never enters a scheduler queue, so the depth the
-            // mesh QoS check needs is the admission backlog: callers holding a
-            // thread while they wait for a permit this node cannot grant. It is
-            // reported on every tier because the tier only selects the
-            // threshold — the backlog itself is one number for the lane.
             let waiting = self.upstream_admission.waiting().min(u32::MAX as usize) as u32;
             return QueueTierSnapshot {
                 realtime: waiting,
@@ -1290,8 +650,11 @@ impl AiInferenceRuntime {
                 batch: waiting,
             };
         }
-        self.scheduler_for(accelerator)
-            .map(|scheduler| scheduler.queue_tier_snapshot())
+        self.queue_snapshots
+            .read()
+            .expect("queue snapshots lock poisoned")
+            .get(&accelerator)
+            .copied()
             .unwrap_or_default()
     }
 
@@ -1299,62 +662,35 @@ impl AiInferenceRuntime {
         &self,
         alias: &str,
         accelerator: AcceleratorKind,
-    ) -> Result<(), String> {
+    ) -> std::result::Result<(), String> {
         if !self.supports_accelerator(accelerator) {
             return Err(format!(
                 "{} accelerator is unavailable on this host",
                 accelerator.as_str()
             ));
         }
-        // NPU/TPU requests may fall back to the CPU lane when their optional
-        // vendor runner is unavailable. CPU/GPU requests keep strict device
-        // matching semantics.
         self.ensure_model_loaded(alias)?;
         let models = self.models.read().expect("model registry lock poisoned");
         let model = models
             .get(alias)
             .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?;
-        // Which host interface a component imported is not a hardware claim.
-        // A binding's device is fixed by the manifest, `ensure_model_loaded`
-        // has already put the weights there, and the scheduler dispatches on
-        // `model.accelerator` regardless of how the alias was opened — so an
-        // alias that loaded successfully runs where it is pinned either way.
-        //
-        // This matters because the public OpenAI routes open every alias
-        // through the CPU accelerator, that being the only interface
-        // `guest-openai` imports. Requiring the interface to match the binding
-        // made every `device: cuda`/`metal` alias — the whole point of the GGUF
-        // GPU path — advertise itself in `GET /ai/v1/models` and then fail with
-        // "model unavailable" before any inference ran.
-        //
-        // `Npu`/`Tpu` stay strict, because there the *requested* lane can
-        // silently degrade: `resolve_with_fallback` drops to CPU when no vendor
-        // runner is wired, and a model pinned to an accelerator that is not
-        // actually present must fail rather than quietly execute elsewhere.
-        if matches!(accelerator, AcceleratorKind::Npu | AcceleratorKind::Tpu) {
-            let resolved = accelerator_backend::resolve_with_fallback(
-                accelerator,
-                AcceleratorKind::Cpu,
-                accelerator_backend::probe,
-            );
-            if model.accelerator != resolved {
-                return Err(format!(
-                    "model alias `{alias}` requires `{}` but `{}` resolved to `{}`",
-                    model.accelerator.as_str(),
-                    accelerator.as_str(),
-                    resolved.as_str()
-                ));
-            }
+        if matches!(accelerator, AcceleratorKind::Npu | AcceleratorKind::Tpu)
+            && model.accelerator() != accelerator
+        {
+            return Err(format!(
+                "model alias `{alias}` requires `{}` but `{}` is requested",
+                model.accelerator().as_str(),
+                accelerator.as_str()
+            ));
         }
         Ok(())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn compute_component_prompt(
         &self,
         alias: &str,
         prompt: &str,
-    ) -> Result<String, GenerationError> {
+    ) -> std::result::Result<String, GenerationError> {
         self.compute_component_prompt_with_adapter(alias, prompt, None)
             .map(|generation| generation.text)
     }
@@ -1364,61 +700,37 @@ impl AiInferenceRuntime {
         alias: &str,
         prompt: &str,
         adapter_id: Option<&str>,
-    ) -> Result<ComponentGeneration, GenerationError> {
-        let adapter = adapter_id.map(resolve_lora_adapter_path).transpose()?;
-        self.ensure_model_loaded(alias)?;
-        // Clone the `Arc` out and drop the read lock before inference so a slow
-        // forward pass never blocks lazy registration of other models.
-        let model = {
-            let models = self.models.read().expect("model registry lock poisoned");
-            models
-                .get(alias)
-                .cloned()
-                .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?
-        };
-        let input = SharedInputTensor {
-            dimensions: vec![prompt.len() as u32],
-            ty: TensorType::U8,
-            data: Arc::from(prompt.as_bytes()),
-        };
-        let output = if model.accelerator == AcceleratorKind::Network {
-            // Upstream bindings skip the batch scheduler: see
-            // `UpstreamAdmission`. The permit is released when `_permit` drops
-            // at the end of this scope, including on the error paths below.
-            let _permit = self
-                .upstream_admission
-                .acquire()
-                .map_err(GenerationError::overloaded)?;
-            let mut outputs = model
-                .backend_model
-                .execute_with_adapters(&[input], &[adapter])
-                .map_err(|error| GenerationError::from_anyhow(&error))?;
-            if outputs.len() != 1 {
-                return Err(GenerationError::local(format!(
-                    "upstream model `{alias}` returned {} output(s) for one prompt",
-                    outputs.len()
-                )));
-            }
-            outputs.remove(0)
-        } else {
-            self.scheduler_for(model.accelerator)
-                .ok_or_else(|| {
-                    GenerationError::local(format!(
-                        "{} accelerator is unavailable on this host",
-                        model.accelerator.as_str()
-                    ))
-                })?
-                .infer(Arc::clone(&model), adapter, input)
-                .map_err(|error| GenerationError::from_anyhow(&error))?
-        };
+    ) -> std::result::Result<ComponentGeneration, GenerationError> {
+        if let Some(adapter_id) = adapter_id {
+            validate_lora_adapter_id(adapter_id).map_err(GenerationError::local)?;
+            return Err(GenerationError::invalid_request(format!(
+                "LoRA adapter `{adapter_id}` is not supported by the Magnetar cutover"
+            )));
+        }
+        self.ensure_model_loaded(alias)
+            .map_err(GenerationError::local)?;
+        let model = self
+            .models
+            .read()
+            .expect("model registry lock poisoned")
+            .get(alias)
+            .cloned()
+            .ok_or_else(|| {
+                GenerationError::local(format!("model alias `{alias}` is not loaded"))
+            })?;
+        let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
+        let _upstream_permit = matches!(&model.runtime, ModelRuntime::Upstream(_))
+            .then(|| self.upstream_admission.acquire())
+            .transpose()?;
+        let output = execute_model(&model, prompt.as_bytes())?;
         let text = String::from_utf8(output.bytes)
             .map_err(|error| GenerationError::local(error.to_string()))?;
         Ok(ComponentGeneration {
             text,
+            refusal: output.refusal,
             usage: output.usage,
             finish_reason: output.finish_reason,
             tool_calls: output.tool_calls,
-            refusal: output.refusal,
         })
     }
 
@@ -1426,136 +738,368 @@ impl AiInferenceRuntime {
         &self,
         alias: &str,
         input: &str,
-    ) -> Result<Vec<f32>, GenerationError> {
-        self.ensure_model_loaded(alias)?;
-        let model = {
-            let models = self.models.read().expect("model registry lock poisoned");
-            models
-                .get(alias)
-                .cloned()
-                .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?
-        };
-        if !self.supports_accelerator(model.accelerator) {
-            return Err(GenerationError::local(format!(
-                "{} accelerator is unavailable on this host",
-                model.accelerator.as_str()
-            )));
+    ) -> std::result::Result<Vec<f32>, GenerationError> {
+        self.ensure_model_loaded(alias)
+            .map_err(GenerationError::local)?;
+        let model = self
+            .models
+            .read()
+            .expect("model registry lock poisoned")
+            .get(alias)
+            .cloned()
+            .ok_or_else(|| {
+                GenerationError::local(format!("model alias `{alias}` is not loaded"))
+            })?;
+        let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
+        match &model.runtime {
+            ModelRuntime::Upstream(runtime) => {
+                let _permit = self.upstream_admission.acquire()?;
+                runtime.embed(input).map_err(GenerationError::from)
+            }
+            _ => Err(GenerationError::invalid_request(format!(
+                "model `{alias}` does not expose dense text embeddings in the Magnetar cutover"
+            ))),
         }
-        let tensor = SharedInputTensor {
-            dimensions: vec![input.len() as u32],
-            ty: TensorType::U8,
-            data: Arc::from(input.as_bytes()),
-        };
-        // Embeddings bypass the scheduler on every lane (they are a single
-        // pooled forward, not a decode loop), but an upstream embedding is
-        // still an outbound round trip and counts against the same node-wide
-        // cap as chat: otherwise a burst of `/v1/embeddings` would open
-        // unbounded sockets while `/v1/chat/completions` stayed gated.
-        let _permit = (model.accelerator == AcceleratorKind::Network)
-            .then(|| self.upstream_admission.acquire())
-            .transpose()
-            .map_err(GenerationError::overloaded)?;
-        model
-            .backend_model
-            .embed_text(&tensor)
-            .map_err(|error| GenerationError::from_anyhow(&error))
     }
 
-    /// Stream a prompt's decoded output, invoking `on_token` for each text
-    /// fragment as it is produced. The scope gate (sealed alias) is enforced by
-    /// the caller before this point, exactly as for [`compute_component_prompt`].
-    ///
-    /// Streaming bypasses the batch scheduler: a streamed request is inherently a
-    /// single sequence, and the backend serialises its own execution (the GGUF
-    /// runtime behind a mutex, safetensors per-request). It therefore runs on the
-    /// caller's blocking thread rather than the QoS dispatcher.
-    #[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
     pub(crate) fn stream_component_prompt(
         &self,
         alias: &str,
         prompt: &str,
         adapter_id: Option<&str>,
         sink: &mut dyn StreamSink,
-    ) -> Result<StreamOutcome, GenerationError> {
-        // Resolved exactly as on the buffered path. Ignoring the route's
-        // adapter here made `stream: true` silently run the *base* model while
-        // the otherwise identical buffered request ran the tenant's — the same
-        // request answered by two different models depending on a transport
-        // flag, which is the one outcome a per-tenant adapter must never have.
-        let adapter = adapter_id.map(resolve_lora_adapter_path).transpose()?;
-        self.ensure_model_loaded(alias)?;
-        let model = {
-            let models = self.models.read().expect("model registry lock poisoned");
-            models.get(alias).cloned().ok_or_else(|| {
-                GenerationError::local(format!("model alias `{alias}` is not loaded"))
-            })?
-        };
-        if !self.supports_accelerator(model.accelerator) {
-            return Err(GenerationError::local(format!(
-                "{} accelerator is unavailable on this host",
-                model.accelerator.as_str()
+    ) -> std::result::Result<StreamOutcome, GenerationError> {
+        if let Some(adapter_id) = adapter_id {
+            validate_lora_adapter_id(adapter_id).map_err(GenerationError::local)?;
+            return Err(GenerationError::invalid_request(format!(
+                "LoRA adapter `{adapter_id}` is not supported by the Magnetar cutover"
             )));
         }
-        let input = SharedInputTensor {
-            dimensions: vec![prompt.len() as u32],
-            ty: TensorType::U8,
-            data: Arc::from(prompt.as_bytes()),
-        };
-        // Held for the stream's entire lifetime, not just its first byte: an
-        // upstream SSE connection occupies a socket and a thread until the
-        // client stops reading, which is exactly the resource the cap governs.
-        let _permit = (model.accelerator == AcceleratorKind::Network)
+        self.ensure_model_loaded(alias)
+            .map_err(GenerationError::local)?;
+        let model = self
+            .models
+            .read()
+            .expect("model registry lock poisoned")
+            .get(alias)
+            .cloned()
+            .ok_or_else(|| {
+                GenerationError::local(format!("model alias `{alias}` is not loaded"))
+            })?;
+        let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
+        let _upstream_permit = matches!(&model.runtime, ModelRuntime::Upstream(_))
             .then(|| self.upstream_admission.acquire())
-            .transpose()
-            .map_err(GenerationError::overloaded)?;
-        match adapter {
-            Some(adapter) => model
-                .backend_model
-                .stream_text_with_adapter(&[input], &adapter, sink),
-            None => model.backend_model.stream_text(&[input], sink),
+            .transpose()?;
+        match &model.runtime {
+            ModelRuntime::Mock { .. } => {
+                if sink.is_live() {
+                    sink.emit(StreamEvent::Content(MOCK_INFERENCE_RESPONSE));
+                }
+                record_execution(&model.alias, model.accelerator().as_str(), true);
+                Ok(StreamOutcome::usage(Some(mock_token_usage(
+                    prompt.as_bytes(),
+                    MOCK_INFERENCE_RESPONSE,
+                ))))
+            }
+            ModelRuntime::Magnetar(runtime) => {
+                let mut emit = |fragment: &str| {
+                    if sink.is_live() {
+                        sink.emit(StreamEvent::Content(fragment))
+                    } else {
+                        StreamControl::Stop
+                    }
+                };
+                let result = runtime
+                    .generate_streaming(&[prompt.as_bytes()], &mut emit)
+                    .map(|usage| StreamOutcome::usage(Some(usage)))
+                    .map_err(|error| GenerationError::local(error.to_string()));
+                record_execution(&model.alias, runtime.executed_on(), result.is_ok());
+                result
+            }
+            ModelRuntime::Upstream(runtime) => {
+                let result = runtime
+                    .generate_streaming(&[prompt.as_bytes()], sink)
+                    .map_err(GenerationError::from);
+                record_execution(&model.alias, runtime.executed_on(), result.is_ok());
+                result
+            }
         }
-        .map_err(|error| GenerationError::from_anyhow(&error))
     }
 
-    fn scheduler_for(&self, accelerator: AcceleratorKind) -> Option<AcceleratorScheduler> {
-        self.schedulers.get(&accelerator).cloned()
+    pub(crate) fn magnetar_capability_advertisements(
+        &self,
+    ) -> Vec<magnetar_runtime::CapabilityAdvertisement> {
+        let mut advertisements = self
+            .models
+            .read()
+            .expect("model registry lock poisoned")
+            .values()
+            .filter_map(|model| match &model.runtime {
+                ModelRuntime::Magnetar(runtime) => Some(runtime.provider().clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        advertisements.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        advertisements.dedup_by(|a, b| a.device_id == b.device_id);
+        advertisements
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scheduler_snapshot(&self, _accelerator: AcceleratorKind) -> SchedulerSnapshot {
+        SchedulerSnapshot::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_queue_depth_for_test(
+        &self,
+        accelerator: AcceleratorKind,
+        qos: RouteQos,
+        depth: usize,
+    ) {
+        let depth = depth.min(u32::MAX as usize) as u32;
+        let mut snapshots = self
+            .queue_snapshots
+            .write()
+            .expect("queue snapshots lock poisoned");
+        let snapshot = snapshots.entry(accelerator).or_default();
+        match qos {
+            RouteQos::RealTime => snapshot.realtime = depth,
+            RouteQos::Standard => snapshot.standard = depth,
+            RouteQos::Batch => snapshot.batch = depth,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_memory_residency(&self, alias: &str) -> Option<AcceleratorMemoryResidency> {
+        self.models
+            .read()
+            .expect("model registry lock poisoned")
+            .get(alias)
+            .map(LoadedModel::memory_residency)
+    }
+
+    fn track_queue_depth(&self, accelerator: AcceleratorKind, qos: RouteQos) -> QueueDepthGuard {
+        if matches!(accelerator, AcceleratorKind::Network) {
+            return QueueDepthGuard::noop();
+        }
+        {
+            let mut snapshots = self
+                .queue_snapshots
+                .write()
+                .expect("queue snapshots lock poisoned");
+            adjust_queue_depth(&mut snapshots, accelerator, qos, 1);
+        }
+        QueueDepthGuard {
+            snapshots: Some(Arc::clone(&self.queue_snapshots)),
+            accelerator,
+            qos,
+        }
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct ResolvedLoraAdapter {
-    pub(crate) id: String,
-    pub(crate) path: PathBuf,
+struct QueueDepthGuard {
+    snapshots: Option<Arc<RwLock<HashMap<AcceleratorKind, QueueTierSnapshot>>>>,
+    accelerator: AcceleratorKind,
+    qos: RouteQos,
 }
 
-fn resolve_lora_adapter_path(adapter_id: &str) -> Result<ResolvedLoraAdapter, String> {
-    validate_lora_adapter_id(adapter_id)?;
-    let broker_root = std::env::var(MODEL_BROKER_DIR_ENV).map_err(|_| {
-        format!(
-            "adapter id `{adapter_id}` was requested but `{MODEL_BROKER_DIR_ENV}` is not configured"
-        )
-    })?;
-    let path = Path::new(&broker_root)
-        .join(MODEL_BROKER_ADAPTERS_DIR)
-        .join(format!("{adapter_id}.{SAFETENSORS_EXTENSION}"));
-    if !path.is_file() {
-        return Err(format!(
-            "adapter id `{adapter_id}` is not available at `{}`",
-            path.display()
+impl QueueDepthGuard {
+    fn noop() -> Self {
+        Self {
+            snapshots: None,
+            accelerator: AcceleratorKind::Cpu,
+            qos: RouteQos::Standard,
+        }
+    }
+}
+
+impl Drop for QueueDepthGuard {
+    fn drop(&mut self) {
+        let Some(snapshots) = &self.snapshots else {
+            return;
+        };
+        let mut snapshots = snapshots.write().expect("queue snapshots lock poisoned");
+        adjust_queue_depth(&mut snapshots, self.accelerator, self.qos, -1);
+    }
+}
+
+fn adjust_queue_depth(
+    snapshots: &mut HashMap<AcceleratorKind, QueueTierSnapshot>,
+    accelerator: AcceleratorKind,
+    qos: RouteQos,
+    delta: i32,
+) {
+    let snapshot = snapshots.entry(accelerator).or_default();
+    let slot = match qos {
+        RouteQos::RealTime => &mut snapshot.realtime,
+        RouteQos::Standard => &mut snapshot.standard,
+        RouteQos::Batch => &mut snapshot.batch,
+    };
+    if delta.is_positive() {
+        *slot = slot.saturating_add(delta as u32);
+    } else {
+        *slot = slot.saturating_sub(delta.unsigned_abs());
+    }
+}
+
+struct ModelOutput {
+    bytes: Vec<u8>,
+    usage: Option<TokenUsage>,
+    finish_reason: Option<String>,
+    tool_calls: Vec<ToolCall>,
+    refusal: Option<String>,
+}
+
+fn load_binding(binding: &IntegrityModelBinding) -> Result<LoadedModel> {
+    let path = binding.path.trim();
+    let runtime = if path == "mock" || path.starts_with("mock:") {
+        ModelRuntime::Mock {
+            accelerator: AcceleratorKind::from_model_device(&binding.device),
+        }
+    } else if let Some(runtime) =
+        upstream_openai::UpstreamOpenAiRuntime::try_load(&binding.alias, path)?
+    {
+        ModelRuntime::Upstream(Arc::new(runtime))
+    } else if let Some(runtime) =
+        magnetar_runtime::MagnetarRuntime::try_load(&binding.alias, path, binding.device.as_str())?
+    {
+        ModelRuntime::Magnetar(Arc::new(runtime))
+    } else if magnetar_runtime::is_magnetar_path(path) {
+        return Err(anyhow!(
+            "unsupported Magnetar model binding `{}` at `{}`: expected a Qwen safetensors directory",
+            binding.alias,
+            binding.path
         ));
-    }
-    Ok(ResolvedLoraAdapter {
-        id: adapter_id.to_owned(),
-        path,
+    } else {
+        return Err(anyhow!(
+            "unsupported AI model binding `{}` at `{}`: Magnetar cutover accepts explicit mock paths, openai upstream paths, or Qwen safetensors directories",
+            binding.alias,
+            binding.path
+        ));
+    };
+    Ok(LoadedModel {
+        alias: binding.alias.clone(),
+        qos: binding.qos,
+        runtime,
     })
 }
 
-fn validate_lora_adapter_id(adapter_id: &str) -> Result<(), String> {
+fn execute_model(
+    model: &LoadedModel,
+    prompt: &[u8],
+) -> std::result::Result<ModelOutput, GenerationError> {
+    match &model.runtime {
+        ModelRuntime::Mock { .. } => {
+            record_execution(&model.alias, model.accelerator().as_str(), true);
+            Ok(ModelOutput {
+                bytes: MOCK_INFERENCE_RESPONSE.as_bytes().to_vec(),
+                usage: Some(mock_token_usage(prompt, MOCK_INFERENCE_RESPONSE)),
+                finish_reason: None,
+                tool_calls: Vec::new(),
+                refusal: None,
+            })
+        }
+        ModelRuntime::Magnetar(runtime) => {
+            let result = runtime
+                .generate(&[prompt])
+                .map_err(|error| GenerationError::local(error.to_string()))
+                .map(|mut outputs| {
+                    let (bytes, usage) = outputs.remove(0);
+                    ModelOutput {
+                        bytes,
+                        usage: Some(usage),
+                        finish_reason: None,
+                        tool_calls: Vec::new(),
+                        refusal: None,
+                    }
+                });
+            record_execution(&model.alias, runtime.executed_on(), result.is_ok());
+            result
+        }
+        ModelRuntime::Upstream(runtime) => {
+            let result = runtime
+                .generate(&[prompt])
+                .map(|generation| ModelOutput {
+                    bytes: generation.bytes,
+                    usage: generation.usage,
+                    finish_reason: generation.finish_reason,
+                    tool_calls: generation.tool_calls,
+                    refusal: generation.refusal,
+                })
+                .map_err(GenerationError::from);
+            record_execution(&model.alias, runtime.executed_on(), result.is_ok());
+            result
+        }
+    }
+}
+
+pub(crate) fn detect_tool_call_parser(path: &Path) -> Option<&'static str> {
+    if let Some(declared) = read_declared_tool_call_parser(path) {
+        return Some(declared);
+    }
+    let config = std::fs::read_to_string(path.join("config.json")).ok()?;
+    let normalized = config.to_ascii_lowercase();
+    if normalized.contains("qwen") && normalized.contains("coder") {
+        Some("qwen_coder")
+    } else if normalized.contains("qwen") {
+        Some("qwen")
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelMeta {
+    #[serde(default)]
+    tool_call_parser: Option<String>,
+}
+
+fn read_declared_tool_call_parser(root: &Path) -> Option<&'static str> {
+    let raw = std::fs::read(root.join(MODEL_META_JSON)).ok()?;
+    let meta: ModelMeta = serde_json::from_slice(&raw).ok()?;
+    declared_tool_call_parser(meta.tool_call_parser.as_deref()?)
+}
+
+fn declared_tool_call_parser(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "json" => Some("json"),
+        "qwen" => Some("qwen"),
+        "qwen_coder" => Some("qwen_coder"),
+        "mistral" => Some("mistral"),
+        _ => None,
+    }
+}
+
+pub(crate) fn assert_no_credential_collisions<'a>(
+    aliases: impl IntoIterator<Item = &'a str>,
+) -> std::result::Result<(), String> {
+    let mut seen = HashSet::new();
+    for alias in aliases {
+        let env_name = alias
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        if !seen.insert(env_name.clone()) {
+            return Err(format!(
+                "multiple upstream aliases resolve to credential environment variable `{env_name}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_lora_adapter_id(adapter_id: &str) -> std::result::Result<(), String> {
     if adapter_id.is_empty()
         || adapter_id.contains("..")
         || adapter_id.contains('/')
         || adapter_id.contains('\\')
-        || adapter_id.ends_with(&format!(".{SAFETENSORS_EXTENSION}"))
+        || adapter_id.ends_with(".safetensors")
     {
         return Err(format!(
             "adapter id `{adapter_id}` is not a valid identifier: use the adapter name without path separators, traversal, or extension"
@@ -1564,4879 +1108,264 @@ fn validate_lora_adapter_id(adapter_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Clone)]
-struct AcceleratorScheduler {
-    sender: tokio_mpsc::Sender<PrioritizedInferenceJob>,
-    metrics: Arc<SchedulerMetrics>,
-}
-
-impl AcceleratorScheduler {
-    fn new(
-        accelerator: AcceleratorKind,
-        max_active_sequences: usize,
-        scheduler_config: SchedulerConfig,
-    ) -> Self {
-        let (sender, receiver) = tokio_mpsc::channel(ACCELERATOR_QUEUE_CAPACITY);
-        let metrics = Arc::new(SchedulerMetrics::default());
-        let worker_metrics = Arc::clone(&metrics);
-
-        thread::Builder::new()
-            .name(format!("tachyon-{}-dispatcher", accelerator.as_str()))
-            .spawn(move || {
-                run_scheduler(
-                    accelerator,
-                    receiver,
-                    worker_metrics,
-                    max_active_sequences,
-                    scheduler_config,
-                )
-            })
-            .expect("AI inference scheduler thread should start");
-
-        Self { sender, metrics }
-    }
-
-    fn infer(
-        &self,
-        model: Arc<CandleModel>,
-        adapter: Option<ResolvedLoraAdapter>,
-        input: SharedInputTensor,
-    ) -> Result<InferenceOutput, anyhow::Error> {
-        let response_rx = self.enqueue(model, adapter, input)?;
-        response_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("AI inference response channel closed unexpectedly"))?
-    }
-
-    fn enqueue(
-        &self,
-        model: Arc<CandleModel>,
-        adapter: Option<ResolvedLoraAdapter>,
-        input: SharedInputTensor,
-    ) -> Result<mpsc::Receiver<Result<InferenceOutput, anyhow::Error>>, anyhow::Error> {
-        let (response_tx, response_rx) = mpsc::channel();
-        let sequence = self.metrics.next_sequence.fetch_add(1, Ordering::Relaxed);
-        self.metrics.queued_requests.fetch_add(1, Ordering::Relaxed);
-        self.metrics.record_enqueue(model.qos);
-        let qos = model.qos;
-        let job = PrioritizedInferenceJob::new(
-            model.qos.score(),
-            sequence,
-            InferenceJob {
-                alias: model.alias.clone(),
-                adapter,
-                model,
-                qos,
-                input,
-                response_tx,
-            },
-        );
-        self.sender
-            .blocking_send(job)
-            .map_err(|_| anyhow::anyhow!("AI inference scheduler has stopped"))?;
-        Ok(response_rx)
-    }
-
-    #[cfg(test)]
-    fn snapshot(&self) -> SchedulerSnapshot {
-        SchedulerSnapshot {
-            batches_processed: self.metrics.batches_processed.load(Ordering::Relaxed),
-            requests_processed: self.metrics.requests_processed.load(Ordering::Relaxed),
-            max_batch_size: self.metrics.max_batch_size.load(Ordering::Relaxed),
-            prefill_steps_processed: self.metrics.prefill_steps_processed.load(Ordering::Relaxed),
-            decode_steps_processed: self.metrics.decode_steps_processed.load(Ordering::Relaxed),
-            max_active_sequences: self.metrics.max_active_sequences.load(Ordering::Relaxed),
-            queued_requests: self.metrics.queued_requests.load(Ordering::Relaxed),
-            realtime_queued: self.metrics.realtime_queued.load(Ordering::Relaxed),
-            standard_queued: self.metrics.standard_queued.load(Ordering::Relaxed),
-            batch_queued: self.metrics.batch_queued.load(Ordering::Relaxed),
-            kv_recompute_preemptions: self
-                .metrics
-                .kv_recompute_preemptions
-                .load(Ordering::Relaxed),
-            kv_swap_preemptions: self.metrics.kv_swap_preemptions.load(Ordering::Relaxed),
-            completed_aliases: self
-                .metrics
-                .completed_aliases
-                .lock()
-                .expect("scheduler completion log should not be poisoned")
-                .clone(),
-        }
-    }
-
-    fn queue_tier_snapshot(&self) -> QueueTierSnapshot {
-        QueueTierSnapshot {
-            realtime: self.metrics.realtime_queued.load(Ordering::Relaxed) as u32,
-            standard: self.metrics.standard_queued.load(Ordering::Relaxed) as u32,
-            batch: self.metrics.batch_queued.load(Ordering::Relaxed) as u32,
-        }
-    }
-
-    #[cfg(test)]
-    fn set_queue_depth_for_test(&self, qos: RouteQos, depth: usize) {
-        queue_counter(&self.metrics, qos).store(depth, Ordering::Relaxed);
-        let total = self.metrics.realtime_queued.load(Ordering::Relaxed)
-            + self.metrics.standard_queued.load(Ordering::Relaxed)
-            + self.metrics.batch_queued.load(Ordering::Relaxed);
-        self.metrics.queued_requests.store(total, Ordering::Relaxed);
-    }
-}
-
-#[derive(Default)]
-struct SchedulerMetrics {
-    batches_processed: AtomicUsize,
-    requests_processed: AtomicUsize,
-    max_batch_size: AtomicUsize,
-    prefill_steps_processed: AtomicUsize,
-    decode_steps_processed: AtomicUsize,
-    max_active_sequences: AtomicUsize,
-    queued_requests: AtomicUsize,
-    realtime_queued: AtomicUsize,
-    standard_queued: AtomicUsize,
-    batch_queued: AtomicUsize,
-    kv_recompute_preemptions: AtomicUsize,
-    kv_swap_preemptions: AtomicUsize,
-    next_sequence: AtomicUsize,
-    #[cfg(test)]
-    completed_aliases: Mutex<Vec<String>>,
-}
-
-impl SchedulerMetrics {
-    fn record_enqueue(&self, qos: RouteQos) {
-        queue_counter(self, qos).fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_dequeue(&self, qos: RouteQos) {
-        queue_counter(self, qos).fetch_sub(1, Ordering::Relaxed);
-    }
-
-    fn record_active_sequences(&self, active_sequences: usize) {
-        self.max_active_sequences
-            .fetch_max(active_sequences, Ordering::Relaxed);
-    }
-
-    fn record_prefill_step(&self, batch: &[InferenceJob]) {
-        self.prefill_steps_processed.fetch_add(1, Ordering::Relaxed);
-        self.max_batch_size
-            .fetch_max(batch.len(), Ordering::Relaxed);
-        #[cfg(test)]
-        if let Some(first) = batch.first() {
-            self.completed_aliases
-                .lock()
-                .expect("scheduler completion log should not be poisoned")
-                .push(format!("{}:prefill", first.alias));
-        }
-    }
-
-    fn record_decode_step(&self, batch: &[InferenceJob]) {
-        self.decode_steps_processed.fetch_add(1, Ordering::Relaxed);
-        self.batches_processed.fetch_add(1, Ordering::Relaxed);
-        self.requests_processed
-            .fetch_add(batch.len(), Ordering::Relaxed);
-        self.max_batch_size
-            .fetch_max(batch.len(), Ordering::Relaxed);
-        #[cfg(test)]
-        if let Some(first) = batch.first() {
-            self.completed_aliases
-                .lock()
-                .expect("scheduler completion log should not be poisoned")
-                .push(format!("{}:decode", first.alias));
-        }
-    }
-
-    fn record_kv_preemption(&self, mode: paged_kv::KvPreemptionMode) {
-        match mode {
-            paged_kv::KvPreemptionMode::Recompute => {
-                self.kv_recompute_preemptions
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            paged_kv::KvPreemptionMode::Swap => {
-                self.kv_swap_preemptions.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-fn queue_counter(metrics: &SchedulerMetrics, qos: RouteQos) -> &AtomicUsize {
-    match qos {
-        RouteQos::RealTime => &metrics.realtime_queued,
-        RouteQos::Standard => &metrics.standard_queued,
-        RouteQos::Batch => &metrics.batch_queued,
-    }
-}
-
-#[derive(Clone)]
-struct InferenceJob {
-    alias: String,
-    adapter: Option<ResolvedLoraAdapter>,
-    model: Arc<CandleModel>,
-    qos: RouteQos,
-    input: SharedInputTensor,
-    response_tx: mpsc::Sender<Result<InferenceOutput, anyhow::Error>>,
-}
-
-impl InferenceJob {
-    fn tenant_id(&self) -> &str {
-        self.adapter
-            .as_ref()
-            .map(|adapter| adapter.id.as_str())
-            .unwrap_or("default")
-    }
-}
-
-struct PrioritizedInferenceJob {
-    qos_score: u16,
-    sequence: usize,
-    job: InferenceJob,
-}
-
-impl PrioritizedInferenceJob {
-    fn new(qos_score: u16, sequence: usize, job: InferenceJob) -> Self {
-        Self {
-            qos_score,
-            sequence,
-            job,
-        }
-    }
-
-    fn age(mut self) -> Self {
-        self.qos_score = self.qos_score.saturating_add(1);
-        self
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InferenceSequencePhase {
-    Prefill,
-    Decode,
-}
-
-struct ActiveInferenceSequence {
-    qos_score: u16,
-    sequence: usize,
-    phase: InferenceSequencePhase,
-    job: InferenceJob,
-}
-
-impl From<PrioritizedInferenceJob> for ActiveInferenceSequence {
-    fn from(job: PrioritizedInferenceJob) -> Self {
-        Self {
-            qos_score: job.qos_score,
-            sequence: job.sequence,
-            phase: InferenceSequencePhase::Prefill,
-            job: job.job,
-        }
-    }
-}
-
-impl ActiveInferenceSequence {
-    fn batch_key(&self) -> InferenceBatchKey {
-        InferenceBatchKey {
-            alias: self.job.alias.clone(),
-        }
-    }
-
-    fn priority_cmp(&self, other: &Self) -> CmpOrdering {
-        self.qos_score
-            .cmp(&other.qos_score)
-            .then_with(|| other.sequence.cmp(&self.sequence))
-    }
-
-    fn is_compatible_with(
-        &self,
-        batch_key: &InferenceBatchKey,
-        phase: InferenceSequencePhase,
-    ) -> bool {
-        self.phase == phase && self.job.alias == batch_key.alias
-    }
-}
-
-struct TenantFairSelection<T> {
-    selected: T,
-    tenant: String,
-    eligible_tenants: Vec<String>,
-}
-
-struct TenantFairness {
-    config: SchedulerConfig,
-    deficits: HashMap<String, i64>,
-}
-
-impl TenantFairness {
-    fn new(config: SchedulerConfig) -> Self {
-        Self {
-            config,
-            deficits: HashMap::new(),
-        }
-    }
-
-    fn allows_cross_tenant_active_batching(&self) -> bool {
-        self.config.tenant_weights.is_empty()
-    }
-
-    fn select_active<'a>(
-        &mut self,
-        candidates: Vec<(usize, &'a ActiveInferenceSequence)>,
-        max_qos_score: u16,
-    ) -> Option<TenantFairSelection<(usize, &'a ActiveInferenceSequence)>> {
-        let qos_candidates = candidates
-            .into_iter()
-            .filter(|(_, sequence)| sequence.qos_score == max_qos_score)
-            .collect::<Vec<_>>();
-        if qos_candidates.is_empty() {
-            return None;
-        }
-
-        let eligible_tenants = qos_candidates
-            .iter()
-            .map(|(_, sequence)| sequence.job.tenant_id())
-            .collect::<Vec<_>>();
-        let eligible_tenants = self.accrue_eligible_tenants(eligible_tenants);
-
-        let selected = qos_candidates.into_iter().max_by(|(_, left), (_, right)| {
-            self.deficit(left.job.tenant_id())
-                .cmp(&self.deficit(right.job.tenant_id()))
-                .then_with(|| left.priority_cmp(right))
-        })?;
-        let tenant = selected.1.job.tenant_id().to_owned();
-
-        Some(TenantFairSelection {
-            selected,
-            tenant,
-            eligible_tenants,
-        })
-    }
-
-    fn select_queued(
-        &mut self,
-        queued: &mut BinaryHeap<PrioritizedInferenceJob>,
-    ) -> Option<PrioritizedInferenceJob> {
-        let mut jobs = queued.drain().collect::<Vec<_>>();
-        let selected = self.select_queued_index(&jobs);
-
-        let selected_job = selected.map(|selection| {
-            let job = jobs.swap_remove(selection.selected);
-            self.charge(&selection.tenant, &selection.eligible_tenants, 1);
-            job
-        });
-
-        for job in jobs {
-            queued.push(job);
-        }
-
-        selected_job
-    }
-
-    fn select_queued_index(
-        &mut self,
-        jobs: &[PrioritizedInferenceJob],
-    ) -> Option<TenantFairSelection<usize>> {
-        let max_qos_score = jobs.iter().map(|job| job.qos_score).max()?;
-        let qos_candidates = jobs
-            .iter()
-            .enumerate()
-            .filter(|(_, job)| job.qos_score == max_qos_score)
-            .collect::<Vec<_>>();
-        if qos_candidates.is_empty() {
-            return None;
-        }
-
-        let eligible_tenants = qos_candidates
-            .iter()
-            .map(|(_, job)| job.job.tenant_id())
-            .collect::<Vec<_>>();
-        let eligible_tenants = self.accrue_eligible_tenants(eligible_tenants);
-
-        let selected = qos_candidates.into_iter().max_by(|(_, left), (_, right)| {
-            self.deficit(left.job.tenant_id())
-                .cmp(&self.deficit(right.job.tenant_id()))
-                .then_with(|| left.cmp(right))
-        })?;
-        let tenant = selected.1.job.tenant_id().to_owned();
-
-        Some(TenantFairSelection {
-            selected: selected.0,
-            tenant,
-            eligible_tenants,
-        })
-    }
-
-    fn accrue_eligible_tenants(&mut self, tenants: Vec<&str>) -> Vec<String> {
-        let mut eligible_tenants = Vec::new();
-        for tenant in tenants {
-            if !eligible_tenants.iter().any(|known| known == tenant) {
-                eligible_tenants.push(tenant.to_owned());
-            }
-        }
-
-        for tenant in &eligible_tenants {
-            let weight = self.config.tenant_weight(tenant) as i64;
-            *self.deficits.entry(tenant.clone()).or_insert(0) += weight;
-        }
-
-        eligible_tenants
-    }
-
-    fn charge(&mut self, tenant: &str, eligible_tenants: &[String], cost: usize) {
-        let total_weight = eligible_tenants
-            .iter()
-            .map(|tenant| self.config.tenant_weight(tenant) as i64)
-            .sum::<i64>()
-            .max(1);
-        *self.deficits.entry(tenant.to_owned()).or_insert(0) -= total_weight * cost as i64;
-    }
-
-    fn charge_batch(
-        &mut self,
-        active: &[ActiveInferenceSequence],
-        indices: &[usize],
-        eligible_tenants: &[String],
-    ) {
-        let mut tenant_costs: HashMap<String, usize> = HashMap::new();
-        for sequence in indices.iter().filter_map(|index| active.get(*index)) {
-            *tenant_costs
-                .entry(sequence.job.tenant_id().to_owned())
-                .or_insert(0) += 1;
-        }
-        for (tenant, cost) in tenant_costs {
-            self.charge(&tenant, eligible_tenants, cost);
-        }
-    }
-
-    fn deficit(&self, tenant: &str) -> i64 {
-        self.deficits.get(tenant).copied().unwrap_or_default()
-    }
-}
-
-impl PartialEq for PrioritizedInferenceJob {
-    fn eq(&self, other: &Self) -> bool {
-        self.qos_score == other.qos_score && self.sequence == other.sequence
-    }
-}
-
-impl Eq for PrioritizedInferenceJob {}
-
-impl PartialOrd for PrioritizedInferenceJob {
-    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for PrioritizedInferenceJob {
-    fn cmp(&self, other: &Self) -> CmpOrdering {
-        self.qos_score
-            .cmp(&other.qos_score)
-            .then_with(|| other.sequence.cmp(&self.sequence))
-    }
-}
-
-fn run_scheduler(
-    accelerator: AcceleratorKind,
-    mut receiver: tokio_mpsc::Receiver<PrioritizedInferenceJob>,
-    metrics: Arc<SchedulerMetrics>,
-    max_active_sequences: usize,
-    scheduler_config: SchedulerConfig,
-) {
-    let mut queued = BinaryHeap::new();
-    let mut active = Vec::new();
-    let mut admission_fairness = TenantFairness::new(scheduler_config.clone());
-    let mut tenant_fairness = TenantFairness::new(scheduler_config.clone());
-
-    loop {
-        drain_ready_jobs(&mut receiver, &mut queued);
-        admit_sequences(
-            &mut queued,
-            &mut active,
-            max_active_sequences,
-            &metrics,
-            &mut admission_fairness,
-        );
-
-        if active.is_empty() {
-            let Some(job) = receiver.blocking_recv() else {
-                return;
-            };
-            queued.push(job);
-            continue;
-        }
-
-        run_continuous_step(
-            accelerator,
-            &mut active,
-            &metrics,
-            &mut tenant_fairness,
-            &scheduler_config,
-        );
-        age_waiting_jobs(&mut queued);
-    }
-}
-
-fn admit_sequences(
-    queued: &mut BinaryHeap<PrioritizedInferenceJob>,
-    active: &mut Vec<ActiveInferenceSequence>,
-    max_active_sequences: usize,
-    metrics: &SchedulerMetrics,
-    admission_fairness: &mut TenantFairness,
-) {
-    while active.len() < max_active_sequences {
-        let Some(job) = admission_fairness.select_queued(queued) else {
-            break;
-        };
-        active.push(job.into());
-        metrics.record_active_sequences(active.len());
-    }
-}
-
-fn drain_ready_jobs(
-    receiver: &mut tokio_mpsc::Receiver<PrioritizedInferenceJob>,
-    queued: &mut BinaryHeap<PrioritizedInferenceJob>,
-) {
-    while let Ok(job) = receiver.try_recv() {
-        queued.push(job);
-    }
-}
-
-struct InferenceBatchKey {
-    alias: String,
-}
-
-fn run_continuous_step(
-    accelerator: AcceleratorKind,
-    active: &mut Vec<ActiveInferenceSequence>,
-    metrics: &SchedulerMetrics,
-    tenant_fairness: &mut TenantFairness,
-    scheduler_config: &SchedulerConfig,
-) {
-    if let Some(indices) =
-        select_active_batch(active, InferenceSequencePhase::Prefill, tenant_fairness)
-    {
-        record_scheduler_kv_preemptions(active, &indices, metrics, scheduler_config);
-        let prefill_batch = indices
-            .iter()
-            .map(|index| active[*index].job.clone())
-            .collect::<Vec<_>>();
-        metrics.record_prefill_step(&prefill_batch);
-        for index in indices {
-            active[index].phase = InferenceSequencePhase::Decode;
-        }
-        return;
-    }
-
-    let Some(indices) =
-        select_active_batch(active, InferenceSequencePhase::Decode, tenant_fairness)
-    else {
-        return;
-    };
-    let mut decode_batch = Vec::with_capacity(indices.len());
-    for index in indices.iter().rev() {
-        decode_batch.push(active.swap_remove(*index).job);
-    }
-    decode_batch.reverse();
-
-    let results = process_batch(accelerator, &decode_batch);
-    metrics.record_decode_step(&decode_batch);
-    for (job, result) in decode_batch.into_iter().zip(results) {
-        metrics.queued_requests.fetch_sub(1, Ordering::Relaxed);
-        metrics.record_dequeue(job.qos);
-        let _ = job.response_tx.send(result);
-    }
-}
-
-fn record_scheduler_kv_preemptions(
-    active: &[ActiveInferenceSequence],
-    selected_indices: &[usize],
-    metrics: &SchedulerMetrics,
-    scheduler_config: &SchedulerConfig,
-) {
-    let Some(selected_score) = selected_indices
-        .iter()
-        .filter_map(|index| active.get(*index))
-        .map(|sequence| sequence.qos_score)
-        .max()
-    else {
-        return;
-    };
-    for (index, sequence) in active.iter().enumerate() {
-        if selected_indices.binary_search(&index).is_ok()
-            || sequence.qos_score >= selected_score
-            || !scheduler_config
-                .tier_preemptible
-                .is_preemptible(sequence.job.qos)
-        {
-            continue;
-        }
-        let mode = if scheduler_config.spill_tier_max == SchedulerSpillTier::Nvme
-            && scheduler_config.spill_budget_bytes > 0
-        {
-            paged_kv::KvPreemptionMode::Swap
-        } else {
-            paged_kv::KvPreemptionMode::Recompute
-        };
-        metrics.record_kv_preemption(mode);
-    }
-}
-
-fn select_active_batch(
-    active: &[ActiveInferenceSequence],
-    phase: InferenceSequencePhase,
-    tenant_fairness: &mut TenantFairness,
-) -> Option<Vec<usize>> {
-    let candidates = active
-        .iter()
-        .enumerate()
-        .filter(|(_, sequence)| sequence.phase == phase)
-        .collect::<Vec<_>>();
-    let max_qos_score = candidates
-        .iter()
-        .map(|(_, sequence)| sequence.qos_score)
-        .max()?;
-    let selection = tenant_fairness.select_active(candidates, max_qos_score)?;
-    let (_, first) = selection.selected;
-    let batch_key = first.batch_key();
-    let selected_tenant = selection.tenant.as_str();
-    let allow_cross_tenant_batch = tenant_fairness.allows_cross_tenant_active_batching();
-    let mut indices = active
-        .iter()
-        .enumerate()
-        .filter_map(|(index, sequence)| {
-            (sequence.is_compatible_with(&batch_key, phase)
-                && (allow_cross_tenant_batch || sequence.job.tenant_id() == selected_tenant))
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    indices.sort_unstable();
-    tenant_fairness.charge_batch(active, &indices, &selection.eligible_tenants);
-    Some(indices)
-}
-
-fn age_waiting_jobs(queued: &mut BinaryHeap<PrioritizedInferenceJob>) {
-    if queued.is_empty() {
-        return;
-    }
-    let aged = queued
-        .drain()
-        .map(PrioritizedInferenceJob::age)
-        .collect::<Vec<_>>();
-    for job in aged {
-        queued.push(job);
-    }
-}
-
-fn process_batch(
-    accelerator: AcceleratorKind,
-    batch: &[InferenceJob],
-) -> Vec<Result<InferenceOutput, anyhow::Error>> {
-    let model = Arc::clone(&batch[0].model);
-    #[cfg(test)]
-    if model.mock_latency > Duration::ZERO {
-        thread::sleep(model.mock_latency);
-    }
-
-    let inputs = batch
-        .iter()
-        .map(|job| job.input.clone())
-        .collect::<Vec<_>>();
-    let adapters = batch
-        .iter()
-        .map(|job| job.adapter.clone())
-        .collect::<Vec<_>>();
-    let results = model.run_batch_with_adapter_results(&inputs, &adapters);
-    if results.len() == batch.len() {
-        return results;
-    }
-
-    match results
-        .into_iter()
-        .collect::<Result<Vec<InferenceOutput>, anyhow::Error>>()
-    {
-        // Each job's own output is routed back to that job, never a shared
-        // clone of one job's result broadcast to the whole batch.
-        Ok(outputs) if outputs.len() == batch.len() => outputs.into_iter().map(Ok).collect(),
-        Ok(outputs) => {
-            let message = format!(
-                "{} backend for model `{}` returned {} output(s) for a batch of {} request(s)",
-                accelerator.as_str(),
-                model.alias,
-                outputs.len(),
-                batch.len()
-            );
-            let failure = BatchFailure::local(message);
-            batch
-                .iter()
-                .map(|_| Err(anyhow::Error::new(failure.clone())))
-                .collect()
-        }
-        Err(error) => {
-            // Wrapped, not reformatted: `{error}` would print only the
-            // outermost context and drop the detail the caller needs, and
-            // `from_anyhow` would lose the classification with it.
-            let failure = BatchFailure::from_anyhow(&error.context(format!(
-                "{} backend failed for model `{}`",
-                accelerator.as_str(),
-                model.alias
-            )));
-            batch
-                .iter()
-                .map(|_| Err(anyhow::Error::new(failure.clone())))
-                .collect()
-        }
-    }
-}
-
-fn adapter_assignment_groups(adapters: &[Option<ResolvedLoraAdapter>]) -> Vec<Vec<usize>> {
-    let mut groups: Vec<(Option<&str>, Vec<usize>)> = Vec::new();
-    for (index, adapter) in adapters.iter().enumerate() {
-        let adapter_id = adapter.as_ref().map(|adapter| adapter.id.as_str());
-        if let Some((_, indices)) = groups
-            .iter_mut()
-            .find(|(known_adapter_id, _)| *known_adapter_id == adapter_id)
-        {
-            indices.push(index);
-        } else {
-            groups.push((adapter_id, vec![index]));
-        }
-    }
-    groups.into_iter().map(|(_, indices)| indices).collect()
-}
-
-// Unified candle-native backend model â€” replaces the WasiNnBackend abstraction.
-struct CandleBackendModel {
-    source: BackendModelSource,
-    kind: CandleBackendModelKind,
-}
-
-enum CandleBackendModelKind {
-    Mock,
-    TextGeneration {
-        target: Box<candle_llm_runtime::CandleLlmRuntime>,
-        speculative: Option<SpeculativeDraftRuntime>,
-    },
-    /// A ModelOpt/NVFP4 checkpoint, dequantized to a dense F32 model at load
-    /// time (the fallback NVFP4 execution path: see
-    /// `candle_llm_runtime::CandleLlmRuntime::try_load_modelopt_nvfp4`).
-    /// Native FP4-kernel execution without eager dequantization remains a
-    /// documented follow-up.
-    ModelOptNvfp4(Box<candle_llm_runtime::CandleLlmRuntime>),
-    TextEmbedding(Box<candle_embedding_runtime::CandleEmbeddingRuntime>),
-    Qwen35Moe(Box<qwen35_upstream::Qwen35MoeRuntime>),
-    Vendor(vendor_accelerator::VendorAcceleratorRuntime),
-    /// An OpenAI-compatible server reached over the network. No weights are
-    /// resident on this node: the alias exists so the mesh can route, authorise,
-    /// and meter a model whose tensor math runs in another process (llama.cpp,
-    /// vLLM, or a peer Tachyon node).
-    Upstream(Box<upstream_openai::UpstreamOpenAiRuntime>),
-}
-
-struct SpeculativeDraftRuntime {
-    draft: Box<candle_llm_runtime::CandleLlmRuntime>,
-    draft_tokens: usize,
-}
-
-impl CandleBackendModel {
-    fn mock(binding: &IntegrityModelBinding) -> Result<Self> {
-        if binding.path.trim().is_empty() {
-            return Err(anyhow!(
-                "Integrity Validation Failed: model alias `{}` must declare a non-empty `path`",
-                binding.alias
-            ));
-        }
-        Ok(Self {
-            source: BackendModelSource {
-                alias: binding.alias.clone(),
-                path: binding.path.clone(),
-                requested_target: binding.device.as_str().to_owned(),
-                accelerator: AcceleratorKind::from_model_device(&binding.device),
-                qos: binding.qos,
-                model_size_bytes: model_file_size_bytes(&binding.path),
-            },
-            kind: CandleBackendModelKind::Mock,
-        })
-    }
-
-    fn load(binding: &IntegrityModelBinding) -> Result<Self> {
-        if binding.path.trim().is_empty() {
-            return Err(anyhow!(
-                "Integrity Validation Failed: model alias `{}` must declare a non-empty `path`",
-                binding.alias
-            ));
-        }
-        // The upstream scheme is checked before any on-disk probe: an
-        // `openai:` path is a URL, not a directory, so every filesystem loader
-        // below would reject it.
-        if let Some(runtime) =
-            upstream_openai::UpstreamOpenAiRuntime::try_load(&binding.alias, &binding.path)?
-        {
-            return Ok(Self {
-                source: BackendModelSource {
-                    alias: binding.alias.clone(),
-                    path: binding.path.clone(),
-                    requested_target: binding.device.as_str().to_owned(),
-                    // Local residency accounting only tracks memory this node
-                    // actually holds. An upstream binding holds none, whatever
-                    // `device` the operator wrote — that field describes the
-                    // remote server, which this node does not schedule. The
-                    // matching `scheduling_lane` override keeps its queue off
-                    // the local accelerator lanes too.
-                    accelerator: AcceleratorKind::Network,
-                    qos: binding.qos,
-                    model_size_bytes: 0,
-                },
-                kind: CandleBackendModelKind::Upstream(Box::new(runtime)),
-            });
-        }
-
-        let kind = if is_explicit_mock_binding(binding) {
-            CandleBackendModelKind::Mock
-        } else if matches!(
-            binding.device,
-            crate::ModelDevice::Npu | crate::ModelDevice::Tpu
-        ) {
-            let accelerator = AcceleratorKind::from_model_device(&binding.device);
-            CandleBackendModelKind::Vendor(
-                vendor_accelerator::VendorAcceleratorRuntime::try_load(accelerator, &binding.path)?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "{} vendor backend is unavailable; configure its SDK runner",
-                            accelerator.as_str()
-                        )
-                    })?,
-            )
-        } else {
-            match modelopt_nvfp4::ModelOptNvfp4Directory::try_load(&binding.alias, &binding.path)? {
-                Some(model) => {
-                    static DESCRIPTORS: [&dyn architecture_registry::ArchitectureDescriptor; 1] =
-                        [&qwen35_profile::QWEN35_MOE_DESCRIPTOR];
-                    let registry = architecture_registry::ArchitectureRegistry::new(&DESCRIPTORS);
-                    match registry.resolve(&model)? {
-                        Some(architecture)
-                            if architecture.kind
-                                == architecture_registry::ArchitectureKind::Qwen35MoeText =>
-                        {
-                            CandleBackendModelKind::Qwen35Moe(Box::new(
-                                qwen35_upstream::Qwen35MoeRuntime::from_model(
-                                    &binding.alias,
-                                    &binding.path,
-                                    binding.device.as_str(),
-                                    model,
-                                )?,
-                            ))
-                        }
-                        Some(architecture) => {
-                            return Err(anyhow!(
-                                "unsupported registered ModelOpt/NVFP4 architecture {:?}",
-                                architecture.kind
-                            ));
-                        }
-                        None => {
-                            model.ensure_fallback_memory_within_limits(
-                                modelopt_nvfp4::Nvfp4OutputDType::F32,
-                                modelopt_nvfp4::Nvfp4FallbackScope::Eager,
-                                modelopt_nvfp4::Nvfp4FallbackMemoryLimits {
-                                    max_host_ram_bytes: env_u64("TACHYON_NVFP4_MAX_HOST_RAM_BYTES"),
-                                    max_accelerator_bytes: env_u64(
-                                        "TACHYON_NVFP4_MAX_ACCELERATOR_BYTES",
-                                    ),
-                                },
-                            )?;
-                            CandleBackendModelKind::ModelOptNvfp4(Box::new(
-                                candle_llm_runtime::CandleLlmRuntime::try_load_modelopt_nvfp4(
-                                    &model,
-                                )?,
-                            ))
-                        }
-                    }
-                }
-                None => {
-                    match candle_embedding_runtime::CandleEmbeddingRuntime::try_load(
-                        &binding.alias,
-                        &binding.path,
-                    )? {
-                        Some(model) => CandleBackendModelKind::TextEmbedding(Box::new(model)),
-                        None => match candle_llm_runtime::CandleLlmRuntime::try_load(
-                            &binding.alias,
-                            &binding.path,
-                            binding.device.as_str(),
-                            &binding.hardware_strategy,
-                        )? {
-                            Some(model) => {
-                                let speculative = load_speculative_draft_runtime(binding)?.map(
-                                    |(draft, draft_tokens)| SpeculativeDraftRuntime {
-                                        draft: Box::new(draft),
-                                        draft_tokens,
-                                    },
-                                );
-                                CandleBackendModelKind::TextGeneration {
-                                    target: Box::new(model),
-                                    speculative,
-                                }
-                            }
-                            None => {
-                                return Err(anyhow!(
-                                    "unsupported AI model binding `{}` at `{}`: expected explicit mock path `mock:<name>`, supported Candle LLM directory, ONNX embedding directory, ONNX guest-loaded graph, or ModelOpt/NVFP4 directory",
-                                    binding.alias,
-                                    binding.path
-                                ))
-                            }
-                        },
-                    }
-                }
-            }
-        };
-        Ok(Self {
-            source: BackendModelSource {
-                alias: binding.alias.clone(),
-                path: binding.path.clone(),
-                requested_target: binding.device.as_str().to_owned(),
-                accelerator: AcceleratorKind::from_model_device(&binding.device),
-                qos: binding.qos,
-                model_size_bytes: model_file_size_bytes(&binding.path),
-            },
-            kind,
-        })
-    }
-}
-
-fn load_speculative_draft_runtime(
-    binding: &IntegrityModelBinding,
-) -> Result<Option<(candle_llm_runtime::CandleLlmRuntime, usize)>> {
-    let draft_path = binding
-        .hardware_strategy
-        .speculative_draft_model_path
-        .trim();
-    if draft_path.is_empty() {
-        return Ok(None);
-    }
-    let mut draft_strategy = binding.hardware_strategy.clone();
-    draft_strategy.speculative_draft_model_path.clear();
-    draft_strategy.speculative_draft_tokens = 0;
-    let draft = candle_llm_runtime::CandleLlmRuntime::try_load(
-        &format!("{}:draft", binding.alias),
-        draft_path,
-        binding.device.as_str(),
-        &draft_strategy,
-    )?
-    .ok_or_else(|| {
-        anyhow!(
-            "speculative draft model for `{}` at `{}` is not a supported Candle LLM directory",
-            binding.alias,
-            draft_path
-        )
-    })?;
-    let draft_tokens = usize::try_from(binding.hardware_strategy.speculative_draft_tokens)
-        .ok()
-        .filter(|tokens| *tokens > 0)
-        .unwrap_or(candle_llm_runtime::DEFAULT_SPECULATIVE_DRAFT_TOKENS);
-    Ok(Some((draft, draft_tokens)))
-}
-
-fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-}
-
-impl BackendModel for CandleBackendModel {
-    fn residency(&self) -> AcceleratorMemoryResidency {
-        match self.source.accelerator {
-            // No local weights for an upstream binding, so nothing is resident
-            // anywhere; `HostRam` is the registry's zero-cost answer.
-            AcceleratorKind::Cpu | AcceleratorKind::Network => AcceleratorMemoryResidency::HostRam,
-            AcceleratorKind::Gpu => AcceleratorMemoryResidency::Vram,
-            AcceleratorKind::Npu => AcceleratorMemoryResidency::Sram,
-            AcceleratorKind::Tpu => AcceleratorMemoryResidency::Sram,
-        }
-    }
-
-    fn scheduling_lane(&self) -> Option<AcceleratorKind> {
-        if matches!(self.kind, CandleBackendModelKind::Upstream(_)) {
-            return Some(AcceleratorKind::Network);
-        }
-        // A GGUF binding asking for `cuda` on a host with no physical GPU
-        // resolves to `Device::Cpu` — deliberately, so a `candle-cuda` build
-        // stays usable without one. The binding still said `cuda`, so the work
-        // queued on the GPU lane and had VRAM accounted against it while every
-        // forward ran on the CPU: the GPU lane showed load that could not
-        // exist, and the CPU lane doing the work looked idle to mesh
-        // admission, which is what decides whether to hand a request to a peer.
-        if let CandleBackendModelKind::TextGeneration { target, .. } = &self.kind {
-            if target.executes_on_host() {
-                return Some(AcceleratorKind::Cpu);
-            }
-        }
-        None
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>> {
-        match &self.kind {
-            CandleBackendModelKind::Upstream(_) => {
-                // Delegate to the per-input path so both share one
-                // implementation. `execute`'s all-or-nothing signature is what
-                // its caller asked for, not a property of the backend.
-                let adapters = vec![None; inputs.len()];
-                return self
-                    .execute_with_adapter_results(inputs, &adapters)
-                    .into_iter()
-                    .collect();
-            }
-            CandleBackendModelKind::Qwen35Moe(runtime) => {
-                if inputs
-                    .iter()
-                    .any(|input| !matches!(input.ty, TensorType::U8))
-                {
-                    return Err(anyhow!(
-                        "Qwen 3.5 MoE model `{}` only accepts U8 prompt tensors",
-                        self.source.alias
-                    ));
-                }
-                // Each input is an independent request: the underlying runtime
-                // only ever decodes one prompt per call, so a shared multi-prompt
-                // slice here would silently decode just the first and broadcast
-                // its output to every other request in the batch.
-                let result = inputs
-                    .iter()
-                    .map(|input| {
-                        runtime
-                            .generate(&[input.data.as_ref()])
-                            .map(|(bytes, usage, finish)| {
-                                InferenceOutput::measured(bytes, usage, finish)
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .with_context(|| {
-                        format!(
-                            "Qwen 3.5 MoE model `{}` loaded from `{}` failed",
-                            self.source.alias,
-                            runtime.root().display()
-                        )
-                    });
-                record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
-                return result;
-            }
-            CandleBackendModelKind::ModelOptNvfp4(runtime) => {
-                if inputs
-                    .iter()
-                    .any(|input| !matches!(input.ty, TensorType::U8))
-                {
-                    return Err(anyhow!(
-                        "Candle LLM model `{}` only accepts U8 prompt tensors",
-                        self.source.alias
-                    ));
-                }
-                let result = inputs
-                    .iter()
-                    .map(|input| {
-                        runtime
-                            .generate(&[input.data.as_ref()])
-                            .map(|(bytes, usage, finish)| {
-                                InferenceOutput::measured(bytes, usage, finish)
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .with_context(|| {
-                        format!(
-                            "Candle LLM model `{}` loaded from `{}` failed",
-                            self.source.alias,
-                            runtime.root().display()
-                        )
-                    });
-                let executed_on = match (&self.kind, self.source.accelerator) {
-                    (CandleBackendModelKind::ModelOptNvfp4(_), AcceleratorKind::Gpu) => {
-                        "gpu_fallback"
-                    }
-                    (CandleBackendModelKind::ModelOptNvfp4(_), _) => "cpu_fallback",
-                    (_, AcceleratorKind::Gpu) => "gpu",
-                    _ => "cpu",
-                };
-                record_execution(&self.source.alias, executed_on, result.is_ok());
-                return result;
-            }
-            CandleBackendModelKind::TextGeneration {
-                target,
-                speculative,
-            } => {
-                if inputs
-                    .iter()
-                    .any(|input| !matches!(input.ty, TensorType::U8))
-                {
-                    return Err(anyhow!(
-                        "Candle LLM model `{}` only accepts U8 prompt tensors",
-                        self.source.alias
-                    ));
-                }
-                let result = inputs
-                    .iter()
-                    .map(|input| {
-                        let prompt = input.data.as_ref();
-                        match speculative {
-                            Some(speculative) => target.generate_speculative(
-                                &[prompt],
-                                &speculative.draft,
-                                speculative.draft_tokens,
-                            ),
-                            None => target.generate(&[prompt]),
-                        }
-                        .map(|(bytes, usage, finish)| {
-                            InferenceOutput::measured(bytes, usage, finish)
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .with_context(|| {
-                        format!(
-                            "Candle LLM model `{}` loaded from `{}` failed",
-                            self.source.alias,
-                            target.root().display()
-                        )
-                    });
-                let executed_on = if self.source.accelerator == AcceleratorKind::Gpu {
-                    "gpu"
-                } else {
-                    "cpu"
-                };
-                record_execution(&self.source.alias, executed_on, result.is_ok());
-                return result;
-            }
-            CandleBackendModelKind::Vendor(runtime) => {
-                if inputs.is_empty() {
-                    return Err(anyhow!("vendor backend requires one input tensor"));
-                }
-                // A vendor runner hands back text over a pipe and reports no
-                // counts, so its outputs stay unmeasured.
-                let result = inputs
-                    .iter()
-                    .map(|input| {
-                        runtime
-                            .execute(input.data.as_ref())
-                            .map(InferenceOutput::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>();
-                record_execution(
-                    &self.source.alias,
-                    self.source.accelerator.as_str(),
-                    result.is_ok(),
-                );
-                return result;
-            }
-            CandleBackendModelKind::TextEmbedding(_) => {
-                bail!(
-                    "embedding model `{}` does not support text generation",
-                    self.source.alias
-                );
-            }
-            CandleBackendModelKind::Mock => {}
-        }
-        if inputs.is_empty() {
-            return Err(anyhow!(
-                "{} backend requires at least one input tensor",
-                self.source.accelerator.as_str()
-            ));
-        }
-        let input = &inputs[0];
-        if !matches!(input.ty, TensorType::U8 | TensorType::Fp32) {
-            return Err(anyhow!(
-                "{} backend only supports U8 or F32 tensors",
-                self.source.accelerator.as_str()
-            ));
-        }
-        let longest_prompt = inputs.iter().map(|i| i.byte_len()).max().unwrap_or(1);
-        let batch_size = inputs.len();
-        let _prompt_batch =
-            CandleTensor::zeros((batch_size, longest_prompt), DType::F32, &Device::Cpu)
-                .context("failed to prepare candle mock batch")?;
-        let _resident_weights = self.source.model_size_bytes;
-        record_execution(&self.source.alias, self.source.accelerator.as_str(), true);
-        Ok(inputs
-            .iter()
-            .map(|input| {
-                let bytes = b"MOCK_LLM_RESPONSE".to_vec();
-                let usage = mock_token_usage(
-                    std::slice::from_ref(input),
-                    &String::from_utf8_lossy(&bytes),
-                );
-                // A mock has no token budget to exhaust, so it never reports a
-                // reason and the caller keeps inferring one.
-                InferenceOutput::measured(bytes, usage, None)
-            })
-            .collect())
-    }
-
-    fn execute_with_adapter(
-        &self,
-        inputs: &[SharedInputTensor],
-        adapter: &ResolvedLoraAdapter,
-    ) -> Result<Vec<InferenceOutput>> {
-        match &self.kind {
-            CandleBackendModelKind::Mock => self.execute(inputs),
-            CandleBackendModelKind::TextGeneration { target, .. }
-            | CandleBackendModelKind::ModelOptNvfp4(target) => {
-                validate_u8_prompts(&self.source.alias, inputs)?;
-                inputs
-                    .iter()
-                    .map(|input| {
-                        target
-                            .generate_with_adapter(
-                                &[input.data.as_ref()],
-                                &adapter.id,
-                                &adapter.path,
-                            )
-                            .map(|(bytes, usage, finish)| InferenceOutput::measured(bytes, usage, finish))
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .with_context(|| {
-                        format!(
-                            "Candle LLM model `{}` failed with LoRA adapter `{}` at `{}`",
-                            self.source.alias,
-                            adapter.id,
-                            adapter.path.display()
-                        )
-                    })
-            }
-            CandleBackendModelKind::Qwen35Moe(_)
-            | CandleBackendModelKind::Vendor(_)
-            | CandleBackendModelKind::Upstream(_) => bail!(
-                "LoRA adapter `{}` was resolved for model `{}`, but this backend does not support adapter injection",
-                adapter.id,
-                self.source.alias
-            ),
-            CandleBackendModelKind::TextEmbedding(_) => bail!(
-                "LoRA adapter `{}` was resolved for embedding model `{}`, but embeddings do not support adapter injection",
-                adapter.id,
-                self.source.alias
-            ),
-        }
-    }
-
-    fn execute_with_adapters(
-        &self,
-        inputs: &[SharedInputTensor],
-        adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Result<Vec<InferenceOutput>> {
-        self.execute_with_adapter_results(inputs, adapters)
-            .into_iter()
-            .collect()
-    }
-
-    fn execute_with_adapter_results(
-        &self,
-        inputs: &[SharedInputTensor],
-        adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Vec<Result<InferenceOutput>> {
-        if inputs.len() != adapters.len() {
-            let message = format!(
-                "adapter assignment count {} does not match input count {}",
-                adapters.len(),
-                inputs.len()
-            );
-            return repeat_batch_error(
-                inputs.len().max(adapters.len()),
-                BatchFailure::local(message),
-            );
-        }
-        match &self.kind {
-            CandleBackendModelKind::Upstream(runtime) => {
-                if let Err(error) = validate_u8_prompts(&self.source.alias, inputs) {
-                    return repeat_batch_error(inputs.len(), BatchFailure::from_anyhow(&error));
-                }
-                let alias = self.source.alias.as_str();
-                // Per-input isolation, which the trait default cannot give this
-                // backend: an upstream failure is usually about one request (a
-                // rejected prompt, a 400), and collecting into a single
-                // `Result` would fail every co-called peer with it, discarding
-                // responses already received.
-                //
-                // Sequential is not a concurrency compromise here, because
-                // there is no batch to serialise: upstream bindings no longer
-                // enter the batch scheduler (see `UpstreamAdmission`), so this
-                // is called with exactly one input, from the caller's own
-                // thread, with a permit already held. Concurrency across
-                // independent callers comes from there being many such threads
-                // — not from fanning one call out.
-                let results: Vec<Result<InferenceOutput>> = inputs
-                    .iter()
-                    .zip(adapters)
-                    .map(|(input, adapter)| match adapter {
-                        // Adapter injection has no wire representation
-                        // upstream — but only this caller fails for it.
-                        Some(adapter) => Err(anyhow!(
-                            "LoRA adapter `{}` was resolved for model `{alias}`, but upstream bindings do not support adapter injection",
-                            adapter.id
-                        )),
-                        None => runtime
-                            .generate(&[input.data.as_ref()])
-                            .map(|generation| InferenceOutput {
-                                bytes: generation.bytes,
-                                usage: generation.usage,
-                                finish_reason: generation.finish_reason,
-                                tool_calls: generation.tool_calls,
-                                refusal: generation.refusal,
-                            })
-                            // `anyhow::Error::from` rather than a stringified
-                            // message: `GenerationError::from_anyhow` downcasts
-                            // back to `UpstreamError` to recover the provider's
-                            // HTTP status, and flattening to text here would
-                            // erase it.
-                            .map_err(anyhow::Error::from),
-                    })
-                    .collect();
-                record_execution(
-                    &self.source.alias,
-                    runtime.executed_on(),
-                    results.iter().all(Result::is_ok),
-                );
-                results
-            }
-            CandleBackendModelKind::TextGeneration {
-                target,
-                speculative: None,
-            }
-            | CandleBackendModelKind::ModelOptNvfp4(target) => {
-                if let Err(error) = validate_u8_prompts(&self.source.alias, inputs) {
-                    return repeat_batch_error(inputs.len(), BatchFailure::from_anyhow(&error));
-                }
-                let prompts = inputs
-                    .iter()
-                    .map(|input| input.data.as_ref())
-                    .collect::<Vec<_>>();
-                match target.try_generate_batch_with_adapters(&prompts, adapters) {
-                    Ok(Some(outputs)) => {
-                        if outputs.len() != inputs.len() {
-                            return repeat_batch_error(
-                                inputs.len(),
-                                BatchFailure::local(format!(
-                                    "Candle backend returned {} output(s) for a native mixed-adapter batch of {} input(s)",
-                                    outputs.len(),
-                                    inputs.len()
-                                )),
-                            );
-                        }
-                        let executed_on = if self.source.accelerator == AcceleratorKind::Gpu {
-                            "gpu"
-                        } else {
-                            "cpu"
-                        };
-                        record_execution(&self.source.alias, executed_on, true);
-                        outputs
-                            .into_iter()
-                            .map(|(bytes, usage, finish)| {
-                                Ok(InferenceOutput::measured(bytes, usage, finish))
-                            })
-                            .collect()
-                    }
-                    Ok(None) => self.execute_with_adapters_sequential_results(inputs, adapters),
-                    Err(error) => {
-                        let executed_on = if self.source.accelerator == AcceleratorKind::Gpu {
-                            "gpu"
-                        } else {
-                            "cpu"
-                        };
-                        record_execution(&self.source.alias, executed_on, false);
-                        tracing::warn!(
-                            "Candle LLM model `{}` loaded from `{}` failed during batch-native LoRA decode: {error}",
-                            self.source.alias,
-                            target.root().display()
-                        );
-                        self.execute_with_adapters_sequential_results(inputs, adapters)
-                    }
-                }
-            }
-            CandleBackendModelKind::TextGeneration {
-                speculative: Some(_),
-                ..
-            } => self.execute_with_adapters_sequential_results(inputs, adapters),
-            _ => self.execute_with_adapters_sequential_results(inputs, adapters),
-        }
-    }
-
-    fn stream_text_with_adapter(
-        &self,
-        inputs: &[SharedInputTensor],
-        adapter: &ResolvedLoraAdapter,
-        sink: &mut dyn StreamSink,
-    ) -> Result<StreamOutcome> {
-        // Only the safetensors text-generation runtime can inject an adapter.
-        // Every other kind — GGUF, upstream, NVFP4, MoE, mock — refuses rather
-        // than quietly streaming the base model, which is exactly what the
-        // buffered path already does for them. Refusing is the point: a route
-        // that pins a tenant's adapter must never be answered by the base
-        // model, and a `stream: true` request that silently was would be
-        // invisible to the caller.
-        let CandleBackendModelKind::TextGeneration {
-            target,
-            speculative: None,
-        } = &self.kind
-        else {
-            bail!(
-                "LoRA adapter `{}` was resolved for model `{}`, but this backend does not support adapter injection",
-                adapter.id,
-                self.source.alias
-            );
-        };
-        validate_u8_prompts(&self.source.alias, inputs)?;
-        let prompts = inputs
-            .iter()
-            .map(|input| input.data.as_ref())
-            .collect::<Vec<_>>();
-        let on_token: &mut dyn FnMut(&str) -> StreamControl =
-            &mut |fragment: &str| sink.emit(StreamEvent::Content(fragment));
-        target
-            .generate_with_adapter_streaming(&prompts, &adapter.id, &adapter.path, on_token)
-            .map(|(usage, finish_reason)| {
-                StreamOutcome::usage(Some(usage)).with_finish_reason(finish_reason)
-            })
-            .with_context(|| {
-                format!(
-                    "Candle LLM model `{}` loaded from `{}` failed",
-                    self.source.alias,
-                    target.root().display()
-                )
-            })
-    }
-
-    fn embed_text(&self, input: &SharedInputTensor) -> Result<Vec<f32>> {
-        if !matches!(input.ty, TensorType::U8) {
-            bail!(
-                "embedding model `{}` only accepts U8 text tensors",
-                self.source.alias
-            );
-        }
-
-        match &self.kind {
-            CandleBackendModelKind::Mock => {
-                record_execution(&self.source.alias, self.source.accelerator.as_str(), true);
-                Ok(deterministic_mock_embedding(input.data.as_ref()))
-            }
-            CandleBackendModelKind::TextGeneration { .. }
-            | CandleBackendModelKind::ModelOptNvfp4(_)
-            | CandleBackendModelKind::Qwen35Moe(_) => bail!(
-                "model `{}` is a generation runtime and does not expose hidden-state pooling yet",
-                self.source.alias
-            ),
-            CandleBackendModelKind::Upstream(runtime) => {
-                let input = std::str::from_utf8(input.data.as_ref()).with_context(|| {
-                    format!(
-                        "embedding input for model `{}` was not UTF-8",
-                        self.source.alias
-                    )
-                })?;
-                let result = runtime.embed(input).map_err(anyhow::Error::from);
-                record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
-                result
-            }
-            CandleBackendModelKind::TextEmbedding(runtime) => {
-                let input = std::str::from_utf8(input.data.as_ref()).with_context(|| {
-                    format!(
-                        "embedding input for model `{}` was not UTF-8",
-                        self.source.alias
-                    )
-                })?;
-                let result = runtime.embed(input).with_context(|| {
-                    format!(
-                        "embedding model `{}` loaded from `{}` failed",
-                        self.source.alias,
-                        runtime.root().display()
-                    )
-                });
-                record_execution(
-                    &self.source.alias,
-                    self.source.accelerator.as_str(),
-                    result.is_ok(),
-                );
-                result
-            }
-            CandleBackendModelKind::Vendor(_) => bail!(
-                "vendor backend for model `{}` does not expose dense text embeddings",
-                self.source.alias
-            ),
-        }
-    }
-
-    fn stream_text(
-        &self,
-        inputs: &[SharedInputTensor],
-        sink: &mut dyn StreamSink,
-    ) -> Result<StreamOutcome> {
-        // The upstream backend is the only one that writes to the `ToolCall`
-        // arm — it receives calls already structured — so it takes the sink
-        // whole, before the text adapter borrows it.
-        if let CandleBackendModelKind::Upstream(runtime) = &self.kind {
-            validate_u8_prompts(&self.source.alias, inputs)?;
-            let prompts = inputs
-                .iter()
-                .map(|input| input.data.as_ref())
-                .collect::<Vec<_>>();
-            // Real SSE passthrough rather than the trait's generate-then-emit
-            // default: the upstream already streams, and buffering here would
-            // throw away time-to-first-token.
-            let result = runtime
-                .generate_streaming(&prompts, sink)
-                .map_err(anyhow::Error::from);
-            record_execution(&self.source.alias, runtime.executed_on(), result.is_ok());
-            return result;
-        }
-        // Every local backend produces text and nothing else: a `[TOOL_CALLS]`
-        // envelope from a chat template is *part of* that text, and recognising
-        // it needs the template the caller resolved, not the decode loop. They
-        // therefore keep a plain `&str` callback, adapted here.
-        let on_token: &mut dyn FnMut(&str) -> StreamControl =
-            &mut |fragment: &str| sink.emit(StreamEvent::Content(fragment));
-        // A local backend reports `length` when it spent its whole token budget
-        // and nothing otherwise: EOS, a stop sequence and the deadline stay the
-        // caller's to infer. Streaming and buffered agree here — an absent
-        // reason resolves to `stop` downstream, so a truncated streamed answer
-        // would otherwise be indistinguishable from a complete one.
-        let outcome = |(usage, finish_reason): (TokenUsage, Option<&'static str>)| {
-            StreamOutcome::usage(Some(usage)).with_finish_reason(finish_reason)
-        };
-        match &self.kind {
-            CandleBackendModelKind::Upstream(_) => unreachable!("handled above"),
-            CandleBackendModelKind::ModelOptNvfp4(runtime) => {
-                validate_u8_prompts(&self.source.alias, inputs)?;
-                let prompts = inputs
-                    .iter()
-                    .map(|input| input.data.as_ref())
-                    .collect::<Vec<_>>();
-                runtime
-                    .generate_streaming(&prompts, on_token)
-                    .map(outcome)
-                    .with_context(|| {
-                        format!(
-                            "Candle LLM model `{}` loaded from `{}` failed",
-                            self.source.alias,
-                            runtime.root().display()
-                        )
-                    })
-            }
-            CandleBackendModelKind::TextGeneration {
-                target,
-                speculative,
-            } => {
-                validate_u8_prompts(&self.source.alias, inputs)?;
-                let prompts = inputs
-                    .iter()
-                    .map(|input| input.data.as_ref())
-                    .collect::<Vec<_>>();
-                match speculative {
-                    Some(speculative) => target.generate_speculative_streaming(
-                        &prompts,
-                        &speculative.draft,
-                        speculative.draft_tokens,
-                        on_token,
-                    ),
-                    None => target.generate_streaming(&prompts, on_token),
-                }
-                .map(outcome)
-                .with_context(|| {
-                    format!(
-                        "Candle LLM model `{}` loaded from `{}` failed",
-                        self.source.alias,
-                        target.root().display()
-                    )
-                })
-            }
-            CandleBackendModelKind::Qwen35Moe(runtime) => {
-                validate_u8_prompts(&self.source.alias, inputs)?;
-                let prompts = inputs
-                    .iter()
-                    .map(|input| input.data.as_ref())
-                    .collect::<Vec<_>>();
-                runtime
-                    .generate_streaming(&prompts, on_token)
-                    .map(outcome)
-                    .with_context(|| {
-                        format!(
-                            "Qwen 3.5 MoE model `{}` loaded from `{}` failed",
-                            self.source.alias,
-                            runtime.root().display()
-                        )
-                    })
-            }
-            CandleBackendModelKind::TextEmbedding(_) => {
-                bail!(
-                    "embedding model `{}` does not support text generation",
-                    self.source.alias
-                )
-            }
-            CandleBackendModelKind::Mock => {
-                let outputs = self.execute(inputs);
-                record_execution(
-                    &self.source.alias,
-                    self.source.accelerator.as_str(),
-                    outputs.is_ok(),
-                );
-                let outputs = outputs?;
-                if outputs.len() != 1 {
-                    bail!(
-                        "mock backend expected exactly one output for streaming, got {} for {} input(s)",
-                        outputs.len(),
-                        inputs.len()
-                    );
-                }
-                let text = String::from_utf8(outputs.into_iter().next().unwrap_or_default().bytes)
-                    .map_err(|error| anyhow!("output was not UTF-8: {error}"))?;
-                if !text.is_empty() {
-                    on_token(&text);
-                }
-                // The mock has no tokenizer, so it reports the only counts it
-                // can defend: whitespace-separated words. Deterministic and
-                // obviously synthetic — enough for the end-to-end test to prove
-                // the numbers reach the client, without pretending to be a real
-                // tokenization.
-                Ok(StreamOutcome::usage(Some(mock_token_usage(inputs, &text))))
-            }
-            CandleBackendModelKind::Vendor(_) => {
-                let outputs = self.execute(inputs)?;
-                if outputs.len() != 1 {
-                    bail!(
-                        "vendor backend expected exactly one output for streaming, got {} for {} input(s)",
-                        outputs.len(),
-                        inputs.len()
-                    );
-                }
-                let text = String::from_utf8(outputs.into_iter().next().unwrap_or_default().bytes)
-                    .map_err(|error| anyhow!("vendor output was not UTF-8: {error}"))?;
-                on_token(&text);
-                // A vendor runner returns text over a pipe and never reports
-                // token counts, so there is nothing honest to publish.
-                Ok(StreamOutcome::default())
-            }
-        }
-    }
-}
-
-/// Word counts for the mock backend, which has no tokenizer.
-fn mock_token_usage(inputs: &[SharedInputTensor], output: &str) -> TokenUsage {
-    let prompt_tokens = inputs
-        .first()
-        .map(|input| {
-            String::from_utf8_lossy(&input.data)
-                .split_whitespace()
-                .count()
-        })
-        .unwrap_or(0);
+fn mock_token_usage(prompt: &[u8], completion: &str) -> TokenUsage {
     TokenUsage {
-        prompt_tokens: prompt_tokens as u32,
-        completion_tokens: output.split_whitespace().count() as u32,
-    }
-}
-
-fn deterministic_mock_embedding(input: &[u8]) -> Vec<f32> {
-    const DIM: usize = 8;
-    let mut values = vec![0.0; DIM];
-    for (index, byte) in input.iter().enumerate() {
-        let slot = index % DIM;
-        values[slot] += (*byte as f32 + 1.0) / 256.0;
-    }
-    normalize_f32(values)
-}
-
-fn normalize_f32(mut values: Vec<f32>) -> Vec<f32> {
-    let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if norm == 0.0 {
-        return values;
-    }
-    for value in &mut values {
-        *value /= norm;
-    }
-    values
-}
-
-fn validate_u8_prompts(alias: &str, inputs: &[SharedInputTensor]) -> Result<()> {
-    if inputs
-        .iter()
-        .any(|input| !matches!(input.ty, TensorType::U8))
-    {
-        bail!("text-generation model `{alias}` only accepts U8 prompt tensors");
-    }
-    Ok(())
-}
-
-struct CandleModel {
-    alias: String,
-    accelerator: AcceleratorKind,
-    qos: RouteQos,
-    #[cfg_attr(not(test), allow(dead_code))]
-    memory_residency: AcceleratorMemoryResidency,
-    backend_model: Arc<dyn BackendModel>,
-    #[cfg(test)]
-    mock_latency: Duration,
-}
-
-impl CandleModel {
-    fn load_mock_with_backend(
-        binding: &IntegrityModelBinding,
-        backend_model: Arc<dyn BackendModel>,
-    ) -> Result<Self> {
-        if binding.path.trim().is_empty() {
-            return Err(anyhow!(
-                "Integrity Validation Failed: model alias `{}` must declare a non-empty `path`",
-                binding.alias
-            ));
-        }
-        let memory_residency = backend_model.residency();
-        // The backend gets the final say on its lane: an upstream binding runs
-        // on the network queue whatever `device` the manifest declared, because
-        // that field describes the remote server rather than this node.
-        let accelerator = backend_model
-            .scheduling_lane()
-            .unwrap_or_else(|| AcceleratorKind::from_model_device(&binding.device));
-        Ok(Self {
-            alias: binding.alias.clone(),
-            accelerator,
-            qos: binding.qos,
-            memory_residency,
-            backend_model,
-            #[cfg(test)]
-            mock_latency: Duration::ZERO,
-        })
-    }
-
-    #[cfg(test)]
-    fn load_mock(binding: &IntegrityModelBinding) -> Result<Self> {
-        Self::load_mock_with_backend(binding, Arc::new(CandleBackendModel::mock(binding)?))
-    }
-
-    #[cfg(test)]
-    fn with_mock_latency(mut self, latency: Duration) -> Self {
-        self.mock_latency = latency;
-        self
-    }
-
-    fn run_batch_with_adapter_results(
-        &self,
-        inputs: &[SharedInputTensor],
-        adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Vec<Result<InferenceOutput>> {
-        self.backend_model
-            .execute_with_adapter_results(inputs, adapters)
-    }
-}
-
-fn is_explicit_mock_binding(binding: &IntegrityModelBinding) -> bool {
-    binding.path == "mock" || binding.path.starts_with("mock:")
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KvPrecision {
-    Q8_0,
-    F16,
-}
-
-#[derive(Clone)]
-struct TurboQuantAttentionStack {
-    total_layers: usize,
-    boundary_layers: usize,
-    threshold: f32,
-    bits: u8,
-}
-
-impl Default for TurboQuantAttentionStack {
-    fn default() -> Self {
-        Self {
-            total_layers: 8,
-            boundary_layers: 2,
-            threshold: 1.0e-4,
-            bits: 2,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct TurboQuantLayerDecision {
-    layer_idx: usize,
-    k_precision: KvPrecision,
-    v_compressed: bool,
-}
-
-impl TurboQuantAttentionStack {
-    fn layer_decision(&self, layer_idx: usize) -> TurboQuantLayerDecision {
-        TurboQuantLayerDecision {
-            layer_idx,
-            k_precision: KvPrecision::Q8_0,
-            v_compressed: self.should_compress(layer_idx),
-        }
-    }
-
-    fn should_compress(&self, layer_idx: usize) -> bool {
-        layer_idx >= self.boundary_layers && layer_idx + self.boundary_layers < self.total_layers
-    }
-
-    fn run_mock_prompt(&self, batch_size: usize, prompt_len: usize) -> Result<()> {
-        let value_count = batch_size.max(1) * prompt_len.max(1);
-        let values = quantizable_fixture_values(value_count);
-        let k_tensor = CandleTensor::from_vec(values.clone(), (value_count,), &Device::Cpu)?;
-        let v_tensor = CandleTensor::from_vec(values.clone(), (value_count,), &Device::Cpu)?;
-        let attention =
-            CandleTensor::from_vec(vec![1.0f32; value_count], (value_count,), &Device::Cpu)?;
-
-        let _ = k_tensor;
-        for layer_idx in 0..self.total_layers {
-            let decision = self.layer_decision(layer_idx);
-            if decision.v_compressed {
-                let packed = compress_tensor_values(&v_tensor, self.bits)?;
-                let packed_tensor = CandleTensor::from_vec(
-                    packed,
-                    (turboquant_sys::packed_len(value_count, self.bits)?,),
-                    &Device::Cpu,
-                )?;
-                let restored = packed_tensor.apply_op2_no_bwd(
-                    &attention,
-                    &TurboQuantDecompressor {
-                        bits: self.bits,
-                        threshold: self.threshold,
-                        value_count,
-                    },
-                )?;
-                let restored_values = restored.to_vec1::<f32>()?;
-                if restored_values.len() != value_count {
-                    return Err(anyhow!(
-                        "TurboQuant restored {} values for layer {layer_idx} but expected {value_count}",
-                        restored_values.len()
-                    ));
-                }
-            } else {
-                let restored_values = v_tensor.to_vec1::<f32>()?;
-                if restored_values.len() != value_count {
-                    return Err(anyhow!(
-                        "standard value cache restored {} values for layer {layer_idx} but expected {value_count}",
-                        restored_values.len()
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-struct TurboQuantDecompressor {
-    bits: u8,
-    threshold: f32,
-    value_count: usize,
-}
-
-impl CustomOp2 for TurboQuantDecompressor {
-    fn name(&self) -> &'static str {
-        "turboquant-decompressor"
-    }
-
-    fn cpu_fwd(
-        &self,
-        packed_storage: &CpuStorage,
-        packed_layout: &Layout,
-        attention_storage: &CpuStorage,
-        attention_layout: &Layout,
-    ) -> candle_core::Result<(CpuStorage, Shape)> {
-        let packed =
-            contiguous_u8_slice(packed_storage, packed_layout, "TurboQuant packed values")?;
-        let attention =
-            contiguous_f32_slice(attention_storage, attention_layout, "TurboQuant attention")?;
-        if attention.len() != self.value_count {
-            candle_bail!(
-                "TurboQuant attention tensor must contain {} values but contains {}",
-                self.value_count,
-                attention.len()
-            );
-        }
-        let output = turboquant_sys::decompress_values_sparse(
-            packed,
-            self.value_count,
-            self.bits,
-            attention,
-            self.threshold,
-        )
-        .map_err(|error| candle_core::Error::Msg(error.to_string()).bt())?;
-        Ok((
-            CpuStorage::F32(output),
-            Shape::from_dims(&[self.value_count]),
-        ))
-    }
-}
-
-fn compress_tensor_values(tensor: &CandleTensor, bits: u8) -> Result<Vec<u8>> {
-    let values = tensor.to_vec1::<f32>()?;
-    turboquant_sys::compress_values(&values, bits).map_err(|error| anyhow!(error.to_string()))
-}
-
-fn contiguous_u8_slice<'a>(
-    storage: &'a CpuStorage,
-    layout: &Layout,
-    label: &str,
-) -> candle_core::Result<&'a [u8]> {
-    let (start, end) = layout.contiguous_offsets().ok_or_else(|| {
-        candle_core::Error::Msg(format!(
-            "{label} must be contiguous before invoking TurboQuant"
-        ))
-        .bt()
-    })?;
-    match storage {
-        CpuStorage::U8(values) => Ok(&values[start..end]),
-        _ => candle_bail!("{label} must use a u8 storage tensor"),
-    }
-}
-
-fn contiguous_f32_slice<'a>(
-    storage: &'a CpuStorage,
-    layout: &Layout,
-    label: &str,
-) -> candle_core::Result<&'a [f32]> {
-    let (start, end) = layout.contiguous_offsets().ok_or_else(|| {
-        candle_core::Error::Msg(format!(
-            "{label} must be contiguous before invoking TurboQuant"
-        ))
-        .bt()
-    })?;
-    match storage {
-        CpuStorage::F32(values) => Ok(&values[start..end]),
-        _ => candle_bail!("{label} must use an f32 storage tensor"),
-    }
-}
-
-fn quantizable_fixture_values(value_count: usize) -> Vec<f32> {
-    const LEVELS: [f32; 4] = [-1.0, -0.33333334, 0.33333334, 1.0];
-    (0..value_count)
-        .map(|index| LEVELS[(index * 3 + 1) % LEVELS.len()])
-        .collect()
-}
-
-// Ã¢â€â‚¬Ã¢â€â‚¬ Layer-Wise Inference: memory profile Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-
-/// Controls VRAM placement strategy for a single inference call. Mirrors the
-/// `memory-profile` enum in `wit/ai/inference.wit`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum MemoryProfile {
-    /// All weights are pre-loaded to VRAM at model-load time. Maximum throughput;
-    /// OOM risk scales with model size.
-    #[default]
-    Performance,
-    /// Only one transformer layer occupies VRAM at a time. Weights are streamed
-    /// from a memory-mapped `.safetensors` file; the KV-Cache is paged to Host RAM
-    /// after each layer to maintain an O(1) VRAM footprint regardless of context length.
-    LayerWiseStreaming,
-}
-
-pub(crate) use vram_manager::VramPriority;
-
-// Ã¢â€â‚¬Ã¢â€â‚¬ Layer-Wise Inference: zero-copy model loader Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-
-/// A single transformer layer's weight slice, backed by a memory-mapped region.
-/// Tensors are allocated on `Device::Cpu` and transferred to the accelerator
-/// device only for the duration of that layer's forward pass.
-pub(crate) struct LayerWeightSlice {
-    pub(crate) layer_idx: usize,
-    /// Key weight tensor loaded into CPU memory from the mapped file.
-    pub(crate) weights: CandleTensor,
-    /// Scheduling priority assigned to the VRAM residency backing this layer.
-    pub(crate) priority: VramPriority,
-}
-
-/// Parsed safetensors header: the leading u64 length prefix, the JSON
-/// metadata segment, and the byte range where the tensor blob lives.
-#[derive(Debug, Clone)]
-pub(crate) struct SafetensorsHeader {
-    /// Length, in bytes, of the JSON header segment.
-    pub(crate) header_len: u64,
-    /// Byte offset (relative to the start of the file) where the first
-    /// tensor begins. Always equal to `8 + header_len`.
-    pub(crate) data_start: usize,
-    /// Raw JSON value carrying `shape`, `dtype`, and `data_offsets` for
-    /// every tensor stored in the file.
-    pub(crate) header: serde_json::Value,
-}
-
-impl SafetensorsHeader {
-    /// Parse the leading 8-byte little-endian length prefix and the
-    /// subsequent UTF-8 JSON segment.
-    pub(crate) fn parse(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 8 {
-            anyhow::bail!("safetensors file is missing 8-byte header length prefix");
-        }
-        let header_len = u64::from_le_bytes(bytes[..8].try_into().expect("fixed prefix length"));
-        let header_end = 8usize
-            .checked_add(usize::try_from(header_len).context("header length exceeds usize")?)
-            .context("safetensors header length overflows usize")?;
-        if bytes.len() < header_end {
-            anyhow::bail!(
-                "safetensors header truncated: need {header_end} bytes, got {}",
-                bytes.len()
-            );
-        }
-        let header: serde_json::Value = serde_json::from_slice(&bytes[8..header_end])
-            .context("failed to parse safetensors JSON header")?;
-        Ok(Self {
-            header_len,
-            data_start: header_end,
-            header,
-        })
-    }
-}
-
-/// Wraps a memory-mapped `.safetensors` file and vends per-layer
-/// [`LayerWeightSlice`]s without loading the entire model into RAM at once.
-pub(crate) struct LayerWiseMappedModel {
-    /// Memory-mapped view of the `.safetensors` file. Kept alive for the model's
-    /// lifetime so OS page-cache eviction is handled transparently.
-    mmap: memmap2::Mmap,
-    /// Parsed safetensors header; carries `shape`, `dtype`, and `data_offsets`.
-    pub(crate) header: SafetensorsHeader,
-    /// Total number of transformer layers.
-    pub(crate) num_layers: usize,
-    /// Flattened tensor data length per layer (used for mmap slice indexing).
-    bytes_per_layer: usize,
-}
-
-impl LayerWiseMappedModel {
-    /// Open `path` and create a zero-copy mapping. `num_layers` is used to
-    /// partition the file into equal-sized layer slices.
-    pub(crate) fn open(path: &std::path::Path, num_layers: usize) -> Result<Self> {
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("failed to open safetensors file `{}`", path.display()))?;
-        // SAFETY: the file must not be mutated while the mapping is alive. This
-        // is the standard `memmap2::Mmap::map` contract; no other unsafe is
-        // needed once the mapping exists because we only index it via safe
-        // slice operations below.
-        let mmap = unsafe {
-            memmap2::Mmap::map(&file)
-                .with_context(|| format!("failed to mmap `{}`", path.display()))?
-        };
-        // Parse the safetensors header; if it's malformed we still fall back
-        // to an equal partition so legacy `.bin` style payloads keep working.
-        let header = SafetensorsHeader::parse(&mmap).unwrap_or(SafetensorsHeader {
-            header_len: 0,
-            data_start: 0,
-            header: serde_json::Value::Null,
-        });
-        let payload_len = mmap.len().saturating_sub(header.data_start);
-        let bytes_per_layer = payload_len.checked_div(num_layers).unwrap_or(payload_len);
-        Ok(Self {
-            mmap,
-            header,
-            num_layers,
-            bytes_per_layer,
-        })
-    }
-
-    /// Load the weights for `layer_idx` from the mapped region into a CPU tensor.
-    /// The returned slice's underlying memory lives in the OS page cache; no heap
-    /// allocation is performed for the weight bytes themselves.
-    pub(crate) fn load_layer(&self, layer_idx: usize) -> Result<LayerWeightSlice> {
-        self.load_layer_with_priority(layer_idx, VramPriority::Active)
-    }
-
-    /// Load the weights for `layer_idx` and tag the resulting residency with a
-    /// VRAM priority. Predictive callers use `Volatile` so live requests can
-    /// reclaim the backing memory immediately.
-    pub(crate) fn load_layer_with_priority(
-        &self,
-        layer_idx: usize,
-        priority: VramPriority,
-    ) -> Result<LayerWeightSlice> {
-        if layer_idx >= self.num_layers {
-            anyhow::bail!(
-                "layer {layer_idx} is out of range (model has {} layers)",
-                self.num_layers
-            );
-        }
-        let map_len = self.mmap.len();
-        let data_start = self.header.data_start.min(map_len);
-        let offset = data_start + layer_idx * self.bytes_per_layer;
-        let end = (offset + self.bytes_per_layer).min(map_len);
-        let raw: &[u8] = &self.mmap[offset..end];
-        let values: Vec<f32> = raw
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect();
-        let f32_count = values.len();
-        let weights = CandleTensor::from_vec(values, (f32_count,), &Device::Cpu)
-            .context("failed to build layer weight tensor from mmap slice")?;
-        Ok(LayerWeightSlice {
-            layer_idx,
-            weights,
-            priority,
-        })
-    }
-}
-
-// Ã¢â€â‚¬Ã¢â€â‚¬ Layer-Wise Inference: prefill batching (Phase 1) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-
-/// Holds the intermediate hidden states produced by the prefill sweep.
-/// After `PrefillBatch::run` completes, `hidden_states` contains the activations
-/// ready for the autoregressive decode loop, and `kv_cpu_cache` holds the
-/// per-layer KV-Cache that has been paged off the GPU to Host RAM.
-pub(crate) struct PrefillOutput {
-    /// Final hidden-state tensor after all layers have processed the prompt.
-    pub(crate) hidden_states: CandleTensor,
-    /// KV-Cache slices, one per layer, resident in CPU memory.
-    pub(crate) kv_cpu_cache: Vec<KvCacheSlice>,
-}
-
-/// Implements the layer-wise prefill sweep: given a tokenised prompt, processes
-/// the entire sequence through each transformer layer in sequence, keeping only
-/// the current layer's weights on the GPU and paging the KV-Cache to Host RAM
-/// before loading the next layer.
-pub(crate) struct PrefillBatch {
-    prompt_len: usize,
-    hidden_dim: usize,
-}
-
-impl PrefillBatch {
-    pub(crate) fn new(prompt_len: usize, hidden_dim: usize) -> Self {
-        Self {
-            prompt_len,
-            hidden_dim,
-        }
-    }
-
-    /// Execute the full prefill sweep. Returns the final hidden states and the
-    /// per-layer KV-Cache resident in Host RAM.
-    ///
-    /// For each layer `i`:
-    /// 1. Transfer layer weights to GPU (simulated as CPUÃ¢â€ â€™CPU copy on non-CUDA builds).
-    /// 2. Compute hidden states through the layer.
-    /// 3. Extract the KV-Cache slice and store it in Host RAM.
-    /// 4. Drop layer weights before loading the next layer.
-    pub(crate) fn run(
-        &self,
-        loader: &LayerWiseMappedModel,
-        initial_embed: CandleTensor,
-    ) -> Result<PrefillOutput> {
-        let mut hidden_states = initial_embed;
-        let mut kv_cpu_cache: Vec<KvCacheSlice> = Vec::with_capacity(loader.num_layers);
-
-        for layer_idx in 0..loader.num_layers {
-            // Load this layer's weights into CPU (would be GPU on real hardware).
-            let layer_slice = loader.load_layer(layer_idx)?;
-
-            // Forward pass: hidden_states = layer_weights Ã¢Å â€” hidden_states (mock matmul).
-            // Real implementation: call into a Candle transformer block here.
-            let weight_len = layer_slice.weights.elem_count();
-            let hs_len = hidden_states.elem_count();
-            let out_len = hs_len.min(weight_len);
-            let hs_flat = hidden_states.flatten_all()?;
-            let w_flat = layer_slice.weights.narrow(0, 0, out_len.min(weight_len))?;
-            let hs_slice = hs_flat.narrow(0, 0, out_len)?;
-            hidden_states = (hs_slice + w_flat.broadcast_as((out_len,))?)
-                .map_err(|e| anyhow!("prefill forward pass failed at layer {layer_idx}: {e}"))?
-                .reshape((self.prompt_len.max(1), self.hidden_dim.max(1).min(out_len)))?;
-
-            // KV-Cache: extract the current layer's key-value pair from hidden states
-            // and immediately page it to CPU (Host RAM) before releasing layer weights.
-            let kv_values = hidden_states
-                .to_vec2::<f32>()
-                .unwrap_or_else(|_| vec![vec![0.0f32; self.hidden_dim]; self.prompt_len]);
-            kv_cpu_cache.push(KvCacheSlice {
-                layer_idx,
-                keys: kv_values.to_vec(),
-                values: kv_values,
-            });
-
-            // `layer_slice` is dropped here Ã¢â‚¬â€ weights are freed from (simulated) VRAM.
-        }
-
-        Ok(PrefillOutput {
-            hidden_states,
-            kv_cpu_cache,
-        })
-    }
-}
-
-// Ã¢â€â‚¬Ã¢â€â‚¬ Layer-Wise Inference: KV-Cache Host-RAM paging Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-
-/// A single layer's key-value cache resident in Host RAM (CPU memory).
-/// Paged back to GPU only when the decode loop re-enters that layer.
-#[derive(Clone, Debug)]
-pub(crate) struct KvCacheSlice {
-    pub(crate) layer_idx: usize,
-    /// Key vectors: shape `[seq_len, head_dim]` stored as row-major f32.
-    pub(crate) keys: Vec<Vec<f32>>,
-    /// Value vectors: same shape as `keys`.
-    pub(crate) values: Vec<Vec<f32>>,
-}
-
-impl KvCacheSlice {
-    /// Append a new token's KV entry, growing the sequence dimension.
-    pub(crate) fn append_token(&mut self, key_row: Vec<f32>, value_row: Vec<f32>) {
-        self.keys.push(key_row);
-        self.values.push(value_row);
-    }
-
-    /// Rebuild a CPU tensor from the cached key vectors for use in the next
-    /// layer's attention computation.
-    pub(crate) fn keys_tensor(&self) -> Result<CandleTensor> {
-        let flat: Vec<f32> = self.keys.iter().flat_map(|r| r.iter().copied()).collect();
-        let seq = self.keys.len().max(1);
-        let head_dim = self.keys.first().map_or(1, |r| r.len().max(1));
-        CandleTensor::from_vec(flat, (seq, head_dim), &Device::Cpu)
-            .context("failed to rebuild key tensor from CPU cache")
-    }
-}
-
-// Ã¢â€â‚¬Ã¢â€â‚¬ Layer-Wise Inference: async pipeline ring buffer (Phase 2) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-
-/// A fixed-size ring buffer that holds `capacity` pre-allocated GPU tensors.
-/// The decode loop rotates through the buffer so that layer N+1 weights can be
-/// pre-fetched (via a separate copy stream) while layer N is being computed.
-pub(crate) struct LayerRingBuffer {
-    capacity: usize,
-    slots: Vec<Option<CandleTensor>>,
-    head: usize,
-}
-
-impl LayerRingBuffer {
-    pub(crate) fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            slots: vec![None; capacity],
-            head: 0,
-        }
-    }
-
-    /// Write a layer's weight tensor into the next available slot and advance.
-    pub(crate) fn push(&mut self, tensor: CandleTensor) {
-        self.slots[self.head % self.capacity] = Some(tensor);
-        self.head += 1;
-    }
-
-    /// Retrieve the tensor at slot `idx` without removing it.
-    pub(crate) fn get(&self, idx: usize) -> Option<&CandleTensor> {
-        self.slots[idx % self.capacity].as_ref()
-    }
-
-    /// Evict the oldest slot, releasing its VRAM allocation.
-    pub(crate) fn evict_oldest(&mut self) {
-        let oldest = self.head.saturating_sub(self.capacity);
-        self.slots[oldest % self.capacity] = None;
-    }
-}
-
-/// Implements the autoregressive decode loop with overlapping I/O and compute.
-///
-/// The pipeline maintains at most `window` layers in VRAM simultaneously.
-/// While layer N is computing the forward pass for the current token, layer N+1
-/// weights are pre-fetched from the memory-mapped file into the next ring-buffer
-/// slot. After layer N finishes, its KV-Cache is appended to the CPU-resident
-/// [`KvCacheSlice`] and the eviction policy drops layer N-1 from VRAM.
-pub(crate) struct LayerPipeline {
-    /// Number of layers that fit in available VRAM simultaneously.
-    window: usize,
-    ring: LayerRingBuffer,
-}
-
-impl LayerPipeline {
-    pub(crate) fn new(window: usize) -> Self {
-        Self {
-            window: window.max(1),
-            ring: LayerRingBuffer::new(window.max(1)),
-        }
-    }
-
-    /// Run the autoregressive decode loop for `max_tokens` steps.
-    ///
-    /// # Contract
-    /// - At the start of each layer, `window` layers are resident in the ring buffer.
-    /// - After computing layer N, its KV-Cache is appended to `kv_cache[N]`.
-    /// - Layer N-1 is evicted from the ring buffer (VRAM freed).
-    /// - Layer N+1 is pre-fetched into the freed slot before the next iteration.
-    pub(crate) fn decode(
-        &mut self,
-        loader: &LayerWiseMappedModel,
-        mut hidden_states: CandleTensor,
-        kv_cache: &mut [KvCacheSlice],
-        max_tokens: usize,
-    ) -> Result<Vec<f32>> {
-        let mut output_logits: Vec<f32> = Vec::with_capacity(max_tokens);
-
-        // Pre-fill the ring buffer with the first `window` layers.
-        for layer_idx in 0..self.window.min(loader.num_layers) {
-            let slice = loader.load_layer(layer_idx)?;
-            self.ring.push(slice.weights);
-        }
-
-        for _token_step in 0..max_tokens {
-            for layer_idx in 0..loader.num_layers {
-                // Ã¢â€â‚¬Ã¢â€â‚¬ Compute stream: forward pass for this layer Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-                let layer_weights = match self.ring.get(layer_idx) {
-                    Some(w) => w.clone(),
-                    None => {
-                        // Weights not yet in buffer; load synchronously as fallback.
-                        loader.load_layer(layer_idx)?.weights
-                    }
-                };
-
-                let hs_len = hidden_states.elem_count();
-                let w_len = layer_weights.elem_count().min(hs_len);
-                let hs_flat = hidden_states.flatten_all()?;
-                let w_flat = layer_weights.narrow(0, 0, w_len)?;
-                let hs_slice = hs_flat.narrow(0, 0, w_len)?;
-                hidden_states = (hs_slice + w_flat)
-                    .map_err(|e| anyhow!("decode forward pass failed at layer {layer_idx}: {e}"))?
-                    .reshape((1, w_len))?;
-
-                // Ã¢â€â‚¬Ã¢â€â‚¬ Copy stream: page KV-Cache for this layer to CPU Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-                if let Some(cache) = kv_cache.get_mut(layer_idx) {
-                    let hs_vals = hidden_states.to_vec2::<f32>().unwrap_or_default();
-                    for row in &hs_vals {
-                        cache.append_token(row.clone(), row.clone());
-                    }
-                }
-
-                // Ã¢â€â‚¬Ã¢â€â‚¬ Copy stream: pre-fetch next layer into ring buffer Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-                let next_layer = layer_idx + self.window;
-                if next_layer < loader.num_layers {
-                    if let Ok(next_slice) = loader.load_layer(next_layer) {
-                        self.ring.push(next_slice.weights);
-                    }
-                }
-
-                // Evict the layer that is now two steps behind the window.
-                if layer_idx >= self.window {
-                    self.ring.evict_oldest();
-                }
-            }
-
-            // Collect the top-1 logit from the final hidden state as the output token.
-            let logit = hidden_states
-                .flatten_all()
-                .and_then(|t| t.to_vec1::<f32>())
-                .map(|v| v.into_iter().fold(f32::NEG_INFINITY, f32::max))
-                .unwrap_or(0.0);
-            output_logits.push(logit);
-        }
-
-        Ok(output_logits)
-    }
-}
-
-// Ã¢â€â‚¬Ã¢â€â‚¬ Semantic Context Flattener Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-
-/// Well-known JSON field names that carry semantic context identity.
-const ROLE_FIELD: &str = "role";
-const TURN_ID_FIELD: &str = "turn_id";
-const ID_FIELD: &str = "id";
-const CONTENT_FIELD: &str = "content";
-
-/// Recognised conversation roles that carry semantic significance for
-/// KV-cache key assignment.
-const ROLE_SYSTEM: &str = "system";
-const ROLE_USER: &str = "user";
-const ROLE_ASSISTANT: &str = "assistant";
-
-/// A semantic boundary found inside the inference context.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ContextMarker {
-    SystemPromptBoundary,
-    ConversationTurnStart { turn_id: String },
-    AssistantResponse { turn_id: String },
-}
-
-/// A text chunk paired with a KV-cache key derived from its semantic position.
-/// Keys are assigned so that logically contiguous sequences produce adjacent
-/// B-Tree entries in the KV-cache, maximising cache locality.
-#[derive(Clone, Debug)]
-pub(crate) struct FlattenedChunk {
-    pub(crate) text: String,
-    /// Semantically ordered cache key, e.g. `sys:0`, `usr:1:node42`, `ast:1`.
-    pub(crate) cache_key: String,
-    pub(crate) markers: Vec<ContextMarker>,
-}
-
-/// Replaces the previous depth-based JSON traversal of AI context messages
-/// with **semantic inlining**: known conversation roles and turn identifiers
-/// are extracted and used to assign ordered cache keys, ensuring contiguous
-/// logical sequences produce adjacent entries in the redb KV-cache and
-/// maximising cache-hit rates across multi-turn conversations.
-pub(crate) struct SemanticContextFlattener;
-
-impl SemanticContextFlattener {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    /// Flattens the `messages` array inside `context_json` into an ordered
-    /// list of [`FlattenedChunk`]s.  Each chunk gets a stable, semantically
-    /// ordered cache key rather than a key derived from arbitrary JSON depth.
-    pub(crate) fn flatten(&self, context_json: &serde_json::Value) -> Vec<FlattenedChunk> {
-        let messages = match context_json.get("messages").and_then(|v| v.as_array()) {
-            Some(arr) => arr,
-            None => return self.flatten_legacy(context_json),
-        };
-
-        let mut chunks = Vec::with_capacity(messages.len());
-        let mut user_turn: u32 = 0;
-
-        for message in messages {
-            let role = message
-                .get(ROLE_FIELD)
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let turn_id = message
-                .get(TURN_ID_FIELD)
-                .or_else(|| message.get(ID_FIELD))
-                .and_then(|v| v.as_str())
-                .map(str::to_owned);
-            let text = message
-                .get(CONTENT_FIELD)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-
-            let (cache_key, markers) = match role {
-                ROLE_SYSTEM => {
-                    let key = format!("sys:0:{}", turn_id.as_deref().unwrap_or("0"));
-                    (key, vec![ContextMarker::SystemPromptBoundary])
-                }
-                ROLE_USER => {
-                    user_turn = user_turn.saturating_add(1);
-                    let tid = turn_id.clone().unwrap_or_else(|| format!("{user_turn}"));
-                    let key = format!("usr:{user_turn}:{tid}");
-                    (
-                        key,
-                        vec![ContextMarker::ConversationTurnStart { turn_id: tid }],
-                    )
-                }
-                ROLE_ASSISTANT => {
-                    let tid = turn_id.clone().unwrap_or_else(|| format!("{user_turn}"));
-                    let key = format!("ast:{user_turn}:{tid}");
-                    (key, vec![ContextMarker::AssistantResponse { turn_id: tid }])
-                }
-                _ => {
-                    // Unknown role: keep a stable sequential key so unknown
-                    // turns don't disrupt the ordering of subsequent entries.
-                    let key = format!("unk:{user_turn}:{}", turn_id.as_deref().unwrap_or("0"));
-                    (key, vec![])
-                }
-            };
-
-            chunks.push(FlattenedChunk {
-                text,
-                cache_key,
-                markers,
-            });
-        }
-
-        chunks
-    }
-
-    /// Fallback for legacy context payloads that don't use the `messages`
-    /// structure: emits a single chunk with a generic cache key.
-    fn flatten_legacy(&self, context_json: &serde_json::Value) -> Vec<FlattenedChunk> {
-        let text = context_json
-            .as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| context_json.to_string());
-        vec![FlattenedChunk {
-            cache_key: "legacy:0".to_owned(),
-            text,
-            markers: vec![],
-        }]
-    }
-}
-
-fn repeat_batch_error(count: usize, failure: BatchFailure) -> Vec<Result<InferenceOutput>> {
-    (0..count)
-        .map(|_| Err(anyhow::Error::new(failure.clone())))
-        .collect()
-}
-
-impl CandleBackendModel {
-    fn execute_with_adapters_sequential_results(
-        &self,
-        inputs: &[SharedInputTensor],
-        adapters: &[Option<ResolvedLoraAdapter>],
-    ) -> Vec<Result<InferenceOutput>> {
-        if inputs.len() != adapters.len() {
-            let message = format!(
-                "adapter assignment count {} does not match input count {}",
-                adapters.len(),
-                inputs.len()
-            );
-            return repeat_batch_error(
-                inputs.len().max(adapters.len()),
-                BatchFailure::local(message),
-            );
-        }
-        let mut results = (0..inputs.len()).map(|_| None).collect::<Vec<_>>();
-        for group in adapter_assignment_groups(adapters) {
-            let adapter = adapters[group[0]].as_ref();
-            let group_inputs = group
-                .iter()
-                .map(|index| inputs[*index].clone())
-                .collect::<Vec<_>>();
-            let outputs = match adapter {
-                Some(adapter) => self.execute_with_adapter(&group_inputs, adapter),
-                None => self.execute(&group_inputs),
-            };
-            let outputs = match outputs {
-                Ok(outputs) => outputs,
-                Err(error) => {
-                    let failure = BatchFailure::from_anyhow(&error);
-                    for index in group {
-                        results[index] = Some(Err(anyhow::Error::new(failure.clone())));
-                    }
-                    continue;
-                }
-            };
-            if outputs.len() != group.len() {
-                let message = format!(
-                    "Candle backend returned {} output(s) for an adapter group of {} input(s)",
-                    outputs.len(),
-                    group.len()
-                );
-                let failure = BatchFailure::local(message);
-                for index in group {
-                    results[index] = Some(Err(anyhow::Error::new(failure.clone())));
-                }
-                continue;
-            }
-            for (index, output) in group.into_iter().zip(outputs) {
-                results[index] = Some(Ok(output));
-            }
-        }
-        results
-            .into_iter()
-            .map(|output| output.expect("adapter groups cover every input"))
-            .collect()
+        prompt_tokens: String::from_utf8_lossy(prompt)
+            .split_whitespace()
+            .count()
+            .max(1) as u32,
+        completion_tokens: completion.split_whitespace().count().max(1) as u32,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{IntegrityRoute, ModelDevice};
 
-    /// The classification has to survive the *wrappers*, not just exist.
-    ///
-    /// The first attempt at this only tested the guest's mapping from a
-    /// hand-built `GenerationError`, so it passed while the real path was
-    /// broken: the execution wrappers formatted the cause into their message
-    /// with `anyhow!("…: {error}")`, which erased the typed error before the
-    /// downcast could ever see it. This exercises the wrapping those wrappers
-    /// actually do.
-    #[test]
-    fn a_local_rejection_survives_the_execution_wrappers() {
-        use anyhow::Context;
-
-        let rejected: Result<(), _> = Err(candle_llm_runtime::CandleLlmError::InvalidRequest {
-            alias: "coder".to_owned(),
-            detail: "max_new_tokens 9000 exceeds the 4096-token ceiling".to_owned(),
-        });
-        let wrapped = rejected
-            .with_context(|| {
-                format!(
-                    "Candle LLM model `{}` loaded from `{}` failed",
-                    "coder", "/models/coder"
-                )
-            })
-            .expect_err("the request was rejected");
-
-        let error = GenerationError::from_anyhow(&wrapped);
-        assert!(
-            error.invalid_request,
-            "a request the runtime refused must reach the client as a 400, not a retryable 500"
-        );
-        assert_eq!(error.upstream_status, None, "no provider was involved");
-        // Both halves of the chain, or the message regresses to naming only the
-        // wrapper while the caller loses the detail it needs to fix its request.
-        assert!(
-            error.message.contains("max_new_tokens 9000"),
-            "the cause's detail must survive: {}",
-            error.message
-        );
-        assert!(
-            error.message.contains("loaded from"),
-            "and so must the wrapper's context: {}",
-            error.message
-        );
-    }
-
-    /// The scheduler fans one backend failure out to every input in the batch,
-    /// re-materialising an error that cannot be cloned. That fan-out was the
-    /// third place the classification died — after the execution wrappers and
-    /// before the guest — and the one that made the first fix look like it
-    /// worked in a unit test while doing nothing in production.
-    #[test]
-    fn a_local_rejection_survives_the_batch_fan_out() {
-        use anyhow::Context;
-
-        let rejected: Result<(), _> = Err(candle_llm_runtime::CandleLlmError::InvalidRequest {
-            alias: "coder".to_owned(),
-            detail: "max_new_tokens 9000 exceeds the 4096-token ceiling".to_owned(),
-        });
-        let wrapped = rejected
-            .context("Candle LLM model `coder` loaded from `/models/coder` failed")
-            .expect_err("the request was rejected");
-
-        // Exactly what the fan-out does with it.
-        let fanned_out: Vec<_> = repeat_batch_error(3, BatchFailure::from_anyhow(&wrapped));
-        assert_eq!(fanned_out.len(), 3);
-        for result in fanned_out {
-            let error = GenerationError::from_anyhow(&result.expect_err("every input fails"));
-            assert!(
-                error.invalid_request,
-                "each input's share of a rejected request is still a rejected request"
-            );
-            assert!(
-                error.message.contains("max_new_tokens 9000"),
-                "and still says why: {}",
-                error.message
-            );
-        }
-    }
-
-    /// A host fault wrapped identically stays a 500 — the classification keys
-    /// on the typed cause, not on having been wrapped.
-    #[test]
-    fn a_host_failure_is_not_classified_as_the_callers_fault() {
-        use anyhow::Context;
-
-        let failed: Result<(), _> = Err(candle_llm_runtime::CandleLlmError::Execution {
-            alias: "coder".to_owned(),
-            detail: "transformer forward pass failed".to_owned(),
-        });
-        let wrapped = failed
-            .context("Candle LLM model `coder` loaded from `/models/coder` failed")
-            .expect_err("the execution failed");
-
-        assert!(!GenerationError::from_anyhow(&wrapped).invalid_request);
-    }
-
-    #[test]
-    fn an_openai_binding_loads_as_an_upstream_without_touching_the_filesystem() {
-        let backend = CandleBackendModel::load(&IntegrityModelBinding {
-            alias: "remote-coder".to_owned(),
-            // Deliberately not a directory: the upstream scheme must be claimed
-            // before any on-disk loader is probed.
-            path: "openai:http://127.0.0.1:8080/v1?model=qwen3-coder-30b".to_owned(),
-            // Deliberately `Cuda`: the remote server's device is not this
-            // node's to account for.
-            device: ModelDevice::Cuda,
-            qos: RouteQos::Standard,
-            dynamic: false,
-            hardware_strategy: Default::default(),
-        })
-        .expect("an upstream binding should load without reaching the network");
-
-        assert!(matches!(backend.kind, CandleBackendModelKind::Upstream(_),));
-        // No local weights, so no local residency claim.
-        assert_eq!(backend.residency(), AcceleratorMemoryResidency::HostRam);
-        assert_eq!(backend.source.model_size_bytes, 0);
-    }
-
-    #[test]
-    fn one_bad_upstream_request_does_not_poison_its_co_batched_neighbours() {
-        let upstream = upstream_openai::FakeUpstream::start_many(
-            "HTTP/1.1 200 OK",
-            "application/json",
-            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
-            2,
-        );
-        let backend = CandleBackendModel::load(&IntegrityModelBinding {
-            alias: "remote-coder".to_owned(),
-            path: upstream.binding(),
-            device: ModelDevice::Cpu,
-            qos: RouteQos::Standard,
-            dynamic: false,
-            hardware_strategy: Default::default(),
-        })
-        .expect("upstream binding should load");
-
-        // Middle request is rejected before it ever leaves the host
-        // (`max_new_tokens: 0`); the other two are valid and must still get
-        // their own answers rather than inherit the failure.
-        let inputs = [
-            &br#"{"prompt":"a"}"#[..],
-            &br#"{"prompt":"b","max_new_tokens":0}"#[..],
-            &br#"{"prompt":"c"}"#[..],
-        ]
-        .map(|data| SharedInputTensor {
-            dimensions: vec![data.len() as u32],
-            ty: TensorType::U8,
-            data: Arc::from(data),
-        });
-        let adapters = vec![None, None, None];
-
-        let results = backend.execute_with_adapter_results(&inputs, &adapters);
-        assert_eq!(results.len(), 3);
-        assert_eq!(
-            results[0]
-                .as_ref()
-                .expect("first request should succeed")
-                .bytes,
-            b"ok"
-        );
-        assert!(
-            results[1].is_err(),
-            "the malformed request should fail on its own"
-        );
-        assert_eq!(
-            results[2]
-                .as_ref()
-                .expect("third request should succeed")
-                .bytes,
-            b"ok"
-        );
-    }
-
-    #[test]
-    fn an_invalid_openai_binding_fails_at_load_rather_than_at_first_request() {
-        let error = CandleBackendModel::load(&IntegrityModelBinding {
-            alias: "remote-coder".to_owned(),
-            path: "openai:ftp://nope".to_owned(),
-            device: ModelDevice::Cpu,
-            qos: RouteQos::Standard,
-            dynamic: false,
-            hardware_strategy: Default::default(),
-        })
-        .err()
-        .expect("a malformed upstream URL must fail closed at load");
-        assert!(
-            error.to_string().contains("http://"),
-            "the error should name the accepted schemes, got: {error}"
-        );
-    }
-
-    fn model_broker_env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static MODEL_BROKER_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        MODEL_BROKER_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("model broker env lock should not be poisoned")
-    }
-    use crate::{IntegrityConfig, IntegrityRoute, ModelDevice};
-    // `fs` and `PathBuf` were used by the deleted `turboquant_ffi_match` test. The
-    // replacement test builds its input in-memory so neither is needed any more.
-
-    fn mock_scheduler_model(alias: &str) -> Arc<CandleModel> {
-        Arc::new(
-            CandleModel::load_mock(&IntegrityModelBinding {
-                alias: alias.to_owned(),
-                path: format!("mock:{alias}"),
-                device: ModelDevice::Cuda,
-                qos: RouteQos::Standard,
-                dynamic: false,
-                hardware_strategy: Default::default(),
-            })
-            .expect("mock scheduler model should load"),
-        )
-    }
-
-    fn mock_inference_job(
-        model: &Arc<CandleModel>,
-        tenant: &str,
-        response_tx: mpsc::Sender<Result<InferenceOutput, anyhow::Error>>,
-    ) -> InferenceJob {
-        InferenceJob {
-            alias: model.alias.clone(),
-            adapter: Some(ResolvedLoraAdapter {
-                id: tenant.to_owned(),
-                path: PathBuf::from(format!("{tenant}.safetensors")),
-            }),
-            model: Arc::clone(model),
-            qos: model.qos,
-            input: SharedInputTensor {
-                dimensions: vec![1],
-                ty: TensorType::U8,
-                data: Arc::from(tenant.as_bytes()),
-            },
-            response_tx,
-        }
-    }
-
-    struct AdapterEchoBackend;
-
-    impl BackendModel for AdapterEchoBackend {
-        fn residency(&self) -> AcceleratorMemoryResidency {
-            AcceleratorMemoryResidency::Vram
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>> {
-            Ok(inputs
-                .iter()
-                .map(|input| {
-                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref()))
-                        .into_bytes()
-                        .into()
-                })
-                .collect())
-        }
-
-        fn execute_with_adapter(
-            &self,
-            inputs: &[SharedInputTensor],
-            adapter: &ResolvedLoraAdapter,
-        ) -> Result<Vec<InferenceOutput>> {
-            Ok(inputs
-                .iter()
-                .map(|input| {
-                    format!(
-                        "{}:{}",
-                        adapter.id,
-                        String::from_utf8_lossy(input.data.as_ref())
-                    )
-                    .into_bytes()
-                    .into()
-                })
-                .collect())
-        }
-    }
-
-    struct FailingAdapterBackend;
-
-    impl BackendModel for FailingAdapterBackend {
-        fn residency(&self) -> AcceleratorMemoryResidency {
-            AcceleratorMemoryResidency::Vram
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>> {
-            Ok(inputs
-                .iter()
-                .map(|input| {
-                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref()))
-                        .into_bytes()
-                        .into()
-                })
-                .collect())
-        }
-
-        fn execute_with_adapter(
-            &self,
-            inputs: &[SharedInputTensor],
-            adapter: &ResolvedLoraAdapter,
-        ) -> Result<Vec<InferenceOutput>> {
-            if adapter.id == "broken" {
-                bail!("adapter `{}` is malformed", adapter.id);
-            }
-            Ok(inputs
-                .iter()
-                .map(|input| {
-                    format!(
-                        "{}:{}",
-                        adapter.id,
-                        String::from_utf8_lossy(input.data.as_ref())
-                    )
-                    .into_bytes()
-                    .into()
-                })
-                .collect())
-        }
-    }
-
-    #[derive(Default)]
-    struct NativeAdapterBatchBackend {
-        native_batches: AtomicUsize,
-        sequential_adapter_calls: AtomicUsize,
-    }
-
-    impl BackendModel for NativeAdapterBatchBackend {
-        fn residency(&self) -> AcceleratorMemoryResidency {
-            AcceleratorMemoryResidency::Vram
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
-        fn execute(&self, inputs: &[SharedInputTensor]) -> Result<Vec<InferenceOutput>> {
-            self.sequential_adapter_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(inputs
-                .iter()
-                .map(|input| {
-                    format!("base:{}", String::from_utf8_lossy(input.data.as_ref()))
-                        .into_bytes()
-                        .into()
-                })
-                .collect())
-        }
-
-        fn execute_with_adapter(
-            &self,
-            inputs: &[SharedInputTensor],
-            adapter: &ResolvedLoraAdapter,
-        ) -> Result<Vec<InferenceOutput>> {
-            self.sequential_adapter_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(inputs
-                .iter()
-                .map(|input| {
-                    format!(
-                        "{}:{}",
-                        adapter.id,
-                        String::from_utf8_lossy(input.data.as_ref())
-                    )
-                    .into_bytes()
-                    .into()
-                })
-                .collect())
-        }
-
-        fn execute_with_adapters(
-            &self,
-            inputs: &[SharedInputTensor],
-            adapters: &[Option<ResolvedLoraAdapter>],
-        ) -> Result<Vec<InferenceOutput>> {
-            self.execute_with_adapter_results(inputs, adapters)
-                .into_iter()
-                .collect()
-        }
-
-        fn execute_with_adapter_results(
-            &self,
-            inputs: &[SharedInputTensor],
-            adapters: &[Option<ResolvedLoraAdapter>],
-        ) -> Vec<Result<InferenceOutput>> {
-            self.native_batches.fetch_add(1, Ordering::SeqCst);
-            inputs
-                .iter()
-                .zip(adapters)
-                .map(|(input, adapter)| {
-                    Ok(format!(
-                        "{}:{}",
-                        adapter
-                            .as_ref()
-                            .map(|adapter| adapter.id.as_str())
-                            .unwrap_or("base"),
-                        String::from_utf8_lossy(input.data.as_ref())
-                    )
-                    .into_bytes()
-                    .into())
-                })
-                .collect()
-        }
-    }
-
-    fn adapter_echo_model(alias: &str) -> Arc<CandleModel> {
-        Arc::new(
-            CandleModel::load_mock_with_backend(
-                &IntegrityModelBinding {
-                    alias: alias.to_owned(),
-                    path: format!("mock:{alias}"),
-                    device: ModelDevice::Cuda,
-                    qos: RouteQos::Standard,
-                    dynamic: false,
-                    hardware_strategy: Default::default(),
-                },
-                Arc::new(AdapterEchoBackend),
-            )
-            .expect("adapter echo model should load"),
-        )
-    }
-
-    fn native_adapter_batch_model(
-        alias: &str,
-        backend: Arc<NativeAdapterBatchBackend>,
-    ) -> Arc<CandleModel> {
-        Arc::new(
-            CandleModel::load_mock_with_backend(
-                &IntegrityModelBinding {
-                    alias: alias.to_owned(),
-                    path: format!("mock:{alias}"),
-                    device: ModelDevice::Cuda,
-                    qos: RouteQos::Standard,
-                    dynamic: false,
-                    hardware_strategy: Default::default(),
-                },
-                backend,
-            )
-            .expect("native adapter batch model should load"),
-        )
-    }
-
-    fn failing_adapter_model(alias: &str) -> Arc<CandleModel> {
-        Arc::new(
-            CandleModel::load_mock_with_backend(
-                &IntegrityModelBinding {
-                    alias: alias.to_owned(),
-                    path: format!("mock:{alias}"),
-                    device: ModelDevice::Cuda,
-                    qos: RouteQos::Standard,
-                    dynamic: false,
-                    hardware_strategy: Default::default(),
-                },
-                Arc::new(FailingAdapterBackend),
-            )
-            .expect("failing adapter model should load"),
-        )
-    }
-
-    fn config_with_upstream_binding(alias: &str, binding_path: String) -> IntegrityConfig {
-        let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
-            alias: alias.to_owned(),
-            path: binding_path,
-            device: ModelDevice::Cpu,
-            qos: RouteQos::Standard,
-            dynamic: false,
-            hardware_strategy: Default::default(),
-        }];
-        IntegrityConfig {
-            routes: vec![route],
-            ..IntegrityConfig::default_sealed()
-        }
-    }
-
-    #[test]
-    fn the_upstream_gate_admits_up_to_its_capacity_and_makes_the_rest_wait() {
-        let gate = Arc::new(UpstreamAdmission::new(2));
-        let first = gate.acquire().expect("first permit fits");
-        let second = gate.acquire().expect("second permit fits");
-        assert_eq!(gate.in_flight(), 2);
-        assert_eq!(gate.waiting(), 0);
-
-        // A third caller must block rather than open a third socket.
-        let blocked = Arc::clone(&gate);
-        let admitted = thread::spawn(move || {
-            let _permit = blocked
-                .acquire()
-                .expect("third caller is admitted once one frees");
-            true
-        });
-        // Spin rather than sleep: the wait is observable through the gate.
-        while gate.waiting() == 0 {
-            std::hint::spin_loop();
-        }
-        assert_eq!(
-            gate.in_flight(),
-            2,
-            "capacity is not exceeded while waiting"
-        );
-
-        drop(first);
-        assert!(
-            admitted.join().expect("waiting caller should not panic"),
-            "releasing a permit must wake exactly one waiter"
-        );
-        drop(second);
-        assert_eq!(gate.in_flight(), 0, "every permit is returned");
-    }
-
-    #[test]
-    fn an_upstream_permit_is_returned_when_its_request_unwinds() {
-        let gate = UpstreamAdmission::new(1);
-        let failed: Result<(), String> = (|| {
-            let _permit = gate.acquire()?;
-            Err("upstream returned 500".to_owned())
-        })();
-        assert!(failed.is_err());
-        assert_eq!(
-            gate.in_flight(),
-            0,
-            "the permit must be released on the error path, not only on success"
-        );
-        // Proves the capacity is genuinely reusable, not merely counted back.
-        drop(gate.acquire().expect("capacity is available again"));
-    }
-
-    #[test]
-    fn a_saturated_upstream_gate_sheds_instead_of_queueing_forever() {
-        // `UPSTREAM_ADMISSION_TIMEOUT` is the production wait; this asserts the
-        // shed *path* exists and names the knob, without waiting 30s for it.
-        let gate = UpstreamAdmission::new(1);
-        let _held = gate.acquire().expect("first permit fits");
-        let mut state = gate.state.lock().expect("gate lock");
-        state.waiting += 1;
-        drop(state);
-        assert_eq!(
-            gate.waiting(),
-            1,
-            "a blocked caller is visible as backlog, not as in-flight work"
-        );
-    }
-
-    /// The cap belongs to the node, not to whichever manifest is loaded.
-    ///
-    /// Built per runtime, a hot reload gave the incoming generation its own
-    /// gate while the previous one was still draining — so for the length of
-    /// that overlap the node allowed twice the configured concurrency against
-    /// the same upstream, at exactly the moment a provider is least able to
-    /// absorb it.
-    #[test]
-    fn every_runtime_generation_shares_one_upstream_gate() {
-        let first = node_upstream_admission();
-        let second = node_upstream_admission();
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "a second generation must not get a gate of its own"
-        );
-
-        // Pointer equality is the whole property: the same `Arc` is the same
-        // `UpstreamAdmission` behind the same mutex, so a permit taken through
-        // either handle is counted by both. Asserting on `in_flight` instead
-        // would race any other test in this binary that builds a runtime and
-        // acquires — a flake that would say nothing extra.
-    }
-
-    /// A refused admission is an overload, not a broken node.
-    ///
-    /// Without a status the caller sees 500 `server_error` — a node that has
-    /// failed — and an agent retries immediately, adding to the queue that just
-    /// refused it. 503 is what says "come back", and it is the answer that
-    /// makes a client's backoff correct rather than harmful.
-    #[test]
-    fn a_refused_admission_is_reported_as_an_overload() {
-        let gate = UpstreamAdmission::new(1);
-        let _held = gate.acquire().expect("first permit fits");
-        {
-            let mut state = gate.state.lock().expect("gate lock");
-            state.waiting = UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT;
-        }
-        let Err(refusal) = gate.acquire() else {
-            panic!("a queue at its depth refuses");
-        };
-
-        let error = GenerationError::overloaded(refusal);
-        assert_eq!(
-            error.upstream_status,
-            Some(503),
-            "an overloaded node has to say so, or the client's retry makes it worse"
-        );
-        assert!(
-            !error.invalid_request,
-            "the request was fine; there was simply no room for it"
-        );
-        assert!(error.message.contains("saturated"), "{}", error.message);
-    }
-
-    /// A full queue refuses immediately rather than parking another thread.
-    ///
-    /// The caller has already spawned its dedicated stream thread by the time
-    /// it gets here, so an unbounded queue converts a burst into unbounded
-    /// parked threads — each held for the whole admission timeout while only
-    /// `capacity` requests are actually being served. Refusing past the depth
-    /// is what keeps the parked count a multiple of the work in flight.
-    #[test]
-    fn a_queue_at_its_depth_refuses_instead_of_parking_another_caller() {
-        let gate = UpstreamAdmission::new(1);
-        let _held = gate.acquire().expect("first permit fits");
-        // Stand in for callers already parked, so the refusal can be observed
-        // without waiting out `UPSTREAM_ADMISSION_TIMEOUT` for each of them.
-        {
-            let mut state = gate.state.lock().expect("gate lock");
-            state.waiting = UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT;
-        }
-
-        let Err(refused) = gate.acquire() else {
-            panic!("a queue at its depth must refuse rather than park");
-        };
-
-        assert!(
-            refused.contains("already queued"),
-            "the refusal must say the queue is what is full, not the capacity: {refused}"
-        );
-        assert!(
-            refused.contains(UPSTREAM_MAX_CONCURRENCY_ENV),
-            "the refusal must name the knob that raises the limit: {refused}"
-        );
-        assert_eq!(
-            gate.waiting(),
-            UPSTREAM_MAX_QUEUE_DEPTH_PER_PERMIT,
-            "a refused caller never joins the backlog it was refused for"
-        );
-    }
-
-    #[test]
-    fn the_network_lane_reports_the_admission_backlog_rather_than_a_scheduler_queue() {
-        let upstream = upstream_openai::FakeUpstream::start(
-            "HTTP/1.1 200 OK",
-            "application/json",
-            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
-        );
-        let runtime = AiInferenceRuntime::from_config(&config_with_upstream_binding(
-            "remote-coder",
-            upstream.binding(),
-        ))
-        .expect("runtime should load the upstream binding");
-
-        // The `Network` lane has no dispatcher thread at all — upstream work
-        // never enters a scheduler queue — yet the lane is still supported.
-        assert!(runtime.supports_accelerator(AcceleratorKind::Network));
-        assert!(
-            !runtime.schedulers.contains_key(&AcceleratorKind::Network),
-            "the network lane must not spawn a dispatcher that never receives a job"
-        );
-        assert_eq!(
-            runtime.queue_tier_snapshot(AcceleratorKind::Network),
-            QueueTierSnapshot::default(),
-            "an idle node reports no upstream backlog"
-        );
-
-        // With a caller blocked on admission, the same lane reports depth on
-        // every tier, which is what `should_consult_mesh_qos_override` reads to
-        // spill realtime traffic to a peer.
-        let mut state = runtime
-            .upstream_admission
-            .state
-            .lock()
-            .expect("gate lock poisoned");
-        state.waiting = 3;
-        drop(state);
-        assert_eq!(
-            runtime.queue_tier_snapshot(AcceleratorKind::Network),
-            QueueTierSnapshot {
-                realtime: 3,
-                standard: 3,
-                batch: 3,
-            }
-        );
-    }
-
-    #[test]
-    fn an_upstream_prompt_runs_under_a_permit_and_returns_it() {
-        let upstream = upstream_openai::FakeUpstream::start(
-            "HTTP/1.1 200 OK",
-            "application/json",
-            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
-        );
-        let runtime = AiInferenceRuntime::from_config(&config_with_upstream_binding(
-            "remote-coder",
-            upstream.binding(),
-        ))
-        .expect("runtime should load the upstream binding");
-
-        let generation = runtime
-            .compute_component_prompt_with_adapter("remote-coder", r#"{"prompt":"hi"}"#, None)
-            .expect("upstream prompt should round-trip without the batch scheduler");
-        assert_eq!(generation.text, "ok");
-        assert_eq!(
-            runtime.upstream_admission.in_flight(),
-            0,
-            "the permit must not outlive the request"
-        );
-    }
-
-    #[test]
-    fn runtime_preloads_model_aliases_from_config() {
-        let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![
-            IntegrityModelBinding {
-                alias: "llama3".to_owned(),
-                path: "mock:llama3".to_owned(),
-                device: ModelDevice::Cuda,
-                qos: RouteQos::Standard,
-                dynamic: false,
-                hardware_strategy: Default::default(),
-            },
-            IntegrityModelBinding {
-                alias: "tiny".to_owned(),
-                path: "mock:tiny".to_owned(),
-                device: ModelDevice::Cpu,
-                qos: RouteQos::Standard,
-                dynamic: false,
-                hardware_strategy: Default::default(),
-            },
-        ];
-        let config = IntegrityConfig {
-            routes: vec![route],
-            ..IntegrityConfig::default_sealed()
-        };
-
-        let runtime =
-            AiInferenceRuntime::from_config(&config).expect("runtime should preload models");
-
-        assert_eq!(
-            runtime.loaded_model_aliases(),
-            vec!["llama3".to_owned(), "tiny".to_owned()]
-        );
-    }
-
-    #[test]
-    fn real_candle_llm_runtime_generates_non_mock_text() {
-        let model_dir = unique_candle_llm_dir("real-generation");
-        candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
-            .expect("fixture should be written");
-        let runtime =
-            AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
-                .expect("runtime should load real Candle LLM fixture");
-
-        let output = runtime
-            .compute_component_prompt("tiny", "hello")
-            .expect("real Candle LLM should generate");
-
-        // The transformer forward is prompt-driven (and its weights are a fixture),
-        // so we assert it produced real decoded text rather than the retired mock
-        // constant, not a specific hard-coded token. (Prompt-dependence and
-        // determinism are covered directly in `candle_llm_runtime::tests`.)
-        assert!(
-            !output.is_empty(),
-            "a real forward pass should decode at least one token"
-        );
-        assert_ne!(output, MOCK_INFERENCE_RESPONSE);
-        let _ = fs::remove_dir_all(model_dir);
-    }
-
-    #[test]
-    fn real_candle_llm_runtime_applies_resolved_lora_adapter() {
-        let _env_guard = model_broker_env_guard();
-        let model_dir = unique_candle_llm_dir("real-lora-apply");
-        candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
-            .expect("fixture should be written");
-        let adapter_root = std::env::temp_dir().join(format!(
-            "tachyon-real-lora-{}",
+    fn unique_model_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tachyon-magnetar-cutover-{name}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .expect("time should be valid")
+                .expect("time")
                 .as_nanos()
-        ));
-        let adapter_dir = adapter_root.join("adapters");
-        fs::create_dir_all(&adapter_dir).expect("adapter dir should be created");
-        write_tiny_lora_adapter(&adapter_dir.join("tenant-a.safetensors"), 0.25)
-            .expect("adapter should be written");
-        std::env::set_var(MODEL_BROKER_DIR_ENV, &adapter_root);
-
-        let runtime =
-            AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
-                .expect("runtime should load real Candle LLM fixture");
-        let base_before = runtime
-            .compute_component_prompt("tiny", "hello")
-            .expect("base model generation before adapter");
-        let output = runtime
-            .compute_component_prompt_with_adapter("tiny", "hello", Some("tenant-a"))
-            .expect("real backend should apply the resolved adapter")
-            .text;
-        let base_after = runtime
-            .compute_component_prompt_with_adapter("tiny", "hello", None)
-            .expect("base model generation after adapter")
-            .text;
-
-        assert!(!output.is_empty());
-        assert_ne!(output, MOCK_INFERENCE_RESPONSE);
-        assert_eq!(
-            base_before, base_after,
-            "omitting adapter_id must keep the base model path unchanged"
-        );
-        std::env::remove_var(MODEL_BROKER_DIR_ENV);
-        let _ = fs::remove_dir_all(adapter_root);
-        let _ = fs::remove_dir_all(model_dir);
-    }
-
-    #[test]
-    fn real_candle_lora_adapter_rejects_unsupported_gguf_backend() {
-        let _env_guard = model_broker_env_guard();
-        let model_dir = unique_candle_llm_dir("lora-gguf-reject");
-        candle_llm_runtime::write_tachyon_tiny_gguf_fixture(&model_dir)
-            .expect("gguf fixture should be written");
-        let adapter_root = std::env::temp_dir().join(format!(
-            "tachyon-real-lora-gguf-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time should be valid")
-                .as_nanos()
-        ));
-        let adapter_dir = adapter_root.join("adapters");
-        fs::create_dir_all(&adapter_dir).expect("adapter dir should be created");
-        write_tiny_lora_adapter(&adapter_dir.join("tenant-a.safetensors"), 0.25)
-            .expect("adapter should be written");
-        std::env::set_var(MODEL_BROKER_DIR_ENV, &adapter_root);
-
-        let runtime = AiInferenceRuntime::from_config(&config_with_real_candle_model(
-            "tiny-gguf",
-            &model_dir,
         ))
-        .expect("runtime should load real GGUF fixture");
-        let error = runtime
-            .compute_component_prompt_with_adapter("tiny-gguf", "hello", Some("tenant-a"))
-            .expect_err("GGUF must reject LoRA injection explicitly");
+    }
 
-        assert!(error.message.contains("safetensors Llama checkpoints only"));
-        std::env::remove_var(MODEL_BROKER_DIR_ENV);
-        let _ = fs::remove_dir_all(adapter_root);
-        let _ = fs::remove_dir_all(model_dir);
+    fn write_qwen_safetensors_fixture(path: &Path) {
+        std::fs::create_dir_all(path).expect("fixture dir should be created");
+        std::fs::write(path.join("config.json"), br#"{"model_type":"qwen3"}"#)
+            .expect("config should be written");
+        std::fs::write(path.join("model.safetensors"), b"weights")
+            .expect("weights should be written");
     }
 
     #[test]
-    fn streamed_prompt_matches_the_buffered_output() {
-        let model_dir = unique_candle_llm_dir("stream-vs-buffered");
-        candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
-            .expect("fixture should be written");
-        let runtime =
-            AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
-                .expect("runtime should load real Candle LLM fixture");
-
-        let buffered = runtime
-            .compute_component_prompt("tiny", "hello")
-            .expect("buffered generation");
-        let mut streamed = String::new();
-        let mut fragments = 0usize;
-        runtime
-            .stream_component_prompt("tiny", "hello", None, &mut |event: StreamEvent<'_>| {
-                if let StreamEvent::Content(delta) = event {
-                    streamed.push_str(delta);
-                    fragments += 1;
-                }
-                StreamControl::Continue
-            })
-            .expect("streamed generation");
-        assert_eq!(
-            streamed, buffered,
-            "streamed fragments must reconstruct the buffered output exactly"
-        );
-        assert!(fragments >= 1, "streaming must emit at least one fragment");
-        let _ = fs::remove_dir_all(model_dir);
-    }
-
-    #[test]
-    fn real_candle_llm_runtime_accepts_json_generation_request() {
-        let model_dir = unique_candle_llm_dir("json-generation");
-        candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
-            .expect("fixture should be written");
-        let runtime =
-            AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
-                .expect("runtime should load real Candle LLM fixture");
-
-        let output = runtime
-            .compute_component_prompt(
-                "tiny",
-                r#"{"prompt":"hello","max_new_tokens":1,"temperature":0.0,"seed":7}"#,
-            )
-            .expect("real Candle LLM should generate from JSON request");
-
-        assert!(
-            !output.is_empty(),
-            "a JSON generation request should decode at least one token"
-        );
-        assert_ne!(output, MOCK_INFERENCE_RESPONSE);
-        let _ = fs::remove_dir_all(model_dir);
-    }
-
-    #[test]
-    fn unsupported_non_mock_binding_does_not_register_mock_backend() {
-        let model_dir = unique_candle_llm_dir("unsupported");
-        fs::create_dir_all(&model_dir).expect("fixture dir should be created");
-        fs::write(
-            model_dir.join("model.safetensors"),
-            b"not-a-supported-layout",
-        )
-        .expect("unsupported safetensors marker should be written");
-
-        let error = match AiInferenceRuntime::from_config(&config_with_real_candle_model(
-            "unsupported",
-            &model_dir,
-        )) {
-            Ok(_) => panic!("unsupported non-mock binding should fail before registration"),
-            Err(error) => error.to_string(),
-        };
-
-        assert!(error.contains("unsupported AI model binding `unsupported`"));
-        assert!(error.contains(model_dir.to_string_lossy().as_ref()));
-        assert!(!error.contains(MOCK_INFERENCE_RESPONSE));
-        let _ = fs::remove_dir_all(model_dir);
-    }
-
-    #[test]
-    fn invalid_candle_llm_tokenizer_reports_alias_and_path() {
-        let model_dir = unique_candle_llm_dir("invalid-tokenizer");
-        fs::create_dir_all(&model_dir).expect("fixture dir should be created");
-        fs::write(
-            model_dir.join("config.json"),
-            serde_json::json!({
-                "model_type": candle_llm_runtime::LLAMA_MODEL_TYPE,
-                "architectures": ["LlamaForCausalLM"],
-                "vocab_size": 4
-            })
-            .to_string(),
-        )
-        .expect("config should be written");
-        fs::write(model_dir.join("tokenizer.json"), b"{not-json")
-            .expect("invalid tokenizer should be written");
-        fs::write(model_dir.join("model.safetensors"), b"not-used")
-            .expect("weights marker should be written");
-
-        let error = match AiInferenceRuntime::from_config(&config_with_real_candle_model(
-            "bad-tokenizer",
-            &model_dir,
-        )) {
-            Ok(_) => panic!("invalid tokenizer should fail before registration"),
-            Err(error) => error.to_string(),
-        };
-
-        assert!(error.contains("bad-tokenizer"));
-        assert!(error.contains(model_dir.to_string_lossy().as_ref()));
-        assert!(error.contains("tokenizer.json"));
-        let _ = fs::remove_dir_all(model_dir);
-    }
-
-    #[test]
-    fn real_candle_llm_runtime_reports_invalid_config_and_weights() {
-        let unsupported_dir = unique_candle_llm_dir("unsupported-architecture");
-        candle_llm_runtime::write_tachyon_tiny_fixture(&unsupported_dir)
-            .expect("fixture should be written");
-        fs::write(
-            unsupported_dir.join("config.json"),
-            serde_json::json!({
-                "model_type": "unsupported_fixture",
-                "architectures": ["UnsupportedFixture"],
-                "vocab_size": 4
-            })
-            .to_string(),
-        )
-        .expect("unsupported config should be written");
-        let config_error = match AiInferenceRuntime::from_config(&config_with_real_candle_model(
-            "bad-config",
-            &unsupported_dir,
-        )) {
-            Ok(_) => panic!("unsupported architecture should fail before registration"),
-            Err(error) => error.to_string(),
-        };
-        assert!(config_error.contains("bad-config"));
-        assert!(config_error.contains(unsupported_dir.to_string_lossy().as_ref()));
-        assert!(config_error.contains(candle_llm_runtime::LLAMA_MODEL_TYPE));
-
-        let weights_dir = unique_candle_llm_dir("invalid-weights");
-        candle_llm_runtime::write_tachyon_tiny_fixture(&weights_dir)
-            .expect("fixture should be written");
-        fs::write(weights_dir.join("model.safetensors"), b"not-a-safetensor")
-            .expect("invalid weights should be written");
-        let weights_error = match AiInferenceRuntime::from_config(&config_with_real_candle_model(
-            "bad-weights",
-            &weights_dir,
-        )) {
-            Ok(_) => panic!("invalid weights should fail before registration"),
-            Err(error) => error.to_string(),
-        };
-        assert!(weights_error.contains("bad-weights"));
-        assert!(weights_error.contains(weights_dir.to_string_lossy().as_ref()));
-        assert!(weights_error.contains("model.safetensors"));
-
-        let _ = fs::remove_dir_all(unsupported_dir);
-        let _ = fs::remove_dir_all(weights_dir);
-    }
-
-    #[test]
-    fn real_candle_llm_runtime_enforces_generation_limits() {
-        let model_dir = unique_candle_llm_dir("limits");
-        candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
-            .expect("fixture should be written");
-        let runtime =
-            AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
-                .expect("runtime should load real Candle LLM fixture");
-
-        let over_cap = candle_llm_runtime::HOST_MAX_NEW_TOKENS + 1;
-        let too_many_tokens = runtime
-            .compute_component_prompt(
-                "tiny",
-                &format!(r#"{{"prompt":"hello","max_new_tokens":{over_cap}}}"#),
-            )
-            .expect_err("generation cap should reject oversized request");
-        assert!(too_many_tokens
-            .message
-            .contains(&format!("max_new_tokens {over_cap}")));
-
-        // The byte cap is derived from the checkpoint's context window, so the
-        // fixture's tiny window is what bounds this — not a flat constant.
-        let (_, max_prompt_bytes) = candle_llm_runtime::prompt_limits_for(
-            candle_llm_runtime::FIXTURE_MAX_POSITION_EMBEDDINGS,
-        );
-        let over_bytes = max_prompt_bytes + 1;
-        let long_prompt = "x".repeat(over_bytes);
-        let prompt_error = runtime
-            .compute_component_prompt("tiny", &long_prompt)
-            .expect_err("prompt byte limit should reject oversized prompt");
-        assert!(prompt_error.message.contains(&format!(
-            "prompt bytes {over_bytes} exceed limit {max_prompt_bytes}"
-        )));
-        let _ = fs::remove_dir_all(model_dir);
-    }
-
-    #[test]
-    fn uploaded_model_is_lazily_loaded_from_the_broker_models_root() {
-        let root = unique_candle_llm_dir("dynamic-root");
-        let alias = "tenant-llama";
-        candle_llm_runtime::write_tachyon_tiny_fixture(&root.join(alias))
-            .expect("fixture should be written");
-
-        // The alias is absent from the sealed config; only the on-disk upload
-        // directory and the dynamic models root make it resolvable.
-        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed())
-            .expect("runtime should build")
-            .with_dynamic_models_root(Some(root.clone()));
-
-        let output = runtime
-            .compute_component_prompt(alias, "hello")
-            .expect("an uploaded model should load lazily and generate");
-        assert!(!output.is_empty());
-        assert_ne!(output, MOCK_INFERENCE_RESPONSE);
-        // It is now registered for reuse.
-        assert!(runtime.loaded_model_aliases().contains(&alias.to_owned()));
-
-        // An alias with no upload directory stays unloaded.
-        let missing = runtime
-            .compute_component_prompt("no-such-model", "hello")
-            .expect_err("an absent alias must not load");
-        assert!(missing.message.contains("is not loaded"));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn lazy_load_is_disabled_without_a_dynamic_models_root() {
-        let root = unique_candle_llm_dir("no-dynamic-root");
-        let alias = "tenant-llama";
-        candle_llm_runtime::write_tachyon_tiny_fixture(&root.join(alias))
-            .expect("fixture should be written");
-
-        // Same on-disk model, but no dynamic root configured → not loadable.
-        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed())
-            .expect("runtime should build");
-        let error = runtime
-            .compute_component_prompt(alias, "hello")
-            .expect_err("without a dynamic root, uploads must not load");
-        assert!(error.message.contains("is not loaded"));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn dynamic_binding_is_sealed_but_not_eager_loaded() {
-        let root = unique_candle_llm_dir("dynamic-binding-root");
-        let alias = "tenant-llama";
-        candle_llm_runtime::write_tachyon_tiny_fixture(&root.join(alias))
-            .expect("fixture should be written");
-
-        // A `dynamic` binding seals the alias for the route but carries no path
-        // and is not present at boot. from_config must build without eager-loading
-        // it, so the host can start before the model has been uploaded.
+    fn magnetar_qwen_binding_is_rejected_until_real_execution_exists() {
+        let model_dir = unique_model_dir("qwen-runtime");
+        write_qwen_safetensors_fixture(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
-            alias: alias.to_owned(),
-            path: String::new(),
-            device: ModelDevice::Cpu,
-            qos: RouteQos::Standard,
-            dynamic: true,
-            hardware_strategy: Default::default(),
-        }];
-        let config = IntegrityConfig {
-            routes: vec![route],
-            ..IntegrityConfig::default_sealed()
-        };
-
-        let runtime = AiInferenceRuntime::from_config(&config)
-            .expect("a dynamic binding must not fail boot")
-            .with_dynamic_models_root(Some(root.clone()));
-
-        // Not eager-loaded at boot.
-        assert!(!runtime.loaded_model_aliases().contains(&alias.to_owned()));
-
-        // Lazily materialised from the broker models root on first use.
-        let output = runtime
-            .compute_component_prompt(alias, "hello")
-            .expect("a sealed dynamic alias should load lazily once uploaded");
-        assert!(!output.is_empty());
-        assert!(runtime.loaded_model_aliases().contains(&alias.to_owned()));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn static_binding_with_empty_path_is_rejected() {
-        let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
-            alias: "needs-path".to_owned(),
-            path: String::new(),
+            alias: "qwen35".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
             device: ModelDevice::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
         }];
-        let config = IntegrityConfig {
+
+        let error = match AiInferenceRuntime::from_config(&IntegrityConfig {
             routes: vec![route],
             ..IntegrityConfig::default_sealed()
-        };
-        let error = match AiInferenceRuntime::from_config(&config) {
-            Ok(_) => panic!("a static binding without a path must fail validation"),
+        }) {
+            Ok(_) => panic!("Qwen safetensors must not be admitted until Magnetar executes them"),
             Err(error) => error,
         };
-        let message = error.to_string();
-        assert!(message.contains("needs-path"), "message was: {message}");
-        assert!(message.contains("dynamic"), "message was: {message}");
+
+        assert!(error.to_string().contains("not implemented yet"));
+        let _ = std::fs::remove_dir_all(model_dir);
     }
 
     #[test]
-    fn scheduler_batches_concurrent_requests_for_same_alias() {
-        let runtime = AiInferenceRuntime::from_config(&config_with_model("llama3"))
-            .expect("runtime should build");
-        let scheduler = runtime
-            .scheduler_for(AcceleratorKind::Cpu)
-            .expect("cpu scheduler should exist");
-        let mut handles = Vec::new();
-        let barrier = Arc::new(std::sync::Barrier::new(8));
-
-        for _ in 0..8 {
-            let barrier = Arc::clone(&barrier);
-            let scheduler = scheduler.clone();
-            let model = runtime
-                .models
-                .read()
-                .expect("model registry lock poisoned")
-                .get("llama3")
-                .expect("model should exist")
-                .clone();
-            handles.push(thread::spawn(move || {
-                barrier.wait();
-                scheduler
-                    .infer(
-                        model,
-                        None,
-                        SharedInputTensor {
-                            dimensions: vec![1],
-                            ty: TensorType::U8,
-                            data: Arc::from(b"hello".as_slice()),
-                        },
-                    )
-                    .expect("inference should succeed")
-            }));
-        }
-
-        for handle in handles {
-            let output = handle.join().expect("worker should join");
-            assert_eq!(output.bytes, MOCK_INFERENCE_RESPONSE.as_bytes());
-        }
-
-        let snapshot = runtime.scheduler_snapshot(AcceleratorKind::Cpu);
-        assert_eq!(snapshot.requests_processed, 8);
-        assert!(snapshot.prefill_steps_processed >= 1);
-        assert!(snapshot.decode_steps_processed >= 1);
-        assert_eq!(snapshot.batches_processed, snapshot.decode_steps_processed);
-        assert!(snapshot.max_batch_size >= 1);
-        assert_eq!(snapshot.queued_requests, 0);
-    }
-
-    /// Regression test for a cross-contamination bug: `process_batch` used to
-    /// clone one job's output across every job sharing its scheduler batch,
-    /// so concurrent *different* prompts to the same real model could receive
-    /// each other's generated text. `scheduler_batches_concurrent_requests_for_same_alias`
-    /// above didn't catch it because every thread sent the identical prompt to
-    /// a mock model with a fixed response — contamination and correctness look
-    /// identical in that setup. This test uses a real Candle Llama fixture with
-    /// distinct prompts so a misrouted response is observable.
-    #[test]
-    fn scheduler_routes_distinct_concurrent_prompts_to_their_own_response() {
-        let model_dir = unique_candle_llm_dir("concurrent-distinct-prompts");
-        candle_llm_runtime::write_tachyon_tiny_fixture(&model_dir)
-            .expect("fixture should be written");
-        let runtime =
-            AiInferenceRuntime::from_config(&config_with_real_candle_model("tiny", &model_dir))
-                .expect("runtime should load real Candle LLM fixture");
-
-        // The fixture's tokenizer vocab is exactly `<unk> hello tachyon mesh`
-        // (see `TINY_TOKENIZER_JSON`), so these three are distinct, valid,
-        // deterministic (greedy) prompts for the same loaded model.
-        let prompts = ["hello", "tachyon", "mesh"];
-        let expected = prompts.map(|prompt| {
-            runtime
-                .compute_component_prompt("tiny", prompt)
-                .unwrap_or_else(|error| {
-                    panic!("reference generation for `{prompt}` failed: {error}")
-                })
-        });
-        assert_ne!(
-            expected[0], expected[1],
-            "fixture prompts must decode differently, or this test can't detect misrouting"
-        );
-        assert_ne!(
-            expected[0], expected[2],
-            "fixture prompts must decode differently, or this test can't detect misrouting"
-        );
-        assert_ne!(
-            expected[1], expected[2],
-            "fixture prompts must decode differently, or this test can't detect misrouting"
-        );
-
-        let runtime = Arc::new(runtime);
-        let barrier = Arc::new(std::sync::Barrier::new(prompts.len()));
-        let handles = prompts
-            .into_iter()
-            .map(|prompt| {
-                let runtime = Arc::clone(&runtime);
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
-                    barrier.wait();
-                    let output = runtime
-                        .compute_component_prompt("tiny", prompt)
-                        .unwrap_or_else(|error| {
-                            panic!("concurrent generation for `{prompt}` failed: {error}")
-                        });
-                    (prompt, output)
-                })
-            })
-            .collect::<Vec<_>>();
-
-        for handle in handles {
-            let (prompt, output) = handle.join().expect("worker should join");
-            let expected_output = &expected[prompts
-                .iter()
-                .position(|p| *p == prompt)
-                .expect("prompt should be one of the fixed test prompts")];
-            assert_eq!(
-                &output, expected_output,
-                "prompt `{prompt}` received another concurrent request's output"
-            );
-        }
-
-        let _ = fs::remove_dir_all(model_dir);
-    }
-
-    #[test]
-    fn scheduler_tenant_weights_select_weighted_share_within_same_qos() {
-        let model_a = mock_scheduler_model("shared-a");
-        let model_b = mock_scheduler_model("shared-b");
-        let mut tenant_fairness = TenantFairness::new(SchedulerConfig {
-            tenant_weights: std::collections::BTreeMap::from([
-                ("tenant-a".to_owned(), 3),
-                ("tenant-b".to_owned(), 1),
-            ]),
-            ..SchedulerConfig::default()
-        });
-        let (tenant_a_tx, _tenant_a_rx) = mpsc::channel();
-        let (tenant_b_tx, _tenant_b_rx) = mpsc::channel();
-        let active = vec![
-            ActiveInferenceSequence {
-                qos_score: RouteQos::Standard.score(),
-                sequence: 0,
-                phase: InferenceSequencePhase::Decode,
-                job: mock_inference_job(&model_a, "tenant-a", tenant_a_tx),
-            },
-            ActiveInferenceSequence {
-                qos_score: RouteQos::Standard.score(),
-                sequence: 1,
-                phase: InferenceSequencePhase::Decode,
-                job: mock_inference_job(&model_b, "tenant-b", tenant_b_tx),
-            },
-        ];
-
-        let selected = (0..8)
-            .map(|_| {
-                let indices = select_active_batch(
-                    &active,
-                    InferenceSequencePhase::Decode,
-                    &mut tenant_fairness,
-                )
-                .expect("tenant should be selected");
-                active[indices[0]].job.tenant_id().to_owned()
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            selected
-                .iter()
-                .filter(|tenant| tenant.as_str() == "tenant-a")
-                .count(),
-            6
-        );
-        assert_eq!(
-            selected
-                .iter()
-                .filter(|tenant| tenant.as_str() == "tenant-b")
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn scheduler_tenant_weights_apply_during_admission() {
-        let model = mock_scheduler_model("admission-shared");
-        let metrics = SchedulerMetrics::default();
-        let mut admission_fairness = TenantFairness::new(SchedulerConfig {
-            tenant_weights: std::collections::BTreeMap::from([
-                ("tenant-high".to_owned(), 3),
-                ("tenant-low".to_owned(), 1),
-            ]),
-            ..SchedulerConfig::default()
-        });
-        let mut queued = BinaryHeap::new();
-        let mut receivers = Vec::new();
-
-        for sequence in 0..4 {
-            let (tx, rx) = mpsc::channel();
-            receivers.push(rx);
-            queued.push(PrioritizedInferenceJob::new(
-                RouteQos::Standard.score(),
-                sequence,
-                mock_inference_job(&model, "tenant-low", tx),
-            ));
-        }
-        let (high_tx, high_rx) = mpsc::channel();
-        receivers.push(high_rx);
-        queued.push(PrioritizedInferenceJob::new(
-            RouteQos::Standard.score(),
-            4,
-            mock_inference_job(&model, "tenant-high", high_tx),
-        ));
-
-        let mut active = Vec::new();
-        admit_sequences(
-            &mut queued,
-            &mut active,
-            1,
-            &metrics,
-            &mut admission_fairness,
-        );
-
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].job.tenant_id(), "tenant-high");
-        assert_eq!(queued.len(), 4);
-    }
-
-    #[test]
-    fn scheduler_tenant_weights_do_not_batch_lower_weight_tenant_on_same_model() {
-        let model = adapter_echo_model("weighted-batch-shared");
-        let mut tenant_fairness = TenantFairness::new(SchedulerConfig {
-            tenant_weights: std::collections::BTreeMap::from([
-                ("tenant-high".to_owned(), 3),
-                ("tenant-low".to_owned(), 1),
-            ]),
-            ..SchedulerConfig::default()
-        });
-        let (tenant_high_tx, _tenant_high_rx) = mpsc::channel();
-        let (tenant_low_tx, _tenant_low_rx) = mpsc::channel();
-        let active = vec![
-            ActiveInferenceSequence {
-                qos_score: RouteQos::Standard.score(),
-                sequence: 0,
-                phase: InferenceSequencePhase::Decode,
-                job: mock_inference_job(&model, "tenant-high", tenant_high_tx),
-            },
-            ActiveInferenceSequence {
-                qos_score: RouteQos::Standard.score(),
-                sequence: 1,
-                phase: InferenceSequencePhase::Decode,
-                job: mock_inference_job(&model, "tenant-low", tenant_low_tx),
-            },
-        ];
-
-        let first = select_active_batch(
-            &active,
-            InferenceSequencePhase::Decode,
-            &mut tenant_fairness,
-        )
-        .expect("tenant should be selected");
-
-        assert_eq!(
-            first,
-            vec![0],
-            "configured tenant weights must not let another tenant hitchhike on a same-alias batch"
-        );
-    }
-
-    #[test]
-    fn scheduler_batches_distinct_lora_adapters_as_sub_batches_for_same_model() {
-        let model = adapter_echo_model("batch-shared");
-        let mut tenant_fairness = TenantFairness::new(SchedulerConfig::default());
-        let (tenant_a_tx_1, _tenant_a_rx_1) = mpsc::channel();
-        let (tenant_a_tx_2, _tenant_a_rx_2) = mpsc::channel();
-        let (base_tx, _base_rx) = mpsc::channel();
-        let (tenant_b_tx, _tenant_b_rx) = mpsc::channel();
-        let active = vec![
-            ActiveInferenceSequence {
-                qos_score: RouteQos::Standard.score(),
-                sequence: 0,
-                phase: InferenceSequencePhase::Decode,
-                job: mock_inference_job(&model, "tenant-a", tenant_a_tx_1),
-            },
-            ActiveInferenceSequence {
-                qos_score: RouteQos::Standard.score(),
-                sequence: 1,
-                phase: InferenceSequencePhase::Decode,
-                job: mock_inference_job(&model, "tenant-a", tenant_a_tx_2),
-            },
-            ActiveInferenceSequence {
-                qos_score: RouteQos::Standard.score(),
-                sequence: 2,
-                phase: InferenceSequencePhase::Decode,
-                job: InferenceJob {
-                    alias: model.alias.clone(),
-                    adapter: None,
-                    model: Arc::clone(&model),
-                    qos: model.qos,
-                    input: SharedInputTensor {
-                        dimensions: vec![1],
-                        ty: TensorType::U8,
-                        data: Arc::from(b"plain".as_slice()),
-                    },
-                    response_tx: base_tx,
-                },
-            },
-            ActiveInferenceSequence {
-                qos_score: RouteQos::Standard.score(),
-                sequence: 3,
-                phase: InferenceSequencePhase::Decode,
-                job: mock_inference_job(&model, "tenant-b", tenant_b_tx),
-            },
-        ];
-
-        let first = select_active_batch(
-            &active,
-            InferenceSequencePhase::Decode,
-            &mut tenant_fairness,
-        )
-        .expect("same base model should be selected");
-        assert_eq!(
-            first,
-            vec![0, 1, 2, 3],
-            "different adapters for the same model should share one scheduler step"
-        );
-
-        let batch = first
-            .iter()
-            .map(|index| active[*index].job.clone())
-            .collect::<Vec<_>>();
-        let outputs = process_batch(AcceleratorKind::Gpu, &batch)
-            .into_iter()
-            .map(|result| String::from_utf8(result.expect("sub-batch output").bytes).expect("utf8"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            outputs,
-            vec![
-                "tenant-a:tenant-a".to_owned(),
-                "tenant-a:tenant-a".to_owned(),
-                "base:plain".to_owned(),
-                "tenant-b:tenant-b".to_owned(),
-            ],
-            "adapter-specific sub-batches must route each output back to its original request"
-        );
-    }
-
-    #[test]
-    fn process_batch_uses_native_multi_adapter_batch_when_backend_supports_it() {
-        let backend = Arc::new(NativeAdapterBatchBackend::default());
-        let model = native_adapter_batch_model("native-batch-shared", Arc::clone(&backend));
-        let (tenant_a_tx, _tenant_a_rx) = mpsc::channel();
-        let (base_tx, _base_rx) = mpsc::channel();
-        let (tenant_b_tx, _tenant_b_rx) = mpsc::channel();
-        let batch = vec![
-            mock_inference_job(&model, "tenant-a", tenant_a_tx),
-            InferenceJob {
-                alias: model.alias.clone(),
-                adapter: None,
-                model: Arc::clone(&model),
-                qos: model.qos,
-                input: SharedInputTensor {
-                    dimensions: vec![1],
-                    ty: TensorType::U8,
-                    data: Arc::from(b"plain".as_slice()),
-                },
-                response_tx: base_tx,
-            },
-            mock_inference_job(&model, "tenant-b", tenant_b_tx),
-        ];
-
-        let outputs = process_batch(AcceleratorKind::Gpu, &batch)
-            .into_iter()
-            .map(|result| {
-                String::from_utf8(result.expect("native batch output").bytes).expect("utf8")
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            outputs,
-            vec![
-                "tenant-a:tenant-a".to_owned(),
-                "base:plain".to_owned(),
-                "tenant-b:tenant-b".to_owned(),
-            ]
-        );
-        assert_eq!(backend.native_batches.load(Ordering::SeqCst), 1);
-        assert_eq!(backend.sequential_adapter_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn process_batch_scopes_adapter_group_failures_to_matching_rows() {
-        let model = failing_adapter_model("adapter-failure-scope");
-        let (ok_tx, _ok_rx) = mpsc::channel();
-        let (base_tx, _base_rx) = mpsc::channel();
-        let (broken_tx, _broken_rx) = mpsc::channel();
-        let mut broken_job = mock_inference_job(&model, "broken", broken_tx);
-        broken_job.input.data = Arc::from(b"broken-input".as_slice());
-        let batch = vec![
-            mock_inference_job(&model, "tenant-ok", ok_tx),
-            InferenceJob {
-                alias: model.alias.clone(),
-                adapter: None,
-                model: Arc::clone(&model),
-                qos: model.qos,
-                input: SharedInputTensor {
-                    dimensions: vec![1],
-                    ty: TensorType::U8,
-                    data: Arc::from(b"plain".as_slice()),
-                },
-                response_tx: base_tx,
-            },
-            broken_job,
-        ];
-
-        let mut results = process_batch(AcceleratorKind::Gpu, &batch);
-        assert_eq!(
-            String::from_utf8(
-                results
-                    .remove(0)
-                    .expect("healthy adapter row should succeed")
-                    .bytes
-            )
-            .expect("utf8"),
-            "tenant-ok:tenant-ok"
-        );
-        assert_eq!(
-            String::from_utf8(results.remove(0).expect("base row should succeed").bytes)
-                .expect("utf8"),
-            "base:plain"
-        );
-        let error = results
-            .remove(0)
-            .expect_err("broken adapter row should fail independently");
-        assert!(
-            error.to_string().contains("adapter `broken` is malformed"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn realtime_qos_preempts_batch_backlog_on_gpu_scheduler() {
-        let batch_model = Arc::new(
-            CandleModel::load_mock(&IntegrityModelBinding {
-                alias: "gpu-batch".to_owned(),
-                path: "mock:gpu-batch".to_owned(),
-                device: ModelDevice::Cuda,
-                qos: RouteQos::Batch,
-                dynamic: false,
-                hardware_strategy: Default::default(),
-            })
-            .expect("batch model should load")
-            .with_mock_latency(Duration::from_millis(20)),
-        );
-        let realtime_model = Arc::new(
-            CandleModel::load_mock(&IntegrityModelBinding {
-                alias: "gpu-bot".to_owned(),
-                path: "mock:gpu-bot".to_owned(),
-                device: ModelDevice::Cuda,
-                qos: RouteQos::RealTime,
-                dynamic: false,
-                hardware_strategy: Default::default(),
-            })
-            .expect("realtime model should load")
-            .with_mock_latency(Duration::from_millis(20)),
-        );
-
-        let metrics = SchedulerMetrics::default();
-        metrics.queued_requests.store(2, Ordering::Relaxed);
-        metrics.record_enqueue(RouteQos::Batch);
-        metrics.record_enqueue(RouteQos::RealTime);
-        let mut queued = BinaryHeap::new();
-        let (batch_tx, batch_rx) = mpsc::channel();
-        let (realtime_tx, realtime_rx) = mpsc::channel();
-        let mut active = vec![ActiveInferenceSequence {
-            qos_score: RouteQos::Batch.score(),
-            sequence: 0,
-            phase: InferenceSequencePhase::Decode,
-            job: InferenceJob {
-                alias: batch_model.alias.clone(),
-                adapter: None,
-                model: Arc::clone(&batch_model),
-                qos: batch_model.qos,
-                input: SharedInputTensor {
-                    dimensions: vec![1],
-                    ty: TensorType::U8,
-                    data: Arc::from(b"batch".as_slice()),
-                },
-                response_tx: batch_tx,
-            },
-        }];
-        queued.push(PrioritizedInferenceJob::new(
-            RouteQos::RealTime.score(),
-            1,
-            InferenceJob {
-                alias: realtime_model.alias.clone(),
-                adapter: None,
-                model: Arc::clone(&realtime_model),
-                qos: realtime_model.qos,
-                input: SharedInputTensor {
-                    dimensions: vec![1],
-                    ty: TensorType::U8,
-                    data: Arc::from(b"realtime".as_slice()),
-                },
-                response_tx: realtime_tx,
-            },
-        ));
-
-        let mut admission_fairness = TenantFairness::new(SchedulerConfig::default());
-        admit_sequences(
-            &mut queued,
-            &mut active,
-            2,
-            &metrics,
-            &mut admission_fairness,
-        );
-        let mut tenant_fairness = TenantFairness::new(SchedulerConfig::default());
-        run_continuous_step(
-            AcceleratorKind::Gpu,
-            &mut active,
-            &metrics,
-            &mut tenant_fairness,
-            &SchedulerConfig::default(),
-        );
-        run_continuous_step(
-            AcceleratorKind::Gpu,
-            &mut active,
-            &metrics,
-            &mut tenant_fairness,
-            &SchedulerConfig::default(),
-        );
-
-        let _ = realtime_rx
-            .recv()
-            .expect("realtime response should arrive")
-            .expect("realtime inference should succeed");
-        assert!(
-            batch_rx.try_recv().is_err(),
-            "active batch decode should not complete before inserted realtime decode"
-        );
-        run_continuous_step(
-            AcceleratorKind::Gpu,
-            &mut active,
-            &metrics,
-            &mut tenant_fairness,
-            &SchedulerConfig::default(),
-        );
-        let _ = batch_rx
-            .recv()
-            .expect("batch response should arrive")
-            .expect("batch inference should succeed");
-
-        let completed_aliases = metrics
-            .completed_aliases
-            .lock()
-            .expect("scheduler completion log should not be poisoned")
-            .clone();
-        let realtime_prefill_position = completed_aliases
-            .iter()
-            .position(|alias| alias == "gpu-bot:prefill")
-            .expect("realtime prefill should complete");
-        let realtime_decode_position = completed_aliases
-            .iter()
-            .position(|alias| alias == "gpu-bot:decode")
-            .expect("realtime decode should complete");
-        let batch_decode_position = completed_aliases
-            .iter()
-            .position(|alias| alias == "gpu-batch:decode")
-            .expect("batch decode should complete");
-        assert!(realtime_prefill_position < realtime_decode_position);
-        assert!(
-            realtime_decode_position < batch_decode_position,
-            "realtime decode should be inserted ahead of an active batch decode"
-        );
-        assert_eq!(
-            metrics.kv_recompute_preemptions.load(Ordering::Relaxed),
-            1,
-            "one lower-tier KV context should be marked for recompute"
-        );
-        assert_eq!(metrics.kv_swap_preemptions.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn a_binding_opens_from_any_interface_and_runs_on_its_own_device() {
-        let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![
-            IntegrityModelBinding {
-                alias: "llama3".to_owned(),
-                path: "mock:llama3".to_owned(),
-                device: ModelDevice::Cuda,
-                qos: RouteQos::RealTime,
-                dynamic: false,
-                hardware_strategy: Default::default(),
-            },
-            IntegrityModelBinding {
-                alias: "tiny".to_owned(),
-                path: "mock:tiny".to_owned(),
-                device: ModelDevice::Cpu,
-                qos: RouteQos::Batch,
-                dynamic: false,
-                hardware_strategy: Default::default(),
-            },
-        ];
-        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
-            routes: vec![route],
-            ..IntegrityConfig::default_sealed()
-        })
-        .expect("runtime should build");
-
-        assert!(runtime.supports_accelerator(AcceleratorKind::Cpu));
-        assert!(runtime.supports_accelerator(AcceleratorKind::Gpu));
-        assert!(runtime.supports_accelerator(AcceleratorKind::Npu));
-        assert!(runtime.supports_accelerator(AcceleratorKind::Tpu));
-        assert!(runtime
-            .load_component_model("llama3", AcceleratorKind::Gpu)
-            .is_ok());
-        // A GPU-bound alias opens through the CPU interface too. This used to
-        // be refused, which made every `device: cuda`/`metal` binding
-        // unreachable from `/ai/v1/chat/completions` — `guest-openai` imports
-        // only `tachyon:accelerator/cpu`, so that is the one interface the
-        // public route can open an alias with. The binding still executes on
-        // its own device: the scheduler dispatches on `model.accelerator`, not
-        // on how the handle was obtained.
-        assert!(runtime
-            .load_component_model("llama3", AcceleratorKind::Cpu)
-            .is_ok());
-        assert!(runtime
-            .load_component_model("tiny", AcceleratorKind::Tpu)
-            .is_ok());
-        assert_eq!(
-            runtime
-                .compute_component_prompt("llama3", "hello")
-                .expect("component compute should succeed"),
-            MOCK_INFERENCE_RESPONSE
-        );
-        // The binding is still recorded on its own lane: opening it from the
-        // CPU interface must not move where it executes, only permit the
-        // handle. Scheduling reads this, not the interface.
-        let models = runtime.models.read().expect("model registry lock");
-        assert_eq!(
-            models
-                .get("llama3")
-                .expect("llama3 should be loaded")
-                .accelerator,
-            AcceleratorKind::Gpu
-        );
-    }
-
-    #[test]
-    fn load_component_model_honestly_resolves_npu_and_tpu_fallbacks() {
-        // `supports_accelerator` reports `Npu`/`Tpu` as a valid scheduling
-        // lane (it is, for QoS/batching purposes), but without an initialized
-        // vendor runner the request resolves to CPU. A model pinned to the
-        // unavailable vendor device must not silently execute elsewhere.
-        let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![
-            IntegrityModelBinding {
-                alias: "npu-whisper".to_owned(),
-                path: "mock:npu-whisper".to_owned(),
-                device: ModelDevice::Npu,
-                qos: RouteQos::RealTime,
-                dynamic: false,
-                hardware_strategy: Default::default(),
-            },
-            IntegrityModelBinding {
-                alias: "tpu-embed".to_owned(),
-                path: "mock:tpu-embed".to_owned(),
-                device: ModelDevice::Tpu,
-                qos: RouteQos::Batch,
-                dynamic: false,
-                hardware_strategy: Default::default(),
-            },
-        ];
-        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
-            routes: vec![route],
-            ..IntegrityConfig::default_sealed()
-        })
-        .expect("runtime should build");
-
-        let npu_error = runtime
-            .load_component_model("npu-whisper", AcceleratorKind::Npu)
-            .expect_err("npu dispatch should be rejected: no backend is wired");
-        assert!(npu_error.contains("resolved to `cpu`"), "{npu_error}");
-
-        let tpu_error = runtime
-            .load_component_model("tpu-embed", AcceleratorKind::Tpu)
-            .expect_err("tpu dispatch should be rejected: no backend is wired");
-        assert!(tpu_error.contains("resolved to `cpu`"), "{tpu_error}");
-
-        // The pre-existing internal mock-compute path (bypassing the
-        // guest-facing dispatch boundary above) is unaffected: it exercises
-        // the runtime's own batching/QoS plumbing, not a real accelerator.
-        assert_eq!(
-            runtime
-                .compute_component_prompt("npu-whisper", "ping")
-                .expect("internal mock compute should still succeed"),
-            MOCK_INFERENCE_RESPONSE
-        );
-    }
-
-    #[test]
-    fn component_accelerator_runtime_loads_lora_adapter_for_single_call() {
-        let _env_guard = model_broker_env_guard();
-        let adapter_root = std::env::temp_dir().join(format!(
-            "tachyon-lora-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time should be valid")
-                .as_nanos()
-        ));
-        let adapter_dir = adapter_root.join("adapters");
-        fs::create_dir_all(&adapter_dir).expect("adapter dir should be created");
-        fs::write(adapter_dir.join("tenant-a.safetensors"), b"mock-lora")
-            .expect("adapter should be written");
-        std::env::set_var(MODEL_BROKER_DIR_ENV, &adapter_root);
-
-        let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
-            alias: "llama3".to_owned(),
-            path: "mock:llama3".to_owned(),
-            device: ModelDevice::Cuda,
-            qos: RouteQos::RealTime,
+    fn explicit_magnetar_binding_rejects_non_qwen_model_directory() {
+        let model_dir = unique_model_dir("non-qwen");
+        std::fs::create_dir_all(&model_dir).expect("fixture dir should be created");
+        std::fs::write(model_dir.join("config.json"), br#"{"model_type":"llama"}"#)
+            .expect("config should be written");
+        std::fs::write(model_dir.join("model.safetensors"), b"weights")
+            .expect("weights should be written");
+        let error = match load_binding(&IntegrityModelBinding {
+            alias: "llama".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
-        }];
-        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
-            routes: vec![route],
-            ..IntegrityConfig::default_sealed()
-        })
-        .expect("runtime should build");
+        }) {
+            Ok(_) => panic!("Magnetar cutover accepts only Qwen directories"),
+            Err(error) => error,
+        };
 
-        assert_eq!(
-            runtime
-                .compute_component_prompt_with_adapter("llama3", "hello", Some("tenant-a"))
-                .expect("adapter-backed inference should succeed")
-                .text,
-            MOCK_INFERENCE_RESPONSE
-        );
-        let missing = runtime
-            .compute_component_prompt_with_adapter("llama3", "hello", Some("tenant-b"))
-            .expect_err("missing adapter must fail before inference");
-        assert!(missing.message.contains("tenant-b"));
-        assert!(missing.message.contains("adapters"));
-        assert!(runtime
-            .compute_component_prompt_with_adapter("llama3", "hello", Some("../bad"))
-            .is_err());
-
-        std::env::remove_var(MODEL_BROKER_DIR_ENV);
-        let _ = fs::remove_dir_all(adapter_root);
+        assert!(error
+            .to_string()
+            .contains("expected a Qwen safetensors directory"));
+        let _ = std::fs::remove_dir_all(model_dir);
     }
 
     #[test]
-    fn candle_lora_linear_from_pinned_fork_applies_active_adapter() {
-        use candle_core::{DType, Device, Tensor};
-        use candle_nn::{linear_no_bias, lora::LoraLinear, Module, VarBuilder, VarMap};
+    fn local_non_qwen_candle_style_directory_is_rejected() {
+        let model_dir = unique_model_dir("legacy-candle");
+        std::fs::create_dir_all(&model_dir).expect("fixture dir should be created");
+        std::fs::write(model_dir.join("config.json"), br#"{"model_type":"llama"}"#)
+            .expect("config should be written");
 
-        let device = Device::Cpu;
-        let mut base_vars = VarMap::new();
-        let base_vb = VarBuilder::from_varmap(&base_vars, DType::F32, &device);
-        let base = linear_no_bias(3, 2, base_vb.pp("q_proj")).expect("base linear");
-        base_vars
-            .set_one(
-                "q_proj.weight",
-                Tensor::new(&[[1f32, 0., 0.], [0., 1., 0.]], &device).expect("base weight"),
-            )
-            .expect("set base weight");
-
-        let mut adapter_vars = VarMap::new();
-        let adapter_vb = VarBuilder::from_varmap(&adapter_vars, DType::F32, &device);
-        let lora = LoraLinear::from_peft(base, adapter_vb.pp("q_proj"), 2, 4.0)
-            .expect("LoRA adapter should load through candle-nn");
-        adapter_vars
-            .set_one(
-                "q_proj.lora_A.weight",
-                Tensor::new(&[[1f32, 0., 0.], [0., 1., 0.]], &device).expect("lora A"),
-            )
-            .expect("set lora A");
-        adapter_vars
-            .set_one(
-                "q_proj.lora_B.weight",
-                Tensor::new(&[[1f32, 0.], [0., 1.]], &device).expect("lora B"),
-            )
-            .expect("set lora B");
-
-        let output = lora
-            .forward(&Tensor::new(&[[1f32, 2., 3.]], &device).expect("input"))
-            .expect("LoRA forward");
-        assert_eq!(output.to_vec2::<f32>().expect("output"), vec![vec![3., 6.]]);
-    }
-
-    #[test]
-    fn heterogeneous_runtime_routes_models_to_dedicated_accelerators() {
-        let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![
-            IntegrityModelBinding {
-                alias: "cpu-bert".to_owned(),
-                path: "mock:cpu-bert".to_owned(),
-                device: ModelDevice::Cpu,
-                qos: RouteQos::Standard,
-                dynamic: false,
-                hardware_strategy: Default::default(),
-            },
-            IntegrityModelBinding {
-                alias: "gpu-llama".to_owned(),
-                path: "mock:gpu-llama".to_owned(),
-                device: ModelDevice::Cuda,
-                qos: RouteQos::RealTime,
-                dynamic: false,
-                hardware_strategy: Default::default(),
-            },
-            IntegrityModelBinding {
-                alias: "npu-whisper".to_owned(),
-                path: "mock:npu-whisper".to_owned(),
-                device: ModelDevice::Npu,
-                qos: RouteQos::RealTime,
-                dynamic: false,
-                hardware_strategy: Default::default(),
-            },
-            IntegrityModelBinding {
-                alias: "tpu-embed".to_owned(),
-                path: "mock:tpu-embed".to_owned(),
-                device: ModelDevice::Tpu,
-                qos: RouteQos::Batch,
-                dynamic: false,
-                hardware_strategy: Default::default(),
-            },
-        ];
-        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
-            routes: vec![route],
-            ..IntegrityConfig::default_sealed()
-        })
-        .expect("runtime should build");
-
-        assert_eq!(
-            runtime
-                .compute_component_prompt("cpu-bert", "ping")
-                .expect("cpu inference should succeed"),
-            MOCK_INFERENCE_RESPONSE
-        );
-        assert_eq!(
-            runtime
-                .compute_component_prompt("gpu-llama", "ping")
-                .expect("gpu inference should succeed"),
-            MOCK_INFERENCE_RESPONSE
-        );
-        assert_eq!(
-            runtime
-                .compute_component_prompt("npu-whisper", "ping")
-                .expect("npu inference should succeed"),
-            MOCK_INFERENCE_RESPONSE
-        );
-        assert_eq!(
-            runtime
-                .compute_component_prompt("tpu-embed", "ping")
-                .expect("tpu inference should succeed"),
-            MOCK_INFERENCE_RESPONSE
-        );
-
-        assert_eq!(
-            runtime.model_memory_residency("cpu-bert"),
-            Some(AcceleratorMemoryResidency::HostRam)
-        );
-        assert_eq!(
-            runtime.model_memory_residency("gpu-llama"),
-            Some(AcceleratorMemoryResidency::Vram)
-        );
-        assert_eq!(
-            runtime.model_memory_residency("npu-whisper"),
-            Some(AcceleratorMemoryResidency::Sram)
-        );
-        assert_eq!(
-            runtime.model_memory_residency("tpu-embed"),
-            Some(AcceleratorMemoryResidency::Sram)
-        );
-
-        assert_eq!(
-            runtime
-                .scheduler_snapshot(AcceleratorKind::Cpu)
-                .requests_processed,
-            1
-        );
-        assert_eq!(
-            runtime
-                .scheduler_snapshot(AcceleratorKind::Gpu)
-                .requests_processed,
-            1
-        );
-        assert_eq!(
-            runtime
-                .scheduler_snapshot(AcceleratorKind::Npu)
-                .requests_processed,
-            1
-        );
-        assert_eq!(
-            runtime
-                .scheduler_snapshot(AcceleratorKind::Tpu)
-                .requests_processed,
-            1
-        );
-    }
-
-    #[test]
-    fn turboquant_round_trip_through_native_rust_implementation() {
-        // Previously this test compared the host's TurboQuant decompressor against
-        // pre-recorded byte fixtures produced by the C++ FFI shim, to assert the
-        // Rust Ã¢â€ â€ C++ round-trip. The C++ shim is gone; the fixtures went with it.
-        // We now build a representative input from the 2-bit codebook directly,
-        // round-trip it through the same custom-op the production inference path
-        // uses, and assert the output matches the input. This is a stronger test
-        // than the old fixture comparison because it exercises the full
-        // `apply_op2_no_bwd` integration end-to-end with no external state.
-        let source: Vec<f32> = (0..64)
-            .map(|i| match i % 4 {
-                0 => -1.0,
-                1 => -0.333_333_34,
-                2 => 0.333_333_34,
-                _ => 1.0,
-            })
-            .collect();
-        let packed = turboquant_sys::compress_values(&source, 2).expect("packing should succeed");
-        let value_count = source.len();
-        let packed_tensor = CandleTensor::from_vec(packed.clone(), (packed.len(),), &Device::Cpu)
-            .expect("packed tensor should build");
-        let attention =
-            CandleTensor::from_vec(vec![1.0f32; value_count], (value_count,), &Device::Cpu)
-                .expect("attention tensor should build");
-
-        let restored = packed_tensor
-            .apply_op2_no_bwd(
-                &attention,
-                &TurboQuantDecompressor {
-                    bits: 2,
-                    threshold: 0.0,
-                    value_count,
-                },
-            )
-            .expect("TurboQuant custom op should restore values");
-        let actual = restored
-            .to_vec1::<f32>()
-            .expect("restored tensor should convert to a vec");
-        assert_eq!(actual, source);
-    }
-
-    #[test]
-    fn boundary_layers_bypass_turboquant_value_compression() {
-        let stack = TurboQuantAttentionStack::default();
-
-        let decisions = (0..stack.total_layers)
-            .map(|layer_idx| stack.layer_decision(layer_idx))
-            .collect::<Vec<_>>();
-
-        assert_eq!(decisions[0].k_precision, KvPrecision::Q8_0);
-        assert_eq!(decisions[1].k_precision, KvPrecision::Q8_0);
-        assert!(!decisions[0].v_compressed);
-        assert!(!decisions[1].v_compressed);
-        assert!(decisions[2].v_compressed);
-        assert!(decisions[3].v_compressed);
-        assert!(decisions[4].v_compressed);
-        assert!(decisions[5].v_compressed);
-        assert!(!decisions[6].v_compressed);
-        assert!(!decisions[7].v_compressed);
-    }
-
-    #[test]
-    fn sparse_decode_skips_low_attention_values() {
-        let source = vec![-1.0f32, -0.33333334f32, 0.33333334f32, 1.0f32];
-        let packed = turboquant_sys::compress_values(&source, 2).expect("packing should succeed");
-        let packed_tensor =
-            CandleTensor::from_vec(packed, (1,), &Device::Cpu).expect("packed tensor should build");
-        let attention = CandleTensor::from_vec(vec![1.0f32, 0.0, 0.5, 0.0], (4,), &Device::Cpu)
-            .expect("attention tensor should build");
-
-        let restored = packed_tensor
-            .apply_op2_no_bwd(
-                &attention,
-                &TurboQuantDecompressor {
-                    bits: 2,
-                    threshold: 0.1,
-                    value_count: 4,
-                },
-            )
-            .expect("TurboQuant sparse decode should succeed")
-            .to_vec1::<f32>()
-            .expect("restored tensor should convert");
-
-        assert_eq!(restored, vec![-1.0, 0.0, 0.33333334, 0.0]);
-    }
-
-    /// A dynamic binding cannot be an upstream, so it cannot collide as one.
-    ///
-    /// `ensure_model_loaded` replaces a dynamic binding's path with the broker
-    /// directory the upload landed in, so its declared path says nothing about
-    /// where requests go. Counting it let two dynamic aliases that normalise to
-    /// the same credential suffix — `vendor-a` and `vendor_a` — refuse the
-    /// whole boot over a variable neither would ever read.
-    #[test]
-    fn dynamic_aliases_do_not_collide_over_credentials_they_never_use() {
-        let colliding = |dynamic: bool| {
-            let mut route = IntegrityRoute::user("/api/guest-ai");
-            route.models = ["vendor-a", "vendor_a"]
-                .into_iter()
-                .map(|alias| IntegrityModelBinding {
-                    alias: alias.to_owned(),
-                    path: "openai:http://up.invalid/v1".to_owned(),
+        let error = match AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![{
+                let mut route = IntegrityRoute::user("/api/guest-ai");
+                route.models = vec![IntegrityModelBinding {
+                    alias: "llama".to_owned(),
+                    path: model_dir.to_string_lossy().into_owned(),
                     device: ModelDevice::Cpu,
                     qos: RouteQos::Standard,
-                    dynamic,
+                    dynamic: false,
                     hardware_strategy: Default::default(),
-                })
-                .collect();
-            IntegrityConfig {
-                routes: vec![route],
-                ..IntegrityConfig::default_sealed()
+                }];
+                route
+            }],
+            ..IntegrityConfig::default_sealed()
+        }) {
+            Ok(_) => panic!("legacy Candle directories must not load"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("Magnetar cutover accepts"));
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn buffered_generation_rejects_lora_adapter_instead_of_ignoring_it() {
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![{
+                let mut route = IntegrityRoute::user("/api/guest-ai");
+                route.models = vec![IntegrityModelBinding {
+                    alias: "mock-model".to_owned(),
+                    path: "mock".to_owned(),
+                    device: ModelDevice::Cpu,
+                    qos: RouteQos::Standard,
+                    dynamic: false,
+                    hardware_strategy: Default::default(),
+                }];
+                route
+            }],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("runtime");
+
+        let error = runtime
+            .compute_component_prompt_with_adapter("mock-model", "hello", Some("adapter-a"))
+            .expect_err("adapter injection must not silently use the base model");
+
+        assert!(error.invalid_request);
+        assert!(error.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn streaming_generation_rejects_lora_adapter_as_invalid_request() {
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![{
+                let mut route = IntegrityRoute::user("/api/guest-ai");
+                route.models = vec![IntegrityModelBinding {
+                    alias: "mock-model".to_owned(),
+                    path: "mock".to_owned(),
+                    device: ModelDevice::Cpu,
+                    qos: RouteQos::Standard,
+                    dynamic: false,
+                    hardware_strategy: Default::default(),
+                }];
+                route
+            }],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("runtime");
+        struct TestSink;
+        impl StreamSink for TestSink {
+            fn emit(&mut self, _event: StreamEvent<'_>) -> StreamControl {
+                StreamControl::Continue
             }
-        };
+        }
+        let mut sink = TestSink;
 
-        let upstream_aliases = |config: &IntegrityConfig| {
-            config
-                .routes
-                .iter()
-                .flat_map(|route| route.models.iter())
-                .filter(|binding| binding_runs_upstream(binding))
-                .map(|binding| binding.alias.clone())
-                .collect::<Vec<_>>()
-        };
+        let error = runtime
+            .stream_component_prompt("mock-model", "hello", Some("adapter-a"), &mut sink)
+            .expect_err("streaming adapter injection must be a client error");
 
-        // Non-dynamic: both really do load as upstreams, and one would send the
-        // other's key to a third party. That still refuses the boot.
-        let statics = upstream_aliases(&colliding(false));
-        assert!(
-            assert_no_credential_collisions(statics.iter().map(String::as_str)).is_err(),
-            "two real upstreams sharing a credential suffix must not boot"
-        );
-
-        // Dynamic: nothing here will ever read a credential.
-        let dynamics = upstream_aliases(&colliding(true));
-        assert!(
-            dynamics.is_empty(),
-            "a dynamic binding is not an upstream, whatever its declared path says"
-        );
-        assert!(assert_no_credential_collisions(dynamics.iter().map(String::as_str)).is_ok());
+        assert!(error.invalid_request);
+        assert!(error.to_string().contains("adapter-a"));
     }
 
-    fn config_with_model(alias: &str) -> IntegrityConfig {
+    #[test]
+    fn dynamic_openai_placeholders_do_not_collide_as_upstream_credentials() {
         let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
-            alias: alias.to_owned(),
-            path: format!("mock:{alias}"),
-            device: ModelDevice::Cpu,
-            qos: RouteQos::Standard,
-            dynamic: false,
-            hardware_strategy: Default::default(),
-        }];
-        IntegrityConfig {
+        route.models = vec![
+            IntegrityModelBinding {
+                alias: "vendor-a".to_owned(),
+                path: "openai:http://placeholder.invalid/v1".to_owned(),
+                device: ModelDevice::Cpu,
+                qos: RouteQos::Standard,
+                dynamic: true,
+                hardware_strategy: Default::default(),
+            },
+            IntegrityModelBinding {
+                alias: "vendor_a".to_owned(),
+                path: "openai:http://placeholder.invalid/v1".to_owned(),
+                device: ModelDevice::Cpu,
+                qos: RouteQos::Standard,
+                dynamic: true,
+                hardware_strategy: Default::default(),
+            },
+        ];
+
+        AiInferenceRuntime::from_config(&IntegrityConfig {
             routes: vec![route],
             ..IntegrityConfig::default_sealed()
-        }
+        })
+        .expect("dynamic placeholders should not be validated as upstream credentials");
     }
 
-    fn config_with_real_candle_model(alias: &str, path: &std::path::Path) -> IntegrityConfig {
-        let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
-            alias: alias.to_owned(),
-            path: path.to_string_lossy().into_owned(),
-            device: ModelDevice::Cpu,
-            qos: RouteQos::Standard,
-            dynamic: false,
-            hardware_strategy: Default::default(),
-        }];
-        IntegrityConfig {
-            routes: vec![route],
-            ..IntegrityConfig::default_sealed()
-        }
-    }
+    #[test]
+    fn queue_tier_snapshot_tracks_active_local_execution_depths() {
+        let runtime =
+            AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed()).expect("runtime");
 
-    fn unique_candle_llm_dir(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "tachyon-candle-llm-{name}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time should be valid")
-                .as_nanos()
-        ))
-    }
-
-    fn write_tiny_lora_adapter(path: &std::path::Path, value: f32) -> anyhow::Result<()> {
-        let rank = 2usize;
-        let hidden = candle_llm_runtime::FIXTURE_HIDDEN_SIZE;
-        let mut tensors = HashMap::new();
-        for layer in 0..candle_llm_runtime::FIXTURE_NUM_LAYERS {
-            tensors.insert(
-                format!("model.layers.{layer}.self_attn.q_proj.lora_A.weight"),
-                CandleTensor::from_vec(vec![value; rank * hidden], (rank, hidden), &Device::Cpu)?,
-            );
-            tensors.insert(
-                format!("model.layers.{layer}.self_attn.q_proj.lora_B.weight"),
-                CandleTensor::from_vec(vec![value; hidden * rank], (hidden, rank), &Device::Cpu)?,
+        {
+            let _guard = runtime.track_queue_depth(AcceleratorKind::Gpu, RouteQos::RealTime);
+            assert_eq!(
+                runtime.queue_tier_snapshot(AcceleratorKind::Gpu),
+                QueueTierSnapshot {
+                    realtime: 1,
+                    standard: 0,
+                    batch: 0,
+                }
             );
         }
-        candle_core::safetensors::save(&tensors, path)?;
-        Ok(())
+
+        assert_eq!(
+            runtime.queue_tier_snapshot(AcceleratorKind::Gpu),
+            QueueTierSnapshot::default()
+        );
     }
 
     #[test]
-    fn semantic_flattener_assigns_ordered_cache_keys() {
-        let ctx = serde_json::json!({
-            "messages": [
-                { "role": "system", "content": "You are a helpful assistant." },
-                { "role": "user",      "turn_id": "t1", "content": "Hello" },
-                { "role": "assistant", "turn_id": "t1", "content": "Hi there!" },
-                { "role": "user",      "turn_id": "t2", "content": "How are you?" },
-            ]
-        });
-        let flattener = SemanticContextFlattener::new();
-        let chunks = flattener.flatten(&ctx);
+    fn accelerator_support_is_derived_from_loaded_models() {
+        let runtime =
+            AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed()).expect("runtime");
 
-        assert_eq!(chunks.len(), 4);
-        assert_eq!(chunks[0].cache_key, "sys:0:0");
-        assert!(chunks[0]
-            .markers
-            .contains(&ContextMarker::SystemPromptBoundary));
-        assert_eq!(chunks[1].cache_key, "usr:1:t1");
-        assert!(chunks[1]
-            .markers
-            .contains(&ContextMarker::ConversationTurnStart {
-                turn_id: "t1".to_owned()
-            }));
-        assert_eq!(chunks[2].cache_key, "ast:1:t1");
-        assert_eq!(chunks[3].cache_key, "usr:2:t2");
+        assert!(runtime.supports_accelerator(AcceleratorKind::Cpu));
+        assert!(!runtime.supports_accelerator(AcceleratorKind::Gpu));
+        assert!(!runtime.supports_accelerator(AcceleratorKind::Npu));
+        assert!(!runtime.supports_accelerator(AcceleratorKind::Tpu));
     }
 
     #[test]
-    fn semantic_flattener_falls_back_to_legacy_for_plain_string() {
-        let ctx = serde_json::json!("just a plain prompt");
-        let flattener = SemanticContextFlattener::new();
-        let chunks = flattener.flatten(&ctx);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].cache_key, "legacy:0");
-    }
+    fn upstream_admission_bounds_concurrent_work() {
+        let gate = UpstreamAdmission::new(1);
+        {
+            let mut state = gate.state.lock().expect("admission lock");
+            state.in_flight = 1;
+            state.waiting = 1;
+        }
 
-    #[test]
-    fn layer_ring_buffer_push_get_evict() {
-        let mut buf = LayerRingBuffer::new(3);
-        let t0 = CandleTensor::zeros((4,), DType::F32, &Device::Cpu).expect("create zeros tensor");
-        let t1 = CandleTensor::ones((4,), DType::F32, &Device::Cpu).expect("create ones tensor");
-        buf.push(t0);
-        buf.push(t1);
-        assert!(buf.get(0).is_some());
-        assert!(buf.get(1).is_some());
-        assert!(buf.get(2).is_none());
-        buf.evict_oldest();
-        // slot 0 was the oldest and is now None
-        assert!(buf.get(0).is_none());
-    }
+        match gate.acquire() {
+            Err(UpstreamAdmissionError::QueueFull { waiting, limit }) => {
+                assert_eq!(waiting, 1);
+                assert_eq!(limit, 1);
+            }
+            _ => panic!("expected queue-full admission error"),
+        }
 
-    #[test]
-    fn kv_cache_slice_append_and_keys_tensor() {
-        let mut slice = KvCacheSlice {
-            layer_idx: 0,
-            keys: vec![vec![1.0f32, 2.0f32]],
-            values: vec![vec![3.0f32, 4.0f32]],
-        };
-        slice.append_token(vec![5.0f32, 6.0f32], vec![7.0f32, 8.0f32]);
-        assert_eq!(slice.keys.len(), 2);
-        let t = slice.keys_tensor().expect("tensor should build");
-        assert_eq!(t.dims(), &[2, 2]);
-    }
-
-    #[test]
-    fn memory_profile_default_is_performance() {
-        assert_eq!(MemoryProfile::default(), MemoryProfile::Performance);
-    }
-
-    #[test]
-    fn per_request_execution_telemetry_records_selected_target() {
-        let runtime = AiInferenceRuntime::from_config(&config_with_model("telemetry-model"))
-            .expect("runtime");
-        runtime
-            .compute_component_prompt("telemetry-model", "hello")
-            .expect("compute");
-        let records = inference_execution_telemetry();
-        assert!(records.iter().any(|record| {
-            record.alias == "telemetry-model" && record.executed_on == "cpu" && record.succeeded
-        }));
+        assert_eq!(gate.in_flight(), 1);
+        gate.release();
+        assert_eq!(gate.in_flight(), 0);
     }
 }

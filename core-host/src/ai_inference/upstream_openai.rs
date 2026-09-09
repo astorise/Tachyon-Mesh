@@ -32,10 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
 
-use super::candle_llm_runtime::{
-    TokenUsage, HOST_MAX_GENERATION_DEADLINE, MAX_PROMPT_BYTES_CEILING,
-};
-use super::{StreamEvent, StreamOutcome, StreamSink, ToolCall};
+use super::{StreamEvent, StreamOutcome, StreamSink, TokenUsage, ToolCall};
 // Named only by the tests now: the backend reaches `StreamControl` through
 // `StreamSink::emit`'s return value rather than constructing one.
 #[cfg(test)]
@@ -82,6 +79,8 @@ pub(crate) const UPSTREAM_MAX_NEW_TOKENS: usize = 8192;
 /// Applied when a request omits `max_new_tokens`, so the upstream's own default
 /// (possibly unlimited) never governs the budget.
 pub(crate) const UPSTREAM_DEFAULT_MAX_NEW_TOKENS: usize = 2048;
+const HOST_MAX_GENERATION_DEADLINE: Duration = Duration::from_secs(300);
+const MAX_PROMPT_BYTES_CEILING: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub(crate) enum UpstreamError {
