@@ -393,7 +393,10 @@ pub(crate) fn binding_tool_call_parser(path: &str) -> Option<&'static str> {
         if path.starts_with(crate::ai_inference::UPSTREAM_SCHEME) {
             return None;
         }
-        crate::ai_inference::detect_tool_call_parser(std::path::Path::new(path))
+        let metadata_path = path
+            .strip_prefix(crate::ai_inference::MAGNETAR_PATH_PREFIX)
+            .unwrap_or(path);
+        crate::ai_inference::detect_tool_call_parser(std::path::Path::new(metadata_path))
     }
     #[cfg(not(feature = "ai-inference"))]
     {
@@ -1773,6 +1776,33 @@ mod configured_binding_registry_tests {
             row["withdrawn"], true,
             "a row that no longer describes what the path holds must not stay advertised"
         );
+    }
+
+    #[test]
+    fn configured_magnetar_binding_strips_scheme_before_parser_probe() {
+        let (store, dir) = temp_store();
+        let model_dir = dir.join("local-coder");
+        std::fs::create_dir_all(&model_dir).expect("model dir");
+        std::fs::write(model_dir.join("config.json"), br#"{"model_type":"qwen3"}"#)
+            .expect("config");
+
+        let config = config_with(vec![binding(
+            "local-coder",
+            &format!("magnetar:{}", model_dir.display()),
+            false,
+        )]);
+        publish_configured_model_bindings(&store, &config);
+
+        let published = store
+            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "local-coder")
+            .expect("read")
+            .expect("the binding publishes a row");
+        let published: serde_json::Value = serde_json::from_slice(&published).expect("row json");
+        assert_eq!(
+            published["toolCallParser"], "qwen",
+            "the publisher must probe the real filesystem path, not `magnetar:<path>`"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// The converse: an untouched directory costs no availability.

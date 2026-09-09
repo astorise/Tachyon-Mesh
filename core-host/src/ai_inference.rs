@@ -1,5 +1,7 @@
 #[path = "ai_inference/magnetar_runtime.rs"]
 mod magnetar_runtime;
+#[path = "ai_inference/upstream_openai.rs"]
+mod upstream_openai;
 
 use anyhow::{anyhow, Result};
 use std::{
@@ -14,10 +16,19 @@ use wasmtime_wasi_nn::{
 use crate::{IntegrityConfig, IntegrityModelBinding, RouteQos};
 
 pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
+pub(crate) use magnetar_runtime::MAGNETAR_PATH_PREFIX;
 const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
 
 pub(crate) fn binding_runs_upstream(binding: &IntegrityModelBinding) -> bool {
     !binding.dynamic && binding.path.trim().starts_with(UPSTREAM_SCHEME)
+}
+
+pub(crate) fn upstream_max_concurrency() -> usize {
+    std::env::var("TACHYON_UPSTREAM_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(32)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -182,6 +193,20 @@ impl GenerationError {
     }
 }
 
+impl From<upstream_openai::UpstreamError> for GenerationError {
+    fn from(error: upstream_openai::UpstreamError) -> Self {
+        let upstream_status = error.http_status();
+        let invalid_request =
+            matches!(error, upstream_openai::UpstreamError::InvalidRequest { .. });
+        Self {
+            message: error.to_string(),
+            upstream_status,
+            class: None,
+            invalid_request,
+        }
+    }
+}
+
 impl std::fmt::Display for GenerationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
@@ -244,7 +269,7 @@ impl GraphRegistry for EmptyGraphRegistry {
 enum ModelRuntime {
     Mock { accelerator: AcceleratorKind },
     Magnetar(Arc<magnetar_runtime::MagnetarRuntime>),
-    UpstreamPlaceholder,
+    Upstream(Arc<upstream_openai::UpstreamOpenAiRuntime>),
 }
 
 #[derive(Clone)]
@@ -265,7 +290,7 @@ impl LoadedModel {
                     AcceleratorKind::Cpu
                 }
             }
-            ModelRuntime::UpstreamPlaceholder => AcceleratorKind::Network,
+            ModelRuntime::Upstream(_) => AcceleratorKind::Network,
         }
     }
 
@@ -277,7 +302,7 @@ impl LoadedModel {
             ModelRuntime::Mock {
                 accelerator: AcceleratorKind::Npu | AcceleratorKind::Tpu,
             } => AcceleratorMemoryResidency::Sram,
-            ModelRuntime::Mock { .. } | ModelRuntime::UpstreamPlaceholder => {
+            ModelRuntime::Mock { .. } | ModelRuntime::Upstream(_) => {
                 AcceleratorMemoryResidency::HostRam
             }
             ModelRuntime::Magnetar(_) => AcceleratorMemoryResidency::MagnetarArena,
@@ -446,6 +471,9 @@ impl AiInferenceRuntime {
     ) -> std::result::Result<ComponentGeneration, GenerationError> {
         if let Some(adapter_id) = adapter_id {
             validate_lora_adapter_id(adapter_id).map_err(GenerationError::local)?;
+            return Err(GenerationError::invalid_request(format!(
+                "LoRA adapter `{adapter_id}` is not supported by the Magnetar cutover"
+            )));
         }
         self.ensure_model_loaded(alias)
             .map_err(GenerationError::local)?;
@@ -463,21 +491,35 @@ impl AiInferenceRuntime {
             .map_err(|error| GenerationError::local(error.to_string()))?;
         Ok(ComponentGeneration {
             text,
-            refusal: None,
-            usage: Some(output.usage),
-            finish_reason: None,
-            tool_calls: Vec::new(),
+            refusal: output.refusal,
+            usage: output.usage,
+            finish_reason: output.finish_reason,
+            tool_calls: output.tool_calls,
         })
     }
 
     pub(crate) fn embed_component_input(
         &self,
         alias: &str,
-        _input: &str,
+        input: &str,
     ) -> std::result::Result<Vec<f32>, GenerationError> {
-        Err(GenerationError::local(format!(
-            "model `{alias}` is a Magnetar generation runtime and does not expose hidden-state pooling yet"
-        )))
+        self.ensure_model_loaded(alias)
+            .map_err(GenerationError::local)?;
+        let model = self
+            .models
+            .read()
+            .expect("model registry lock poisoned")
+            .get(alias)
+            .cloned()
+            .ok_or_else(|| {
+                GenerationError::local(format!("model alias `{alias}` is not loaded"))
+            })?;
+        match &model.runtime {
+            ModelRuntime::Upstream(runtime) => runtime.embed(input).map_err(GenerationError::from),
+            _ => Err(GenerationError::invalid_request(format!(
+                "model `{alias}` does not expose dense text embeddings in the Magnetar cutover"
+            ))),
+        }
     }
 
     pub(crate) fn stream_component_prompt(
@@ -529,12 +571,13 @@ impl AiInferenceRuntime {
                 record_execution(&model.alias, runtime.executed_on(), result.is_ok());
                 result
             }
-            ModelRuntime::UpstreamPlaceholder => Err(GenerationError {
-                message: "openai upstream bindings are disabled by the Magnetar cutover".to_owned(),
-                upstream_status: Some(503),
-                class: Some("magnetar-cutover".to_owned()),
-                invalid_request: false,
-            }),
+            ModelRuntime::Upstream(runtime) => {
+                let result = runtime
+                    .generate_streaming(&[prompt.as_bytes()], sink)
+                    .map_err(GenerationError::from);
+                record_execution(&model.alias, runtime.executed_on(), result.is_ok());
+                result
+            }
         }
     }
 
@@ -593,7 +636,10 @@ impl AiInferenceRuntime {
 
 struct ModelOutput {
     bytes: Vec<u8>,
-    usage: TokenUsage,
+    usage: Option<TokenUsage>,
+    finish_reason: Option<String>,
+    tool_calls: Vec<ToolCall>,
+    refusal: Option<String>,
 }
 
 fn load_binding(binding: &IntegrityModelBinding) -> Result<LoadedModel> {
@@ -602,8 +648,10 @@ fn load_binding(binding: &IntegrityModelBinding) -> Result<LoadedModel> {
         ModelRuntime::Mock {
             accelerator: AcceleratorKind::from_model_device(&binding.device),
         }
-    } else if path.starts_with(UPSTREAM_SCHEME) {
-        ModelRuntime::UpstreamPlaceholder
+    } else if let Some(runtime) =
+        upstream_openai::UpstreamOpenAiRuntime::try_load(&binding.alias, path)?
+    {
+        ModelRuntime::Upstream(Arc::new(runtime))
     } else if let Some(runtime) =
         magnetar_runtime::MagnetarRuntime::try_load(&binding.alias, path, binding.device.as_str())?
     {
@@ -637,7 +685,10 @@ fn execute_model(
             record_execution(&model.alias, model.accelerator().as_str(), true);
             Ok(ModelOutput {
                 bytes: MOCK_INFERENCE_RESPONSE.as_bytes().to_vec(),
-                usage: mock_token_usage(prompt, MOCK_INFERENCE_RESPONSE),
+                usage: Some(mock_token_usage(prompt, MOCK_INFERENCE_RESPONSE)),
+                finish_reason: None,
+                tool_calls: Vec::new(),
+                refusal: None,
             })
         }
         ModelRuntime::Magnetar(runtime) => {
@@ -646,17 +697,31 @@ fn execute_model(
                 .map_err(|error| GenerationError::local(error.to_string()))
                 .and_then(|mut outputs| {
                     let (bytes, usage) = outputs.remove(0);
-                    Ok(ModelOutput { bytes, usage })
+                    Ok(ModelOutput {
+                        bytes,
+                        usage: Some(usage),
+                        finish_reason: None,
+                        tool_calls: Vec::new(),
+                        refusal: None,
+                    })
                 });
             record_execution(&model.alias, runtime.executed_on(), result.is_ok());
             result
         }
-        ModelRuntime::UpstreamPlaceholder => Err(GenerationError {
-            message: "openai upstream bindings are disabled by the Magnetar cutover".to_owned(),
-            upstream_status: Some(503),
-            class: Some("magnetar-cutover".to_owned()),
-            invalid_request: false,
-        }),
+        ModelRuntime::Upstream(runtime) => {
+            let result = runtime
+                .generate(&[prompt])
+                .map(|generation| ModelOutput {
+                    bytes: generation.bytes,
+                    usage: generation.usage,
+                    finish_reason: generation.finish_reason,
+                    tool_calls: generation.tool_calls,
+                    refusal: generation.refusal,
+                })
+                .map_err(GenerationError::from);
+            record_execution(&model.alias, runtime.executed_on(), result.is_ok());
+            result
+        }
     }
 }
 
@@ -744,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn magnetar_qwen_binding_loads_through_runtime_and_advertises_capabilities() {
+    fn magnetar_qwen_binding_is_rejected_until_real_execution_exists() {
         let model_dir = unique_model_dir("qwen-runtime");
         write_qwen_safetensors_fixture(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
@@ -757,25 +822,15 @@ mod tests {
             hardware_strategy: Default::default(),
         }];
 
-        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+        let error = match AiInferenceRuntime::from_config(&IntegrityConfig {
             routes: vec![route],
             ..IntegrityConfig::default_sealed()
-        })
-        .expect("runtime should load Magnetar Qwen binding");
+        }) {
+            Ok(_) => panic!("Qwen safetensors must not be admitted until Magnetar executes them"),
+            Err(error) => error,
+        };
 
-        assert_eq!(runtime.loaded_model_aliases(), vec!["qwen35".to_owned()]);
-        assert_eq!(
-            runtime.model_memory_residency("qwen35"),
-            Some(AcceleratorMemoryResidency::MagnetarArena)
-        );
-        let capabilities = runtime.magnetar_capability_advertisements();
-        assert_eq!(capabilities.len(), 1);
-        assert_eq!(capabilities[0].device_id, "CPU_REF");
-        assert!(capabilities[0].components.contains(&"qwen-component"));
-        let generated = runtime
-            .compute_component_prompt("qwen35", "hello magnetar")
-            .expect("Magnetar facade should generate");
-        assert!(generated.contains("MAGNETAR_QWEN_RESPONSE:qwen35:CPU_REF"));
+        assert!(error.to_string().contains("not implemented yet"));
         let _ = std::fs::remove_dir_all(model_dir);
     }
 
@@ -836,78 +891,29 @@ mod tests {
     }
 
     #[test]
-    fn two_node_qwen_route_selects_cuda_capable_node() {
-        let cpu_dir = unique_model_dir("node-a-cpu");
-        let gpu_dir = unique_model_dir("node-b-gpu");
-        write_qwen_safetensors_fixture(&cpu_dir);
-        write_qwen_safetensors_fixture(&gpu_dir);
-
-        let node_a = runtime_with_model("qwen35", &cpu_dir, ModelDevice::Cpu);
-        let _guard = env_guard("TACHYON_MAGNETAR_CUDA", Some("1"));
-        let node_b = runtime_with_model("qwen35", &gpu_dir, ModelDevice::Cuda);
-
-        let routed = select_node_for_dtype([("node-a", &node_a), ("node-b", &node_b)], "F16")
-            .expect("a CUDA node should satisfy F16");
-
-        assert_eq!(routed, "node-b");
-        let response = node_b
-            .compute_component_prompt("qwen35", "route me")
-            .expect("node-b should execute Qwen");
-        assert!(response.contains("CUDA_0"));
-        let _ = std::fs::remove_dir_all(cpu_dir);
-        let _ = std::fs::remove_dir_all(gpu_dir);
-    }
-
-    fn runtime_with_model(alias: &str, path: &Path, device: ModelDevice) -> AiInferenceRuntime {
-        let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
-            alias: alias.to_owned(),
-            path: format!("magnetar:{}", path.display()),
-            device,
-            qos: RouteQos::Standard,
-            dynamic: false,
-            hardware_strategy: Default::default(),
-        }];
-        AiInferenceRuntime::from_config(&IntegrityConfig {
-            routes: vec![route],
+    fn buffered_generation_rejects_lora_adapter_instead_of_ignoring_it() {
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![{
+                let mut route = IntegrityRoute::user("/api/guest-ai");
+                route.models = vec![IntegrityModelBinding {
+                    alias: "mock-model".to_owned(),
+                    path: "mock".to_owned(),
+                    device: ModelDevice::Cpu,
+                    qos: RouteQos::Standard,
+                    dynamic: false,
+                    hardware_strategy: Default::default(),
+                }];
+                route
+            }],
             ..IntegrityConfig::default_sealed()
         })
-        .expect("runtime")
-    }
+        .expect("runtime");
 
-    fn select_node_for_dtype<'a>(
-        nodes: impl IntoIterator<Item = (&'a str, &'a AiInferenceRuntime)>,
-        dtype: &str,
-    ) -> Option<&'a str> {
-        nodes.into_iter().find_map(|(name, runtime)| {
-            runtime
-                .magnetar_capability_advertisements()
-                .iter()
-                .any(|advertisement| advertisement.supported_dtypes.contains(&dtype))
-                .then_some(name)
-        })
-    }
+        let error = runtime
+            .compute_component_prompt_with_adapter("mock-model", "hello", Some("adapter-a"))
+            .expect_err("adapter injection must not silently use the base model");
 
-    struct EnvGuard {
-        name: &'static str,
-        previous: Option<String>,
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(self.name, value),
-                None => std::env::remove_var(self.name),
-            }
-        }
-    }
-
-    fn env_guard(name: &'static str, value: Option<&str>) -> EnvGuard {
-        let previous = std::env::var(name).ok();
-        match value {
-            Some(value) => std::env::set_var(name, value),
-            None => std::env::remove_var(name),
-        }
-        EnvGuard { name, previous }
+        assert!(error.invalid_request);
+        assert!(error.to_string().contains("not supported"));
     }
 }

@@ -1,4 +1,4 @@
-package tachyon:mesh@1.1.0;
+package tachyon:mesh@2.0.0;
 
 // This file is the single source of truth for all Tachyon Mesh WIT interfaces.
 // Do NOT fork worlds or create `-with-X` variants. Per-deployment import

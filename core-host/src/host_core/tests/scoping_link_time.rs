@@ -12,13 +12,13 @@ fn test_engine() -> Engine {
 }
 
 /// Build a minimal WAT component that declares a single function import from
-/// `tachyon:mesh/bridge-controller@1.1.0`. The component body is otherwise empty
+/// `tachyon:mesh/bridge-controller@2.0.0`. The component body is otherwise empty
 /// (it never calls the import); we only care about whether the linker satisfies it.
 fn bridge_importing_component(engine: &Engine) -> Component {
     Component::new(
         engine,
         r#"(component
-            (import "tachyon:mesh/bridge-controller@1.1.0" (instance
+            (import "tachyon:mesh/bridge-controller@2.0.0" (instance
                 (export "create-bridge" (func))
             ))
         )"#,

@@ -1,4 +1,4 @@
-package tachyon:mesh@1.1.0;
+package tachyon:mesh@2.0.0;
 
 interface handler {
     type headers = list<tuple<string, string>>;
@@ -74,6 +74,9 @@ interface telemetry-reader {
         tpu-rt-load: u32,
         tpu-standard-load: u32,
         tpu-batch-load: u32,
+        network-rt-load: u32,
+        network-standard-load: u32,
+        network-batch-load: u32,
         hot-models: list<string>,
         dropped-events: u64,
         last-status: u16,

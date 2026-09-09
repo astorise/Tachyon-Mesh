@@ -1,21 +1,18 @@
 use anyhow::{anyhow, bail, Context, Result};
-use memmap2::Mmap;
 use serde_json::Value;
 use std::{
-    fs::File,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use super::{StreamControl, TokenUsage};
 
-const MAGNETAR_PATH_PREFIX: &str = "magnetar:";
+pub(crate) const MAGNETAR_PATH_PREFIX: &str = "magnetar:";
 const CPU_DEVICE_ID: &str = "CPU_REF";
 const CUDA_DEVICE_ID: &str = "CUDA_0";
 const DEFAULT_CPU_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const DEFAULT_CUDA_MEMORY_BYTES: u64 = 24 * 1024 * 1024 * 1024;
 const DEFAULT_KV_BYTES_PER_REQUEST: u64 = 256 * 1024 * 1024;
-const RESPONSE: &str = "MAGNETAR_QWEN_RESPONSE";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PreparedKernelId(pub(crate) u64);
@@ -47,42 +44,15 @@ impl MagnetarRuntime {
         path: &str,
         requested_target: &str,
     ) -> Result<Option<Self>> {
+        let _ = requested_target;
         let root = magnetar_root(path);
         if !is_qwen_model_dir(&root)? {
             return Ok(None);
         }
-        let artifact = find_safetensors(&root).with_context(|| {
-            format!(
-                "Magnetar Qwen model `{alias}` at `{}` is missing a safetensors artifact",
-                root.display()
-            )
-        })?;
-        let file = File::open(&artifact).with_context(|| {
-            format!(
-                "failed to open Magnetar model artifact `{}`",
-                artifact.display()
-            )
-        })?;
-        let artifact_len = file
-            .metadata()
-            .with_context(|| format!("failed to stat `{}`", artifact.display()))?
-            .len() as usize;
-        // SAFETY: The mapping is immediately dropped after validation. Production
-        // Magnetar will own the mmap handoff; this facade proves Tachyon no
-        // longer copies tensor bytes into host-owned buffers during admission.
-        let _mapping = unsafe { Mmap::map(&file) }
-            .with_context(|| format!("failed to mmap `{}`", artifact.display()))?;
-
-        let provider = provider_for_target(requested_target);
-        let available_kv_bytes = AtomicU64::new(provider.available_memory / 2);
-        Ok(Some(Self {
-            alias: alias.to_owned(),
-            root,
-            artifact,
-            artifact_len,
-            provider,
-            available_kv_bytes,
-        }))
+        Err(anyhow!(
+            "Magnetar Qwen execution for `{alias}` at `{}` is not implemented yet; bind the model through an `openai:` upstream or a `mock:` test binding",
+            root.display()
+        ))
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -145,24 +115,10 @@ impl MagnetarRuntime {
     pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<Vec<(Vec<u8>, TokenUsage)>> {
         validate_prompts(prompts)?;
         self.check_admission_capacity(DEFAULT_KV_BYTES_PER_REQUEST)?;
-        Ok(prompts
-            .iter()
-            .map(|prompt| {
-                let text = format!(
-                    "{RESPONSE}:{}:{}:{}",
-                    self.alias,
-                    self.provider.device_id,
-                    prompt.len()
-                );
-                (
-                    text.into_bytes(),
-                    TokenUsage {
-                        prompt_tokens: prompt_token_count(prompt),
-                        completion_tokens: 1,
-                    },
-                )
-            })
-            .collect())
+        bail!(
+            "Magnetar Qwen execution for `{}` is not implemented yet",
+            self.alias
+        )
     }
 
     pub(crate) fn generate_streaming(
@@ -281,7 +237,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn magnetar_loader_accepts_qwen_safetensors_directory() {
+    fn magnetar_loader_rejects_qwen_safetensors_until_execution_exists() {
         let root = std::env::temp_dir().join(format!(
             "tachyon-magnetar-qwen-{}",
             std::time::SystemTime::now()
@@ -293,16 +249,10 @@ mod tests {
         std::fs::write(root.join("config.json"), br#"{"model_type":"qwen3"}"#).expect("config");
         std::fs::write(root.join("model.safetensors"), b"weights").expect("weights");
 
-        let runtime = MagnetarRuntime::try_load("qwen", &root.to_string_lossy(), "cpu")
-            .expect("load")
-            .expect("qwen model");
+        let error = MagnetarRuntime::try_load("qwen", &root.to_string_lossy(), "cpu")
+            .expect_err("placeholder generation must not be admitted");
 
-        assert_eq!(runtime.provider().device_id, CPU_DEVICE_ID);
-        assert_eq!(runtime.artifact_len, 7);
-        assert_eq!(runtime.artifact, root.join("model.safetensors"));
-        runtime
-            .execute_node(PreparedKernelId(1), &[TensorId(10)], &[TensorId(20)])
-            .expect("opaque handle execution should validate");
+        assert!(error.to_string().contains("not implemented yet"));
         let _ = std::fs::remove_dir_all(root);
     }
 }
