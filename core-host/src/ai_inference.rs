@@ -265,6 +265,74 @@ impl GraphRegistry for EmptyGraphRegistry {
     }
 }
 
+#[cfg(test)]
+struct MockPreloadedGraphRegistry {
+    graphs: HashMap<String, WasiGraph>,
+}
+
+#[cfg(test)]
+impl MockPreloadedGraphRegistry {
+    fn from_aliases(aliases: impl IntoIterator<Item = String>) -> Self {
+        use wasmtime_wasi_nn::{
+            backend::{BackendError, BackendExecutionContext, BackendGraph, Id, NamedTensor},
+            wit::{Tensor as WasiTensor, TensorType as WasiTensorType},
+            ExecutionContext, Graph,
+        };
+
+        struct MockGraph;
+        struct MockCtx;
+
+        impl BackendGraph for MockGraph {
+            fn init_execution_context(&self) -> Result<ExecutionContext, BackendError> {
+                Ok(ExecutionContext::from(
+                    Box::new(MockCtx) as Box<dyn BackendExecutionContext>
+                ))
+            }
+        }
+
+        impl BackendExecutionContext for MockCtx {
+            fn set_input(&mut self, _id: Id, _tensor: &WasiTensor) -> Result<(), BackendError> {
+                Ok(())
+            }
+
+            fn compute(
+                &mut self,
+                _named: Option<Vec<NamedTensor>>,
+            ) -> Result<Option<Vec<NamedTensor>>, BackendError> {
+                Ok(None)
+            }
+
+            fn get_output(&mut self, _id: Id) -> Result<WasiTensor, BackendError> {
+                Ok(WasiTensor {
+                    dimensions: vec![MOCK_INFERENCE_RESPONSE.len() as u32],
+                    ty: WasiTensorType::U8,
+                    data: MOCK_INFERENCE_RESPONSE.as_bytes().to_vec(),
+                })
+            }
+        }
+
+        let graphs = aliases
+            .into_iter()
+            .map(|alias| {
+                let graph = Graph::from(Box::new(MockGraph) as Box<dyn BackendGraph>);
+                (alias, graph)
+            })
+            .collect();
+        Self { graphs }
+    }
+}
+
+#[cfg(test)]
+impl GraphRegistry for MockPreloadedGraphRegistry {
+    fn get(&self, name: &str) -> Option<&WasiGraph> {
+        self.graphs.get(name)
+    }
+
+    fn get_mut(&mut self, name: &str) -> Option<&mut WasiGraph> {
+        self.graphs.get_mut(name)
+    }
+}
+
 #[derive(Clone)]
 enum ModelRuntime {
     Mock { accelerator: AcceleratorKind },
@@ -410,7 +478,18 @@ impl AiInferenceRuntime {
     }
 
     pub(crate) fn build_wasi_nn_ctx(&self) -> WasiNnCtx {
-        WasiNnCtx::new([], WasiRegistry::from(EmptyGraphRegistry))
+        #[cfg(test)]
+        let registry = WasiRegistry::from(MockPreloadedGraphRegistry::from_aliases(
+            self.models
+                .read()
+                .expect("model registry lock poisoned")
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        #[cfg(not(test))]
+        let registry = WasiRegistry::from(EmptyGraphRegistry);
+        WasiNnCtx::new([], registry)
     }
 
     pub(crate) fn supports_accelerator(&self, accelerator: AcceleratorKind) -> bool {
