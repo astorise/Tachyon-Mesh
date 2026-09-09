@@ -940,8 +940,7 @@ pub(crate) fn preopen_s3_volume_dirs(
         wasi.preopened_dir(
             &prep.temp_path,
             &prep.guest_path,
-            volume_dir_perms(prep.readonly),
-            volume_file_perms(prep.readonly),
+            volume_fs_perms(prep.readonly),
         )
         .map_err(|error| {
             ExecutionError::Internal(format!(
@@ -989,8 +988,7 @@ pub(crate) fn preopen_route_volumes(
         wasi.preopened_dir(
             &host_path,
             &volume.guest_path,
-            volume_dir_perms(volume.readonly),
-            volume_file_perms(volume.readonly),
+            volume_fs_perms(volume.readonly),
         )
         .map_err(|error| {
             ExecutionError::Internal(format!(
@@ -1026,8 +1024,7 @@ pub(crate) fn preopen_gitops_config_store(
     wasi.preopened_dir(
         &host_path,
         GITOPS_CONFIG_STORE_GUEST_PATH,
-        volume_dir_perms(false),
-        volume_file_perms(false),
+        volume_fs_perms(false),
     )
     .map_err(|error| {
         ExecutionError::Internal(format!(
@@ -1099,8 +1096,7 @@ pub(crate) fn preopen_batch_target_volumes(
         wasi.preopened_dir(
             &host_path,
             &volume.guest_path,
-            volume_dir_perms(volume.readonly),
-            volume_file_perms(volume.readonly),
+            volume_fs_perms(volume.readonly),
         )
         .map_err(|error| {
             anyhow!(
@@ -1253,19 +1249,11 @@ pub(crate) fn decode_tde_key_hex(value: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-pub(crate) fn volume_dir_perms(readonly: bool) -> DirPerms {
+pub(crate) fn volume_fs_perms(readonly: bool) -> FsPerms {
     if readonly {
-        DirPerms::READ
+        FsPerms::ReadOnly
     } else {
-        DirPerms::READ | DirPerms::MUTATE
-    }
-}
-
-pub(crate) fn volume_file_perms(readonly: bool) -> FilePerms {
-    if readonly {
-        FilePerms::READ
-    } else {
-        FilePerms::READ | FilePerms::WRITE
+        FsPerms::ReadWrite
     }
 }
 

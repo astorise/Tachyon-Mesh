@@ -120,7 +120,7 @@ pub(crate) use wasmtime_wasi::{
     cli::{InputFile, IsTerminal, StdinStream, StdoutStream},
     p1::{self, WasiP1Ctx},
     p2::{InputStream, OutputStream, Pollable, StreamError, StreamResult},
-    DirPerms, FilePerms, I32Exit, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
+    FsPerms, I32Exit, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
 #[cfg(feature = "ai-inference")]
 pub(crate) use wasmtime_wasi_nn::witx::WasiNnCtx;

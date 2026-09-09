@@ -915,7 +915,7 @@ pub(super) fn execute_legacy_guest_with_sync_file_capture(
         ));
 
     if let Some(module_dir) = module_path.parent() {
-        wasi.preopened_dir(module_dir, ".", DirPerms::READ, FilePerms::READ)
+        wasi.preopened_dir(module_dir, ".", FsPerms::ReadOnly)
             .map_err(|error| {
                 guest_execution_error(
                     error,
