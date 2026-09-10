@@ -9,4 +9,4 @@ license = "MIT"
 path = "src/lib.rs"
 
 [dependencies]
-wit-bindgen = "0.60"
+wit-bindgen = "0.61"
