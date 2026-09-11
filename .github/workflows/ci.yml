@@ -45,6 +45,8 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -126,6 +128,8 @@ jobs:
             cache_scope: docker-fips
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -148,6 +152,8 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -186,6 +192,8 @@ jobs:
       BREAKING_MANIFEST_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'breaking-manifest') }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -242,6 +250,8 @@ jobs:
       RENOVATE_PR: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/') }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Install Linux system dependencies for Tauri
         run: |
@@ -356,6 +366,8 @@ jobs:
       RENOVATE_PR: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/') }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -497,6 +509,8 @@ jobs:
       RUSTFLAGS: "-D dead_code"
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -547,6 +561,8 @@ jobs:
       RUSTFLAGS: "-D dead_code"
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -598,6 +614,8 @@ jobs:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -703,6 +721,8 @@ jobs:
       RUSTFLAGS: "-D dead_code"
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -776,6 +796,8 @@ jobs:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -836,6 +858,8 @@ jobs:
       RENOVATE_PR: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/') }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -886,6 +910,8 @@ jobs:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -974,6 +1000,8 @@ jobs:
             cache_scope: docker-default
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
