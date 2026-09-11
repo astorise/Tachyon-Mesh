@@ -29,4 +29,4 @@
 
 - [x] 5.1 Replace active `candle-cuda` GPU proof commands with Magnetar production-loading CPU/GPU checks.
 - [x] 5.2 Remove or quarantine Candle-oriented canonical spec requirements that no longer describe the active local inference path.
-- [ ] 5.3 Run formatting, clippy, focused tests, and feature compile checks required by the change.
+- [x] 5.3 Run formatting, clippy, focused tests, and feature compile checks required by the change.
