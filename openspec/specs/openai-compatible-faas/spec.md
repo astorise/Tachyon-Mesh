@@ -39,8 +39,8 @@ included in the route's sealed dynamic model bindings.
 - **WHEN** a client requests `POST /ai/v1/embeddings` naming that model with a
   single string or list of strings
 - **THEN** `guest-openai` loads the model on the CPU accelerator, calls the host
-  Candle ONNX embeddings primitive once per input, applies masked pooling and
-  L2 normalization, and returns an OpenAI-shaped `list` of `embedding` objects
+  ONNX embeddings primitive once per input, applies masked pooling and L2
+  normalization, and returns an OpenAI-shaped `list` of `embedding` objects
   preserving input order
 
 #### Scenario: Listed dynamic model is authorized for chat

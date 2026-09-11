@@ -2812,17 +2812,19 @@ mod tests {
 
     #[test]
     fn resolves_openai_model_id_to_registry_alias() {
-        let models = vec![registry_model("nvidia--Qwen3.6-35B-A3B-NVFP4", None)];
+        let mut model = registry_model("qwen2.5-0.5b-instruct", None);
+        model.engine = "magnetar".to_owned();
+        let models = vec![model];
 
         assert_eq!(
-            resolve_registered_model("safetensors/nvidia--Qwen3.6-35B-A3B-NVFP4", &models)
+            resolve_registered_model("magnetar/qwen2.5-0.5b-instruct", &models)
                 .map(|model| model.alias.as_str()),
-            Some("nvidia--Qwen3.6-35B-A3B-NVFP4")
+            Some("qwen2.5-0.5b-instruct")
         );
         assert_eq!(
-            resolve_registered_model("nvidia--Qwen3.6-35B-A3B-NVFP4", &models)
+            resolve_registered_model("qwen2.5-0.5b-instruct", &models)
                 .map(|model| model.alias.as_str()),
-            Some("nvidia--Qwen3.6-35B-A3B-NVFP4")
+            Some("qwen2.5-0.5b-instruct")
         );
         assert!(resolve_registered_model("unknown", &models).is_none());
     }

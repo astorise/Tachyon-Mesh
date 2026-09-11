@@ -28,5 +28,6 @@
 ## 5. CI and Specification Cleanup
 
 - [x] 5.1 Replace active `candle-cuda` GPU proof commands with Magnetar production-loading CPU/GPU checks.
-- [x] 5.2 Remove or quarantine Candle-oriented canonical spec requirements that no longer describe the active local inference path.
+- [x] 5.2 Remove Candle-oriented canonical spec requirements that no longer describe the active local inference path.
 - [x] 5.3 Run formatting, clippy, focused tests, and feature compile checks required by the change.
+- [x] 5.4 Remove historical local runtime compatibility aliases, modules, GPU workflow, and active documentation now that Magnetar adoption is complete.

@@ -37,7 +37,7 @@ The Tachyon AI panel SHALL expose each route model binding from the active manif
 - **AND** it does not call `apply_configuration` or persist an AI payload under `ui_configurations`
 
 #### Scenario: Runtime rejects an unsupported hardware strategy
-- **WHEN** `apply_manifest_config` rejects a `hardware_strategy` because the selected Candle runtime path is not available
+- **WHEN** `apply_manifest_config` rejects a `hardware_strategy` because the selected runtime path is not available
 - **THEN** the AI panel displays the returned rejection message in its feedback area
 
 ### Requirement: Hardware Accelerator Panel

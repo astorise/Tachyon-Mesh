@@ -9,19 +9,11 @@ interface config-ai {
     }
 
     /// `tensor-parallelism`/`pipeline-parallelism`/`expert-parallelism` are
-    /// executable, not configuration-only. The runtime now wires this
-    /// `hardware-strategy` into model loading: `candle_llm_runtime::try_load`
-    /// reads it, validates the plan against discovered hardware, and selects
-    /// the matching engine (see
-    /// `openspec/changes/2026-06-22-wire-model-parallel-runtime-dispatch`).
-    /// Status by mode: `tensor-parallelism` runs the full autoregressive
-    /// decode loop; `pipeline-parallelism` is loaded and prefill-correct but
-    /// its decode loop is a disclosed follow-up (generation returns a typed
-    /// error until then); `expert-parallelism` is validated and placed but
-    /// rejected at load until a full MoE checkpoint loader lands (only the
-    /// verified per-expert primitive exists today). Real GPU execution,
-    /// multi-GPU VRAM telemetry, and the NCCL all-reduce require the
-    /// `candle-cuda` build and are exercised on the CUDA CI lane.
+    /// executable, not configuration-only. Tachyon validates requested
+    /// placement against discovered devices and delegates supported execution
+    /// to Magnetar. Unsupported placement modes fail closed instead of using a
+    /// local compatibility runtime. Real GPU execution requires the
+    /// `magnetar-cuda` build and is exercised on the CUDA CI lane.
     enum gpu-distribution {
         single,
         tensor-parallelism,
@@ -56,16 +48,15 @@ interface config-ai {
         /// stages. Ignored outside `pipeline-parallelism`.
         pipeline-depth: u32,
         /// Request block-paged KV-cache attention. Tachyon accepts this
-        /// declarative knob only when its runtime has wired Candle's paged
-        /// flash-attn API to a block allocator and per-sequence block table.
+        /// declarative knob only when the active runtime supports the matching
+        /// block allocator and per-sequence block table.
         paged-attention: bool,
         /// Request CUDA Graph capture/replay for the steady-state decode step.
         /// Tachyon rejects this until its GPU decode loop has fixed shapes,
-        /// stable device buffers, and a direct `candle-core` CudaGraph path.
+        /// stable device buffers, and a Provider-supported capture path.
         cuda-graph-decode: bool,
-        /// Request the optional Candle FlashInfer-style decode-attention
-        /// backend. Tachyon rejects this until the model decode path is wired
-        /// to `candle-flashinfer-kernels`.
+        /// Request an optional fused decode-attention backend. Tachyon rejects
+        /// this until Magnetar exposes a matching Provider capability.
         flashinfer-attention: bool,
         /// Optional prefill chunk size in tokens. Absent uses Tachyon's
         /// default (8192 tokens), `some(0)` disables chunked prefill.

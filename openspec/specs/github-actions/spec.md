@@ -16,7 +16,7 @@ proof.
 - **THEN** it executes a Tachyon-to-Magnetar production Qwen ingestion and Reference CPU generation
   test
 - **AND** that test uses Magnetar ingestion, trust policy, tokenizer loading, fixture construction,
-  and Provider execution instead of a local Candle text-generation path
+  and Provider execution instead of a local legacy text-generation path
 
 #### Scenario: GPU quality proves real Magnetar CUDA selection
 - **WHEN** the `cuda-quality` job runs on the self-hosted NVIDIA runner

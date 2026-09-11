@@ -13,7 +13,7 @@ The Mesh SHALL expose a `wit/ai/training.wit` interface that allows a Wasm guest
 - **AND** the inference critical path continues to operate at unchanged latency
 
 ### Requirement: LoRA training tolerates limited VRAM via system RAM spillover
-The Candle execution engine SHALL fall back to system RAM (CPU/RAM spillover) when accelerator VRAM is exhausted during backpropagation, and SHALL persist the resulting `.safetensors` adapter into `system-faas-model-broker` upon successful completion.
+The training execution engine SHALL fall back to system RAM (CPU/RAM spillover) when accelerator VRAM is exhausted during backpropagation, and SHALL persist the resulting `.safetensors` adapter into `system-faas-model-broker` upon successful completion.
 
 #### Scenario: Training completes on a VRAM-constrained Edge node
 - **WHEN** a queued LoRA training job runs on a node with insufficient VRAM

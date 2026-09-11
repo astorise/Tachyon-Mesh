@@ -46,7 +46,8 @@ interface inference {
     }
 
     /// Run a single inference call. The host honours `adapter-id` by hot-applying the
-    /// adapter weights via Candle, then removing the overlay before returning.
+    /// adapter weights through the active inference provider, then removing the
+    /// overlay before returning.
     infer: func(req: inference-request) -> result<inference-response, string>;
 
     /// Run a call with explicit per-call options. Falls back to `infer` semantics

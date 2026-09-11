@@ -19,14 +19,13 @@ TBD - created by archiving change v1-1-audit-absolute-polish-v2. Update Purpose 
 - **WHEN** `cargo tree -p core-host --no-default-features` is inspected
 - **THEN** `biscuit-auth` SHALL NOT appear in the dependency tree
 
-### Requirement: Constrained Decoding Module Removal
-The broken constrained-decoding FSM SHALL be removed from `core-host/src/ai_inference/samplers.rs`, and the matching WIT contracts SHALL be removed from the `wit/` tree.
+### Requirement: Removed Constrained Decoding Module Stays Absent
+The broken constrained-decoding FSM SHALL remain absent from active local inference code, and the matching WIT contracts SHALL be removed from the `wit/` tree.
 
 #### Scenario: Sampler module has no broken FSM
-- **GIVEN** the post-cleanup `samplers.rs`
-- **WHEN** the file is inspected
-- **THEN** the file SHALL NOT contain the previously flagged dummy FSM logic
-- **AND** any retained code SHALL compile with `-D dead_code`
+- **GIVEN** the post-cleanup source tree
+- **WHEN** active local inference files are inspected
+- **THEN** no removed constrained-decoding FSM module is compiled
 
 #### Scenario: WIT tree drops constrained-decoding contract
 - **GIVEN** the `wit/` directory

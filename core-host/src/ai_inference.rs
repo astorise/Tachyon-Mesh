@@ -1347,7 +1347,7 @@ mod tests {
         trust_tachyon_qwen_bundle(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
-            alias: "qwen35".to_owned(),
+            alias: "qwen2_5".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
             device: ModelDevice::Cpu,
             qos: RouteQos::Standard,
@@ -1361,7 +1361,7 @@ mod tests {
         })
         .expect("real Magnetar production Qwen bundle should load");
         let generation = runtime
-            .compute_component_prompt("qwen35", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .compute_component_prompt("qwen2_5", r#"{"prompt":"hi","max_new_tokens":1}"#)
             .expect("real Magnetar production Qwen should generate");
 
         assert!(!generation.is_empty());
@@ -1526,8 +1526,8 @@ mod tests {
     }
 
     #[test]
-    fn local_non_qwen_candle_style_directory_is_rejected() {
-        let model_dir = unique_model_dir("legacy-candle");
+    fn local_non_qwen_huggingface_style_directory_is_rejected() {
+        let model_dir = unique_model_dir("non-qwen-hf");
         std::fs::create_dir_all(&model_dir).expect("fixture dir should be created");
         std::fs::write(model_dir.join("config.json"), br#"{"model_type":"llama"}"#)
             .expect("config should be written");
@@ -1547,7 +1547,7 @@ mod tests {
             }],
             ..IntegrityConfig::default_sealed()
         }) {
-            Ok(_) => panic!("legacy Candle directories must not load"),
+            Ok(_) => panic!("non-Qwen Hugging Face-style directories must not load"),
             Err(error) => error,
         };
 

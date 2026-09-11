@@ -445,7 +445,7 @@ fn binding_engine_label(path: &str) -> &'static str {
             }
         }
         // ONNX outranks the sidecar, because the loader never asks the sidecar
-        // about it. `CandleEmbeddingRuntime::try_load` runs first and resolves
+        // about it. The ONNX embedding probe runs first and resolves
         // its file by `model_file`, then `model.onnx`, then any `.onnx` in the
         // directory — the declared format is consulted nowhere in that path. A
         // directory declaring `safetensors` beside a usable ONNX therefore
@@ -462,8 +462,8 @@ fn binding_engine_label(path: &str) -> &'static str {
         if let Some(declared) = declared_model_format(path) {
             return declared;
         }
-        // ONNX first, because that is the order `CandleBackendModel::load`
-        // probes in: `CandleEmbeddingRuntime::try_load` runs before the GGUF
+        // ONNX first, because that is the order the host probes in: the ONNX
+        // embedding loader runs before the GGUF
         // runtime and accepts a bare `.onnx` file with no sidecar. Preferring
         // GGUF here labelled a directory `gguf/<alias>` while requests for it
         // executed the ONNX embedding backend — and the label is half the
@@ -1676,7 +1676,7 @@ mod configured_binding_registry_tests {
         let model_dir = dir.join("onnx-no-sidecar");
         fs::create_dir_all(&model_dir).expect("model dir");
         // No sidecar at all, and a leftover checkpoint beside the ONNX one.
-        // `CandleBackendModel::load` probes the embedding runtime first and it
+        // The host probes the embedding runtime first and it
         // accepts a bare `.onnx`, so labelling this `gguf/<alias>` advertised a
         // backend that would never run.
         fs::write(model_dir.join("stale.gguf"), b"not read").expect("stale gguf");
@@ -2089,7 +2089,7 @@ mod configured_binding_registry_tests {
     /// as `safetensors/<alias>` while the ONNX embedding backend executes is a
     /// listing that lies about where a prompt goes. The sidecar is
     /// authoritative for the loaders that read it — and
-    /// `CandleEmbeddingRuntime::try_load`, which runs first, never does.
+    /// the ONNX embedding probe, which runs first, never does.
     #[test]
     fn a_usable_onnx_outranks_a_sidecar_the_loader_will_not_consult() {
         let dir = std::env::temp_dir().join(format!(

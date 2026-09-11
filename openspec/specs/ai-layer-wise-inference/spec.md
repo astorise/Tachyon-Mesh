@@ -60,7 +60,7 @@ During the initial prompt tokenization:
 #### Asynchronous Pipelining (Phase 2 - Decode)
 For the autoregressive token generation phase, Codex must implement an overlapping I/O and Compute strategy.
 - Determine the maximum number of layers that safely fit in the user's VRAM (e.g., $K=4$).
-- Establish two distinct execution streams on the device (if using CUDARC/Candle integration: one Compute Stream, one Copy Stream).
+- Establish two distinct execution streams on the device when the selected Provider supports separate compute and copy streams.
 - **The Pipeline Loop for Layer $N$:**
   1. **Compute Stream:** Executes the forward pass for Token $T$ on Layer $N$.
   2. **Copy Stream (Host-to-Device):** Concurrently loads the weights of Layer $N+1$ from the mapped CPU memory into a pre-allocated GPU buffer.
@@ -74,38 +74,38 @@ To ensure a strictly constant $O(1)$ VRAM footprint regardless of context length
 - After Layer $N$ computes, its KV-Cache must be appended/swapped to a Host CPU buffer (or dispatched to `tachyon:ai/kv-partition` V2 if integrating with the swarm context memory). 
 - When computing Layer $N$ for the next token, page back its specific KV-Cache slice from CPU to GPU.
 
-### Requirement: Layer-wise streaming MUST preserve NVFP4 tensor structure
-Layer-wise streaming for ModelOpt/NVFP4 checkpoints SHALL map safetensors shards by tensor name and vend typed per-layer quantized components instead of partitioning raw bytes into equal `f32` slices.
+### Requirement: Layer-wise streaming MUST preserve provider tensor structure
+Layer-wise streaming SHALL map safetensors shards by tensor name and vend provider-native per-layer tensor components instead of partitioning raw bytes into equal `f32` slices.
 
-#### Scenario: Active layer loads typed NVFP4 components
+#### Scenario: Active layer loads typed tensor components
 - **WHEN** `memory-profile` is `layer-wise-streaming`
-- **AND** the active layer contains ModelOpt/NVFP4 linear operators
-- **THEN** the loader maps the packed weights, block scales, tensor scales, and any BF16 tensors required for that layer
+- **AND** the active layer contains provider-native typed operators
+- **THEN** the loader maps the weights, scales, and any dense tensors required for that layer
 - **AND** it transfers or dequantizes only the active layer's required components according to the selected backend
 
 #### Scenario: Sharded tensor index drives layer mapping
-- **WHEN** a ModelOpt/NVFP4 checkpoint uses multiple safetensors shards
+- **WHEN** a checkpoint uses multiple safetensors shards
 - **THEN** the layer-wise loader resolves each tensor through `model.safetensors.index.json`
 - **AND** it never assumes all weights for a layer are contiguous in a single equal-sized byte range
 
-### Requirement: Layer-wise NVFP4 execution MUST keep memory-profile semantics
-The ModelOpt/NVFP4 layer-wise runtime SHALL preserve the existing performance and layer-wise-streaming memory profile behavior while accounting for packed quantized storage and fallback dequantization.
+### Requirement: Layer-wise provider execution MUST keep memory-profile semantics
+The layer-wise runtime SHALL preserve the existing performance and layer-wise-streaming memory profile behavior while accounting for provider-native storage and fallback materialization.
 
 #### Scenario: Layer-wise streaming avoids full packed-model residency on accelerator
-- **WHEN** a ModelOpt/NVFP4 model runs with `layer-wise-streaming`
+- **WHEN** a provider-native model runs with `layer-wise-streaming`
 - **THEN** the runtime does not load all model layers into accelerator memory at once
 - **AND** it pages KV cache and layer weights according to the existing layer-wise streaming contract
 
 #### Scenario: Fallback dequantization respects memory limits
-- **WHEN** native NVFP4 kernels are unavailable under `layer-wise-streaming`
+- **WHEN** native provider kernels are unavailable under `layer-wise-streaming`
 - **THEN** the runtime may dequantize only the active layer or configured layer window
 - **AND** it rejects execution if fallback dequantization would require full-model accelerator residency
 
 ### Requirement: Layer-wise sparse-MoE execution MUST page only active experts
 
-For compatible Qwen 3.5 MoE checkpoints, layer-wise streaming SHALL map and
+For compatible sparse-MoE checkpoints, layer-wise streaming SHALL map and
 transfer only the active layer, selected routed experts, shared expert, and
-required attention state.
+required attention state through the selected Provider contract.
 
 #### Scenario: Inactive experts remain off accelerator
 

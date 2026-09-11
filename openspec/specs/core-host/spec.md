@@ -168,23 +168,23 @@ The `core-host` crate SHALL keep constrained decoding dependencies optional unde
 - **THEN** it verifies that `sample-constrained` and `FsmLogitProcessor` symbols exist in the codebase
 - **AND** the build fails if either symbol is absent, preventing a recurrence of a merged spec requirement with no matching implementation
 
-### Requirement: Candle LLM dependencies MUST remain feature-gated
-The `core-host` crate SHALL keep tokenizer and Candle text-generation dependencies optional under the existing `ai-inference` feature and SHALL keep the default host build free of those dependencies.
+### Requirement: Magnetar inference dependencies MUST remain feature-gated
+The `core-host` crate SHALL keep local production inference dependencies optional under the existing `ai-inference` feature and SHALL keep the default host build free of those dependencies.
 
-#### Scenario: Default host build excludes Candle LLM runtime
+#### Scenario: Default host build excludes local production inference runtime
 - **WHEN** a developer builds `core-host` without `--features ai-inference`
-- **THEN** tokenizer and Candle LLM runtime dependencies are not linked
+- **THEN** Magnetar runtime, loader, tokenizer, and Provider dependencies are not linked
 - **AND** the default release and container workflows remain unchanged
 
-#### Scenario: AI inference build includes Candle LLM runtime
+#### Scenario: AI inference build includes Magnetar production runtime
 - **WHEN** a developer builds `core-host` with `--features ai-inference`
-- **THEN** the Candle LLM runtime module, tokenizer support, and selected Candle text-generation dependency are compiled
+- **THEN** the Magnetar runtime adapter, Hugging Face loader, tokenizer support, and selected Provider dependency are compiled
 - **AND** existing ONNX/WASI-NN AI inference support remains available
 
-#### Scenario: AI inference build consumes the downstream Candle quantization fork
+#### Scenario: AI inference build consumes the pinned Magnetar submodule
 - **WHEN** a developer builds `core-host` with `--features ai-inference`
-- **THEN** `candle-core`, `candle-nn`, `candle-onnx`, and `candle-transformers` resolve from the pinned `astorise/candle` fork revision that carries GPTQ/Marlin, AWQ, and block-wise FP8 weight-quantization kernels proposed upstream in `huggingface/candle#3650`
-- **AND** the default `core-host` build remains free of those optional Candle dependencies
+- **THEN** Magnetar resolves from the repository-pinned submodule revision
+- **AND** the default `core-host` build remains free of those optional inference dependencies
 
 #### Scenario: AI guest runs without ai-inference feature
 - **WHEN** `core-host` is built without `--features ai-inference`
