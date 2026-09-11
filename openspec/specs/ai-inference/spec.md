@@ -3,6 +3,59 @@
 ## Purpose
 TBD - created by archiving change ai-inference-wasinn. Update Purpose after archive.
 ## Requirements
+### Requirement: Magnetar production Qwen is the active local text-generation runtime
+For local Qwen text-generation bindings, Tachyon SHALL delegate production model ingestion,
+tokenizer loading, manifest normalization, model instance construction, execution planning, and
+Provider execution to Magnetar. Tachyon SHALL keep provenance, routing, QoS, mesh transport, and
+placement policy, but SHALL NOT parse Safetensors payloads, convert model dtypes, construct a Qwen
+graph, or fabricate Magnetar tensor/kernel/hardware identities.
+
+#### Scenario: Tachyon-staged Qwen bundle loads through Magnetar
+- **WHEN** a model binding points at a `magnetar:` Tachyon-staged Qwen bundle
+- **THEN** Tachyon constructs an authorized local bundle with `ModelArtifactSource::Tachyon`
+- **AND** Magnetar's Hugging Face ingestor reads `config.json`, tokenizer metadata, generation
+  metadata, and Safetensors payloads
+- **AND** Tachyon receives a normalized Magnetar manifest and bounded payload source
+- **AND** Tachyon does not parse the model payloads itself
+
+#### Scenario: Magnetar trust policy is explicit
+- **WHEN** Magnetar ingestion succeeds for a bundle whose manifest digest is not trusted by
+  Tachyon's model trust policy
+- **THEN** Tachyon rejects the binding before Provider execution
+- **AND** parsing success, source kind, and local filesystem authorization do not grant trust
+
+#### Scenario: Reference CPU generation is allowed by CPU placement
+- **WHEN** route policy selects CPU for an admitted Qwen bundle
+- **THEN** Tachyon executes generation through Magnetar's Reference CPU production Qwen path
+- **AND** mesh telemetry reports the real Magnetar Provider used for execution
+
+#### Scenario: CUDA placement is fail-closed until device-resident decode exists
+- **WHEN** route policy explicitly selects CUDA
+- **THEN** Tachyon uses a real Magnetar `CudaProvider` when one is available
+- **AND** Tachyon rejects the request when CUDA is unavailable instead of silently falling back to
+  Reference CPU
+- **AND** requests for more than one generated token on CUDA fail closed until Magnetar provides
+  device-resident multi-step decode
+
+### Requirement: Legacy Candle text-generation requirements are quarantined
+Canonical requirements in this file that name the Candle LLM runtime, `candle-cuda`, Candle
+Flash Attention, Candle CUDA Graph decode, FlashInfer-on-Candle, Candle GGUF/Safetensors
+single-device generation, or native Candle non-Llama dispatch are retained only as historical
+legacy compatibility context. They SHALL NOT be used as acceptance criteria for the active local
+Qwen inference path, which is Magnetar production ingestion and Provider execution.
+
+#### Scenario: Active local Qwen audits ignore quarantined Candle criteria
+- **WHEN** a reviewer evaluates the Tachyon local Qwen cutover
+- **THEN** the reviewer uses the Magnetar production Qwen requirements above as the active
+  acceptance criteria
+- **AND** the reviewer does not treat legacy Candle LLM, `candle-cuda`, FlashInfer, CUDA Graph, or
+  Candle GGUF/Safetensors requirements as active proof obligations for that cutover
+
+#### Scenario: Legacy Candle code must not be selected by production Qwen bindings
+- **WHEN** a production Qwen binding uses the `magnetar:` source scheme
+- **THEN** Tachyon routes it to the Magnetar adapter
+- **AND** the legacy Candle text-generation modules are not a fallback for that binding
+
 ### Requirement: Host optionally exposes WASI-NN imports to legacy guests
 The `core-host` runtime SHALL define an `ai-inference` Cargo feature that links the `wasi_ephemeral_nn` preview1 host functions for legacy WASI guests without changing the default host build. The feature SHALL use `candle-onnx` (pure Rust) as the ONNX inference backend, making `--features ai-inference` compatible with musl libc targets.
 

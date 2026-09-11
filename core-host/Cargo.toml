@@ -21,10 +21,13 @@ admin-plane = []
 # safetensors through the Magnetar facade; legacy Candle modules are retained
 # outside the compiled path for reference during the migration.
 ai-inference = [
+    "dep:magnetar-loader-huggingface",
+    "dep:magnetar-provider-cpu",
+    "dep:magnetar-runtime",
     "dep:wasmtime-wasi-nn",
 ]
 # Compatibility aliases kept for old build commands during the Magnetar cutover.
-# They no longer enable backend code.
+# `candle-cuda` now selects the real Magnetar CUDA provider path.
 candle-flashinfer = ["ai-inference"]
 ebpf-loader = ["dep:aya"]
 # `experimental` gates unwired v1.1 stubs (QUIC safetensors replication, predictive
@@ -34,7 +37,8 @@ experimental = []
 fips = ["tokio-rustls/aws_lc_rs", "tokio-rustls/fips"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tower", "dep:tokio-stream"]
 mtls = []
-candle-cuda = ["ai-inference"]
+magnetar-cuda = ["ai-inference", "dep:magnetar-provider-cuda"]
+candle-cuda = ["magnetar-cuda"]
 candle-metal = ["ai-inference"]
 nvfp4-cuda = ["ai-inference"]
 rate-limit = ["dep:governor", "dep:forwarded-header-value"]
@@ -63,6 +67,10 @@ forwarded-header-value = { version = "0.1", optional = true }
 globset = "0.4"
 governor = { version = "0.10", optional = true }
 memmap2 = "0.9"
+magnetar-loader-huggingface = { path = "../vendor/Magnetar/loaders/huggingface", optional = true }
+magnetar-provider-cpu = { path = "../vendor/Magnetar/providers/cpu", optional = true }
+magnetar-provider-cuda = { path = "../vendor/Magnetar/providers/cuda", optional = true }
+magnetar-runtime = { path = "../vendor/Magnetar/magnetar-runtime", features = ["wasmtime-component-engine"], optional = true }
 moka = { version = "0.12", features = ["sync"] }
 notify = { version = "8.0", default-features = false, features = ["macos_kqueue"] }
 h3 = { version = "0.0.8", optional = true }

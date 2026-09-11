@@ -3,6 +3,29 @@
 ## Purpose
 TBD - created by archiving change github-actions. Update Purpose after archive.
 ## Requirements
+### Requirement: CI validates Magnetar production Qwen without vacuous GPU success
+The CI workflow SHALL validate Tachyon's active local Qwen inference path through Magnetar
+production ingestion. CPU quality SHALL run a focused production Qwen ingestion and Reference CPU
+generation test. The GPU quality job SHALL build and lint the `magnetar-cuda` feature, verify that
+its GPU-critical test filters select non-empty test sets, run a hardware-required `CudaProvider`
+guard, run the Magnetar CUDA prefill / first-token proof, and run the CUDA multi-token fail-closed
+proof.
+
+#### Scenario: CPU quality covers Magnetar production ingestion
+- **WHEN** the quality job runs without GPU hardware
+- **THEN** it executes a Tachyon-to-Magnetar production Qwen ingestion and Reference CPU generation
+  test
+- **AND** that test uses Magnetar ingestion, trust policy, tokenizer loading, fixture construction,
+  and Provider execution instead of a local Candle text-generation path
+
+#### Scenario: GPU quality proves real Magnetar CUDA selection
+- **WHEN** the `cuda-quality` job runs on the self-hosted NVIDIA runner
+- **THEN** it compiles the `magnetar-cuda` feature
+- **AND** it fails before execution if any critical Magnetar CUDA test filter selects zero tests
+- **AND** it runs a real `CudaProvider` availability guard
+- **AND** it runs the Magnetar CUDA first-token proof
+- **AND** it runs the CUDA multi-token fail-closed proof
+
 ### Requirement: Repository provides a GitHub Actions CI workflow for the main branch
 The repository SHALL define a GitHub Actions workflow at `.github/workflows/ci.yml` that runs on pushes to `main` and pull requests targeting `main`.
 
