@@ -1328,10 +1328,27 @@ mod tests {
 
     static TRUST_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
+    struct QwenInterprocessGuard {
+        path: PathBuf,
+    }
+
     struct TrustStoreEnvGuard {
+        _qwen_lock: QwenInterprocessGuard,
         _lock: std::sync::MutexGuard<'static, ()>,
         previous: Option<std::ffi::OsString>,
         path: PathBuf,
+    }
+
+    struct TrustStoreEnvUnsetGuard {
+        _qwen_lock: QwenInterprocessGuard,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for QwenInterprocessGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 
     impl Drop for TrustStoreEnvGuard {
@@ -1345,15 +1362,69 @@ mod tests {
         }
     }
 
+    impl Drop for TrustStoreEnvUnsetGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV, previous);
+            }
+        }
+    }
+
+    fn qwen_interprocess_lock() -> QwenInterprocessGuard {
+        let path = std::env::temp_dir().join("tachyon-magnetar-qwen-tests.lock");
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return QwenInterprocessGuard { path },
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > std::time::Duration::from_secs(300));
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                }
+                Err(error) => panic!(
+                    "failed to acquire Qwen test lock `{}`: {error}",
+                    path.display()
+                ),
+            }
+        }
+    }
+
+    fn trust_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        TRUST_ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("trust env lock poisoned")
+    }
+
+    fn without_tachyon_model_trust_store() -> TrustStoreEnvUnsetGuard {
+        let qwen_lock = qwen_interprocess_lock();
+        let lock = trust_env_lock();
+        let previous = std::env::var_os(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
+        std::env::remove_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
+        TrustStoreEnvUnsetGuard {
+            _qwen_lock: qwen_lock,
+            _lock: lock,
+            previous,
+        }
+    }
+
     fn trust_tachyon_qwen_bundle(path: &Path) -> TrustStoreEnvGuard {
         use ::magnetar_runtime::production_model_ingestion::{
             ProductionModelArtifactIngestor, ProductionModelSource,
         };
 
-        let lock = TRUST_ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("trust env lock poisoned");
+        let qwen_lock = qwen_interprocess_lock();
+        let lock = trust_env_lock();
         let source = ProductionModelSource::authorized_local_bundle(
             ::magnetar_runtime::ModelArtifactSource::Tachyon("tachyon:test-fixture".to_owned()),
             path.to_path_buf(),
@@ -1379,6 +1450,7 @@ mod tests {
         let previous = std::env::var_os(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
         std::env::set_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV, &trust_path);
         TrustStoreEnvGuard {
+            _qwen_lock: qwen_lock,
             _lock: lock,
             previous,
             path: trust_path,
@@ -1507,6 +1579,7 @@ mod tests {
 
     #[test]
     fn explicit_magnetar_binding_rejects_non_qwen_model_directory() {
+        let _trust = without_tachyon_model_trust_store();
         let model_dir = unique_model_dir("non-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
         std::fs::write(model_dir.join("config.json"), br#"{"model_type":"llama"}"#)
@@ -1529,6 +1602,7 @@ mod tests {
 
     #[test]
     fn explicit_magnetar_binding_rejects_untrusted_qwen_bundle() {
+        let _trust = without_tachyon_model_trust_store();
         let model_dir = unique_model_dir("untrusted-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
         let error = match load_binding(&IntegrityModelBinding {
@@ -1703,6 +1777,7 @@ mod tests {
 
     #[test]
     fn local_non_qwen_huggingface_style_directory_is_rejected() {
+        let _trust = without_tachyon_model_trust_store();
         let model_dir = unique_model_dir("non-qwen-hf");
         std::fs::create_dir_all(&model_dir).expect("fixture dir should be created");
         std::fs::write(model_dir.join("config.json"), br#"{"model_type":"llama"}"#)
