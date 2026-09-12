@@ -424,6 +424,7 @@ fn provider_advertisement(provider: &dyn Provider) -> CapabilityAdvertisement {
     }
 }
 
+#[derive(Debug)]
 struct GenerationRequestView {
     prompt: PromptInput,
     parameters: GenerationParameters,
@@ -592,4 +593,65 @@ fn json_f32(object: &serde_json::Map<String, Value>, key: &str) -> Result<Option
                 .map(|value| value as f32)
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_request_maps_openai_chat_controls_to_magnetar_contracts() {
+        let request = GenerationRequestView::parse(
+            br#"{
+                "messages":[{"role":"system","content":"brief"},{"role":"user","content":"hi"}],
+                "temperature":0.7,
+                "top_p":0.9,
+                "top_k":12,
+                "seed":42,
+                "frequency_penalty":0.1,
+                "presence_penalty":0.2,
+                "repetition_penalty":1.1,
+                "max_new_tokens":16,
+                "stop":["<eos>"],
+                "include_usage":true
+            }"#,
+        )
+        .expect("OpenAI-shaped request should parse")
+        .into_magnetar_request()
+        .expect("supported controls should build a Magnetar request");
+
+        match request.prompt {
+            PromptInput::ChatMessages(messages) => {
+                assert_eq!(messages.len(), 2);
+                assert_eq!(messages[0].role, "system");
+                assert_eq!(messages[1].content, "hi");
+            }
+            other => panic!("expected chat messages, got {other:?}"),
+        }
+        assert_eq!(request.max_new_tokens, Some(16));
+        assert_eq!(request.parameters.temperature, 0.7);
+        assert_eq!(request.parameters.top_p, Some(0.9));
+        assert_eq!(request.parameters.top_k, Some(12));
+        assert_eq!(request.parameters.seed, Some(42));
+        assert!(request.parameters.deterministic);
+        assert_eq!(request.parameters.frequency_penalty, Some(0.1));
+        assert_eq!(request.parameters.presence_penalty, Some(0.2));
+        assert_eq!(request.parameters.repetition_penalty, Some(1.1));
+        assert_eq!(
+            request.stop_conditions.stop_text_sequences,
+            vec!["<eos>".to_owned()]
+        );
+    }
+
+    #[test]
+    fn generation_request_rejects_unsupported_local_fields() {
+        let error =
+            GenerationRequestView::parse(br#"{"prompt":"hi","json_schema":{"type":"object"}}"#)
+                .expect_err("unsupported local fields must fail closed");
+
+        assert!(
+            error.to_string().contains("json_schema"),
+            "unexpected unsupported-field error: {error}"
+        );
+    }
 }
