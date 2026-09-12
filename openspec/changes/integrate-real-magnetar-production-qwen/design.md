@@ -1,6 +1,6 @@
 ## Context
 
-Tachyon currently accepts `magnetar:` model bindings, but `core-host/src/ai_inference/magnetar_runtime.rs` is a local compatibility facade that rejects real Qwen execution with `not implemented yet`. The previous cutover archive also left canonical specs and GPU CI steps describing `candle-cuda` as the active local inference path.
+Before this corrective change, Tachyon accepted `magnetar:` model bindings through a local compatibility facade that rejected real Qwen execution instead of calling Magnetar. The previous cutover archive also left canonical specs and GPU CI steps describing `candle-cuda` as the active local inference path.
 
 Magnetar now exposes the public embedder path for production Qwen loading at commit `b235783abb2b0c92843febfa3ff29f30745e1934`: `ProductionModelSource`, `HuggingFaceIngestor`, `ModelTrustStore`, `production_qwen_fixture`, `ProductionGenerationRequest`, provider generation, and streaming generation events. Tachyon should become a transport, provenance, routing, and QoS layer around that API, not a parser or execution-engine shim.
 
@@ -24,9 +24,9 @@ Magnetar now exposes the public embedder path for production Qwen loading at com
 
 ## Decisions
 
-1. **Pin Magnetar with git dependencies, not a local path.**
+1. **Pin Magnetar through the vendored submodule and path dependencies.**
    - Use the exact Magnetar revision from the completed production Qwen loading audit so CI resolves the same API surface everywhere.
-   - Local `../Magnetar` paths are useful for inspection but would make CI and PR review depend on developer workstation layout.
+   - Tachyon depends on the vendored `vendor/Magnetar` crates instead of workstation-local `../Magnetar` paths or unpublished registry versions.
 
 2. **Keep the Tachyon adapter narrow.**
    - The adapter maps a Tachyon model binding into `ProductionModelSource::authorized_local_bundle(ModelArtifactSource::Tachyon(..), root)`, invokes `HuggingFaceIngestor`, loads the real tokenizer, creates a `ModelTrustStore`, builds `production_qwen_fixture`, and calls Magnetar generation.

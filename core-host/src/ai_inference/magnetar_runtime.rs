@@ -32,7 +32,7 @@ const QWEN_COMPONENT_MANIFEST_BYTES: &[u8] = include_bytes!(
 static QWEN_COMPONENT_REGISTERED: OnceLock<()> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CapabilityAdvertisement {
+pub(crate) struct ProviderAdvertisement {
     pub(crate) provider_name: String,
     pub(crate) provider_version: String,
     pub(crate) device_ids: Vec<String>,
@@ -52,7 +52,7 @@ pub(crate) struct MagnetarRuntime {
     payload_source: Arc<dyn ProductionArtifactPayloadSource>,
     trust_store: ModelTrustStore,
     chat_formatter: Option<Arc<HuggingFaceChatTemplateFormatter>>,
-    provider: CapabilityAdvertisement,
+    provider: ProviderAdvertisement,
     target: MagnetarProviderTarget,
 }
 
@@ -167,7 +167,7 @@ impl MagnetarRuntime {
         self.provider.provider_name.as_str()
     }
 
-    pub(crate) fn provider(&self) -> &CapabilityAdvertisement {
+    pub(crate) fn provider(&self) -> &ProviderAdvertisement {
         &self.provider
     }
 
@@ -383,7 +383,7 @@ fn provider_target(requested_target: &str) -> Result<MagnetarProviderTarget> {
     }
 }
 
-fn capability_advertisement(target: MagnetarProviderTarget) -> Result<CapabilityAdvertisement> {
+fn capability_advertisement(target: MagnetarProviderTarget) -> Result<ProviderAdvertisement> {
     match target {
         MagnetarProviderTarget::ReferenceCpu => {
             let provider = magnetar_runtime::ReferenceCpuProvider::new();
@@ -410,14 +410,14 @@ fn capability_advertisement(target: MagnetarProviderTarget) -> Result<Capability
     }
 }
 
-fn provider_advertisement(provider: &dyn Provider) -> CapabilityAdvertisement {
+fn provider_advertisement(provider: &dyn Provider) -> ProviderAdvertisement {
     let metadata = provider.metadata();
     let device_ids = provider
         .devices()
         .iter()
         .map(|device| device.metadata().id.as_str().to_owned())
         .collect();
-    CapabilityAdvertisement {
+    ProviderAdvertisement {
         provider_name: metadata.name,
         provider_version: metadata.version,
         device_ids,

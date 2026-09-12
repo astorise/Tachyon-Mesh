@@ -829,7 +829,7 @@ impl AiInferenceRuntime {
 
     pub(crate) fn magnetar_capability_advertisements(
         &self,
-    ) -> Vec<magnetar_runtime::CapabilityAdvertisement> {
+    ) -> Vec<magnetar_runtime::ProviderAdvertisement> {
         let mut advertisements = self
             .models
             .read()
@@ -903,7 +903,7 @@ impl AiInferenceRuntime {
     }
 }
 
-fn magnetar_provider_is_cuda(provider: &magnetar_runtime::CapabilityAdvertisement) -> bool {
+fn magnetar_provider_is_cuda(provider: &magnetar_runtime::ProviderAdvertisement) -> bool {
     provider.provider_name.to_ascii_lowercase().contains("cuda")
 }
 
