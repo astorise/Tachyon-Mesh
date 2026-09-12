@@ -1,22 +1,26 @@
 use anyhow::{anyhow, bail, Context, Result};
-use magnetar_loader_huggingface::HuggingFaceIngestor;
+use magnetar_loader_huggingface::{
+    parse_tokenizer_config, HuggingFaceChatTemplateFormatter, HuggingFaceIngestor,
+};
 use magnetar_runtime::model::{ModelTrustStatus, ModelTrustStore};
 use magnetar_runtime::production_model_ingestion::{
     ProductionArtifactPayloadSource, ProductionModelArtifactIngestor, ProductionModelSource,
 };
 use magnetar_runtime::tokenizer::Tokenizer;
-use magnetar_runtime::{ModelArtifactSource, Provider};
+use magnetar_runtime::{
+    ChatMessage, GenerationParameters, GenerationStreamEvent, ModelArtifactSource,
+    ProductionGenerationRequest, PromptInput, Provider, StopConditions,
+};
 use serde_json::Value;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
 
 use super::{StreamControl, TokenUsage};
 
 pub(crate) const MAGNETAR_PATH_PREFIX: &str = "magnetar:";
-const TACHYON_MODEL_TRUST_JSON: &str = "tachyon-model-trust.json";
-const TACHYON_HIDDEN_MODEL_TRUST_JSON: &str = ".tachyon-model-trust.json";
+pub(crate) const TACHYON_MODEL_TRUST_STORE_ENV: &str = "TACHYON_MODEL_TRUST_STORE";
 
 const QWEN_COMPONENT_BYTES: &[u8] = include_bytes!(
     "../../../vendor/Magnetar/magnetar-runtime/fixtures/components/qwen-real.component.wasm"
@@ -47,6 +51,7 @@ pub(crate) struct MagnetarRuntime {
     fixture: magnetar_runtime::E2eFixture,
     payload_source: Arc<dyn ProductionArtifactPayloadSource>,
     trust_store: ModelTrustStore,
+    chat_formatter: Option<Arc<HuggingFaceChatTemplateFormatter>>,
     provider: CapabilityAdvertisement,
     target: MagnetarProviderTarget,
 }
@@ -91,9 +96,32 @@ impl MagnetarRuntime {
         let tokenizer_path = root.join("tokenizer.json");
         let tokenizer_bytes = std::fs::read(&tokenizer_path)
             .with_context(|| format!("failed to read `{}`", tokenizer_path.display()))?;
+        let tokenizer_config_path = root.join("tokenizer_config.json");
+        let tokenizer_config_bytes =
+            if tokenizer_config_path.is_file() {
+                Some(std::fs::read(&tokenizer_config_path).with_context(|| {
+                    format!("failed to read `{}`", tokenizer_config_path.display())
+                })?)
+            } else {
+                None
+            };
+        let tokenizer_config_metadata = tokenizer_config_bytes
+            .as_deref()
+            .map(parse_tokenizer_config)
+            .transpose()
+            .with_context(|| {
+                format!("Magnetar failed to parse tokenizer_config.json for `{alias}`")
+            })?;
+        let chat_formatter = tokenizer_config_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.chat_template_reference.as_deref())
+            .map(HuggingFaceChatTemplateFormatter::new)
+            .transpose()
+            .with_context(|| format!("Magnetar failed to load chat template for `{alias}`"))?
+            .map(Arc::new);
         let real_tokenizer = magnetar_loader_huggingface::HuggingFaceTokenizer::from_bytes(
             &tokenizer_bytes,
-            None,
+            tokenizer_config_metadata.as_ref(),
             format!("{alias}-tokenizer"),
             ingested
                 .manifest
@@ -129,6 +157,7 @@ impl MagnetarRuntime {
             fixture,
             payload_source: Arc::clone(&ingested.payload_source),
             trust_store,
+            chat_formatter,
             provider,
             target,
         }))
@@ -151,56 +180,22 @@ impl MagnetarRuntime {
             );
         }
         let request = GenerationRequestView::parse(prompts[0])?;
-        let mut fixture = self.fixture.clone();
-        if let Some(max_new_tokens) = request.max_new_tokens {
-            let defaults = fixture
-                .manifest
-                .generation
-                .get_or_insert_with(Default::default);
-            defaults.max_tokens = Some(max_new_tokens);
-        }
+        let request = request.into_magnetar_request()?;
 
-        let outcome = match self.target {
-            MagnetarProviderTarget::ReferenceCpu => magnetar_runtime::run_production_qwen_generation(
-                fixture,
-                self.payload_source.as_ref(),
-                self.trust_store.clone(),
-                request.prompt.as_str(),
-            ),
-            MagnetarProviderTarget::Cuda => {
-                let requested = requested_max_tokens(&fixture, request.max_new_tokens);
-                if requested != Some(1) {
-                    bail!(
-                        "Magnetar CUDA generation for `{}` supports only prefill / first-token execution until device-resident multi-step decode is available; request max_new_tokens=1 or route to cpu",
-                        self.alias
-                    );
-                }
-                #[cfg(feature = "magnetar-cuda")]
-                {
-                    let provider = magnetar_provider_cuda::CudaProvider::new();
-                    if !provider.is_available() {
-                        bail!(
-                            "Magnetar CUDA provider is unavailable for `{}`; explicit CUDA placement cannot fall back to CPU",
-                            self.alias
-                        );
-                    }
-                    magnetar_runtime::run_production_qwen_generation_for_provider(
-                        fixture,
-                        self.payload_source.as_ref(),
-                        self.trust_store.clone(),
-                        request.prompt.as_str(),
-                        Arc::new(provider),
-                    )
-                }
-                #[cfg(not(feature = "magnetar-cuda"))]
-                {
-                    bail!(
-                        "Magnetar CUDA provider is not compiled into this host; rebuild with `magnetar-cuda` for explicit CUDA placement"
-                    )
-                }
-            }
-        }
-        .map_err(|error| anyhow!("Magnetar Qwen generation for `{}` failed: {error}", self.alias))?;
+        let outcome = magnetar_runtime::run_production_qwen_generation_for_provider_with_request(
+            self.fixture.clone(),
+            self.payload_source.as_ref(),
+            self.trust_store.clone(),
+            request,
+            self.chat_formatter(),
+            self.provider_for_generation()?,
+        )
+        .map_err(|error| {
+            anyhow!(
+                "Magnetar Qwen generation for `{}` failed: {error}",
+                self.alias
+            )
+        })?;
 
         let usage = outcome.result.output.usage;
         Ok(vec![(
@@ -217,16 +212,94 @@ impl MagnetarRuntime {
         prompts: &[&[u8]],
         on_token: &mut dyn FnMut(&str) -> StreamControl,
     ) -> Result<TokenUsage> {
-        let mut outputs = self.generate(prompts)?;
-        let (bytes, usage) = outputs.remove(0);
-        let text = String::from_utf8(bytes).context("Magnetar output was not UTF-8")?;
-        if !text.is_empty() {
-            on_token(&text);
+        if prompts.len() != 1 {
+            bail!(
+                "Magnetar Qwen streaming generation for `{}` expects exactly one prompt, got {}",
+                self.alias,
+                prompts.len()
+            );
         }
-        Ok(usage)
+        let request = GenerationRequestView::parse(prompts[0])?.into_magnetar_request()?;
+        let mut streamed_usage = None;
+        let mut on_event = |event: GenerationStreamEvent| -> std::ops::ControlFlow<()> {
+            match event {
+                GenerationStreamEvent::Token {
+                    text_delta: Some(delta),
+                    ..
+                } if !delta.is_empty() => {
+                    if on_token(&delta).is_stop() {
+                        std::ops::ControlFlow::Break(())
+                    } else {
+                        std::ops::ControlFlow::Continue(())
+                    }
+                }
+                GenerationStreamEvent::Finished { usage, .. } => {
+                    streamed_usage = Some(TokenUsage {
+                        prompt_tokens: usage.prompt_tokens.min(u32::MAX as usize) as u32,
+                        completion_tokens: usage.generated_tokens.min(u32::MAX as usize) as u32,
+                    });
+                    std::ops::ControlFlow::Continue(())
+                }
+                _ => std::ops::ControlFlow::Continue(()),
+            }
+        };
+        let outcome = magnetar_runtime::run_production_qwen_generation_for_provider_streaming(
+            self.fixture.clone(),
+            self.payload_source.as_ref(),
+            self.trust_store.clone(),
+            request,
+            self.chat_formatter(),
+            self.provider_for_generation()?,
+            &mut on_event,
+        )
+        .map_err(|error| {
+            anyhow!(
+                "Magnetar Qwen streaming generation for `{}` failed: {error}",
+                self.alias
+            )
+        })?;
+        Ok(streamed_usage.unwrap_or_else(|| {
+            let usage = outcome.result.output.usage;
+            TokenUsage {
+                prompt_tokens: usage.prompt_tokens.min(u32::MAX as usize) as u32,
+                completion_tokens: usage.generated_tokens.min(u32::MAX as usize) as u32,
+            }
+        }))
+    }
+
+    fn provider_for_generation(&self) -> Result<Arc<dyn Provider>> {
+        match self.target {
+            MagnetarProviderTarget::ReferenceCpu => {
+                Ok(Arc::new(magnetar_runtime::ReferenceCpuProvider::new()) as Arc<dyn Provider>)
+            }
+            MagnetarProviderTarget::Cuda => {
+                #[cfg(feature = "magnetar-cuda")]
+                {
+                    let provider = magnetar_provider_cuda::CudaProvider::new();
+                    if !provider.is_available() {
+                        bail!(
+                            "Magnetar CUDA provider is unavailable for `{}`; explicit CUDA placement cannot fall back to CPU",
+                            self.alias
+                        );
+                    }
+                    Ok(Arc::new(provider) as Arc<dyn Provider>)
+                }
+                #[cfg(not(feature = "magnetar-cuda"))]
+                {
+                    bail!(
+                        "Magnetar CUDA provider is not compiled into this host; rebuild with `magnetar-cuda` for explicit CUDA placement"
+                    )
+                }
+            }
+        }
+    }
+
+    fn chat_formatter(&self) -> Option<&dyn magnetar_runtime::ChatTemplateFormatter> {
+        self.chat_formatter
+            .as_deref()
+            .map(|formatter| formatter as &dyn magnetar_runtime::ChatTemplateFormatter)
     }
 }
-
 pub(crate) fn is_magnetar_path(path: &str) -> bool {
     path.trim().starts_with(MAGNETAR_PATH_PREFIX)
 }
@@ -249,14 +322,12 @@ fn magnetar_root(path: &str) -> PathBuf {
     }
 }
 
-fn tachyon_model_trust_store(root: &std::path::Path) -> Result<ModelTrustStore> {
-    let trust_path = [TACHYON_HIDDEN_MODEL_TRUST_JSON, TACHYON_MODEL_TRUST_JSON]
-        .into_iter()
-        .map(|file| root.join(file))
-        .find(|path| path.is_file());
-    let Some(trust_path) = trust_path else {
+fn tachyon_model_trust_store(root: &Path) -> Result<ModelTrustStore> {
+    let Some(trust_path) = std::env::var_os(TACHYON_MODEL_TRUST_STORE_ENV).map(PathBuf::from)
+    else {
         return Ok(ModelTrustStore::default());
     };
+    reject_trust_store_inside_artifact(root, &trust_path)?;
     let value = serde_json::from_slice::<Value>(
         &std::fs::read(&trust_path)
             .with_context(|| format!("failed to read `{}`", trust_path.display()))?,
@@ -282,6 +353,26 @@ fn tachyon_model_trust_store(root: &std::path::Path) -> Result<ModelTrustStore> 
         trust_store = trust_store.trust_digest(digest);
     }
     Ok(trust_store)
+}
+
+fn reject_trust_store_inside_artifact(root: &Path, trust_path: &Path) -> Result<()> {
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize model root `{}`", root.display()))?;
+    let canonical_trust_path = trust_path.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize Tachyon trust store `{}`",
+            trust_path.display()
+        )
+    })?;
+    if canonical_trust_path.starts_with(&canonical_root) {
+        bail!(
+            "Tachyon model trust store `{}` must be controlled outside artifact root `{}`",
+            canonical_trust_path.display(),
+            canonical_root.display()
+        );
+    }
+    Ok(())
 }
 
 fn provider_target(requested_target: &str) -> Result<MagnetarProviderTarget> {
@@ -333,22 +424,11 @@ fn provider_advertisement(provider: &dyn Provider) -> CapabilityAdvertisement {
     }
 }
 
-fn requested_max_tokens(
-    fixture: &magnetar_runtime::E2eFixture,
-    request_max_new_tokens: Option<u32>,
-) -> Option<u32> {
-    request_max_new_tokens.or_else(|| {
-        fixture
-            .manifest
-            .generation
-            .as_ref()
-            .and_then(|generation| generation.max_tokens)
-    })
-}
-
 struct GenerationRequestView {
-    prompt: String,
-    max_new_tokens: Option<u32>,
+    prompt: PromptInput,
+    parameters: GenerationParameters,
+    stop_conditions: StopConditions,
+    max_new_tokens: Option<usize>,
 }
 
 impl GenerationRequestView {
@@ -357,29 +437,159 @@ impl GenerationRequestView {
             .map_err(|error| anyhow!("Qwen prompt must be UTF-8: {error}"))?;
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             return Ok(Self {
-                prompt: text.to_owned(),
+                prompt: PromptInput::PlainText(text.to_owned()),
+                parameters: GenerationParameters::greedy(),
+                stop_conditions: StopConditions::default(),
                 max_new_tokens: None,
             });
         };
         let Value::Object(object) = value else {
             return Ok(Self {
-                prompt: text.to_owned(),
+                prompt: PromptInput::PlainText(text.to_owned()),
+                parameters: GenerationParameters::greedy(),
+                stop_conditions: StopConditions::default(),
                 max_new_tokens: None,
             });
         };
-        let prompt = object
-            .get("prompt")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| text.to_owned());
+        fail_on_unsupported_generation_fields(&object)?;
+        let prompt = if let Some(messages) = object.get("messages") {
+            PromptInput::ChatMessages(parse_chat_messages(messages)?)
+        } else {
+            let prompt = object
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| text.to_owned());
+            PromptInput::PlainText(prompt)
+        };
         let max_new_tokens = object
             .get("max_new_tokens")
             .or_else(|| object.get("max_tokens"))
             .and_then(Value::as_u64)
-            .map(|value| value.min(u64::from(u32::MAX)) as u32);
+            .map(|value| value.min(usize::MAX as u64) as usize);
+        let mut parameters = GenerationParameters::greedy();
+        if let Some(temperature) = json_f32(&object, "temperature")? {
+            if temperature == 0.0 {
+                parameters = GenerationParameters::greedy();
+            } else {
+                parameters.temperature = temperature;
+                parameters.greedy = false;
+                parameters.sampling_enabled = true;
+            }
+        }
+        if let Some(top_p) = json_f32(&object, "top_p")? {
+            parameters.top_p = Some(top_p);
+        }
+        if let Some(top_k) = object
+            .get("top_k")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(u64::from(u32::MAX)) as u32)
+        {
+            parameters.top_k = Some(top_k);
+        }
+        if let Some(seed) = object.get("seed").and_then(Value::as_u64) {
+            parameters.seed = Some(seed);
+            parameters.deterministic = true;
+        }
+        parameters.frequency_penalty = json_f32(&object, "frequency_penalty")?;
+        parameters.presence_penalty = json_f32(&object, "presence_penalty")?;
+        parameters.repetition_penalty = json_f32(&object, "repetition_penalty")?;
+
+        let mut stop_conditions = StopConditions::default();
+        if let Some(stop) = object.get("stop") {
+            stop_conditions.stop_text_sequences = parse_stop_sequences(stop)?;
+        }
         Ok(Self {
             prompt,
+            parameters,
+            stop_conditions,
             max_new_tokens,
         })
     }
+
+    fn into_magnetar_request(self) -> Result<ProductionGenerationRequest> {
+        self.parameters
+            .validate()
+            .map_err(|error| anyhow!("invalid Magnetar generation parameters: {error}"))?;
+        Ok(ProductionGenerationRequest {
+            prompt: self.prompt,
+            parameters: self.parameters,
+            stop_conditions: self.stop_conditions,
+            max_new_tokens: self.max_new_tokens,
+        })
+    }
+}
+
+fn fail_on_unsupported_generation_fields(object: &serde_json::Map<String, Value>) -> Result<()> {
+    const SUPPORTED: &[&str] = &[
+        "prompt",
+        "messages",
+        "max_new_tokens",
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "seed",
+        "stop",
+        "frequency_penalty",
+        "presence_penalty",
+        "repetition_penalty",
+        "include_usage",
+    ];
+    if let Some(key) = object.keys().find(|key| !SUPPORTED.contains(&key.as_str())) {
+        bail!("Magnetar generation request field `{key}` is not supported by Tachyon");
+    }
+    Ok(())
+}
+
+fn parse_chat_messages(value: &Value) -> Result<Vec<ChatMessage>> {
+    let messages = value
+        .as_array()
+        .ok_or_else(|| anyhow!("`messages` must be an array"))?;
+    messages
+        .iter()
+        .map(|message| {
+            let object = message
+                .as_object()
+                .ok_or_else(|| anyhow!("chat message entries must be objects"))?;
+            let role = object
+                .get("role")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("chat message entries require string `role`"))?;
+            let content = object
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("chat message entries require string `content`"))?;
+            Ok(ChatMessage::new(role, content))
+        })
+        .collect()
+}
+
+fn parse_stop_sequences(value: &Value) -> Result<Vec<String>> {
+    if let Some(stop) = value.as_str() {
+        return Ok(vec![stop.to_owned()]);
+    }
+    let stops = value
+        .as_array()
+        .ok_or_else(|| anyhow!("`stop` must be a string or string array"))?;
+    stops
+        .iter()
+        .map(|stop| {
+            stop.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("`stop` array entries must be strings"))
+        })
+        .collect()
+}
+
+fn json_f32(object: &serde_json::Map<String, Value>, key: &str) -> Result<Option<f32>> {
+    object
+        .get(key)
+        .map(|value| {
+            value
+                .as_f64()
+                .ok_or_else(|| anyhow!("`{key}` must be a number"))
+                .map(|value| value as f32)
+        })
+        .transpose()
 }

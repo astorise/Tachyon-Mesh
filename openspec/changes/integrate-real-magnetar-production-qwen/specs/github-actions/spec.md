@@ -1,11 +1,11 @@
 ## ADDED Requirements
 
 ### Requirement: GPU CI MUST validate real Magnetar CUDA execution without vacuous success
-The GPU quality workflow SHALL validate the active Magnetar local inference path on a self-hosted GPU runner. The job SHALL run a CUDA prefill / first-token production Qwen test through a real Magnetar `CudaProvider` and SHALL fail if the selected test set is empty or if the hardware-required assertion did not run.
+The GPU quality workflow SHALL validate the active Magnetar local inference path on a self-hosted GPU runner. The job SHALL run a CUDA multi-token production Qwen test through a real Magnetar `CudaProvider` and SHALL fail if the selected test set is empty or if the hardware-required assertion did not run.
 
-#### Scenario: GPU job runs Magnetar CUDA prefill proof
+#### Scenario: GPU job runs Magnetar CUDA multi-token proof
 - **WHEN** the GPU quality job runs on the self-hosted NVIDIA runner
-- **THEN** it executes a Magnetar production Qwen CUDA prefill / first-token test
+- **THEN** it executes a Magnetar production Qwen CUDA generation test for at least sixteen tokens
 - **AND** the test constructs a real `CudaProvider`
 - **AND** the test fails if CUDA is unavailable on that runner
 

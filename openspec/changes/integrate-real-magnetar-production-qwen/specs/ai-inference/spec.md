@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Tachyon MUST load Qwen bundles through Magnetar production ingestion
-For local Qwen model bindings, the host SHALL delegate production model parsing and normalization to Magnetar's public production ingestion API. Tachyon SHALL construct a `ProductionModelSource::authorized_local_bundle` using `ModelArtifactSource::Tachyon` for Tachyon-staged bundles, invoke the Hugging Face ingestor, load the real tokenizer through the ingestor's tokenizer implementation, evaluate trust through `ModelTrustStore`, and build a Magnetar production Qwen fixture before generation.
+For local Qwen model bindings, the host SHALL delegate production model parsing and normalization to Magnetar's public production ingestion API. Tachyon SHALL construct a `ProductionModelSource::authorized_local_bundle` using `ModelArtifactSource::Tachyon` for Tachyon-staged bundles, invoke the Hugging Face ingestor, load the real tokenizer through the ingestor's tokenizer implementation, evaluate trust through a host-controlled `ModelTrustStore` outside the artifact bundle, and build a Magnetar production Qwen fixture before generation.
 
 #### Scenario: Tachyon-staged Qwen bundle loads through Magnetar
 - **WHEN** a model binding points at a Tachyon-staged Qwen bundle containing `config.json`, `tokenizer.json`, tokenizer configuration, generation configuration, and Safetensors payloads
@@ -14,8 +14,13 @@ For local Qwen model bindings, the host SHALL delegate production model parsing 
 - **THEN** loading fails before Provider resource materialization
 - **AND** Tachyon reports a trust-shaped local inference error
 
+#### Scenario: Artifact-local trust policy is ignored
+- **WHEN** a Tachyon-staged bundle contains a `tachyon-model-trust.json` or `.tachyon-model-trust.json` file that trusts its own manifest digest
+- **THEN** Tachyon still treats the bundle as untrusted unless the host-controlled trust store outside the artifact root trusts that digest
+- **AND** model artifacts cannot self-authorize by shipping trust metadata inside the bundle
+
 ### Requirement: Tachyon MUST execute production Qwen through real Magnetar Providers
-The host SHALL execute admitted Qwen generation through Magnetar's real production Qwen path: real tokenizer, `ModelInstance`, Qwen Component, prepared execution plan, memory manager, and a real Provider. Reference CPU execution SHALL use Magnetar's Reference CPU path. CUDA execution SHALL use a real `CudaProvider`.
+The host SHALL execute admitted Qwen generation through Magnetar's real production Qwen path: real tokenizer, `ModelInstance`, Qwen Component, prepared execution plan, memory manager, and a real Provider. Reference CPU execution SHALL use Magnetar's Reference CPU Provider. CUDA execution SHALL use a real `CudaProvider`. Tachyon SHALL pass caller input through `ProductionGenerationRequest`, mapping chat messages to `PromptInput::ChatMessages`, supported generation parameters to `GenerationParameters`, and text stop sequences to `StopConditions`.
 
 #### Scenario: CPU policy generates through Reference CPU
 - **WHEN** route policy selects CPU for an admitted Qwen bundle
@@ -27,12 +32,22 @@ The host SHALL execute admitted Qwen generation through Magnetar's real producti
 - **THEN** Tachyon constructs and passes a real Magnetar `CudaProvider`
 - **AND** a successful response cannot have silently used Reference CPU as a fallback
 
-### Requirement: CUDA multi-token generation MUST fail closed until device-resident decode exists
-Until Magnetar provides device-resident multi-step CUDA decode, Tachyon SHALL NOT claim full CUDA generation support. CUDA placement MAY run the supported prefill / first-token path, but a request that explicitly requires CUDA and more than one generated token SHALL fail with an unsupported-capability error instead of falling back to CPU or copying KV history through host memory.
+#### Scenario: OpenAI chat request uses Magnetar chat input
+- **WHEN** a local OpenAI chat request contains `messages`
+- **THEN** Tachyon passes those messages to Magnetar as `PromptInput::ChatMessages`
+- **AND** Tachyon does not render the Qwen chat template locally
 
-#### Scenario: Explicit CUDA multi-token request is rejected
-- **WHEN** a request explicitly selects CUDA and asks for more than one generated token
-- **THEN** Tachyon rejects the request with an unsupported-capability error
+#### Scenario: Request parameters and stops reach Magnetar
+- **WHEN** a local OpenAI request supplies supported sampling parameters, seed, max token budget, or stop text
+- **THEN** Tachyon maps them to Magnetar `GenerationParameters`, `ProductionGenerationRequest.max_new_tokens`, and `StopConditions`
+- **AND** unsupported local Magnetar request fields fail closed instead of being silently ignored
+
+### Requirement: CUDA multi-token generation MUST use Magnetar device-resident decode
+Now that Magnetar provides device-resident multi-step CUDA decode, Tachyon SHALL NOT reject explicit CUDA requests solely because they ask for more than one generated token. Tachyon SHALL still fail closed when the real `CudaProvider` is unavailable and SHALL NOT emulate CUDA generation by falling back to CPU or copying KV history through host memory.
+
+#### Scenario: Explicit CUDA multi-token request runs on CUDA
+- **WHEN** a request explicitly selects CUDA and asks for at least sixteen generated tokens
+- **THEN** Tachyon executes generation through Magnetar's real `CudaProvider`
 - **AND** Tachyon does not silently execute the request on Reference CPU
 - **AND** Tachyon does not implement a GPU-to-host-to-GPU KV-cache workaround
 
@@ -40,6 +55,14 @@ Until Magnetar provides device-resident multi-step CUDA decode, Tachyon SHALL NO
 - **WHEN** route policy selects Reference CPU for the same Qwen bundle
 - **THEN** Tachyon may execute multi-token generation through Magnetar's CPU path
 - **AND** the response is not reported as CUDA execution
+
+### Requirement: Tachyon streaming MUST consume Magnetar generation events
+For local Magnetar Qwen streaming, Tachyon SHALL use Magnetar's production streaming entry point and consume `GenerationStreamEvent::Token.text_delta`. Tachyon SHALL NOT buffer a full generation and then emit it as a fabricated streaming chunk.
+
+#### Scenario: Streaming emits token deltas from Magnetar
+- **WHEN** a local OpenAI request uses `stream: true`
+- **THEN** Tachyon obtains token deltas from Magnetar streaming events
+- **AND** cancellation from the downstream stream propagates with `ControlFlow::Break`
 
 ### Requirement: Tachyon MUST NOT fabricate Magnetar execution or hardware identities
 The host SHALL consume Magnetar runtime, Provider, and Device contracts rather than creating local stand-ins for Magnetar handles or capability advertisements. Tachyon SHALL NOT define permanent local `PreparedKernelId`, `TensorId`, hardcoded `CUDA_0`, hardcoded VRAM/dtype support, environment-variable hardware truth, or pseudo Magnetar memory residency as the source of mesh routing truth.

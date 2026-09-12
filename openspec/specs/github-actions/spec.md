@@ -8,8 +8,7 @@ The CI workflow SHALL validate Tachyon's active local Qwen inference path throug
 production ingestion. CPU quality SHALL run a focused production Qwen ingestion and Reference CPU
 generation test. The GPU quality job SHALL build and lint the `magnetar-cuda` feature, verify that
 its GPU-critical test filters select non-empty test sets, run a hardware-required `CudaProvider`
-guard, run the Magnetar CUDA prefill / first-token proof, and run the CUDA multi-token fail-closed
-proof.
+guard, and run the Magnetar CUDA multi-token generation proof.
 
 #### Scenario: CPU quality covers Magnetar production ingestion
 - **WHEN** the quality job runs without GPU hardware
@@ -23,8 +22,7 @@ proof.
 - **THEN** it compiles the `magnetar-cuda` feature
 - **AND** it fails before execution if any critical Magnetar CUDA test filter selects zero tests
 - **AND** it runs a real `CudaProvider` availability guard
-- **AND** it runs the Magnetar CUDA first-token proof
-- **AND** it runs the CUDA multi-token fail-closed proof
+- **AND** it runs the Magnetar CUDA multi-token proof for at least sixteen generated tokens
 
 ### Requirement: Repository provides a GitHub Actions CI workflow for the main branch
 The repository SHALL define a GitHub Actions workflow at `.github/workflows/ci.yml` that runs on pushes to `main` and pull requests targeting `main`.

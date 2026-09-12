@@ -2,24 +2,24 @@
 
 Tachyon currently accepts `magnetar:` model bindings, but `core-host/src/ai_inference/magnetar_runtime.rs` is a local compatibility facade that rejects real Qwen execution with `not implemented yet`. The previous cutover archive also left canonical specs and GPU CI steps describing `candle-cuda` as the active local inference path.
 
-Magnetar now exposes the public embedder path for production Qwen loading at commit `0104bcbda4383b572d278faf5a24cb93ab3fd072`: `ProductionModelSource`, `HuggingFaceIngestor`, `ModelTrustStore`, `production_qwen_fixture`, and `run_production_qwen_generation(_for_provider)`. Tachyon should become a transport, provenance, routing, and QoS layer around that API, not a parser or execution-engine shim.
+Magnetar now exposes the public embedder path for production Qwen loading at commit `b235783abb2b0c92843febfa3ff29f30745e1934`: `ProductionModelSource`, `HuggingFaceIngestor`, `ModelTrustStore`, `production_qwen_fixture`, `ProductionGenerationRequest`, provider generation, and streaming generation events. Tachyon should become a transport, provenance, routing, and QoS layer around that API, not a parser or execution-engine shim.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- Pin Magnetar crates to `0104bcbda4383b572d278faf5a24cb93ab3fd072`.
+- Pin Magnetar crates to `b235783abb2b0c92843febfa3ff29f30745e1934`.
 - Replace the Tachyon-local Magnetar facade with a thin adapter over Magnetar's public production Qwen APIs.
 - Treat Tachyon-staged model directories as `ModelArtifactSource::Tachyon` through `ProductionModelSource::authorized_local_bundle`.
 - Use Magnetar's real Hugging Face ingestor, tokenizer, trust store, ModelInstance, Qwen Component, prepared execution plan, Reference CPU Provider, and CudaProvider.
-- Fail closed when CUDA is explicitly requested but unavailable, or when CUDA is requested for unsupported multi-token decode.
+- Fail closed when CUDA is explicitly requested but unavailable, and allow CUDA multi-token generation only through Magnetar's real device-resident decode path.
 - Update specs and CI so Candle is no longer described as the active local inference runtime and GPU checks cannot pass vacuously.
 
 **Non-Goals:**
 
 - Do not implement Magnetar's device-resident multi-step CUDA decode in Tachyon.
 - Do not add Safetensors, tokenizer, BF16/F16 conversion, Tensor Resource, Qwen graph, KV-cache, or Provider execution logic to Tachyon.
-- Do not claim full CUDA generation until Magnetar supports device-resident multi-token decode.
+- Do not emulate CUDA generation through CPU fallback or GPU-host-GPU KV round trips.
 - Do not silently fall back from explicitly requested CUDA to Reference CPU.
 
 ## Decisions
@@ -33,31 +33,36 @@ Magnetar now exposes the public embedder path for production Qwen loading at com
    - Tachyon records routing telemetry and enforces policy, but it never fabricates Magnetar kernel/tensor IDs or hardware capabilities.
 
 3. **Make placement explicit and fail-closed.**
-   - CPU placement uses `run_production_qwen_generation`.
-   - CUDA placement constructs a real `CudaProvider` and uses `run_production_qwen_generation_for_provider`.
-   - CUDA requests with `max_tokens > 1` return an unsupported-capability error until Magnetar's device-resident multi-step decode is available. CPU may generate multiple tokens when policy selected CPU explicitly.
+   - CPU placement constructs a real Reference CPU Provider and uses `run_production_qwen_generation_for_provider_with_request`.
+   - CUDA placement constructs a real `CudaProvider` and uses `run_production_qwen_generation_for_provider_with_request`.
+   - CUDA multi-token requests are no longer rejected by Tachyon; Magnetar owns the provider capability check and device-resident decode implementation.
 
-4. **Replace Candle CI proof with Magnetar proof.**
+4. **Forward production request semantics.**
+   - Tachyon maps OpenAI chat turns to `PromptInput::ChatMessages` and does not render Qwen chat templates locally.
+   - Tachyon maps accepted generation parameters and stop sequences into Magnetar `GenerationParameters` and `StopConditions`.
+   - Streaming uses `run_production_qwen_generation_for_provider_streaming` and emits `GenerationStreamEvent::Token.text_delta`.
+
+5. **Replace Candle CI proof with Magnetar proof.**
    - CPU CI covers real production ingestion and generation through Magnetar.
-   - GPU CI covers CUDA prefill / first-token generation with a real CudaProvider and includes an assertion that the GPU-critical path actually ran.
+   - GPU CI covers CUDA multi-token generation with a real CudaProvider and includes an assertion that the GPU-critical path actually ran.
    - Test selection commands must fail if they match zero tests.
 
-5. **Correct, do not rewrite, the archived history.**
+6. **Correct, do not rewrite, the archived history.**
    - The old archive remains historical evidence. This change adds a corrective successor that records why the earlier completion was insufficient and what replaces it.
 
 ## Risks / Trade-offs
 
 - [Risk] Magnetar APIs at the pinned SHA use Rust 2024 while `core-host` is Rust 2021. -> Mitigation: Cargo supports mixed-edition dependencies; keep Tachyon code idiomatic 2021 and isolate Magnetar calls in one module.
 - [Risk] Pulling `magnetar-provider-cuda` into ordinary CPU CI could require CUDA runtime libraries. -> Mitigation: keep CUDA dependency optional and gate CUDA checks behind the existing GPU runner path.
-- [Risk] Magnetar generation API currently returns full generation output rather than Tachyon's existing streaming callback semantics. -> Mitigation: preserve buffered generation first; streaming may emit the final generated chunk until Magnetar exposes a token streaming embedder API.
-- [Risk] Existing route configs that requested `magnetar:` CUDA multi-token generation will fail where they previously reached only a facade. -> Mitigation: this is intentional fail-closed behavior; operators can choose CPU placement or `max_tokens = 1` for CUDA prefill validation.
+- [Risk] Accepted OpenAI request options can drift from Magnetar's production request contract. -> Mitigation: Tachyon maps supported fields explicitly and rejects unsupported local Magnetar fields instead of silently ignoring them.
+- [Risk] Trust policy could be smuggled inside an artifact bundle. -> Mitigation: Tachyon reads trust from a host-controlled path outside the artifact root and ignores artifact-local trust files.
 
 ## Migration Plan
 
 1. Add pinned Magnetar dependencies and feature gates.
 2. Replace the local facade implementation with the real Magnetar adapter while keeping Tachyon's public inference APIs stable.
 3. Remove fake Magnetar capability/residency types from Tachyon's runtime surface and map telemetry to real Provider metadata.
-4. Update tests for CPU production Qwen, explicit trust rejection, non-Qwen rejection, CUDA fail-closed multi-token policy, and GPU prefill coverage.
+4. Update tests for CPU production Qwen, explicit trust rejection, self-trust rejection, non-Qwen rejection, CUDA multi-token generation, and GPU coverage.
 5. Replace `candle-cuda` CI proof steps with Magnetar CPU/GPU checks and zero-test guards.
 6. Run formatting, clippy, focused tests, and compile-only feature checks.
 

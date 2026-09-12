@@ -27,10 +27,13 @@ graph, or fabricate Magnetar tensor, kernel, hardware, or capability identities.
 
 #### Scenario: Magnetar trust policy is explicit
 - **WHEN** Magnetar ingestion succeeds for a bundle whose manifest digest is not
-  trusted by Tachyon's model trust policy
+  trusted by Tachyon's host-controlled model trust policy outside the artifact
+  root
 - **THEN** Tachyon rejects the binding before Provider execution
 - **AND** parsing success, source kind, and local filesystem authorization do
   not grant trust
+- **AND** trust metadata shipped inside the model artifact cannot self-authorize
+  the bundle
 
 #### Scenario: Reference CPU generation is allowed by CPU placement
 - **WHEN** route policy selects CPU for an admitted Qwen bundle
@@ -38,13 +41,23 @@ graph, or fabricate Magnetar tensor, kernel, hardware, or capability identities.
   production Qwen path
 - **AND** mesh telemetry reports the real Magnetar Provider used for execution
 
-#### Scenario: CUDA placement is fail-closed until device-resident decode exists
+#### Scenario: CUDA placement uses Magnetar device-resident decode
 - **WHEN** route policy explicitly selects CUDA
 - **THEN** Tachyon uses a real Magnetar `CudaProvider` when one is available
 - **AND** Tachyon rejects the request when CUDA is unavailable instead of
   silently falling back to Reference CPU
-- **AND** requests for more than one generated token on CUDA fail closed until
-  Magnetar provides device-resident multi-step decode
+- **AND** requests for multiple generated tokens on CUDA execute only through
+  Magnetar's device-resident decode path
+
+#### Scenario: OpenAI-shaped local requests are mapped to Magnetar contracts
+- **WHEN** a local OpenAI chat request supplies messages, supported sampling
+  parameters, a seed, max token budget, stop text, or streaming intent
+- **THEN** Tachyon maps chat turns to `PromptInput::ChatMessages`,
+  generation controls to `GenerationParameters`, stop text to
+  `StopConditions`, and streaming output to `GenerationStreamEvent::Token`
+  deltas
+- **AND** Tachyon does not render Qwen chat templates or fabricate streaming
+  chunks locally
 
 ### Requirement: Local legacy text-generation compatibility is not an active inference surface
 Tachyon SHALL NOT expose Cargo feature aliases, runtime modules, CI gates, or

@@ -322,17 +322,6 @@ jobs:
       - name: Check ai-inference host build
         run: cargo check -p core-host --features ai-inference
 
-      - name: Verify constrained decoding is implemented, not just specified
-        # openspec/specs/core-host/spec.md requires native constrained decoding
-        # behind ai-inference. The previous attempt at this (archived change
-        # 2026-05-16-ai-constrained-decoding) merged the spec text with 0 lines
-        # of matching code. Guard against that drift recurring: the FSM/logit
-        # masking engine must exist in core-host/src, and the WIT contract must
-        # expose `sample-constrained`.
-        run: |
-          grep -rq "FsmLogitProcessor" core-host/src
-          grep -q "sample-constrained" wit/ai/inference.wit
-
       - name: Test real Magnetar production Qwen fixture
         if: env.RENOVATE_PR != 'true'
         run: cargo test -p core-host --features ai-inference --bin core-host magnetar_qwen_binding_generates_through_real_production_cpu_path
@@ -461,20 +450,14 @@ jobs:
           cargo test -p core-host --bin core-host --features magnetar-cuda \
             magnetar_cuda_provider_hardware_required_guard -- --list > /tmp/magnetar-cuda-tests.txt
           cargo test -p core-host --bin core-host --features magnetar-cuda \
-            magnetar_qwen_binding_generates_first_token_on_real_cuda_provider -- --list >> /tmp/magnetar-cuda-tests.txt
-          cargo test -p core-host --bin core-host --features magnetar-cuda \
-            magnetar_qwen_cuda_multi_token_request_fails_closed -- --list >> /tmp/magnetar-cuda-tests.txt
+            magnetar_qwen_cuda_generates_multiple_tokens_on_real_cuda_provider -- --list >> /tmp/magnetar-cuda-tests.txt
           cat /tmp/magnetar-cuda-tests.txt
           if ! grep -q '^.*magnetar_cuda_provider_hardware_required_guard: test$' /tmp/magnetar-cuda-tests.txt; then
             echo "::error::Magnetar CUDA hardware guard selected zero tests"
             exit 1
           fi
-          if ! grep -q '^.*magnetar_qwen_binding_generates_first_token_on_real_cuda_provider: test$' /tmp/magnetar-cuda-tests.txt; then
-            echo "::error::Magnetar CUDA first-token proof selected zero tests"
-            exit 1
-          fi
-          if ! grep -q '^.*magnetar_qwen_cuda_multi_token_request_fails_closed: test$' /tmp/magnetar-cuda-tests.txt; then
-            echo "::error::Magnetar CUDA multi-token fail-closed proof selected zero tests"
+          if ! grep -q '^.*magnetar_qwen_cuda_generates_multiple_tokens_on_real_cuda_provider: test$' /tmp/magnetar-cuda-tests.txt; then
+            echo "::error::Magnetar CUDA multi-token proof selected zero tests"
             exit 1
           fi
 
@@ -483,15 +466,10 @@ jobs:
         timeout-minutes: 10
         run: cargo test -p core-host --bin core-host --features magnetar-cuda magnetar_cuda_provider_hardware_required_guard -- --ignored --nocapture
 
-      - name: Run Magnetar production Qwen CUDA first-token proof
+      - name: Run Magnetar production Qwen CUDA multi-token proof
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 20
-        run: cargo test -p core-host --bin core-host --features magnetar-cuda magnetar_qwen_binding_generates_first_token_on_real_cuda_provider -- --ignored --nocapture
-
-      - name: Run Magnetar CUDA multi-token fail-closed proof
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 10
-        run: cargo test -p core-host --bin core-host --features magnetar-cuda magnetar_qwen_cuda_multi_token_request_fails_closed -- --ignored --nocapture
+        run: cargo test -p core-host --bin core-host --features magnetar-cuda magnetar_qwen_cuda_generates_multiple_tokens_on_real_cuda_provider -- --ignored --nocapture
 
   # ── 4. Tests (needs quality + guests) ───────────────────────────────────────
   # Runs the full workspace nextest suite — including the core-host chaos

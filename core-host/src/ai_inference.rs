@@ -1232,7 +1232,7 @@ mod tests {
             .expect("tokenizer should be written");
         fs::write(
             path.join("tokenizer_config.json"),
-            r#"{"bos_token": "<bos>", "eos_token": "<eos>"}"#,
+            r#"{"bos_token": "<bos>", "eos_token": "<eos>", "chat_template": "{% for message in messages %}{{ message.role }}: {{ message.content }}\n{% endfor %}assistant: "}"#,
         )
         .expect("tokenizer config should be written");
 
@@ -1318,11 +1318,34 @@ mod tests {
             .expect("safetensors payload should write");
     }
 
-    fn trust_tachyon_qwen_bundle(path: &Path) {
+    static TRUST_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    struct TrustStoreEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        path: PathBuf,
+    }
+
+    impl Drop for TrustStoreEnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV, previous);
+            } else {
+                std::env::remove_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
+            }
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn trust_tachyon_qwen_bundle(path: &Path) -> TrustStoreEnvGuard {
         use ::magnetar_runtime::production_model_ingestion::{
             ProductionModelArtifactIngestor, ProductionModelSource,
         };
 
+        let lock = TRUST_ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("trust env lock poisoned");
         let source = ProductionModelSource::authorized_local_bundle(
             ::magnetar_runtime::ModelArtifactSource::Tachyon("tachyon:test-fixture".to_owned()),
             path.to_path_buf(),
@@ -1330,21 +1353,35 @@ mod tests {
         let ingested = magnetar_loader_huggingface::HuggingFaceIngestor::new()
             .ingest(&source)
             .expect("fixture should ingest before writing Tachyon trust policy");
+        let trust_path = unique_model_dir("qwen-trust-policy").join("tachyon-model-trust.json");
+        std::fs::create_dir_all(
+            trust_path
+                .parent()
+                .expect("trust policy should have a parent"),
+        )
+        .expect("trust policy parent should be created");
         fs::write(
-            path.join(".tachyon-model-trust.json"),
+            &trust_path,
             format!(
                 r#"{{"trusted_digests":["{}"]}}"#,
                 ingested.manifest.id.digest.value
             ),
         )
         .expect("trust sidecar should be written");
+        let previous = std::env::var_os(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
+        std::env::set_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV, &trust_path);
+        TrustStoreEnvGuard {
+            _lock: lock,
+            previous,
+            path: trust_path,
+        }
     }
 
     #[test]
     fn magnetar_qwen_binding_generates_through_real_production_cpu_path() {
         let model_dir = unique_model_dir("qwen-runtime");
         write_tiny_production_qwen_bundle(&model_dir);
-        trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
             alias: "qwen2_5".to_owned(),
@@ -1363,6 +1400,37 @@ mod tests {
         let generation = runtime
             .compute_component_prompt("qwen2_5", r#"{"prompt":"hi","max_new_tokens":1}"#)
             .expect("real Magnetar production Qwen should generate");
+
+        assert!(!generation.is_empty());
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn magnetar_qwen_binding_maps_openai_messages_to_chat_prompt_input() {
+        let model_dir = unique_model_dir("qwen-chat-runtime");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "qwen2_5".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }];
+
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("real Magnetar production Qwen bundle should load");
+        let generation = runtime
+            .compute_component_prompt(
+                "qwen2_5",
+                r#"{"messages":[{"role":"user","content":"hi"}],"temperature":0,"max_new_tokens":1}"#,
+            )
+            .expect("OpenAI chat messages should reach Magnetar PromptInput::ChatMessages");
 
         assert!(!generation.is_empty());
         let _ = std::fs::remove_dir_all(model_dir);
@@ -1410,12 +1478,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(model_dir);
     }
 
+    #[test]
+    fn qwen_bundle_cannot_self_authorize_with_embedded_trust_policy() {
+        let model_dir = unique_model_dir("self-trusting-qwen");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let trust_path = std::env::var_os(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV)
+            .map(PathBuf::from)
+            .expect("test trust policy should be configured");
+        std::fs::copy(&trust_path, model_dir.join(".tachyon-model-trust.json"))
+            .expect("embedded fake trust policy should be copied");
+        std::env::remove_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
+
+        let error = match load_binding(&IntegrityModelBinding {
+            alias: "qwen-self-trusting".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }) {
+            Ok(_) => panic!("artifact-local trust policy must not self-authorize a Qwen bundle"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("trust rejected"));
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
     #[cfg(not(feature = "magnetar-cuda"))]
     #[test]
     fn explicit_magnetar_cuda_binding_fails_closed_without_cuda_feature() {
         let model_dir = unique_model_dir("cuda-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
-        trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
         let error = match load_binding(&IntegrityModelBinding {
             alias: "qwen-cuda".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
@@ -1454,7 +1550,7 @@ mod tests {
         );
         let model_dir = unique_model_dir("cuda-qwen-runtime");
         write_tiny_production_qwen_bundle(&model_dir);
-        trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
             alias: "qwen-cuda".to_owned(),
@@ -1488,7 +1584,7 @@ mod tests {
     #[cfg(feature = "magnetar-cuda")]
     #[test]
     #[ignore = "run explicitly on a GPU runner guaranteed to have CUDA available"]
-    fn magnetar_qwen_cuda_multi_token_request_fails_closed() {
+    fn magnetar_qwen_cuda_generates_multiple_tokens_on_real_cuda_provider() {
         let provider = magnetar_provider_cuda::CudaProvider::new();
         assert!(
             provider.is_available(),
@@ -1496,7 +1592,7 @@ mod tests {
         );
         let model_dir = unique_model_dir("cuda-qwen-multitoken");
         write_tiny_production_qwen_bundle(&model_dir);
-        trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
             alias: "qwen-cuda".to_owned(),
@@ -1512,15 +1608,17 @@ mod tests {
             ..IntegrityConfig::default_sealed()
         })
         .expect("real Magnetar production Qwen CUDA bundle should load");
-        let error = runtime
-            .compute_component_prompt("qwen-cuda", r#"{"prompt":"hi","max_new_tokens":2}"#)
-            .expect_err(
-                "multi-token CUDA generation must fail closed until decode is device-resident",
-            );
+        let generation = runtime
+            .compute_component_prompt("qwen-cuda", r#"{"prompt":"hi","max_new_tokens":16}"#)
+            .expect("real Magnetar CUDA should generate multiple tokens device-resident");
 
+        assert!(!generation.is_empty());
+        let telemetry = inference_execution_telemetry();
         assert!(
-            error.to_string().contains("first-token"),
-            "unexpected CUDA multi-token rejection: {error}"
+            telemetry.iter().any(|event| event.alias == "qwen-cuda"
+                && event.succeeded
+                && event.executed_on.to_ascii_lowercase().contains("cuda")),
+            "CUDA multi-token generation must record a real Magnetar CUDA provider execution"
         );
         let _ = std::fs::remove_dir_all(model_dir);
     }
