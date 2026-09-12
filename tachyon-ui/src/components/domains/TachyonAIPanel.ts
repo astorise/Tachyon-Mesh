@@ -361,7 +361,7 @@ export class TachyonAIPanel extends TachyonConfigDashboard {
             <input data-hw-key="${this.escape(key)}" data-hw-field="speculative_draft_tokens" type="number" min="0" value="${strategy.speculative_draft_tokens}" class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-2 font-mono text-xs text-slate-200">
           </label>
         </div>
-        <p class="mt-3 text-[11px] text-amber-300/80">Runtime rejections from unsupported Candle paths are returned by manifest apply and shown in the feedback area.</p>
+        <p class="mt-3 text-[11px] text-amber-300/80">Runtime rejections from unsupported provider paths are returned by manifest apply and shown in the feedback area.</p>
       </article>
     `;
   }

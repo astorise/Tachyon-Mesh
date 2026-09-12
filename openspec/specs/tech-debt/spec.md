@@ -25,18 +25,18 @@ The host file-piping utility (`pipe_range_from_file` or equivalent) SHALL canoni
 - **WHEN** the source is compiled with default features
 - **THEN** the file SHALL NOT contain an `unsafe` block in the safetensors flat-array coercion path
 
-### Requirement: Constrained Decoding Sampler Hygiene
-The sampler module SHALL avoid silent integer truncation, unused `PhantomData` markers, and arbitrary `wrapping_*` arithmetic disguised as FSM logic.
+### Requirement: Removed Sampler Runtime Stays Absent
+The removed in-process sampler runtime SHALL stay absent from active local inference code unless it is reintroduced through a new accepted design and implementation.
 
-#### Scenario: Token id cast preserves width
-- **GIVEN** a token id is used inside `CompiledFsm::transition`
-- **WHEN** the value is propagated to the next state
-- **THEN** the conversion SHALL preserve the original integer width or SHALL be documented as intentionally narrowed
+#### Scenario: No orphan sampler module remains
+- **GIVEN** the post-Magnetar-cutover source tree
+- **WHEN** active local inference files are inspected
+- **THEN** no standalone sampler runtime module is compiled
 
-#### Scenario: PhantomData marker is removed
-- **GIVEN** the legacy `_sampler_marker: PhantomData<NilSamplerResources>` field exists in `samplers.rs`
-- **WHEN** the module is rebuilt
-- **THEN** the field SHALL be removed
+#### Scenario: Future sampler work requires an explicit contract
+- **GIVEN** a future change needs provider-side sampling behavior
+- **WHEN** the change is proposed
+- **THEN** it SHALL define the Provider/runtime contract instead of restoring an implicit local fallback
 
 ### Requirement: Strongly Typed Telemetry Registries
 The telemetry registries SHALL retrieve metric handles via strongly typed maps or enums rather than runtime `Any::downcast_ref`.

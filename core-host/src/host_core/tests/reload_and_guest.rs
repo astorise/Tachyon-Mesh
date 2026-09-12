@@ -758,6 +758,103 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
     );
 }
 
+/// Integration proof for the client-disconnect half of streaming cancellation:
+/// once the SSE consumer drops, the host-visible `consumer_alive` flag is
+/// cleared and the streaming guest worker finishes instead of draining a
+/// response nobody can read.
+#[cfg(feature = "ai-inference")]
+#[tokio::test]
+async fn streaming_guest_openai_disconnect_finishes_worker_without_done_frame() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::ERROR)
+        .with_test_writer()
+        .try_init();
+    let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
+    route.models = vec![IntegrityModelBinding {
+        alias: "llama3".to_owned(),
+        path: "mock:llama3".to_owned(),
+        device: ModelDevice::Cpu,
+        qos: RouteQos::Standard,
+        dynamic: false,
+        hardware_strategy: Default::default(),
+    }];
+    let config = IntegrityConfig {
+        routes: vec![route.clone()],
+        ..IntegrityConfig::default_sealed()
+    };
+    let engine = build_test_engine(&config);
+    if let Err(missing) = resolve_guest_module_path("guest-openai") {
+        assert!(
+            std::env::var_os("TACHYON_REQUIRE_GUEST_OPENAI").is_none(),
+            "guest-openai wasm artifact required but not found ({missing}); \
+             build it with `cargo build -p guest-openai --target wasm32-wasip2 --release`"
+        );
+        eprintln!("SKIP: guest-openai artifact not present; run `cargo build -p guest-openai --target wasm32-wasip2` first");
+        return;
+    }
+
+    let req = GuestRequest::new(
+        "POST",
+        "/ai/v1/chat/completions",
+        Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "llama3",
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": true,
+            }))
+            .expect("encode"),
+        ),
+    );
+    let (htx, hrx) = tokio::sync::oneshot::channel::<(StatusCode, GuestHttpFields)>();
+    let (ctx, mut crx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    let consumer_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let worker_alive = std::sync::Arc::clone(&consumer_alive);
+    let route_c = route.clone();
+    let engine_c = engine.clone();
+    let config_c = config.clone();
+    let worker = std::thread::spawn(move || {
+        execute_streaming_guest(
+            &engine_c,
+            &route_c,
+            "guest-openai",
+            req,
+            htx,
+            ctx,
+            worker_alive,
+            &test_guest_execution_context(config_c, 94),
+        );
+    });
+
+    let (status, headers) = hrx.await.expect("streaming headers should arrive");
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v.contains("text/event-stream")),
+        "streaming response must carry content-type: text/event-stream; got: {headers:?}"
+    );
+    let first_chunk = crx.recv().await.expect("first SSE chunk should arrive");
+    assert!(
+        String::from_utf8_lossy(&first_chunk).contains("data: "),
+        "first streaming chunk should be an SSE frame: {first_chunk:?}"
+    );
+
+    consumer_alive.store(false, std::sync::atomic::Ordering::Release);
+    drop(crx);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !worker.is_finished() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        worker.is_finished(),
+        "streaming worker kept running after the SSE consumer disconnected"
+    );
+    worker
+        .join()
+        .expect("the disconnect-stream worker should finish");
+}
+
 /// Parse every `data:` frame of an SSE body except the `[DONE]` sentinel.
 #[cfg(feature = "ai-inference")]
 fn sse_data_frames(body: &str) -> Vec<Value> {

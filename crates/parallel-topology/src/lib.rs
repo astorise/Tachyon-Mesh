@@ -1,7 +1,7 @@
 //! Pure (no GPU runtime dependency) types and validation logic for
 //! tensor/pipeline/expert-parallel execution plans. Shared between
 //! `core-host` (which validates a plan against *discovered* hardware
-//! topology before dispatching real Candle execution) and
+//! topology before dispatching real provider execution) and
 //! `system-faas-config-api` (which validates a plan's internal shape at
 //! `apply-model-deployment` time, before any hardware has been consulted).
 //!

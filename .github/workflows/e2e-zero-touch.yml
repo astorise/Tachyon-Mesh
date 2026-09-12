@@ -52,6 +52,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Generate OIDC fixture (JWKS + discovery + signed JWT)
         run: node scripts/e2e/make-oidc-fixture.js "$ISSUER" fixture

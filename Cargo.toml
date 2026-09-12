@@ -71,6 +71,7 @@ members = [
     "tachyon-mcp",
     "turboquant-sys",
 ]
+exclude = ["vendor/Magnetar"]
 resolver = "2"
 
 [patch.crates-io]

@@ -16,7 +16,7 @@ OpenAI-compatible gateway directly. By default it posts streamed requests to
 <tachyon-chat-assistant
   endpoint="/ai/v1/chat/completions"
   models-endpoint="/ai/v1/models"
-  model="safetensors/nvidia--Qwen3.6-35B-A3B-NVFP4">
+  model="magnetar/qwen2.5-0.5b-instruct">
 </tachyon-chat-assistant>
 ```
 

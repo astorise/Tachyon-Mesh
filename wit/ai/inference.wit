@@ -1,16 +1,16 @@
 package tachyon:mesh@2.0.0;
 
-/// Inference interface that accepts an optional per-call LoRA adapter. The default
-/// path (no adapter) matches the existing inference behaviour exactly.
+/// Public local-inference contract after the Magnetar cutover.
+///
+/// Tachyon carries request bytes, routing, QoS, trust, and transport concerns.
+/// Model format parsing, tokenizer/chat-template rendering, execution planning,
+/// multi-device behavior, and Provider execution belong to Magnetar.
 interface inference {
     record inference-request {
         /// Foundation model alias as declared in the route's `models`.
         model: string,
-        /// Tokenised or text-mode prompt; encoding is up to the model.
+        /// UTF-8 JSON request envelope or plain prompt bytes for the selected model.
         prompt: list<u8>,
-        /// Optional tenant-specific LoRA adapter to overlay on top of the foundation
-        /// model for this single call. When `none`, the foundation model is used as-is.
-        adapter-id: option<string>,
         /// Maximum tokens to generate.
         max-tokens: u32,
         /// Sampling temperature (0.0-2.0).
@@ -25,130 +25,11 @@ interface inference {
         fuel-consumed: u64,
     }
 
-    /// Controls how model weights and the KV-cache are placed relative to VRAM.
-    enum memory-profile {
-        /// Default: load all weights to VRAM at startup. Maximum throughput; OOM
-        /// risk proportional to model size.
-        performance,
-        /// Layer-wise streaming: keep only one transformer layer in VRAM at a time.
-        /// Each layer is loaded from a memory-mapped `.safetensors` file on demand
-        /// and dropped after its forward pass. The KV-Cache is paged to Host RAM
-        /// after each layer, maintaining an O(1) VRAM footprint.
-        layer-wise-streaming,
-    }
-
-    /// Per-call tuning knobs that override the model-level defaults.
-    record inference-options {
-        temperature: f32,
-        max-tokens: u32,
-        /// Selects the VRAM placement strategy for this call.
-        profile: memory-profile,
-    }
-
-    /// Run a single inference call. The host honours `adapter-id` by hot-applying the
-    /// adapter weights via Candle, then removing the overlay before returning.
+    /// Run a single local inference call through the active Magnetar-backed
+    /// runtime selected by Tachyon placement policy.
     infer: func(req: inference-request) -> result<inference-response, string>;
-
-    /// Run a call with explicit per-call options. Falls back to `infer` semantics
-    /// when `options.profile` is `performance`.
-    infer-with-options: func(req: inference-request, options: inference-options) -> result<inference-response, string>;
-}
-
-/// Zero-copy, handle-based layer manipulation contract for guests that orchestrate
-/// model execution while native host memory owns tensor storage.
-interface layer-execution {
-    /// Opaque resource identifier representing a native tensor on the host.
-    type tensor-handle = u32;
-    type model-id = string;
-
-    /// Residency priority for weights loaded into VRAM.
-    enum vram-priority {
-        active,
-        hot,
-        volatile,
-    }
-
-    /// Instructs the host to slide the mmap window over specific safetensors blocks.
-    load-layer: func(model: model-id, layer-index: u32) -> result<_, string>;
-
-    /// Instructs the host to load a layer with an explicit VRAM eviction priority.
-    load-layer-with-priority: func(model: model-id, layer-index: u32, priority: vram-priority) -> result<_, string>;
-
-    /// Evicts the specified layer weights from memory/VRAM.
-    unload-layer: func(model: model-id, layer-index: u32);
-
-    /// Processes a vector of state pointers through the active layer weights.
-    forward-layer: func(model: model-id, layer-index: u32, inputs: list<tensor-handle>) -> result<list<tensor-handle>, string>;
-
-    /// Safely cleans up the tensor representation on the host side.
-    drop-tensor: func(handle: tensor-handle);
-
-    /// Samples a single token from `logits`, masking out any token whose
-    /// emission would violate `json-schema` (when present) given the FSM
-    /// state accumulated from prior calls in the same generation. Returns
-    /// the sampled vocabulary id. When `json-schema` is `none`, sampling is
-    /// unconstrained (existing behaviour).
-    sample-constrained: func(logits: tensor-handle, json-schema: option<string>) -> result<u32, string>;
-}
-
-/// Declarative multi-GPU/multi-node execution planning for a single model
-/// instance. This is orthogonal to `inference`'s per-call options: a plan is
-/// established once at model-load time and applies to every subsequent call
-/// against that model alias.
-interface parallel-execution {
-    /// How a model's forward pass is split across more than one accelerator.
-    enum parallel-strategy {
-        /// No splitting; the model runs entirely on one device (existing behaviour).
-        none,
-        /// Column/row-parallel weight sharding across the GPUs of one node, with
-        /// an all-reduce/all-gather sync point per transformer block.
-        tensor-parallel,
-        /// Contiguous layer ranges assigned to different nodes/GPUs, with
-        /// activations streamed between stages.
-        pipeline-parallel,
-        /// Mixture-of-Experts checkpoints: experts placed on distinct
-        /// GPUs/nodes, tokens routed only to their selected expert's device.
-        expert-parallel,
-    }
-
-    /// A requested execution plan, validated against discovered hardware
-    /// topology before any weights are loaded.
-    record parallel-execution-plan {
-        strategy: parallel-strategy,
-        /// Logical device identifiers participating in this plan.
-        device-ids: list<u32>,
-        /// For pipeline-parallel: inclusive (start, end) layer index range per
-        /// device, indexed by position in `device-ids`.
-        stage-layer-ranges: list<tuple<u32, u32>>,
-        /// For expert-parallel: (expert-id, device-ids index) placement pairs.
-        expert-device-map: list<tuple<u32, u32>>,
-        /// Bounded number of micro-batches kept in flight across pipeline stages.
-        pipeline-depth: u32,
-    }
-
-    /// Typed reasons a plan cannot be satisfied by the cluster's discovered
-    /// hardware topology, returned instead of silently downgrading to a
-    /// single-device execution plan.
-    variant topology-error {
-        /// Requested device count exceeds what is available on the target.
-        insufficient-device-count(tuple<u32, u32>),
-        /// The interconnect between requested devices does not meet the
-        /// strategy's bandwidth/latency requirement.
-        incompatible-interconnect,
-        /// A computed per-shard VRAM requirement exceeds a target device's
-        /// available VRAM. Payload is (required-bytes, available-bytes).
-        vram-per-shard-exceeded(tuple<u64, u64>),
-    }
-
-    /// Validates that a requested plan can be satisfied by the cluster's
-    /// discovered hardware topology before any weights are loaded. Does not
-    /// load or shard a model; `apply-model-deployment` (config-ai.wit) calls
-    /// this as part of admitting a deployment.
-    validate-parallel-topology: func(plan: parallel-execution-plan) -> result<_, topology-error>;
 }
 
 world inference-host {
     export inference;
-    export layer-execution;
-    export parallel-execution;
 }

@@ -59,6 +59,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 # the E2E workflows reuse it instead of recompiling these crates per variant.
 FROM chef AS wasm-builder
 COPY --from=planner /workspace/recipe.json recipe.json
+COPY --from=planner /workspace/vendor/Magnetar vendor/Magnetar
 
 # Cook dependencies for exactly the package/target sets built below, mirroring
 # the -p/--target lists so the recipe matches the real build.
@@ -99,6 +100,7 @@ RUN cargo build -p legacy-mock --target x86_64-unknown-linux-musl --release
 # feature value only re-keys host-builder, never wasm-builder.
 FROM chef AS host-builder
 COPY --from=planner /workspace/recipe.json recipe.json
+COPY --from=planner /workspace/vendor/Magnetar vendor/Magnetar
 
 # Default core-host deps and the gated FaaS crates' deps are feature-INDEPENDENT
 # (cooking a recipe compiles the dependency tree regardless of which features

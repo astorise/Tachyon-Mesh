@@ -136,13 +136,6 @@ The `core-host` binary SHALL provide a `schema` command that writes `integrity-c
 - **AND** `target/schemas/integrity-lock.schema.json` is written from the `IntegrityManifest` schema
 - **AND** each schema contains a `$id` under `https://github.com/astorise/tachyon-mesh/releases/download/v1.2.3/`
 
-### Requirement: core-host MUST expose a zero-copy layer-wise inference WIT contract
-The project SHALL define `wit/ai/inference.wit` in the existing `tachyon:mesh@1.1.0` WIT package and SHALL expose a `layer-execution` interface with opaque `tensor-handle` values so Wasm guests can sequence model layers without copying intermediate tensors through linear memory.
-
-#### Scenario: Guest orchestrates layer-wise execution through tensor handles
-- **WHEN** a guest calls `load-layer`, `forward-layer`, and `drop-tensor` through the `layer-execution` interface
-- **THEN** the host owns tensor memory natively and the guest only receives opaque `tensor-handle` identifiers
-
 ### Requirement: AI inference dependencies MUST remain feature-gated
 The `core-host` crate SHALL keep heavyweight AI dependencies behind the `ai-inference` feature and SHALL return a clear fallback error for AI guests when the feature is not compiled.
 
@@ -151,40 +144,22 @@ The `core-host` crate SHALL keep heavyweight AI dependencies behind the `ai-infe
 - **AND** an AI guest such as `guest-ai` is selected for execution
 - **THEN** execution fails gracefully with an error naming the missing `ai-inference` feature
 
-### Requirement: core-host MUST support native constrained decoding behind ai-inference
-The `core-host` crate SHALL keep constrained decoding dependencies optional under the `ai-inference` feature, extend `wit/ai/inference.wit` with `sample-constrained`, and provide a native logit processor that compiles JSON Schema strings into cached FSM state before masking invalid token logits. CI SHALL verify that this requirement is implemented in code whenever it is asserted in the spec, so the requirement cannot be merged as spec text without a corresponding implementation.
+### Requirement: Magnetar inference dependencies MUST remain feature-gated
+The `core-host` crate SHALL keep local production inference dependencies optional under the existing `ai-inference` feature and SHALL keep the default host build free of those dependencies.
 
-#### Scenario: Guest samples logits with an optional JSON Schema
-- **WHEN** a guest calls `sample-constrained` with a logits tensor handle and a JSON Schema
-- **THEN** core-host samples only tokens allowed by the compiled schema FSM
-- **AND** repeated calls with the same schema reuse the cached FSM by schema hash
-
-#### Scenario: Core host is built without constrained decoding dependencies
-- **WHEN** `core-host` is built without `--features ai-inference`
-- **THEN** `llm-samplers`, `lru`, and the constrained decoding sampler module are not linked into the binary
-
-#### Scenario: CI fails if the requirement is specified but not implemented
-- **WHEN** the CI workflow builds `core-host --features ai-inference`
-- **THEN** it verifies that `sample-constrained` and `FsmLogitProcessor` symbols exist in the codebase
-- **AND** the build fails if either symbol is absent, preventing a recurrence of a merged spec requirement with no matching implementation
-
-### Requirement: Candle LLM dependencies MUST remain feature-gated
-The `core-host` crate SHALL keep tokenizer and Candle text-generation dependencies optional under the existing `ai-inference` feature and SHALL keep the default host build free of those dependencies.
-
-#### Scenario: Default host build excludes Candle LLM runtime
+#### Scenario: Default host build excludes local production inference runtime
 - **WHEN** a developer builds `core-host` without `--features ai-inference`
-- **THEN** tokenizer and Candle LLM runtime dependencies are not linked
+- **THEN** Magnetar runtime, loader, tokenizer, and Provider dependencies are not linked
 - **AND** the default release and container workflows remain unchanged
 
-#### Scenario: AI inference build includes Candle LLM runtime
+#### Scenario: AI inference build includes Magnetar production runtime
 - **WHEN** a developer builds `core-host` with `--features ai-inference`
-- **THEN** the Candle LLM runtime module, tokenizer support, and selected Candle text-generation dependency are compiled
-- **AND** existing ONNX/WASI-NN AI inference support remains available
+- **THEN** the Magnetar runtime adapter, Hugging Face loader, tokenizer support, and selected Provider dependency are compiled
 
-#### Scenario: AI inference build consumes the downstream Candle quantization fork
+#### Scenario: AI inference build consumes the pinned Magnetar submodule
 - **WHEN** a developer builds `core-host` with `--features ai-inference`
-- **THEN** `candle-core`, `candle-nn`, `candle-onnx`, and `candle-transformers` resolve from the pinned `astorise/candle` fork revision that carries GPTQ/Marlin, AWQ, and block-wise FP8 weight-quantization kernels proposed upstream in `huggingface/candle#3650`
-- **AND** the default `core-host` build remains free of those optional Candle dependencies
+- **THEN** Magnetar resolves from the repository-pinned submodule revision
+- **AND** the default `core-host` build remains free of those optional inference dependencies
 
 #### Scenario: AI guest runs without ai-inference feature
 - **WHEN** `core-host` is built without `--features ai-inference`

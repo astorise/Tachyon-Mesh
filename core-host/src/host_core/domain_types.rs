@@ -435,20 +435,18 @@ pub(crate) struct HardwareStrategy {
     /// Ignored outside `pipeline_parallelism`.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub(crate) pipeline_depth: u32,
-    /// Request block-paged KV cache attention instead of the contiguous
-    /// per-request KV cache. This is serialized only when explicitly enabled;
-    /// the runtime rejects it until the Candle paged flash-attn path is wired
-    /// through Tachyon's block allocator and block table.
+    /// Request block-paged KV cache attention. This is serialized only when
+    /// explicitly enabled; the active Magnetar path rejects unsupported KV
+    /// residency modes instead of falling back to a local implementation.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) paged_attention: bool,
     /// Request CUDA Graph capture/replay for the steady-state decode step.
-    /// This requires the forked Candle `CudaGraph` API plus a GPU decode loop
-    /// with fixed tensor shapes and stable device buffers.
+    /// The active Magnetar path accepts this only after the Provider/runtime
+    /// contract exposes a supported capture mode.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) cuda_graph_decode: bool,
-    /// Request the forked Candle FlashInfer-style decode-attention backend.
-    /// This is rejected until Tachyon's model decode path can pass single-token
-    /// Q/K/V tensors to `candle-flashinfer-kernels`.
+    /// Request a fused decode-attention backend. This remains fail-closed until
+    /// the active Magnetar Provider reports support for that execution mode.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) flashinfer_attention: bool,
     /// Optional prefill chunk size in tokens. `None` uses the runtime default
@@ -457,8 +455,8 @@ pub(crate) struct HardwareStrategy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) prefill_chunk_tokens: Option<u32>,
     /// Optional local draft model directory used for speculative decoding.
-    /// When set, the Candle backend loads this smaller model beside the target
-    /// model and uses it only for greedy propose/verify decoding.
+    /// The active Magnetar path rejects this until draft/verify decoding is a
+    /// supported production runtime capability.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) speculative_draft_model_path: String,
     /// Number of draft tokens proposed before target verification. `0` uses the
@@ -470,8 +468,7 @@ pub(crate) struct HardwareStrategy {
 impl HardwareStrategy {
     /// `true` for the default single-device strategy (`distribution_mode:
     /// single` with no placement data), used to skip the field during
-    /// serialization and to short-circuit the dispatch path to the existing
-    /// single-device loader.
+    /// serialization and to short-circuit additional placement planning.
     pub(crate) fn is_single(&self) -> bool {
         self.distribution_mode == GpuDistribution::Single
             && self.device_ids.is_empty()

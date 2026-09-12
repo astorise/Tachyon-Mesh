@@ -1,7 +1,7 @@
 //! Passthrough backend for an OpenAI-compatible upstream inference server.
 //!
-//! Tachyon's native Candle runtime only executes the checkpoint formats and
-//! architectures it has verified loaders for. This backend covers the rest of
+//! Tachyon's in-process Magnetar path only executes admitted production model
+//! bundles. This backend covers the rest of
 //! the ecosystem — llama.cpp's `llama-server`, vLLM, SGLang, or any other
 //! server speaking the OpenAI chat-completions wire format — by forwarding the
 //! host's own generation request to it and returning the generated text
@@ -372,8 +372,8 @@ pub(crate) fn assert_no_credential_collisions<'a>(
     Ok(())
 }
 
-/// The host generation request, mirroring `candle_llm_runtime`'s private
-/// `GenerationRequest` field for field.
+/// The host generation request envelope shared by local and upstream
+/// generation paths.
 ///
 /// It is deliberately a separate type rather than a shared one: this backend
 /// must accept exactly the same request envelope the native runtime accepts, and

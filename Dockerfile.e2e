@@ -52,6 +52,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS rust-builder
 COPY --from=planner /workspace/recipe.json recipe.json
+COPY --from=planner /workspace/vendor/Magnetar vendor/Magnetar
 RUN cargo chef cook --release --target wasm32-wasip2 --recipe-path recipe.json \
     -p guest-example -p guest-volume \
     -p system-faas-authn -p system-faas-authz -p system-faas-keda \

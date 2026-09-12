@@ -145,7 +145,7 @@
       "scopes": { "kv": ["ai-models-registry"] },
       "models": [
         {
-          "alias": "nvidia--Qwen3.6-35B-A3B-NVFP4",
+          "alias": "qwen2.5-0.5b-instruct",
           "dynamic": true
         }
       ],
@@ -162,7 +162,7 @@
       "scopes": { "kv": ["ai-models-registry"] },
       "models": [
         {
-          "alias": "nvidia--Qwen3.6-35B-A3B-NVFP4",
+          "alias": "qwen2.5-0.5b-instruct",
           "dynamic": true
         }
       ],

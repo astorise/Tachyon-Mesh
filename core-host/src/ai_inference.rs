@@ -195,7 +195,6 @@ pub(crate) enum AcceleratorMemoryResidency {
     HostRam,
     Vram,
     Sram,
-    MagnetarArena,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -489,7 +488,7 @@ impl LoadedModel {
         match &self.runtime {
             ModelRuntime::Mock { accelerator } => *accelerator,
             ModelRuntime::Magnetar(runtime) => {
-                if runtime.provider().device_id.starts_with("CUDA") {
+                if magnetar_provider_is_cuda(runtime.provider()) {
                     AcceleratorKind::Gpu
                 } else {
                     AcceleratorKind::Cpu
@@ -500,7 +499,7 @@ impl LoadedModel {
     }
 
     fn memory_residency(&self) -> AcceleratorMemoryResidency {
-        match self.runtime {
+        match &self.runtime {
             ModelRuntime::Mock {
                 accelerator: AcceleratorKind::Gpu,
             } => AcceleratorMemoryResidency::Vram,
@@ -510,7 +509,13 @@ impl LoadedModel {
             ModelRuntime::Mock { .. } | ModelRuntime::Upstream(_) => {
                 AcceleratorMemoryResidency::HostRam
             }
-            ModelRuntime::Magnetar(_) => AcceleratorMemoryResidency::MagnetarArena,
+            ModelRuntime::Magnetar(runtime) => {
+                if magnetar_provider_is_cuda(runtime.provider()) {
+                    AcceleratorMemoryResidency::Vram
+                } else {
+                    AcceleratorMemoryResidency::HostRam
+                }
+            }
         }
     }
 }
@@ -571,7 +576,11 @@ impl AiInferenceRuntime {
         self
     }
 
-    fn ensure_model_loaded(&self, alias: &str) -> Result<(), String> {
+    fn ensure_model_loaded(
+        &self,
+        alias: &str,
+        requested_accelerator: AcceleratorKind,
+    ) -> Result<(), String> {
         if self
             .models
             .read()
@@ -590,7 +599,7 @@ impl AiInferenceRuntime {
         let binding = IntegrityModelBinding {
             alias: alias.to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: crate::ModelDevice::Cpu,
+            device: model_device_for_accelerator(requested_accelerator)?,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -663,22 +672,14 @@ impl AiInferenceRuntime {
         alias: &str,
         accelerator: AcceleratorKind,
     ) -> std::result::Result<(), String> {
-        if !self.supports_accelerator(accelerator) {
-            return Err(format!(
-                "{} accelerator is unavailable on this host",
-                accelerator.as_str()
-            ));
-        }
-        self.ensure_model_loaded(alias)?;
+        self.ensure_model_loaded(alias, accelerator)?;
         let models = self.models.read().expect("model registry lock poisoned");
         let model = models
             .get(alias)
             .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?;
-        if matches!(accelerator, AcceleratorKind::Npu | AcceleratorKind::Tpu)
-            && model.accelerator() != accelerator
-        {
+        if model.accelerator() != accelerator {
             return Err(format!(
-                "model alias `{alias}` requires `{}` but `{}` is requested",
+                "model alias `{alias}` is loaded for `{}` but `{}` was requested",
                 model.accelerator().as_str(),
                 accelerator.as_str()
             ));
@@ -707,7 +708,7 @@ impl AiInferenceRuntime {
                 "LoRA adapter `{adapter_id}` is not supported by the Magnetar cutover"
             )));
         }
-        self.ensure_model_loaded(alias)
+        self.ensure_model_loaded(alias, AcceleratorKind::Cpu)
             .map_err(GenerationError::local)?;
         let model = self
             .models
@@ -739,7 +740,7 @@ impl AiInferenceRuntime {
         alias: &str,
         input: &str,
     ) -> std::result::Result<Vec<f32>, GenerationError> {
-        self.ensure_model_loaded(alias)
+        self.ensure_model_loaded(alias, AcceleratorKind::Cpu)
             .map_err(GenerationError::local)?;
         let model = self
             .models
@@ -775,7 +776,7 @@ impl AiInferenceRuntime {
                 "LoRA adapter `{adapter_id}` is not supported by the Magnetar cutover"
             )));
         }
-        self.ensure_model_loaded(alias)
+        self.ensure_model_loaded(alias, AcceleratorKind::Cpu)
             .map_err(GenerationError::local)?;
         let model = self
             .models
@@ -828,7 +829,7 @@ impl AiInferenceRuntime {
 
     pub(crate) fn magnetar_capability_advertisements(
         &self,
-    ) -> Vec<magnetar_runtime::CapabilityAdvertisement> {
+    ) -> Vec<magnetar_runtime::ProviderAdvertisement> {
         let mut advertisements = self
             .models
             .read()
@@ -839,8 +840,13 @@ impl AiInferenceRuntime {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        advertisements.sort_by(|a, b| a.device_id.cmp(&b.device_id));
-        advertisements.dedup_by(|a, b| a.device_id == b.device_id);
+        advertisements.sort_by(|a, b| {
+            a.provider_name
+                .cmp(&b.provider_name)
+                .then_with(|| a.device_ids.cmp(&b.device_ids))
+        });
+        advertisements
+            .dedup_by(|a, b| a.provider_name == b.provider_name && a.device_ids == b.device_ids);
         advertisements
     }
 
@@ -894,6 +900,22 @@ impl AiInferenceRuntime {
             accelerator,
             qos,
         }
+    }
+}
+
+fn magnetar_provider_is_cuda(provider: &magnetar_runtime::ProviderAdvertisement) -> bool {
+    provider.provider_name.to_ascii_lowercase().contains("cuda")
+}
+
+fn model_device_for_accelerator(
+    accelerator: AcceleratorKind,
+) -> Result<crate::ModelDevice, String> {
+    match accelerator {
+        AcceleratorKind::Cpu => Ok(crate::ModelDevice::Cpu),
+        AcceleratorKind::Gpu => Ok(crate::ModelDevice::Cuda),
+        AcceleratorKind::Npu => Ok(crate::ModelDevice::Npu),
+        AcceleratorKind::Tpu => Ok(crate::ModelDevice::Tpu),
+        AcceleratorKind::Network => Err("network accelerator cannot load local models".to_owned()),
     }
 }
 
@@ -1122,6 +1144,7 @@ fn mock_token_usage(prompt: &[u8], completion: &str) -> TokenUsage {
 mod tests {
     use super::*;
     use crate::{IntegrityRoute, ModelDevice};
+    use std::{fs, io::Write};
 
     fn unique_model_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1133,21 +1156,315 @@ mod tests {
         ))
     }
 
-    fn write_qwen_safetensors_fixture(path: &Path) {
-        std::fs::create_dir_all(path).expect("fixture dir should be created");
-        std::fs::write(path.join("config.json"), br#"{"model_type":"qwen3"}"#)
-            .expect("config should be written");
-        std::fs::write(path.join("model.safetensors"), b"weights")
-            .expect("weights should be written");
+    const HIDDEN_SIZE: u64 = 4;
+    const LAYER_COUNT: u64 = 1;
+    const ATTENTION_HEAD_COUNT: u64 = 2;
+    const KV_HEAD_COUNT: u64 = 2;
+    const HEAD_DIMENSION: u64 = 2;
+    const INTERMEDIATE_SIZE: u64 = 8;
+    const VOCAB_SIZE: u64 = 16;
+
+    fn tensor_value(seed: u64) -> f32 {
+        let mut x = seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(0x2545_F491_4F6C_DD1D);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        x ^= x >> 33;
+        ((x % 1000) as f32 / 1000.0) - 0.5
+    }
+
+    fn tensor_values(name: &str, element_count: u64) -> Vec<f32> {
+        let mut hash: u64 = 0xCBF2_9CE4_8422_2325;
+        for byte in name.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        (0..element_count)
+            .map(|index| tensor_value(hash.wrapping_add(index)))
+            .collect()
+    }
+
+    fn write_tiny_production_qwen_bundle(path: &Path) {
+        fs::create_dir_all(path).expect("fixture dir should be created");
+        let config_json = format!(
+            r#"{{
+                "architectures": ["Qwen2ForCausalLM"],
+                "model_type": "qwen2",
+                "hidden_size": {HIDDEN_SIZE},
+                "intermediate_size": {INTERMEDIATE_SIZE},
+                "num_hidden_layers": {LAYER_COUNT},
+                "num_attention_heads": {ATTENTION_HEAD_COUNT},
+                "num_key_value_heads": {KV_HEAD_COUNT},
+                "head_dim": {HEAD_DIMENSION},
+                "vocab_size": {VOCAB_SIZE},
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 10000.0,
+                "tie_word_embeddings": false,
+                "torch_dtype": "float32",
+                "bos_token_id": 0,
+                "eos_token_id": 1
+            }}"#
+        );
+        fs::write(path.join("config.json"), config_json).expect("config should be written");
+
+        let vocab_entries = [
+            "<bos>", "<eos>", "hi", "h", "i", " ", "t", "e", "r", "wo", "ld", "!", "a", "b", "c",
+            "d",
+        ];
+        let mut vocab_json = String::from("{");
+        for (id, token) in vocab_entries.iter().take(VOCAB_SIZE as usize).enumerate() {
+            if id > 0 {
+                vocab_json.push(',');
+            }
+            vocab_json.push_str(&format!("\"{token}\":{id}"));
+        }
+        vocab_json.push('}');
+        let tokenizer_json = format!(
+            r#"{{
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [
+                    {{"id": 0, "content": "<bos>", "special": true, "single_word": false, "lstrip": false, "rstrip": false, "normalized": false}},
+                    {{"id": 1, "content": "<eos>", "special": true, "single_word": false, "lstrip": false, "rstrip": false, "normalized": false}}
+                ],
+                "normalizer": null,
+                "pre_tokenizer": null,
+                "post_processor": null,
+                "decoder": null,
+                "model": {{"type": "WordLevel", "vocab": {vocab_json}, "unk_token": "h"}}
+            }}"#
+        );
+        fs::write(path.join("tokenizer.json"), tokenizer_json)
+            .expect("tokenizer should be written");
+        fs::write(
+            path.join("tokenizer_config.json"),
+            r#"{"bos_token": "<bos>", "eos_token": "<eos>", "chat_template": "{% for message in messages %}{{ message.role }}: {{ message.content }}\n{% endfor %}assistant: "}"#,
+        )
+        .expect("tokenizer config should be written");
+
+        let q_dim = ATTENTION_HEAD_COUNT * HEAD_DIMENSION;
+        let kv_dim = KV_HEAD_COUNT * HEAD_DIMENSION;
+        let mut tensors: Vec<(String, Vec<u64>)> = vec![
+            (
+                "model.embed_tokens.weight".into(),
+                vec![VOCAB_SIZE, HIDDEN_SIZE],
+            ),
+            ("model.norm.weight".into(), vec![HIDDEN_SIZE]),
+            ("lm_head.weight".into(), vec![VOCAB_SIZE, HIDDEN_SIZE]),
+        ];
+        for layer in 0..LAYER_COUNT {
+            tensors.push((
+                format!("model.layers.{layer}.input_layernorm.weight"),
+                vec![HIDDEN_SIZE],
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                vec![q_dim, HIDDEN_SIZE],
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.self_attn.k_proj.weight"),
+                vec![kv_dim, HIDDEN_SIZE],
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.self_attn.v_proj.weight"),
+                vec![kv_dim, HIDDEN_SIZE],
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                vec![HIDDEN_SIZE, q_dim],
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                vec![HIDDEN_SIZE],
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.mlp.gate_proj.weight"),
+                vec![INTERMEDIATE_SIZE, HIDDEN_SIZE],
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.mlp.up_proj.weight"),
+                vec![INTERMEDIATE_SIZE, HIDDEN_SIZE],
+            ));
+            tensors.push((
+                format!("model.layers.{layer}.mlp.down_proj.weight"),
+                vec![HIDDEN_SIZE, INTERMEDIATE_SIZE],
+            ));
+        }
+
+        let mut header = String::from("{");
+        let mut data = Vec::new();
+        for (name, shape) in &tensors {
+            let element_count: u64 = shape.iter().product();
+            let values = tensor_values(name, element_count);
+            let start = data.len() as u64;
+            for value in &values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            let end = data.len() as u64;
+            let shape_text = shape
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            header.push_str(&format!(
+                "\"{name}\":{{\"dtype\":\"F32\",\"shape\":[{shape_text}],\"data_offsets\":[{start},{end}]}}",
+            ));
+            header.push(',');
+        }
+        header.pop();
+        header.push('}');
+
+        let mut file =
+            fs::File::create(path.join("model.safetensors")).expect("safetensors should create");
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .expect("safetensors header len should write");
+        file.write_all(header.as_bytes())
+            .expect("safetensors header should write");
+        file.write_all(&data)
+            .expect("safetensors payload should write");
+    }
+
+    static TRUST_ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    struct QwenInterprocessGuard {
+        path: PathBuf,
+    }
+
+    struct TrustStoreEnvGuard {
+        _qwen_lock: QwenInterprocessGuard,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        path: PathBuf,
+    }
+
+    struct TrustStoreEnvUnsetGuard {
+        _qwen_lock: QwenInterprocessGuard,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for QwenInterprocessGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    impl Drop for TrustStoreEnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV, previous);
+            } else {
+                std::env::remove_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
+            }
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    impl Drop for TrustStoreEnvUnsetGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV, previous);
+            }
+        }
+    }
+
+    fn qwen_interprocess_lock() -> QwenInterprocessGuard {
+        let path = std::env::temp_dir().join("tachyon-magnetar-qwen-tests.lock");
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return QwenInterprocessGuard { path },
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > std::time::Duration::from_secs(300));
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                }
+                Err(error) => panic!(
+                    "failed to acquire Qwen test lock `{}`: {error}",
+                    path.display()
+                ),
+            }
+        }
+    }
+
+    fn trust_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        TRUST_ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("trust env lock poisoned")
+    }
+
+    fn without_tachyon_model_trust_store() -> TrustStoreEnvUnsetGuard {
+        let qwen_lock = qwen_interprocess_lock();
+        let lock = trust_env_lock();
+        let previous = std::env::var_os(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
+        std::env::remove_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
+        TrustStoreEnvUnsetGuard {
+            _qwen_lock: qwen_lock,
+            _lock: lock,
+            previous,
+        }
+    }
+
+    fn trust_tachyon_qwen_bundle(path: &Path) -> TrustStoreEnvGuard {
+        use ::magnetar_runtime::production_model_ingestion::{
+            ProductionModelArtifactIngestor, ProductionModelSource,
+        };
+
+        let qwen_lock = qwen_interprocess_lock();
+        let lock = trust_env_lock();
+        let source = ProductionModelSource::authorized_local_bundle(
+            ::magnetar_runtime::ModelArtifactSource::Tachyon("tachyon:test-fixture".to_owned()),
+            path.to_path_buf(),
+        );
+        let ingested = magnetar_loader_huggingface::HuggingFaceIngestor::new()
+            .ingest(&source)
+            .expect("fixture should ingest before writing Tachyon trust policy");
+        let trust_path = unique_model_dir("qwen-trust-policy").join("tachyon-model-trust.json");
+        std::fs::create_dir_all(
+            trust_path
+                .parent()
+                .expect("trust policy should have a parent"),
+        )
+        .expect("trust policy parent should be created");
+        fs::write(
+            &trust_path,
+            format!(
+                r#"{{"trusted_digests":["{}"]}}"#,
+                ingested.manifest.id.digest.value
+            ),
+        )
+        .expect("trust sidecar should be written");
+        let previous = std::env::var_os(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
+        std::env::set_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV, &trust_path);
+        TrustStoreEnvGuard {
+            _qwen_lock: qwen_lock,
+            _lock: lock,
+            previous,
+            path: trust_path,
+        }
     }
 
     #[test]
-    fn magnetar_qwen_binding_is_rejected_until_real_execution_exists() {
+    fn magnetar_qwen_binding_generates_through_real_production_cpu_path() {
         let model_dir = unique_model_dir("qwen-runtime");
-        write_qwen_safetensors_fixture(&model_dir);
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
-            alias: "qwen35".to_owned(),
+            alias: "qwen2_5".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
             device: ModelDevice::Cpu,
             qos: RouteQos::Standard,
@@ -1155,26 +1472,118 @@ mod tests {
             hardware_strategy: Default::default(),
         }];
 
-        let error = match AiInferenceRuntime::from_config(&IntegrityConfig {
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
             routes: vec![route],
             ..IntegrityConfig::default_sealed()
-        }) {
-            Ok(_) => panic!("Qwen safetensors must not be admitted until Magnetar executes them"),
-            Err(error) => error,
-        };
+        })
+        .expect("real Magnetar production Qwen bundle should load");
+        let generation = runtime
+            .compute_component_prompt("qwen2_5", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .expect("real Magnetar production Qwen should generate");
 
-        assert!(error.to_string().contains("not implemented yet"));
+        assert!(!generation.is_empty());
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn magnetar_qwen_binding_maps_openai_messages_to_chat_prompt_input() {
+        let model_dir = unique_model_dir("qwen-chat-runtime");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "qwen2_5".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }];
+
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("real Magnetar production Qwen bundle should load");
+        let generation = runtime
+            .compute_component_prompt(
+                "qwen2_5",
+                r#"{"messages":[{"role":"user","content":"hi"}],"temperature":0,"max_new_tokens":1}"#,
+            )
+            .expect("OpenAI chat messages should reach Magnetar PromptInput::ChatMessages");
+
+        assert!(!generation.is_empty());
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn magnetar_streaming_stops_when_downstream_sink_disconnects() {
+        let model_dir = unique_model_dir("qwen-stream-cancel");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "qwen-stream".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }];
+
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("real Magnetar production Qwen bundle should load");
+
+        struct DisconnectingSink {
+            content_events: u32,
+        }
+        impl StreamSink for DisconnectingSink {
+            fn emit(&mut self, event: StreamEvent<'_>) -> StreamControl {
+                if let StreamEvent::Content(_) = event {
+                    self.content_events += 1;
+                }
+                StreamControl::Stop
+            }
+
+            fn is_live(&mut self) -> bool {
+                self.content_events == 0
+            }
+        }
+        let mut sink = DisconnectingSink { content_events: 0 };
+
+        let outcome = runtime
+            .stream_component_prompt(
+                "qwen-stream",
+                r#"{"prompt":"hi","max_new_tokens":16}"#,
+                None,
+                &mut sink,
+            )
+            .expect("downstream stop should cancel Magnetar streaming cleanly");
+
+        assert_eq!(
+            sink.content_events, 1,
+            "Tachyon must stop relaying after the downstream stream disconnects"
+        );
+        assert!(
+            outcome
+                .usage
+                .map(|usage| usage.completion_tokens <= 1)
+                .unwrap_or(true),
+            "cancelled Magnetar stream must not continue to produce the full request"
+        );
         let _ = std::fs::remove_dir_all(model_dir);
     }
 
     #[test]
     fn explicit_magnetar_binding_rejects_non_qwen_model_directory() {
+        let _trust = without_tachyon_model_trust_store();
         let model_dir = unique_model_dir("non-qwen");
-        std::fs::create_dir_all(&model_dir).expect("fixture dir should be created");
+        write_tiny_production_qwen_bundle(&model_dir);
         std::fs::write(model_dir.join("config.json"), br#"{"model_type":"llama"}"#)
             .expect("config should be written");
-        std::fs::write(model_dir.join("model.safetensors"), b"weights")
-            .expect("weights should be written");
         let error = match load_binding(&IntegrityModelBinding {
             alias: "llama".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
@@ -1187,15 +1596,189 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error
-            .to_string()
-            .contains("expected a Qwen safetensors directory"));
+        assert!(error.to_string().contains("Magnetar failed"));
         let _ = std::fs::remove_dir_all(model_dir);
     }
 
     #[test]
-    fn local_non_qwen_candle_style_directory_is_rejected() {
-        let model_dir = unique_model_dir("legacy-candle");
+    fn explicit_magnetar_binding_rejects_untrusted_qwen_bundle() {
+        let _trust = without_tachyon_model_trust_store();
+        let model_dir = unique_model_dir("untrusted-qwen");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let error = match load_binding(&IntegrityModelBinding {
+            alias: "qwen-untrusted".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }) {
+            Ok(_) => panic!("Magnetar Qwen bundle must require explicit Tachyon trust policy"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("trust rejected"));
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn qwen_bundle_cannot_self_authorize_with_embedded_trust_policy() {
+        let model_dir = unique_model_dir("self-trusting-qwen");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let trust_path = std::env::var_os(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV)
+            .map(PathBuf::from)
+            .expect("test trust policy should be configured");
+        std::fs::copy(&trust_path, model_dir.join(".tachyon-model-trust.json"))
+            .expect("embedded fake trust policy should be copied");
+        std::env::remove_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
+
+        let error = match load_binding(&IntegrityModelBinding {
+            alias: "qwen-self-trusting".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }) {
+            Ok(_) => panic!("artifact-local trust policy must not self-authorize a Qwen bundle"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("trust rejected"));
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[cfg(not(feature = "magnetar-cuda"))]
+    #[test]
+    fn explicit_magnetar_cuda_binding_fails_closed_without_cuda_feature() {
+        let model_dir = unique_model_dir("cuda-qwen");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let error = match load_binding(&IntegrityModelBinding {
+            alias: "qwen-cuda".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ModelDevice::Cuda,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }) {
+            Ok(_) => panic!("explicit CUDA placement must not silently fall back to CPU"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("CUDA provider"));
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[cfg(feature = "magnetar-cuda")]
+    #[test]
+    #[ignore = "run explicitly on a GPU runner guaranteed to have CUDA available"]
+    fn magnetar_cuda_provider_hardware_required_guard() {
+        let provider = magnetar_provider_cuda::CudaProvider::new();
+        assert!(
+            provider.is_available(),
+            "GPU CI selected this test but Magnetar CudaProvider is unavailable"
+        );
+    }
+
+    #[cfg(feature = "magnetar-cuda")]
+    #[test]
+    #[ignore = "run explicitly on a GPU runner guaranteed to have CUDA available"]
+    fn magnetar_qwen_binding_generates_first_token_on_real_cuda_provider() {
+        let provider = magnetar_provider_cuda::CudaProvider::new();
+        assert!(
+            provider.is_available(),
+            "GPU CI selected this test but Magnetar CudaProvider is unavailable"
+        );
+        let model_dir = unique_model_dir("cuda-qwen-runtime");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "qwen-cuda".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ModelDevice::Cuda,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }];
+
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("real Magnetar production Qwen CUDA bundle should load");
+        let generation = runtime
+            .compute_component_prompt("qwen-cuda", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .expect("real Magnetar production Qwen should generate one token on CUDA");
+
+        assert!(!generation.is_empty());
+        let telemetry = inference_execution_telemetry();
+        assert!(
+            telemetry.iter().any(|event| event.alias == "qwen-cuda"
+                && event.succeeded
+                && event.executed_on.to_ascii_lowercase().contains("cuda")),
+            "CUDA generation must record a real Magnetar CUDA provider execution"
+        );
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[cfg(feature = "magnetar-cuda")]
+    #[test]
+    #[ignore = "run explicitly on a GPU runner guaranteed to have CUDA available"]
+    fn magnetar_qwen_cuda_generates_multiple_tokens_on_real_cuda_provider() {
+        let provider = magnetar_provider_cuda::CudaProvider::new();
+        assert!(
+            provider.is_available(),
+            "GPU CI selected this test but Magnetar CudaProvider is unavailable"
+        );
+        let model_dir = unique_model_dir("cuda-qwen-multitoken");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "qwen-cuda".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ModelDevice::Cuda,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }];
+
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("real Magnetar production Qwen CUDA bundle should load");
+        let generation = runtime
+            .compute_component_prompt_with_adapter(
+                "qwen-cuda",
+                r#"{"prompt":"hi","max_new_tokens":16}"#,
+                None,
+            )
+            .expect("real Magnetar CUDA should generate multiple tokens device-resident");
+
+        assert!(!generation.text.is_empty());
+        assert_eq!(
+            generation.usage.map(|usage| usage.completion_tokens),
+            Some(16),
+            "CUDA multi-token proof must generate exactly the requested token budget"
+        );
+        let telemetry = inference_execution_telemetry();
+        assert!(
+            telemetry.iter().any(|event| event.alias == "qwen-cuda"
+                && event.succeeded
+                && event.executed_on.to_ascii_lowercase().contains("cuda")),
+            "CUDA multi-token generation must record a real Magnetar CUDA provider execution"
+        );
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn local_non_qwen_huggingface_style_directory_is_rejected() {
+        let _trust = without_tachyon_model_trust_store();
+        let model_dir = unique_model_dir("non-qwen-hf");
         std::fs::create_dir_all(&model_dir).expect("fixture dir should be created");
         std::fs::write(model_dir.join("config.json"), br#"{"model_type":"llama"}"#)
             .expect("config should be written");
@@ -1215,7 +1798,7 @@ mod tests {
             }],
             ..IntegrityConfig::default_sealed()
         }) {
-            Ok(_) => panic!("legacy Candle directories must not load"),
+            Ok(_) => panic!("non-Qwen Hugging Face-style directories must not load"),
             Err(error) => error,
         };
 
@@ -1311,6 +1894,136 @@ mod tests {
             ..IntegrityConfig::default_sealed()
         })
         .expect("dynamic placeholders should not be validated as upstream credentials");
+    }
+
+    #[test]
+    fn dynamic_cpu_request_loads_and_executes_reference_cpu() {
+        let root = unique_model_dir("dynamic-cpu-models");
+        let model_dir = root.join("dynamic-cpu-qwen");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed())
+            .expect("runtime")
+            .with_dynamic_models_root(Some(root.clone()));
+
+        runtime
+            .load_component_model("dynamic-cpu-qwen", AcceleratorKind::Cpu)
+            .expect("dynamic CPU model should load through Reference CPU");
+        let generation = runtime
+            .compute_component_prompt("dynamic-cpu-qwen", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .expect("dynamic CPU model should generate through Magnetar Reference CPU");
+
+        assert!(!generation.is_empty());
+        let telemetry = inference_execution_telemetry();
+        assert!(
+            telemetry
+                .iter()
+                .any(|event| event.alias == "dynamic-cpu-qwen"
+                    && event.succeeded
+                    && event.executed_on.to_ascii_lowercase().contains("reference")),
+            "dynamic CPU generation must record Reference CPU execution"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn requested_gpu_rejects_cpu_loaded_model() {
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "cpu-only".to_owned(),
+            path: "mock".to_owned(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }];
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("runtime");
+
+        let error = runtime
+            .load_component_model("cpu-only", AcceleratorKind::Gpu)
+            .expect_err("GPU request must not be satisfied by a CPU-loaded model");
+
+        assert!(
+            error.contains("loaded for `cpu` but `gpu` was requested"),
+            "unexpected accelerator mismatch error: {error}"
+        );
+    }
+
+    #[cfg(not(feature = "magnetar-cuda"))]
+    #[test]
+    fn dynamic_gpu_request_does_not_lazy_load_cpu_when_cuda_is_unavailable() {
+        let root = unique_model_dir("dynamic-models");
+        let model_dir = root.join("dynamic-qwen");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed())
+            .expect("runtime")
+            .with_dynamic_models_root(Some(root.clone()));
+
+        let error = runtime
+            .load_component_model("dynamic-qwen", AcceleratorKind::Gpu)
+            .expect_err("dynamic GPU load must fail closed when CudaProvider is unavailable");
+
+        assert!(
+            error.contains("CUDA provider"),
+            "unexpected dynamic CUDA error: {error}"
+        );
+        assert!(
+            !runtime
+                .loaded_model_aliases()
+                .iter()
+                .any(|alias| alias == "dynamic-qwen"),
+            "failed dynamic GPU load must not leave a CPU-loaded model behind"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(feature = "magnetar-cuda"))]
+    #[test]
+    fn loaded_gpu_model_does_not_make_dynamic_gpu_request_fall_back_to_cpu() {
+        let root = unique_model_dir("dynamic-models-with-gpu");
+        let model_dir = root.join("dynamic-qwen-b");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "gpu-a".to_owned(),
+            path: "mock".to_owned(),
+            device: ModelDevice::Cuda,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }];
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("runtime")
+        .with_dynamic_models_root(Some(root.clone()));
+        assert!(runtime.supports_accelerator(AcceleratorKind::Gpu));
+
+        let error = runtime
+            .load_component_model("dynamic-qwen-b", AcceleratorKind::Gpu)
+            .expect_err(
+                "dynamic GPU load must not reuse CPU just because another GPU model exists",
+            );
+
+        assert!(
+            error.contains("CUDA provider"),
+            "unexpected dynamic CUDA error: {error}"
+        );
+        assert!(
+            !runtime
+                .loaded_model_aliases()
+                .iter()
+                .any(|alias| alias == "dynamic-qwen-b"),
+            "failed dynamic GPU load must not leave a CPU-loaded model behind"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

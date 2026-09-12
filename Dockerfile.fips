@@ -54,6 +54,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS wasm-builder
 COPY --from=planner /workspace/recipe.json recipe.json
+COPY --from=planner /workspace/vendor/Magnetar vendor/Magnetar
 RUN cargo chef cook --release --target wasm32-wasip2 --recipe-path recipe.json \
     -p guest-example -p guest-volume \
     -p system-faas-authn -p system-faas-authz -p system-faas-keda \
@@ -119,6 +120,7 @@ COPY rust-toolchain.toml .
 # Reuse the recipe extracted on the Ubuntu side (recipe.json is OS-independent)
 # so the FIPS dependency cook is keyed on Cargo.toml/Cargo.lock too.
 COPY --from=planner /workspace/recipe.json recipe.json
+COPY --from=planner /workspace/vendor/Magnetar vendor/Magnetar
 
 # --no-default-features retire ring ; fips active aws-lc-fips-sys + TLS 1.3 only
 RUN cargo chef cook --release --no-default-features --features fips --recipe-path recipe.json -p core-host
