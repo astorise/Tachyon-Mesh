@@ -136,13 +136,6 @@ The `core-host` binary SHALL provide a `schema` command that writes `integrity-c
 - **AND** `target/schemas/integrity-lock.schema.json` is written from the `IntegrityManifest` schema
 - **AND** each schema contains a `$id` under `https://github.com/astorise/tachyon-mesh/releases/download/v1.2.3/`
 
-### Requirement: core-host MUST expose a zero-copy layer-wise inference WIT contract
-The project SHALL define `wit/ai/inference.wit` in the existing `tachyon:mesh@1.1.0` WIT package and SHALL expose a `layer-execution` interface with opaque `tensor-handle` values so Wasm guests can sequence model layers without copying intermediate tensors through linear memory.
-
-#### Scenario: Guest orchestrates layer-wise execution through tensor handles
-- **WHEN** a guest calls `load-layer`, `forward-layer`, and `drop-tensor` through the `layer-execution` interface
-- **THEN** the host owns tensor memory natively and the guest only receives opaque `tensor-handle` identifiers
-
 ### Requirement: AI inference dependencies MUST remain feature-gated
 The `core-host` crate SHALL keep heavyweight AI dependencies behind the `ai-inference` feature and SHALL return a clear fallback error for AI guests when the feature is not compiled.
 
@@ -162,7 +155,6 @@ The `core-host` crate SHALL keep local production inference dependencies optiona
 #### Scenario: AI inference build includes Magnetar production runtime
 - **WHEN** a developer builds `core-host` with `--features ai-inference`
 - **THEN** the Magnetar runtime adapter, Hugging Face loader, tokenizer support, and selected Provider dependency are compiled
-- **AND** existing ONNX/WASI-NN AI inference support remains available
 
 #### Scenario: AI inference build consumes the pinned Magnetar submodule
 - **WHEN** a developer builds `core-host` with `--features ai-inference`

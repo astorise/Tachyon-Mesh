@@ -49,6 +49,14 @@ graph, or fabricate Magnetar tensor, kernel, hardware, or capability identities.
 - **AND** requests for multiple generated tokens on CUDA execute only through
   Magnetar's device-resident decode path
 
+#### Scenario: Dynamic loading is target-aware
+- **WHEN** a dynamic `magnetar:` model alias is requested for a specific
+  accelerator
+- **THEN** Tachyon lazy-loads the binding for that requested accelerator
+- **AND** a CPU-loaded model cannot satisfy a GPU request
+- **AND** an already-loaded GPU model for another alias cannot make a dynamic
+  GPU request fall back to CPU
+
 #### Scenario: OpenAI-shaped local requests are mapped to Magnetar contracts
 - **WHEN** a local OpenAI chat request supplies messages, supported sampling
   parameters, a seed, max token budget, stop text, or streaming intent
@@ -58,6 +66,22 @@ graph, or fabricate Magnetar tensor, kernel, hardware, or capability identities.
   deltas
 - **AND** Tachyon does not render Qwen chat templates or fabricate streaming
   chunks locally
+- **AND** downstream streaming cancellation propagates to Magnetar so generation
+  does not continue to the full requested token budget after disconnect
+
+### Requirement: Active WIT inference surface remains Magnetar-scoped
+The public `wit/ai/inference.wit` contract SHALL expose only the local inference
+request/response function needed by Tachyon's Magnetar-backed runtime.
+Historical LoRA adapter injection, per-call layer-wise memory profiles,
+handle-based layer execution, and local multi-device topology validation SHALL
+NOT remain in the active inference WIT package.
+
+#### Scenario: Historical local execution contracts are absent
+- **WHEN** `wit/ai/inference.wit` is inspected
+- **THEN** it does not expose `adapter-id`, `infer-with-options`,
+  `memory-profile`, `layer-execution`, or `parallel-execution`
+- **AND** model format parsing, layer execution, tensor handles, and Provider
+  execution remain Magnetar-owned
 
 ### Requirement: Local legacy text-generation compatibility is not an active inference surface
 Tachyon SHALL NOT expose Cargo feature aliases, runtime modules, CI gates, or
@@ -82,23 +106,20 @@ the active Magnetar production bundle contract.
 - **THEN** the selected test set must contain at least one Magnetar CUDA test
 - **AND** a zero-test selection is a CI failure
 
-### Requirement: Host optionally exposes WASI-NN imports without a local text-generation backend
-The `core-host` runtime SHALL define an `ai-inference` Cargo feature that links
-the `wasi_ephemeral_nn` preview1 host functions for legacy WASI guests without
-changing the default host build. This compatibility surface is limited to
-guest-facing WASI-NN imports and SHALL NOT provide a local text-generation
-fallback.
+### Requirement: Magnetar local inference dependencies remain feature-gated
+The `core-host` runtime SHALL keep Magnetar-backed local inference dependencies
+behind the `ai-inference` Cargo feature without preserving historical local
+inference compatibility as an active product contract.
 
 #### Scenario: Default host builds without AI inference
 - **WHEN** a developer builds `core-host` without enabling `ai-inference`
-- **THEN** the host compiles successfully without the optional AI imports
+- **THEN** the host compiles successfully without local production inference dependencies
 - **AND** the default release and container workflows remain unchanged
 
-#### Scenario: AI inference build links WASI-NN imports
+#### Scenario: AI inference build links Magnetar runtime
 - **WHEN** a developer builds `core-host` with `--features ai-inference`
-- **THEN** the legacy preview1 linker registers the `wasi_ephemeral_nn` imports
-- **AND** legacy guests can resolve the `wasi-nn` host functions at
-  instantiation time
+- **THEN** the Magnetar runtime adapter, Hugging Face loader, tokenizer support,
+  and selected Provider dependencies are compiled
 
 #### Scenario: AI guest runs without ai-inference feature
 - **WHEN** `core-host` is built without `--features ai-inference`

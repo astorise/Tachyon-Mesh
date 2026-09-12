@@ -7,7 +7,7 @@ interface model-registry {
     record model-info {
         /// Human-readable identifier (alias supplied at upload time, falls back to sha256 hash).
         alias: string,
-        /// Inference engine format, e.g. "gguf".
+        /// Inference runtime label, e.g. "magnetar".
         engine: string,
         /// Estimated VRAM footprint in MiB; 0 when unknown.
         vram-required-mb: u64,

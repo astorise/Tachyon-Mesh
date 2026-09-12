@@ -41,3 +41,12 @@
 - [x] 6.5 Remove Tachyon's obsolete CUDA multi-token rejection and validate CUDA multi-token generation through the real `CudaProvider`.
 - [x] 6.6 Move Tachyon model trust policy outside artifact bundles and reject self-trust attempts from model-local files.
 - [x] 6.7 Remove stale constrained-decoding WIT/spec/CI guards that referenced deleted local `FsmLogitProcessor` and `sample-constrained` surfaces.
+
+## 7. Post-Audit Corrective Scope
+
+- [x] 7.1 Make dynamic Magnetar model loading target-aware so CPU/GPU requests cannot be satisfied by a model lazy-loaded for a different accelerator.
+- [x] 7.2 Enforce requested-vs-loaded accelerator equality for CPU, GPU, NPU, and TPU placements before generation.
+- [x] 7.3 Remove historical LoRA, layer-wise, per-call memory-profile, and multi-device execution contracts from the active local inference WIT/spec surface.
+- [x] 7.4 Make `system-faas-model-broker` format-neutral: no GGUF/Safetensors detection, no model `format` sidecar declaration, and no auth-session LoRA prewarm instruction.
+- [x] 7.5 Add Magnetar streaming cancellation coverage proving downstream stop propagates through Tachyon instead of completing the full generation.
+- [x] 7.6 Strengthen the real CUDA multi-token test to assert the generated token count, not only a non-empty response.

@@ -576,7 +576,11 @@ impl AiInferenceRuntime {
         self
     }
 
-    fn ensure_model_loaded(&self, alias: &str) -> Result<(), String> {
+    fn ensure_model_loaded(
+        &self,
+        alias: &str,
+        requested_accelerator: AcceleratorKind,
+    ) -> Result<(), String> {
         if self
             .models
             .read()
@@ -595,7 +599,7 @@ impl AiInferenceRuntime {
         let binding = IntegrityModelBinding {
             alias: alias.to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: crate::ModelDevice::Cpu,
+            device: model_device_for_accelerator(requested_accelerator)?,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -668,22 +672,14 @@ impl AiInferenceRuntime {
         alias: &str,
         accelerator: AcceleratorKind,
     ) -> std::result::Result<(), String> {
-        if !self.supports_accelerator(accelerator) {
-            return Err(format!(
-                "{} accelerator is unavailable on this host",
-                accelerator.as_str()
-            ));
-        }
-        self.ensure_model_loaded(alias)?;
+        self.ensure_model_loaded(alias, accelerator)?;
         let models = self.models.read().expect("model registry lock poisoned");
         let model = models
             .get(alias)
             .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?;
-        if matches!(accelerator, AcceleratorKind::Npu | AcceleratorKind::Tpu)
-            && model.accelerator() != accelerator
-        {
+        if model.accelerator() != accelerator {
             return Err(format!(
-                "model alias `{alias}` requires `{}` but `{}` is requested",
+                "model alias `{alias}` is loaded for `{}` but `{}` was requested",
                 model.accelerator().as_str(),
                 accelerator.as_str()
             ));
@@ -712,7 +708,7 @@ impl AiInferenceRuntime {
                 "LoRA adapter `{adapter_id}` is not supported by the Magnetar cutover"
             )));
         }
-        self.ensure_model_loaded(alias)
+        self.ensure_model_loaded(alias, AcceleratorKind::Cpu)
             .map_err(GenerationError::local)?;
         let model = self
             .models
@@ -744,7 +740,7 @@ impl AiInferenceRuntime {
         alias: &str,
         input: &str,
     ) -> std::result::Result<Vec<f32>, GenerationError> {
-        self.ensure_model_loaded(alias)
+        self.ensure_model_loaded(alias, AcceleratorKind::Cpu)
             .map_err(GenerationError::local)?;
         let model = self
             .models
@@ -780,7 +776,7 @@ impl AiInferenceRuntime {
                 "LoRA adapter `{adapter_id}` is not supported by the Magnetar cutover"
             )));
         }
-        self.ensure_model_loaded(alias)
+        self.ensure_model_loaded(alias, AcceleratorKind::Cpu)
             .map_err(GenerationError::local)?;
         let model = self
             .models
@@ -909,6 +905,18 @@ impl AiInferenceRuntime {
 
 fn magnetar_provider_is_cuda(provider: &magnetar_runtime::CapabilityAdvertisement) -> bool {
     provider.provider_name.to_ascii_lowercase().contains("cuda")
+}
+
+fn model_device_for_accelerator(
+    accelerator: AcceleratorKind,
+) -> Result<crate::ModelDevice, String> {
+    match accelerator {
+        AcceleratorKind::Cpu => Ok(crate::ModelDevice::Cpu),
+        AcceleratorKind::Gpu => Ok(crate::ModelDevice::Cuda),
+        AcceleratorKind::Npu => Ok(crate::ModelDevice::Npu),
+        AcceleratorKind::Tpu => Ok(crate::ModelDevice::Tpu),
+        AcceleratorKind::Network => Err("network accelerator cannot load local models".to_owned()),
+    }
 }
 
 struct QueueDepthGuard {
@@ -1437,6 +1445,67 @@ mod tests {
     }
 
     #[test]
+    fn magnetar_streaming_stops_when_downstream_sink_disconnects() {
+        let model_dir = unique_model_dir("qwen-stream-cancel");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "qwen-stream".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }];
+
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("real Magnetar production Qwen bundle should load");
+
+        struct DisconnectingSink {
+            content_events: u32,
+        }
+        impl StreamSink for DisconnectingSink {
+            fn emit(&mut self, event: StreamEvent<'_>) -> StreamControl {
+                if let StreamEvent::Content(_) = event {
+                    self.content_events += 1;
+                }
+                StreamControl::Stop
+            }
+
+            fn is_live(&mut self) -> bool {
+                self.content_events == 0
+            }
+        }
+        let mut sink = DisconnectingSink { content_events: 0 };
+
+        let outcome = runtime
+            .stream_component_prompt(
+                "qwen-stream",
+                r#"{"prompt":"hi","max_new_tokens":16}"#,
+                None,
+                &mut sink,
+            )
+            .expect("downstream stop should cancel Magnetar streaming cleanly");
+
+        assert_eq!(
+            sink.content_events, 1,
+            "Tachyon must stop relaying after the downstream stream disconnects"
+        );
+        assert!(
+            outcome
+                .usage
+                .map(|usage| usage.completion_tokens <= 1)
+                .unwrap_or(true),
+            "cancelled Magnetar stream must not continue to produce the full request"
+        );
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
     fn explicit_magnetar_binding_rejects_non_qwen_model_directory() {
         let model_dir = unique_model_dir("non-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
@@ -1609,10 +1678,19 @@ mod tests {
         })
         .expect("real Magnetar production Qwen CUDA bundle should load");
         let generation = runtime
-            .compute_component_prompt("qwen-cuda", r#"{"prompt":"hi","max_new_tokens":16}"#)
+            .compute_component_prompt_with_adapter(
+                "qwen-cuda",
+                r#"{"prompt":"hi","max_new_tokens":16}"#,
+                None,
+            )
             .expect("real Magnetar CUDA should generate multiple tokens device-resident");
 
-        assert!(!generation.is_empty());
+        assert!(!generation.text.is_empty());
+        assert_eq!(
+            generation.usage.map(|usage| usage.completion_tokens),
+            Some(16),
+            "CUDA multi-token proof must generate exactly the requested token budget"
+        );
         let telemetry = inference_execution_telemetry();
         assert!(
             telemetry.iter().any(|event| event.alias == "qwen-cuda"
@@ -1741,6 +1819,136 @@ mod tests {
             ..IntegrityConfig::default_sealed()
         })
         .expect("dynamic placeholders should not be validated as upstream credentials");
+    }
+
+    #[test]
+    fn dynamic_cpu_request_loads_and_executes_reference_cpu() {
+        let root = unique_model_dir("dynamic-cpu-models");
+        let model_dir = root.join("dynamic-cpu-qwen");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed())
+            .expect("runtime")
+            .with_dynamic_models_root(Some(root.clone()));
+
+        runtime
+            .load_component_model("dynamic-cpu-qwen", AcceleratorKind::Cpu)
+            .expect("dynamic CPU model should load through Reference CPU");
+        let generation = runtime
+            .compute_component_prompt("dynamic-cpu-qwen", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .expect("dynamic CPU model should generate through Magnetar Reference CPU");
+
+        assert!(!generation.is_empty());
+        let telemetry = inference_execution_telemetry();
+        assert!(
+            telemetry
+                .iter()
+                .any(|event| event.alias == "dynamic-cpu-qwen"
+                    && event.succeeded
+                    && event.executed_on.to_ascii_lowercase().contains("reference")),
+            "dynamic CPU generation must record Reference CPU execution"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn requested_gpu_rejects_cpu_loaded_model() {
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "cpu-only".to_owned(),
+            path: "mock".to_owned(),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }];
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("runtime");
+
+        let error = runtime
+            .load_component_model("cpu-only", AcceleratorKind::Gpu)
+            .expect_err("GPU request must not be satisfied by a CPU-loaded model");
+
+        assert!(
+            error.contains("loaded for `cpu` but `gpu` was requested"),
+            "unexpected accelerator mismatch error: {error}"
+        );
+    }
+
+    #[cfg(not(feature = "magnetar-cuda"))]
+    #[test]
+    fn dynamic_gpu_request_does_not_lazy_load_cpu_when_cuda_is_unavailable() {
+        let root = unique_model_dir("dynamic-models");
+        let model_dir = root.join("dynamic-qwen");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed())
+            .expect("runtime")
+            .with_dynamic_models_root(Some(root.clone()));
+
+        let error = runtime
+            .load_component_model("dynamic-qwen", AcceleratorKind::Gpu)
+            .expect_err("dynamic GPU load must fail closed when CudaProvider is unavailable");
+
+        assert!(
+            error.contains("CUDA provider"),
+            "unexpected dynamic CUDA error: {error}"
+        );
+        assert!(
+            !runtime
+                .loaded_model_aliases()
+                .iter()
+                .any(|alias| alias == "dynamic-qwen"),
+            "failed dynamic GPU load must not leave a CPU-loaded model behind"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(feature = "magnetar-cuda"))]
+    #[test]
+    fn loaded_gpu_model_does_not_make_dynamic_gpu_request_fall_back_to_cpu() {
+        let root = unique_model_dir("dynamic-models-with-gpu");
+        let model_dir = root.join("dynamic-qwen-b");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "gpu-a".to_owned(),
+            path: "mock".to_owned(),
+            device: ModelDevice::Cuda,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }];
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("runtime")
+        .with_dynamic_models_root(Some(root.clone()));
+        assert!(runtime.supports_accelerator(AcceleratorKind::Gpu));
+
+        let error = runtime
+            .load_component_model("dynamic-qwen-b", AcceleratorKind::Gpu)
+            .expect_err(
+                "dynamic GPU load must not reuse CPU just because another GPU model exists",
+            );
+
+        assert!(
+            error.contains("CUDA provider"),
+            "unexpected dynamic CUDA error: {error}"
+        );
+        assert!(
+            !runtime
+                .loaded_model_aliases()
+                .iter()
+                .any(|alias| alias == "dynamic-qwen-b"),
+            "failed dynamic GPU load must not leave a CPU-loaded model behind"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

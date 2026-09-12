@@ -19,14 +19,9 @@ use std::{
 use uuid::Uuid;
 
 const MODEL_CHUNK_BYTES: usize = 16 * 1024 * 1024;
-/// Host dispatch sidecar written into each unpacked model directory. The broker
-/// performs the format *detection* and records the result; the host honours the
-/// declared value and still validates the bytes through the matching loader.
+/// Host provenance sidecar written into each unpacked model directory. The
+/// broker records ownership/provenance only; Magnetar owns model format support.
 const MODEL_META_JSON: &str = ".tachyon-model.json";
-/// GGUF files begin with this ASCII magic.
-const GGUF_MAGIC: &[u8; 4] = b"GGUF";
-const FORMAT_GGUF: &str = "gguf";
-const FORMAT_SAFETENSORS: &str = "safetensors";
 const INIT_PATH: &str = "/admin/models/init";
 const UPLOAD_PREFIX: &str = "/admin/models/upload/";
 const COMMIT_PREFIX: &str = "/admin/models/commit/";
@@ -68,10 +63,13 @@ struct CommitUploadResponse {
 
 #[derive(Debug, Deserialize)]
 struct CdcMutationEvent {
+    #[allow(dead_code)]
     namespace: String,
     #[allow(dead_code)]
     key: String,
+    #[allow(dead_code)]
     op: String,
+    #[allow(dead_code)]
     #[serde(default, alias = "new-value", alias = "newValue")]
     new_value: Option<serde_json::Value>,
 }
@@ -189,46 +187,8 @@ fn handle_prompt_finished(
     )
 }
 
-fn jit_prewarm_from_event(event: &CdcMutationEvent) -> Option<PrewarmInstruction> {
-    if !event.namespace.contains("auth") {
-        return None;
-    }
-    if !event.op.eq_ignore_ascii_case("insert")
-        && !event.op.eq_ignore_ascii_case("session_started")
-        && !event.op.eq_ignore_ascii_case("session-issued")
-    {
-        return None;
-    }
-
-    let tenant_id = tenant_id_from_event(event)?;
-    Some(PrewarmInstruction {
-        model: resolve_tenant_adapter(&tenant_id),
-        layer_index: 0,
-        priority: "volatile",
-    })
-}
-
-fn tenant_id_from_event(event: &CdcMutationEvent) -> Option<String> {
-    let value = event.new_value.as_ref()?;
-    tenant_id_from_value(value).or_else(|| {
-        value
-            .as_str()
-            .and_then(|encoded| serde_json::from_str::<serde_json::Value>(encoded).ok())
-            .and_then(|decoded| tenant_id_from_value(&decoded))
-    })
-}
-
-fn tenant_id_from_value(value: &serde_json::Value) -> Option<String> {
-    ["tenant_id", "tenantId", "x-tenant-id"]
-        .iter()
-        .find_map(|key| value.get(key)?.as_str())
-        .map(str::trim)
-        .filter(|tenant| !tenant.is_empty())
-        .map(str::to_owned)
-}
-
-fn resolve_tenant_adapter(tenant_id: &str) -> String {
-    format!("lora:{tenant_id}:default")
+fn jit_prewarm_from_event(_event: &CdcMutationEvent) -> Option<PrewarmInstruction> {
+    None
 }
 
 fn followup_probability(request: &PromptFinishedRequest) -> f32 {
@@ -343,9 +303,9 @@ fn commit_upload(uri: &str) -> Result<String, String> {
         ));
     }
 
-    // The uploaded blob is a gzip+tar archive (single `.gguf` or a safetensors
-    // directory). Unpack it into a per-alias model directory that core-host can
-    // mmap, detect the on-disk format, and drop the host dispatch sidecar.
+    // The uploaded blob is a gzip+tar archive. Unpack it into a per-alias model
+    // directory and drop a host-controlled provenance sidecar. Magnetar, not
+    // the broker, decides later whether the artifact format is supported.
     let alias = model_alias(&pending);
     let model_dir = models_dir().join(&alias);
 
@@ -373,12 +333,9 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     fs::create_dir_all(&incoming_dir)
         .map_err(|error| format!("failed to create the staging model directory: {error}"))?;
 
-    let format = unpack_targz(&staging_path, &incoming_dir)
+    unpack_targz(&staging_path, &incoming_dir)
         .and_then(|()| validate_extracted_file_manifest(&incoming_dir, &pending.files))
-        .and_then(|()| detect_format(&incoming_dir))
-        .and_then(|format| {
-            write_meta_sidecar(&incoming_dir, format, &alias, &upload_id).map(|()| format)
-        })
+        .and_then(|()| write_meta_sidecar(&incoming_dir, &alias, &upload_id))
         .inspect_err(|_error| {
             // Nothing outside the staging directory has been touched yet, so a
             // failure here costs the live checkpoint nothing.
@@ -420,7 +377,7 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     // Published last, because this is the step that can still refuse the
     // upload. On refusal the new files go and the previous checkpoint comes
     // back, leaving the alias exactly as the manifest left it.
-    if let Err(error) = publish_model_uploaded(&alias, format, &model_dir, &pending.files) {
+    if let Err(error) = publish_model_uploaded(&alias, &model_dir, &pending.files) {
         // Unwind only what is still ours. Two commits for the same alias can
         // interleave: by the time this refusal arrives, a second upload may
         // have moved our directory aside and installed its own. Removing the
@@ -807,13 +764,12 @@ fn path_to_manifest_key(path: &Path) -> String {
 
 fn publish_model_uploaded(
     alias: &str,
-    engine: &str,
     model_dir: &Path,
     files: &[ModelUploadFileManifest],
 ) -> Result<(), String> {
     let event = bindings::tachyon::mesh::model_events::ModelUploaded {
         alias: alias.to_owned(),
-        engine: engine.to_owned(),
+        engine: "magnetar".to_owned(),
         model_path: model_dir.to_string_lossy().into_owned(),
         files: files
             .iter()
@@ -888,55 +844,8 @@ fn sanitize_relative(path: &Path) -> Result<PathBuf, String> {
     Ok(clean)
 }
 
-/// Detect the on-disk format of an unpacked model directory by content: a file
-/// starting with the GGUF magic wins; otherwise a `config.json` next to a
-/// `.safetensors` file marks a Hugging Face safetensors checkpoint.
-fn detect_format(dir: &Path) -> Result<&'static str, String> {
-    let mut has_config = false;
-    let mut has_safetensors = false;
-    let read = fs::read_dir(dir)
-        .map_err(|error| format!("failed to scan unpacked model directory: {error}"))?;
-    for entry in read.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if file_starts_with_gguf_magic(&path) {
-            return Ok(FORMAT_GGUF);
-        }
-        match path.file_name().and_then(|name| name.to_str()) {
-            Some("config.json") => has_config = true,
-            Some(name) if name.ends_with(".safetensors") => has_safetensors = true,
-            _ => {}
-        }
-    }
-    if has_config && has_safetensors {
-        Ok(FORMAT_SAFETENSORS)
-    } else {
-        Err(
-            "uploaded model archive contains neither a GGUF file nor a safetensors checkpoint \
-             (config.json + .safetensors)"
-                .to_owned(),
-        )
-    }
-}
-
-/// Cheap content probe: does the file begin with the 4-byte GGUF magic?
-fn file_starts_with_gguf_magic(path: &Path) -> bool {
-    let Ok(mut file) = fs::File::open(path) else {
-        return false;
-    };
-    let mut magic = [0_u8; 4];
-    file.read_exact(&mut magic).is_ok() && &magic == GGUF_MAGIC
-}
-
-/// Write the host dispatch sidecar declaring the detected format.
-fn write_meta_sidecar(
-    dir: &Path,
-    format: &str,
-    alias: &str,
-    upload_id: &str,
-) -> Result<(), String> {
+/// Write the host provenance sidecar without declaring model format support.
+fn write_meta_sidecar(dir: &Path, alias: &str, upload_id: &str) -> Result<(), String> {
     // Carried over from the archive's own sidecar, if it brought one. This is
     // the documented escape hatch for a checkpoint whose chat template does not
     // match how it was actually fine-tuned to emit calls — a Qwen Coder build
@@ -950,7 +859,7 @@ fn write_meta_sidecar(
     // allowlist here would be one more place to forget a new one. Its *type* is
     // not: the host reads this file into `ModelMeta { tool_call_parser:
     // Option<String> }`, so a non-string fails that deserialization and takes
-    // the whole sidecar with it — `format` and `alias` included. The upload
+    // the whole sidecar with it, including `alias`. The upload
     // would commit, publish, and then be unloadable, which is a worse outcome
     // than losing one optional hint.
     //
@@ -964,7 +873,6 @@ fn write_meta_sidecar(
         .and_then(|meta| meta.get("tool_call_parser").cloned())
         .filter(|parser| parser.is_string());
     let mut body = serde_json::json!({
-        "format": format,
         "alias": alias,
         // Who installed this directory. The host ignores unknown sidecar keys,
         // so this costs it nothing and buys the rollback below the one fact it
@@ -1204,11 +1112,11 @@ mod tests {
         // The archive brought its own declaration.
         fs::write(
             dir.join(MODEL_META_JSON),
-            br#"{"format":"gguf","tool_call_parser":"qwen_coder"}"#,
+            br#"{"tool_call_parser":"qwen_coder"}"#,
         )
         .expect("uploaded sidecar");
 
-        write_meta_sidecar(&dir, "gguf", "coder", "up-1").expect("sidecar rewrite");
+        write_meta_sidecar(&dir, "coder", "up-1").expect("sidecar rewrite");
         let raw = fs::read(dir.join(MODEL_META_JSON)).expect("read back");
         let meta: serde_json::Value = serde_json::from_slice(&raw).expect("valid JSON");
         assert_eq!(meta["tool_call_parser"], "qwen_coder");
@@ -1220,30 +1128,34 @@ mod tests {
         // A non-string declaration is dropped rather than relayed. The host
         // reads this file into `ModelMeta { tool_call_parser: Option<String> }`,
         // so relaying an object failed that deserialization and took the whole
-        // sidecar with it — `format` and `alias` included — leaving an upload
+        // sidecar with it, including `alias`, leaving an upload
         // that committed, published, and could not load.
         fs::write(
             dir.join(MODEL_META_JSON),
-            br#"{"format":"gguf","tool_call_parser":{"dialect":"qwen"}}"#,
+            br#"{"tool_call_parser":{"dialect":"qwen"}}"#,
         )
         .expect("uploaded sidecar");
-        write_meta_sidecar(&dir, "gguf", "coder", "up-3").expect("sidecar rewrite");
+        write_meta_sidecar(&dir, "coder", "up-3").expect("sidecar rewrite");
         let raw = fs::read(dir.join(MODEL_META_JSON)).expect("read back");
         let meta: serde_json::Value = serde_json::from_slice(&raw).expect("valid JSON");
         assert!(
             meta.get("tool_call_parser").is_none(),
             "an unusable hint is worth less than a loadable checkpoint: {meta}"
         );
-        assert_eq!(meta["format"], "gguf");
+        assert!(
+            meta.get("format").is_none(),
+            "broker must not declare model format support: {meta}"
+        );
         assert_eq!(meta["alias"], "coder");
 
         // An archive with no declaration gets no key invented for it, so the
         // host falls back to reading the chat template as it always did.
         fs::remove_file(dir.join(MODEL_META_JSON)).expect("clear");
-        write_meta_sidecar(&dir, "gguf", "coder", "up-2").expect("sidecar rewrite");
+        write_meta_sidecar(&dir, "coder", "up-2").expect("sidecar rewrite");
         let raw = fs::read(dir.join(MODEL_META_JSON)).expect("read back");
         let meta: serde_json::Value = serde_json::from_slice(&raw).expect("valid JSON");
         assert!(meta.get("tool_call_parser").is_none());
+        assert!(meta.get("format").is_none());
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -1267,7 +1179,7 @@ mod tests {
             if let Some(upload_id) = upload_id {
                 fs::write(
                     dir.join(MODEL_META_JSON),
-                    format!(r#"{{"format":"gguf","alias":"coder","upload_id":"{upload_id}"}}"#),
+                    format!(r#"{{"alias":"coder","upload_id":"{upload_id}"}}"#),
                 )
                 .expect("fixture sidecar");
             }
@@ -1424,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_session_event_generates_volatile_prewarm_instruction() {
+    fn auth_session_event_does_not_create_lora_prewarm_instruction() {
         let event = CdcMutationEvent {
             namespace: "auth:sessions".to_owned(),
             key: "session-1".to_owned(),
@@ -1435,16 +1347,7 @@ mod tests {
             })),
         };
 
-        let instruction = jit_prewarm_from_event(&event).expect("session should prewarm LoRA");
-
-        assert_eq!(
-            instruction,
-            PrewarmInstruction {
-                model: "lora:tenant-a:default".to_owned(),
-                layer_index: 0,
-                priority: "volatile",
-            }
-        );
+        assert!(jit_prewarm_from_event(&event).is_none());
     }
 
     #[test]
@@ -1519,17 +1422,17 @@ mod tests {
         assert!(sanitize_relative(Path::new("../escape")).is_err());
         assert!(sanitize_relative(Path::new("/abs/path")).is_err());
         assert_eq!(
-            sanitize_relative(Path::new("./nested/model.gguf")).expect("safe path"),
-            PathBuf::from("nested/model.gguf")
+            sanitize_relative(Path::new("./nested/weights.bin")).expect("safe path"),
+            PathBuf::from("nested/weights.bin")
         );
     }
 
     #[test]
-    fn unpack_then_detect_gguf_archive() {
-        let tmp = unique_tmp("gguf");
+    fn unpack_archive_without_claiming_model_format() {
+        let tmp = unique_tmp("artifact");
         fs::create_dir_all(&tmp).expect("tmp dir");
         let archive = build_targz(&[
-            ("model.gguf", b"GGUF\x00\x00\x00\x00body".to_vec()),
+            ("weights.bin", b"opaque model bytes".to_vec()),
             ("tokenizer.json", b"{}".to_vec()),
         ]);
         let staging = tmp.join("upload.part");
@@ -1538,9 +1441,19 @@ mod tests {
         fs::create_dir_all(&dest).expect("dest dir");
 
         unpack_targz(&staging, &dest).expect("archive should unpack");
-        assert!(dest.join("model.gguf").exists());
+        assert!(dest.join("weights.bin").exists());
         assert!(dest.join("tokenizer.json").exists());
-        assert_eq!(detect_format(&dest).expect("format"), FORMAT_GGUF);
+        write_meta_sidecar(&dest, "model-a", "upload-a").expect("sidecar");
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &fs::read(dest.join(MODEL_META_JSON)).expect("sidecar should read"),
+        )
+        .expect("sidecar json");
+        assert_eq!(sidecar["alias"], "model-a");
+        assert_eq!(sidecar["upload_id"], "upload-a");
+        assert!(
+            sidecar.get("format").is_none(),
+            "broker must not declare model format support"
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 
@@ -1548,14 +1461,14 @@ mod tests {
     fn extracted_file_manifest_accepts_matching_files() {
         let tmp = unique_tmp("manifest-ok");
         fs::create_dir_all(&tmp).expect("tmp dir");
-        let model = tmp.join("model.gguf");
-        fs::write(&model, b"GGUFmodel").expect("model");
+        let model = tmp.join("weights.bin");
+        fs::write(&model, b"model").expect("model");
         let tokenizer = tmp.join("tokenizer.json");
         fs::write(&tokenizer, b"{}").expect("tokenizer");
         let manifest = vec![
             ModelUploadFileManifest {
-                path: "model.gguf".to_owned(),
-                size_bytes: 9,
+                path: "weights.bin".to_owned(),
+                size_bytes: 5,
                 sha256: hash_file(&model).expect("hash model"),
             },
             ModelUploadFileManifest {
@@ -1573,10 +1486,10 @@ mod tests {
     fn extracted_file_manifest_rejects_hash_mismatch() {
         let tmp = unique_tmp("manifest-bad");
         fs::create_dir_all(&tmp).expect("tmp dir");
-        fs::write(tmp.join("model.gguf"), b"GGUFmodel").expect("model");
+        fs::write(tmp.join("weights.bin"), b"model").expect("model");
         let manifest = vec![ModelUploadFileManifest {
-            path: "model.gguf".to_owned(),
-            size_bytes: 9,
+            path: "weights.bin".to_owned(),
+            size_bytes: 5,
             sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 .to_owned(),
         }];
@@ -1588,23 +1501,14 @@ mod tests {
     }
 
     #[test]
-    fn detect_format_identifies_safetensors_directory() {
-        let tmp = unique_tmp("safetensors");
+    fn broker_accepts_format_neutral_artifact_directories() {
+        let tmp = unique_tmp("format-neutral");
         fs::create_dir_all(&tmp).expect("tmp dir");
-        fs::write(tmp.join("config.json"), br#"{"model_type":"llama"}"#).expect("config");
-        fs::write(tmp.join("model.safetensors"), b"\x00\x00").expect("weights");
-        fs::write(tmp.join("tokenizer.json"), b"{}").expect("tokenizer");
+        fs::write(tmp.join("README.txt"), b"opaque artifact").expect("file");
 
-        assert_eq!(detect_format(&tmp).expect("format"), FORMAT_SAFETENSORS);
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn detect_format_rejects_an_unrecognized_archive() {
-        let tmp = unique_tmp("junk");
-        fs::create_dir_all(&tmp).expect("tmp dir");
-        fs::write(tmp.join("README.txt"), b"not a model").expect("file");
-        assert!(detect_format(&tmp).is_err());
+        write_meta_sidecar(&tmp, "opaque", "upload-opaque")
+            .expect("broker sidecar should not require format detection");
+        assert_eq!(installed_upload_id(&tmp).as_deref(), Some("upload-opaque"));
         let _ = fs::remove_dir_all(&tmp);
     }
 }

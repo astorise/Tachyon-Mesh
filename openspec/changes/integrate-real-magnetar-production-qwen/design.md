@@ -36,6 +36,7 @@ Magnetar now exposes the public embedder path for production Qwen loading at com
    - CPU placement constructs a real Reference CPU Provider and uses `run_production_qwen_generation_for_provider_with_request`.
    - CUDA placement constructs a real `CudaProvider` and uses `run_production_qwen_generation_for_provider_with_request`.
    - CUDA multi-token requests are no longer rejected by Tachyon; Magnetar owns the provider capability check and device-resident decode implementation.
+   - Dynamic lazy loading receives the requested accelerator and materializes the binding for that target. A loaded binding whose accelerator differs from the request is rejected for every accelerator class, including CPU and GPU.
 
 4. **Forward production request semantics.**
    - Tachyon maps OpenAI chat turns to `PromptInput::ChatMessages` and does not render Qwen chat templates locally.
@@ -50,6 +51,11 @@ Magnetar now exposes the public embedder path for production Qwen loading at com
 6. **Correct, do not rewrite, the archived history.**
    - The old archive remains historical evidence. This change adds a corrective successor that records why the earlier completion was insufficient and what replaces it.
 
+7. **Remove historical compatibility from active contracts.**
+   - `wit/ai/inference.wit` keeps only the Magnetar-backed request/response surface.
+   - Per-call LoRA adapter injection, layer-wise memory profiles, layer tensor handles, and local multi-device topology validation are not public Tachyon promises after the cutover.
+   - `system-faas-model-broker` remains an artifact transport/provenance component. It verifies declared files and publishes Magnetar-owned upload events, but it does not detect GGUF/Safetensors, write a model `format` sidecar, or synthesize tenant LoRA prewarm instructions.
+
 ## Risks / Trade-offs
 
 - [Risk] Magnetar APIs at the pinned SHA use Rust 2024 while `core-host` is Rust 2021. -> Mitigation: Cargo supports mixed-edition dependencies; keep Tachyon code idiomatic 2021 and isolate Magnetar calls in one module.
@@ -63,8 +69,9 @@ Magnetar now exposes the public embedder path for production Qwen loading at com
 2. Replace the local facade implementation with the real Magnetar adapter while keeping Tachyon's public inference APIs stable.
 3. Remove fake Magnetar capability/residency types from Tachyon's runtime surface and map telemetry to real Provider metadata.
 4. Update tests for CPU production Qwen, explicit trust rejection, self-trust rejection, non-Qwen rejection, CUDA multi-token generation, and GPU coverage.
-5. Replace `candle-cuda` CI proof steps with Magnetar CPU/GPU checks and zero-test guards.
-6. Run formatting, clippy, focused tests, and compile-only feature checks.
+5. Add post-audit tests for target-aware dynamic loading, accelerator mismatch rejection, streaming cancellation, format-neutral broker behavior, and exact CUDA multi-token counts.
+6. Replace `candle-cuda` CI proof steps with Magnetar CPU/GPU checks and zero-test guards.
+7. Run formatting, clippy, focused tests, and compile-only feature checks.
 
 ## Open Questions
 

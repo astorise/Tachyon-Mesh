@@ -32,6 +32,12 @@ The host SHALL execute admitted Qwen generation through Magnetar's real producti
 - **THEN** Tachyon constructs and passes a real Magnetar `CudaProvider`
 - **AND** a successful response cannot have silently used Reference CPU as a fallback
 
+#### Scenario: Dynamic loading is target-aware
+- **WHEN** a dynamic `magnetar:` model alias is requested for a specific accelerator
+- **THEN** Tachyon lazy-loads the binding for that requested accelerator
+- **AND** a CPU-loaded model cannot satisfy a GPU request
+- **AND** an already-loaded GPU model for another alias cannot make a dynamic GPU request fall back to CPU
+
 #### Scenario: OpenAI chat request uses Magnetar chat input
 - **WHEN** a local OpenAI chat request contains `messages`
 - **THEN** Tachyon passes those messages to Magnetar as `PromptInput::ChatMessages`
@@ -63,6 +69,15 @@ For local Magnetar Qwen streaming, Tachyon SHALL use Magnetar's production strea
 - **WHEN** a local OpenAI request uses `stream: true`
 - **THEN** Tachyon obtains token deltas from Magnetar streaming events
 - **AND** cancellation from the downstream stream propagates with `ControlFlow::Break`
+- **AND** Magnetar generation stops instead of completing the full requested token budget after the downstream stream disconnects
+
+### Requirement: Active WIT inference surface MUST stay Magnetar-scoped
+The public `wit/ai/inference.wit` contract SHALL expose only the local inference request/response function needed by Tachyon's Magnetar-backed runtime. Historical LoRA adapter injection, per-call layer-wise memory profiles, handle-based layer execution, and local multi-device topology validation SHALL NOT remain in the active inference WIT package.
+
+#### Scenario: Historical local execution contracts are absent
+- **WHEN** `wit/ai/inference.wit` is inspected
+- **THEN** it does not expose `adapter-id`, `infer-with-options`, `memory-profile`, `layer-execution`, or `parallel-execution`
+- **AND** model format parsing, layer execution, tensor handles, and Provider execution remain Magnetar-owned
 
 ### Requirement: Tachyon MUST NOT fabricate Magnetar execution or hardware identities
 The host SHALL consume Magnetar runtime, Provider, and Device contracts rather than creating local stand-ins for Magnetar handles or capability advertisements. Tachyon SHALL NOT define permanent local `PreparedKernelId`, `TensorId`, hardcoded `CUDA_0`, hardcoded VRAM/dtype support, environment-variable hardware truth, or pseudo Magnetar memory residency as the source of mesh routing truth.
@@ -94,3 +109,11 @@ The host SHALL consume Magnetar runtime, Provider, and Device contracts rather t
 ### Requirement: `candle-cuda` MUST be documented as the single CUDA switch
 **Reason**: CUDA coverage for the active local inference path must use Magnetar Provider/CUDA gates, not Candle feature switches.
 **Migration**: Use Magnetar CUDA Provider CI checks and explicit fail-closed placement requirements.
+
+### Requirement: WIT layer-wise and multi-device local execution contracts
+**Reason**: Layer-wise tensor handles and topology validation were historical Tachyon-local execution contracts. Active local Qwen execution now belongs to Magnetar's ModelInstance, prepared execution plan, memory manager, and Provider APIs.
+**Migration**: Keep routing and placement policy in Tachyon; express model execution topology through Magnetar contracts when those capabilities are exposed.
+
+### Requirement: Per-call LoRA adapter injection in local inference WIT
+**Reason**: Per-call adapter overlays are not part of the current Magnetar production Qwen integration and must not stay as a public local inference promise.
+**Migration**: Reintroduce adapter behavior only through explicit Magnetar Component/Provider support in a future change.
