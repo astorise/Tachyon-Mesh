@@ -1,6 +1,6 @@
 ## 1. Dependencies and Build Gates
 
-- [x] 1.1 Add pinned Magnetar dependencies for `magnetar-runtime`, `magnetar-loader-huggingface`, `magnetar-provider-cpu`, and optional `magnetar-provider-cuda` at `b235783abb2b0c92843febfa3ff29f30745e1934`.
+- [x] 1.1 Add pinned Magnetar dependencies for `magnetar-runtime`, `magnetar-loader-huggingface`, `magnetar-provider-cpu`, and optional `magnetar-provider-cuda` at `d4e3df841765fc1a520195dab2dd8b6bd8a92fb4`.
 - [x] 1.2 Replace Candle compatibility feature aliases used for active inference with Magnetar-oriented feature gates while preserving non-AI default builds.
 - [x] 1.3 Verify `cargo check -p core-host --features ai-inference` resolves the pinned Magnetar graph.
 
@@ -34,7 +34,7 @@
 
 ## 6. Magnetar Post-Closure Integration Update
 
-- [x] 6.1 Pin Magnetar to `b235783abb2b0c92843febfa3ff29f30745e1934` after production loading, streaming, and device-resident CUDA multi-token decode landed upstream.
+- [x] 6.1 Pin Magnetar to `d4e3df841765fc1a520195dab2dd8b6bd8a92fb4` after production loading, streaming, and device-resident CUDA multi-token decode landed upstream.
 - [x] 6.2 Replace buffered/facade generation calls with `ProductionGenerationRequest` and provider-specific Magnetar generation entry points.
 - [x] 6.3 Map OpenAI chat messages to `PromptInput::ChatMessages` and map supported generation parameters and stop sequences into Magnetar contracts.
 - [x] 6.4 Use Magnetar streaming events and `GenerationStreamEvent::Token.text_delta` for Tachyon streaming instead of buffering full generation first.
@@ -50,3 +50,15 @@
 - [x] 7.4 Make `system-faas-model-broker` format-neutral: no GGUF/Safetensors detection, no model `format` sidecar declaration, and no auth-session LoRA prewarm instruction.
 - [x] 7.5 Add Magnetar streaming cancellation coverage proving downstream stop propagates through Tachyon instead of completing the full generation.
 - [x] 7.6 Strengthen the real CUDA multi-token test to assert the generated token count, not only a non-empty response.
+
+## 8. PR #412 Production Closure
+
+- [x] 8.1 Preserve the full `guest-openai` host request envelope for local Magnetar models instead of rejecting Tachyon-owned control fields.
+- [x] 8.2 Restore functional local tool calling by making `tools` and `tool_choice` visible to Qwen prompt construction while keeping tool-call parsing in `guest-openai`.
+- [x] 8.3 Wire `max_generation_ms` to real deadline enforcement for local Magnetar execution.
+- [x] 8.4 Either support structured-output controls on the Magnetar path or reject unsupported schema requests as invalid requests instead of runtime/server failures.
+- [x] 8.5 Replace per-request Magnetar Runtime/Provider/model materialization with a persistent loaded ModelInstance lifecycle.
+- [x] 8.6 Add sequential and concurrent tests proving one resident model is reused by multiple generation sessions.
+- [x] 8.7 Track the real Hugging Face Qwen checkpoint acceptance lane separately from fast synthetic fixture CI.
+- [x] 8.8 Remove provider-name string matching from accelerator classification.
+- [x] 8.9 Update PR/README documentation to the actual pinned Magnetar SHA and supported CUDA multi-token state.

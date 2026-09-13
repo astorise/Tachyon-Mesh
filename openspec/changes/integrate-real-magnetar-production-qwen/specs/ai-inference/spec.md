@@ -48,6 +48,19 @@ The host SHALL execute admitted Qwen generation through Magnetar's real producti
 - **THEN** Tachyon maps them to Magnetar `GenerationParameters`, `ProductionGenerationRequest.max_new_tokens`, and `StopConditions`
 - **AND** unsupported local Magnetar request fields fail closed instead of being silently ignored
 
+#### Scenario: Tachyon-owned OpenAI controls remain host controls
+- **WHEN** `guest-openai` forwards `tools`, `tool_choice`, `tool_call_parser`, `max_generation_ms`, or `json_schema` in the host request envelope
+- **THEN** Tachyon SHALL NOT reject those fields as unknown Magnetar generation fields
+- **AND** `tools` and `tool_choice` SHALL be made visible to Qwen prompt construction while tool-call parsing remains in `guest-openai`
+- **AND** `max_generation_ms` SHALL bound the local Magnetar generation loop
+- **AND** unsupported structured-output schemas SHALL fail as invalid requests rather than server/runtime failures
+
+#### Scenario: Loaded Magnetar model is resident across requests
+- **WHEN** Tachyon loads a local Magnetar Qwen binding
+- **THEN** Tachyon SHALL keep a ready Magnetar `ModelInstance` inside the loaded model lifecycle
+- **AND** sequential or concurrent generation requests SHALL create sessions against the same resident `ModelInstance`
+- **AND** requests SHALL NOT rematerialize model weights unless the model is explicitly unloaded or evicted
+
 ### Requirement: CUDA multi-token generation MUST use Magnetar device-resident decode
 Now that Magnetar provides device-resident multi-step CUDA decode, Tachyon SHALL NOT reject explicit CUDA requests solely because they ask for more than one generated token. Tachyon SHALL still fail closed when the real `CudaProvider` is unavailable and SHALL NOT emulate CUDA generation by falling back to CPU or copying KV history through host memory.
 

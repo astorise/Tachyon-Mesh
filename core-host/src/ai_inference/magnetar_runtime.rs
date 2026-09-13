@@ -4,7 +4,7 @@ use magnetar_loader_huggingface::{
 };
 use magnetar_runtime::model::{ModelTrustStatus, ModelTrustStore};
 use magnetar_runtime::production_model_ingestion::{
-    ProductionArtifactPayloadSource, ProductionModelArtifactIngestor, ProductionModelSource,
+    ProductionModelArtifactIngestor, ProductionModelSource,
 };
 use magnetar_runtime::tokenizer::Tokenizer;
 use magnetar_runtime::{
@@ -13,8 +13,9 @@ use magnetar_runtime::{
 };
 use serde_json::Value;
 use std::{
+    fmt,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use super::{StreamControl, TokenUsage};
@@ -36,6 +37,13 @@ pub(crate) struct ProviderAdvertisement {
     pub(crate) provider_name: String,
     pub(crate) provider_version: String,
     pub(crate) device_ids: Vec<String>,
+    pub(crate) device_class: ProviderDeviceClass,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderDeviceClass {
+    ReferenceCpu,
+    Cuda,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,16 +52,12 @@ enum MagnetarProviderTarget {
     Cuda,
 }
 
-#[derive(Clone)]
 pub(crate) struct MagnetarRuntime {
     alias: String,
     root: PathBuf,
-    fixture: magnetar_runtime::E2eFixture,
-    payload_source: Arc<dyn ProductionArtifactPayloadSource>,
-    trust_store: ModelTrustStore,
     chat_formatter: Option<Arc<HuggingFaceChatTemplateFormatter>>,
     provider: ProviderAdvertisement,
-    target: MagnetarProviderTarget,
+    loaded_model: Mutex<magnetar_runtime::ProductionQwenLoadedModel>,
 }
 
 impl std::fmt::Debug for MagnetarRuntime {
@@ -62,7 +66,7 @@ impl std::fmt::Debug for MagnetarRuntime {
             .field("alias", &self.alias)
             .field("root", &self.root)
             .field("provider", &self.provider)
-            .field("target", &self.target)
+            .field("target", &self.provider.device_class)
             .finish_non_exhaustive()
     }
 }
@@ -150,16 +154,23 @@ impl MagnetarRuntime {
             format!("Magnetar failed to build production Qwen fixture for `{alias}`")
         })?;
         let provider = capability_advertisement(target)?;
+        let provider_for_generation = provider_for_target(target, alias)?;
+        let loaded_model = magnetar_runtime::ProductionQwenLoadedModel::load(
+            fixture.clone(),
+            ingested.payload_source.as_ref(),
+            trust_store.clone(),
+            provider_for_generation,
+        )
+        .with_context(|| {
+            format!("Magnetar failed to materialize resident Qwen model for `{alias}`")
+        })?;
 
         Ok(Some(Self {
             alias: alias.to_owned(),
             root,
-            fixture,
-            payload_source: Arc::clone(&ingested.payload_source),
-            trust_store,
             chat_formatter,
             provider,
-            target,
+            loaded_model: Mutex::new(loaded_model),
         }))
     }
 
@@ -169,6 +180,18 @@ impl MagnetarRuntime {
 
     pub(crate) fn provider(&self) -> &ProviderAdvertisement {
         &self.provider
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resident_debug(&self) -> Result<(String, usize)> {
+        let loaded = self
+            .loaded_model
+            .lock()
+            .map_err(|_| anyhow!("resident Magnetar model lock poisoned for `{}`", self.alias))?;
+        Ok((
+            loaded.model_instance_id().to_string(),
+            loaded.materialization_count(),
+        ))
     }
 
     pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<Vec<(Vec<u8>, TokenUsage)>> {
@@ -182,20 +205,17 @@ impl MagnetarRuntime {
         let request = GenerationRequestView::parse(prompts[0])?;
         let request = request.into_magnetar_request()?;
 
-        let outcome = magnetar_runtime::run_production_qwen_generation_for_provider_with_request(
-            self.fixture.clone(),
-            self.payload_source.as_ref(),
-            self.trust_store.clone(),
-            request,
-            self.chat_formatter(),
-            self.provider_for_generation()?,
-        )
-        .map_err(|error| {
-            anyhow!(
-                "Magnetar Qwen generation for `{}` failed: {error}",
-                self.alias
-            )
-        })?;
+        let outcome = self
+            .loaded_model
+            .lock()
+            .map_err(|_| anyhow!("resident Magnetar model lock poisoned for `{}`", self.alias))?
+            .generate(request, self.chat_formatter())
+            .map_err(|error| {
+                anyhow!(
+                    "Magnetar Qwen generation for `{}` failed: {error}",
+                    self.alias
+                )
+            })?;
 
         let usage = outcome.result.output.usage;
         Ok(vec![(
@@ -243,21 +263,17 @@ impl MagnetarRuntime {
                 _ => std::ops::ControlFlow::Continue(()),
             }
         };
-        let outcome = magnetar_runtime::run_production_qwen_generation_for_provider_streaming(
-            self.fixture.clone(),
-            self.payload_source.as_ref(),
-            self.trust_store.clone(),
-            request,
-            self.chat_formatter(),
-            self.provider_for_generation()?,
-            &mut on_event,
-        )
-        .map_err(|error| {
-            anyhow!(
-                "Magnetar Qwen streaming generation for `{}` failed: {error}",
-                self.alias
-            )
-        })?;
+        let outcome = self
+            .loaded_model
+            .lock()
+            .map_err(|_| anyhow!("resident Magnetar model lock poisoned for `{}`", self.alias))?
+            .generate_streaming(request, self.chat_formatter(), &mut on_event)
+            .map_err(|error| {
+                anyhow!(
+                    "Magnetar Qwen streaming generation for `{}` failed: {error}",
+                    self.alias
+                )
+            })?;
         Ok(streamed_usage.unwrap_or_else(|| {
             let usage = outcome.result.output.usage;
             TokenUsage {
@@ -267,38 +283,32 @@ impl MagnetarRuntime {
         }))
     }
 
-    fn provider_for_generation(&self) -> Result<Arc<dyn Provider>> {
-        match self.target {
-            MagnetarProviderTarget::ReferenceCpu => {
-                Ok(Arc::new(magnetar_runtime::ReferenceCpuProvider::new()) as Arc<dyn Provider>)
-            }
-            MagnetarProviderTarget::Cuda => {
-                #[cfg(feature = "magnetar-cuda")]
-                {
-                    let provider = magnetar_provider_cuda::CudaProvider::new();
-                    if !provider.is_available() {
-                        bail!(
-                            "Magnetar CUDA provider is unavailable for `{}`; explicit CUDA placement cannot fall back to CPU",
-                            self.alias
-                        );
-                    }
-                    Ok(Arc::new(provider) as Arc<dyn Provider>)
-                }
-                #[cfg(not(feature = "magnetar-cuda"))]
-                {
-                    bail!(
-                        "Magnetar CUDA provider is not compiled into this host; rebuild with `magnetar-cuda` for explicit CUDA placement"
-                    )
-                }
-            }
-        }
-    }
-
     fn chat_formatter(&self) -> Option<&dyn magnetar_runtime::ChatTemplateFormatter> {
         self.chat_formatter
             .as_deref()
             .map(|formatter| formatter as &dyn magnetar_runtime::ChatTemplateFormatter)
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct InvalidGenerationRequest(String);
+
+impl fmt::Display for InvalidGenerationRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidGenerationRequest {}
+
+pub(crate) fn is_invalid_generation_request(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<InvalidGenerationRequest>())
+}
+
+fn invalid_request(message: impl Into<String>) -> anyhow::Error {
+    anyhow!(InvalidGenerationRequest(message.into()))
 }
 pub(crate) fn is_magnetar_path(path: &str) -> bool {
     path.trim().starts_with(MAGNETAR_PATH_PREFIX)
@@ -387,7 +397,10 @@ fn capability_advertisement(target: MagnetarProviderTarget) -> Result<ProviderAd
     match target {
         MagnetarProviderTarget::ReferenceCpu => {
             let provider = magnetar_runtime::ReferenceCpuProvider::new();
-            Ok(provider_advertisement(&provider))
+            Ok(provider_advertisement(
+                &provider,
+                ProviderDeviceClass::ReferenceCpu,
+            ))
         }
         MagnetarProviderTarget::Cuda => {
             #[cfg(feature = "magnetar-cuda")]
@@ -398,7 +411,7 @@ fn capability_advertisement(target: MagnetarProviderTarget) -> Result<ProviderAd
                         "Magnetar CUDA provider is unavailable; explicit CUDA placement cannot fall back to CPU"
                     );
                 }
-                Ok(provider_advertisement(&provider))
+                Ok(provider_advertisement(&provider, ProviderDeviceClass::Cuda))
             }
             #[cfg(not(feature = "magnetar-cuda"))]
             {
@@ -410,7 +423,37 @@ fn capability_advertisement(target: MagnetarProviderTarget) -> Result<ProviderAd
     }
 }
 
-fn provider_advertisement(provider: &dyn Provider) -> ProviderAdvertisement {
+fn provider_for_target(target: MagnetarProviderTarget, alias: &str) -> Result<Arc<dyn Provider>> {
+    match target {
+        MagnetarProviderTarget::ReferenceCpu => {
+            Ok(Arc::new(magnetar_runtime::ReferenceCpuProvider::new()) as Arc<dyn Provider>)
+        }
+        MagnetarProviderTarget::Cuda => {
+            #[cfg(feature = "magnetar-cuda")]
+            {
+                let provider = magnetar_provider_cuda::CudaProvider::new();
+                if !provider.is_available() {
+                    bail!(
+                        "Magnetar CUDA provider is unavailable for `{alias}`; explicit CUDA placement cannot fall back to CPU"
+                    );
+                }
+                Ok(Arc::new(provider) as Arc<dyn Provider>)
+            }
+            #[cfg(not(feature = "magnetar-cuda"))]
+            {
+                let _ = alias;
+                bail!(
+                    "Magnetar CUDA provider is not compiled into this host; rebuild with `magnetar-cuda` for explicit CUDA placement"
+                )
+            }
+        }
+    }
+}
+
+fn provider_advertisement(
+    provider: &dyn Provider,
+    device_class: ProviderDeviceClass,
+) -> ProviderAdvertisement {
     let metadata = provider.metadata();
     let device_ids = provider
         .devices()
@@ -421,6 +464,7 @@ fn provider_advertisement(provider: &dyn Provider) -> ProviderAdvertisement {
         provider_name: metadata.name,
         provider_version: metadata.version,
         device_ids,
+        device_class,
     }
 }
 
@@ -430,6 +474,7 @@ struct GenerationRequestView {
     parameters: GenerationParameters,
     stop_conditions: StopConditions,
     max_new_tokens: Option<usize>,
+    max_generation_millis: Option<u64>,
 }
 
 impl GenerationRequestView {
@@ -442,6 +487,7 @@ impl GenerationRequestView {
                 parameters: GenerationParameters::greedy(),
                 stop_conditions: StopConditions::default(),
                 max_new_tokens: None,
+                max_generation_millis: None,
             });
         };
         let Value::Object(object) = value else {
@@ -450,6 +496,7 @@ impl GenerationRequestView {
                 parameters: GenerationParameters::greedy(),
                 stop_conditions: StopConditions::default(),
                 max_new_tokens: None,
+                max_generation_millis: None,
             });
         };
         fail_on_unsupported_generation_fields(&object)?;
@@ -463,6 +510,7 @@ impl GenerationRequestView {
                 .unwrap_or_else(|| text.to_owned());
             PromptInput::PlainText(prompt)
         };
+        let prompt = apply_host_generation_controls(prompt, &object)?;
         let max_new_tokens = object
             .get("max_new_tokens")
             .or_else(|| object.get("max_tokens"))
@@ -505,6 +553,7 @@ impl GenerationRequestView {
             parameters,
             stop_conditions,
             max_new_tokens,
+            max_generation_millis: parse_max_generation_millis(&object)?,
         })
     }
 
@@ -517,6 +566,7 @@ impl GenerationRequestView {
             parameters: self.parameters,
             stop_conditions: self.stop_conditions,
             max_new_tokens: self.max_new_tokens,
+            max_generation_millis: self.max_generation_millis,
         })
     }
 }
@@ -536,11 +586,141 @@ fn fail_on_unsupported_generation_fields(object: &serde_json::Map<String, Value>
         "presence_penalty",
         "repetition_penalty",
         "include_usage",
+        "tools",
+        "tool_choice",
+        "tool_call_parser",
+        "max_generation_ms",
+        "json_schema",
     ];
     if let Some(key) = object.keys().find(|key| !SUPPORTED.contains(&key.as_str())) {
-        bail!("Magnetar generation request field `{key}` is not supported by Tachyon");
+        return Err(invalid_request(format!(
+            "Magnetar generation request field `{key}` is not supported by Tachyon"
+        )));
     }
     Ok(())
+}
+
+fn apply_host_generation_controls(
+    prompt: PromptInput,
+    object: &serde_json::Map<String, Value>,
+) -> Result<PromptInput> {
+    let mut instructions = Vec::new();
+    if let Some(schema) = object.get("json_schema") {
+        instructions.push(structured_output_instruction(schema)?);
+    }
+    let tool_choice = object.get("tool_choice");
+    if tool_choice.is_some_and(|choice| choice.as_str() == Some("none")) {
+        return prepend_system_instructions(prompt, instructions);
+    }
+    if let Some(tools) = object.get("tools").filter(|tools| !is_empty_json(tools)) {
+        instructions.push(tool_instruction(tools, tool_choice)?);
+    } else if let Some(choice) = tool_choice {
+        instructions.push(format!(
+            "Tool choice requested without a tool list: {}.",
+            serde_json::to_string(choice).unwrap_or_else(|_| "null".to_owned())
+        ));
+    }
+    if object.get("tool_call_parser").is_some() {
+        // Host-only parser selection. guest-openai consumes the generated text
+        // after generation; Magnetar only needs the tool instructions above.
+    }
+    prepend_system_instructions(prompt, instructions)
+}
+
+fn structured_output_instruction(schema: &Value) -> Result<String> {
+    let schema_text = schema
+        .as_str()
+        .ok_or_else(|| invalid_request("`json_schema` must be a JSON schema string"))?;
+    let schema_value = serde_json::from_str::<Value>(schema_text)
+        .map_err(|error| invalid_request(format!("invalid `json_schema`: {error}")))?;
+    if schema_value == serde_json::json!({"type":"object"}) {
+        Ok("Respond with a single valid JSON object and no surrounding prose.".to_owned())
+    } else {
+        Err(invalid_request(
+            "`response_format: json_schema` is not supported by local Magnetar generation; use `json_object` or route to an OpenAI-compatible upstream",
+        ))
+    }
+}
+
+fn tool_instruction(tools: &Value, tool_choice: Option<&Value>) -> Result<String> {
+    let tools = tools
+        .as_array()
+        .ok_or_else(|| invalid_request("`tools` must be an array"))?;
+    let mut lines = vec![
+        "Tools are available. When calling a tool, respond only with a JSON object in this shape: {\"tool_calls\":[{\"name\":\"function_name\",\"arguments\":{}}]}.".to_owned(),
+        "Available tools:".to_owned(),
+    ];
+    for tool in tools {
+        let name = tool
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_request("each tool must contain `function.name`"))?;
+        let description = tool
+            .get("function")
+            .and_then(|function| function.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let parameters = tool
+            .get("function")
+            .and_then(|function| function.get("parameters"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        lines.push(format!(
+            "- {name}: {description} parameters={}",
+            serde_json::to_string(&parameters).unwrap_or_else(|_| "{}".to_owned())
+        ));
+    }
+    if let Some(choice) = tool_choice {
+        lines.push(format!(
+            "Tool choice: {}.",
+            serde_json::to_string(choice).unwrap_or_else(|_| "null".to_owned())
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn prepend_system_instructions(
+    prompt: PromptInput,
+    instructions: Vec<String>,
+) -> Result<PromptInput> {
+    if instructions.is_empty() {
+        return Ok(prompt);
+    }
+    let instruction = instructions.join("\n\n");
+    Ok(match prompt {
+        PromptInput::ChatMessages(mut messages) => {
+            messages.insert(0, ChatMessage::new("system", instruction));
+            PromptInput::ChatMessages(messages)
+        }
+        PromptInput::PlainText(text) => PromptInput::PlainText(format!("{instruction}\n\n{text}")),
+        PromptInput::TokenIds(_) | PromptInput::TestTokenSequence(_) => {
+            return Err(invalid_request(
+                "host generation controls require text or chat message input",
+            ));
+        }
+    })
+}
+
+fn parse_max_generation_millis(object: &serde_json::Map<String, Value>) -> Result<Option<u64>> {
+    let Some(value) = object.get("max_generation_ms") else {
+        return Ok(None);
+    };
+    let millis = value
+        .as_u64()
+        .ok_or_else(|| invalid_request("`max_generation_ms` must be an integer"))?;
+    if millis == 0 {
+        return Err(invalid_request(
+            "`max_generation_ms` must be greater than zero",
+        ));
+    }
+    Ok(Some(millis))
+}
+
+fn is_empty_json(value: &Value) -> bool {
+    matches!(value, Value::Null)
+        || value.as_array().is_some_and(Vec::is_empty)
+        || value.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
 fn parse_chat_messages(value: &Value) -> Result<Vec<ChatMessage>> {
@@ -645,13 +825,76 @@ mod tests {
 
     #[test]
     fn generation_request_rejects_unsupported_local_fields() {
-        let error =
-            GenerationRequestView::parse(br#"{"prompt":"hi","json_schema":{"type":"object"}}"#)
-                .expect_err("unsupported local fields must fail closed");
+        let error = GenerationRequestView::parse(br#"{"prompt":"hi","unknown_local":true}"#)
+            .expect_err("unsupported local fields must fail closed");
 
         assert!(
-            error.to_string().contains("json_schema"),
+            error.to_string().contains("unknown_local"),
             "unexpected unsupported-field error: {error}"
         );
+        assert!(is_invalid_generation_request(&error));
+    }
+
+    #[test]
+    fn generation_request_preserves_tools_as_prompt_instructions() {
+        let request = GenerationRequestView::parse(
+            br#"{
+                "messages":[{"role":"user","content":"weather?"}],
+                "tools":[{
+                    "type":"function",
+                    "function":{
+                        "name":"get_weather",
+                        "description":"Fetch weather",
+                        "parameters":{"type":"object","properties":{"city":{"type":"string"}}}
+                    }
+                }],
+                "tool_choice":"auto",
+                "tool_call_parser":"qwen"
+            }"#,
+        )
+        .expect("tools are Tachyon host controls, not unsupported Magnetar fields")
+        .into_magnetar_request()
+        .expect("tools should map to prompt-visible instructions");
+
+        let PromptInput::ChatMessages(messages) = request.prompt else {
+            panic!("expected chat messages");
+        };
+        assert_eq!(messages[0].role, "system");
+        assert!(messages[0].content.contains("get_weather"));
+        assert!(messages[0].content.contains("Tool choice"));
+        assert_eq!(messages[1].content, "weather?");
+    }
+
+    #[test]
+    fn generation_request_maps_json_object_and_rejects_json_schema() {
+        let request = GenerationRequestView::parse(
+            br#"{"prompt":"hi","json_schema":"{\"type\":\"object\"}"}"#,
+        )
+        .expect("json_object schema should map to prompt instruction")
+        .into_magnetar_request()
+        .expect("json_object instruction should build request");
+        let PromptInput::PlainText(prompt) = request.prompt else {
+            panic!("expected plain prompt");
+        };
+        assert!(prompt.contains("valid JSON object"));
+
+        let error = GenerationRequestView::parse(
+            br#"{"prompt":"hi","json_schema":"{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"}}}"}"#,
+        )
+        .expect_err("local Magnetar path must reject unsupported constrained schema");
+        assert!(is_invalid_generation_request(&error));
+    }
+
+    #[test]
+    fn generation_request_carries_max_generation_deadline() {
+        let request = GenerationRequestView::parse(br#"{"prompt":"hi","max_generation_ms":5000}"#)
+            .expect("deadline should parse")
+            .into_magnetar_request()
+            .expect("deadline should build request");
+        assert_eq!(request.max_generation_millis, Some(5000));
+
+        let error = GenerationRequestView::parse(br#"{"prompt":"hi","max_generation_ms":0}"#)
+            .expect_err("zero deadline should fail closed");
+        assert!(is_invalid_generation_request(&error));
     }
 }

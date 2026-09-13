@@ -2,13 +2,13 @@
 
 Before this corrective change, Tachyon accepted `magnetar:` model bindings through a local compatibility facade that rejected real Qwen execution instead of calling Magnetar. The previous cutover archive also left canonical specs and GPU CI steps describing `candle-cuda` as the active local inference path.
 
-Magnetar now exposes the public embedder path for production Qwen loading at commit `b235783abb2b0c92843febfa3ff29f30745e1934`: `ProductionModelSource`, `HuggingFaceIngestor`, `ModelTrustStore`, `production_qwen_fixture`, `ProductionGenerationRequest`, provider generation, and streaming generation events. Tachyon should become a transport, provenance, routing, and QoS layer around that API, not a parser or execution-engine shim.
+Magnetar now exposes the public embedder path for production Qwen loading at commit `d4e3df841765fc1a520195dab2dd8b6bd8a92fb4`: `ProductionModelSource`, `HuggingFaceIngestor`, `ModelTrustStore`, `production_qwen_fixture`, `ProductionGenerationRequest`, resident model lifecycle, provider generation, and streaming generation events. Tachyon should become a transport, provenance, routing, and QoS layer around that API, not a parser or execution-engine shim.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- Pin Magnetar crates to `b235783abb2b0c92843febfa3ff29f30745e1934`.
+- Pin Magnetar crates to `d4e3df841765fc1a520195dab2dd8b6bd8a92fb4`.
 - Replace the Tachyon-local Magnetar facade with a thin adapter over Magnetar's public production Qwen APIs.
 - Treat Tachyon-staged model directories as `ModelArtifactSource::Tachyon` through `ProductionModelSource::authorized_local_bundle`.
 - Use Magnetar's real Hugging Face ingestor, tokenizer, trust store, ModelInstance, Qwen Component, prepared execution plan, Reference CPU Provider, and CudaProvider.
@@ -47,6 +47,7 @@ Magnetar now exposes the public embedder path for production Qwen loading at com
    - CPU CI covers real production ingestion and generation through Magnetar.
    - GPU CI covers CUDA multi-token generation with a real CudaProvider and includes an assertion that the GPU-critical path actually ran.
    - Test selection commands must fail if they match zero tests.
+   - Fast PR CI may keep the synthetic Qwen fixture for determinism and runtime, while a separate acceptance/nightly lane tracks a genuine public Hugging Face Qwen checkpoint against the same Tachyon -> Magnetar path.
 
 6. **Correct, do not rewrite, the archived history.**
    - The old archive remains historical evidence. This change adds a corrective successor that records why the earlier completion was insufficient and what replaces it.

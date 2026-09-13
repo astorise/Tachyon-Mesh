@@ -813,7 +813,7 @@ impl AiInferenceRuntime {
                 let result = runtime
                     .generate_streaming(&[prompt.as_bytes()], &mut emit)
                     .map(|usage| StreamOutcome::usage(Some(usage)))
-                    .map_err(|error| GenerationError::local(error.to_string()));
+                    .map_err(magnetar_generation_error);
                 record_execution(&model.alias, runtime.executed_on(), result.is_ok());
                 result
             }
@@ -884,6 +884,18 @@ impl AiInferenceRuntime {
             .map(LoadedModel::memory_residency)
     }
 
+    #[cfg(test)]
+    pub(crate) fn magnetar_resident_debug(&self, alias: &str) -> Option<(String, usize)> {
+        self.models
+            .read()
+            .expect("model registry lock poisoned")
+            .get(alias)
+            .and_then(|model| match &model.runtime {
+                ModelRuntime::Magnetar(runtime) => runtime.resident_debug().ok(),
+                _ => None,
+            })
+    }
+
     fn track_queue_depth(&self, accelerator: AcceleratorKind, qos: RouteQos) -> QueueDepthGuard {
         if matches!(accelerator, AcceleratorKind::Network) {
             return QueueDepthGuard::noop();
@@ -904,7 +916,15 @@ impl AiInferenceRuntime {
 }
 
 fn magnetar_provider_is_cuda(provider: &magnetar_runtime::ProviderAdvertisement) -> bool {
-    provider.provider_name.to_ascii_lowercase().contains("cuda")
+    provider.device_class == magnetar_runtime::ProviderDeviceClass::Cuda
+}
+
+fn magnetar_generation_error(error: anyhow::Error) -> GenerationError {
+    if magnetar_runtime::is_invalid_generation_request(&error) {
+        GenerationError::invalid_request(error.to_string())
+    } else {
+        GenerationError::local(error.to_string())
+    }
 }
 
 fn model_device_for_accelerator(
@@ -1024,7 +1044,7 @@ fn execute_model(
         ModelRuntime::Magnetar(runtime) => {
             let result = runtime
                 .generate(&[prompt])
-                .map_err(|error| GenerationError::local(error.to_string()))
+                .map_err(magnetar_generation_error)
                 .map(|mut outputs| {
                     let (bytes, usage) = outputs.remove(0);
                     ModelOutput {
@@ -1482,6 +1502,100 @@ mod tests {
             .expect("real Magnetar production Qwen should generate");
 
         assert!(!generation.is_empty());
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn magnetar_qwen_reuses_resident_model_instance_across_requests() {
+        let model_dir = unique_model_dir("qwen-resident-runtime");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "qwen_resident".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }];
+
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("real Magnetar production Qwen bundle should load");
+        let before = runtime
+            .magnetar_resident_debug("qwen_resident")
+            .expect("resident model debug should be available");
+        runtime
+            .compute_component_prompt("qwen_resident", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .expect("first generation should succeed");
+        runtime
+            .compute_component_prompt("qwen_resident", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .expect("second generation should reuse resident model");
+        let after = runtime
+            .magnetar_resident_debug("qwen_resident")
+            .expect("resident model debug should still be available");
+
+        assert_eq!(before.0, after.0, "ModelInstance identity must be stable");
+        assert_eq!(after.1, 1, "weights must be materialized once");
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn magnetar_qwen_concurrent_requests_share_one_resident_model() {
+        let model_dir = unique_model_dir("qwen-resident-concurrent-runtime");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.models = vec![IntegrityModelBinding {
+            alias: "qwen_concurrent".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }];
+
+        let runtime = Arc::new(
+            AiInferenceRuntime::from_config(&IntegrityConfig {
+                routes: vec![route],
+                ..IntegrityConfig::default_sealed()
+            })
+            .expect("real Magnetar production Qwen bundle should load"),
+        );
+        let before = runtime
+            .magnetar_resident_debug("qwen_concurrent")
+            .expect("resident model debug should be available");
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let handles = (0..4)
+            .map(|_| {
+                let runtime = Arc::clone(&runtime);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    runtime
+                        .compute_component_prompt(
+                            "qwen_concurrent",
+                            r#"{"prompt":"hi","max_new_tokens":1}"#,
+                        )
+                        .expect("concurrent generation should reuse resident model")
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            assert!(!handle.join().expect("thread should not panic").is_empty());
+        }
+        let after = runtime
+            .magnetar_resident_debug("qwen_concurrent")
+            .expect("resident model debug should still be available");
+
+        assert_eq!(before.0, after.0, "ModelInstance identity must be stable");
+        assert_eq!(
+            after.1, 1,
+            "concurrent requests must not rematerialize weights"
+        );
         let _ = std::fs::remove_dir_all(model_dir);
     }
 

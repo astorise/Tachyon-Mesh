@@ -4,7 +4,7 @@ The archived Magnetar cutover claimed a completed full cutover while Tachyon sti
 
 ## What Changes
 
-- Replace Tachyon's local Magnetar facade with the real Magnetar production Qwen loading path pinned to Magnetar commit `b235783abb2b0c92843febfa3ff29f30745e1934`.
+- Replace Tachyon's local Magnetar facade with the real Magnetar production Qwen loading path pinned to Magnetar commit `d4e3df841765fc1a520195dab2dd8b6bd8a92fb4`.
 - Use `ProductionModelSource::authorized_local_bundle(ModelArtifactSource::Tachyon(..), root)` and `HuggingFaceIngestor` for Tachyon-staged Qwen bundles instead of parsing `config.json`, tokenizer, or Safetensors payloads in Tachyon.
 - Execute production Qwen through Magnetar's real tokenizer, `ModelTrustStore`, `ModelInstance`, Qwen Component, prepared execution plans, and CPU/CUDA Providers.
 - Remove permanent Tachyon-owned fake Magnetar constructs such as local `PreparedKernelId`, `TensorId`, hardcoded `CUDA_0`, hardcoded VRAM/dtype capability advertisements, `TACHYON_MAGNETAR_CUDA` as hardware truth, and pseudo `MagnetarArena` residency.
