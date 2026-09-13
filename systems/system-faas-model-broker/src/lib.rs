@@ -377,7 +377,7 @@ fn commit_upload(uri: &str) -> Result<String, String> {
     // Published last, because this is the step that can still refuse the
     // upload. On refusal the new files go and the previous checkpoint comes
     // back, leaving the alias exactly as the manifest left it.
-    if let Err(error) = publish_model_uploaded(&alias, &model_dir, &pending.files) {
+    if let Err(error) = publish_artifact_uploaded(&alias, &model_dir, &pending.files) {
         // Unwind only what is still ours. Two commits for the same alias can
         // interleave: by the time this refusal arrives, a second upload may
         // have moved our directory aside and installed its own. Removing the
@@ -762,26 +762,28 @@ fn path_to_manifest_key(path: &Path) -> String {
         .join("/")
 }
 
-fn publish_model_uploaded(
+fn publish_artifact_uploaded(
     alias: &str,
-    model_dir: &Path,
+    artifact_dir: &Path,
     files: &[ModelUploadFileManifest],
 ) -> Result<(), String> {
-    let event = bindings::tachyon::mesh::model_events::ModelUploaded {
+    let event = bindings::tachyon::mesh::artifact_events::ArtifactUploaded {
         alias: alias.to_owned(),
         engine: "magnetar".to_owned(),
-        model_path: model_dir.to_string_lossy().into_owned(),
+        artifact_path: artifact_dir.to_string_lossy().into_owned(),
         files: files
             .iter()
-            .map(|file| bindings::tachyon::mesh::model_events::ModelFile {
-                path: file.path.clone(),
-                size_bytes: file.size_bytes,
-                sha256: file.sha256.clone(),
-            })
+            .map(
+                |file| bindings::tachyon::mesh::artifact_events::ArtifactFile {
+                    path: file.path.clone(),
+                    size_bytes: file.size_bytes,
+                    sha256: file.sha256.clone(),
+                },
+            )
             .collect(),
     };
-    bindings::tachyon::mesh::model_events::publish_model_uploaded(&event)
-        .map_err(|error| format!("failed to publish model upload event: {error}"))
+    bindings::tachyon::mesh::artifact_events::publish_artifact_uploaded(&event)
+        .map_err(|error| format!("failed to publish artifact upload event: {error}"))
 }
 
 /// Stream a gzip+tar archive into `dest`, writing only regular files and
