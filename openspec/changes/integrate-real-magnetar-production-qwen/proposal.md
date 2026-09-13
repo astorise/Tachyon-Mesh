@@ -1,35 +1,36 @@
 ## Why
 
-The archived Magnetar cutover claimed a completed full cutover while Tachyon still used a local fail-closed facade and retained Candle-oriented specs and GPU CI gates. Magnetar now exposes real production Qwen loading, caller-supplied generation requests, streaming events, and device-resident CUDA multi-token decode, so Tachyon can replace the facade with the public Magnetar ingestion/runtime/provider APIs.
+The archived Candle-to-Magnetar cutover claimed completion while Tachyon still
+used a local facade. The first corrective PR then proved real Magnetar
+production execution, but it still placed model-family and loader/provider
+knowledge directly in `core-host`. The final audit requires the architectural
+boundary to be Component-centric: Tachyon transports, trusts, routes, and
+invokes opaque inference Components; Magnetar and the Component own model
+semantics.
 
 ## What Changes
 
-- Replace Tachyon's local Magnetar facade with the real Magnetar production Qwen loading path pinned to Magnetar commit `d4e3df841765fc1a520195dab2dd8b6bd8a92fb4`.
-- Use `ProductionModelSource::authorized_local_bundle(ModelArtifactSource::Tachyon(..), root)` and `HuggingFaceIngestor` for Tachyon-staged Qwen bundles instead of parsing `config.json`, tokenizer, or Safetensors payloads in Tachyon.
-- Execute production Qwen through Magnetar's real tokenizer, `ModelTrustStore`, `ModelInstance`, Qwen Component, prepared execution plans, and CPU/CUDA Providers.
-- Remove permanent Tachyon-owned fake Magnetar constructs such as local `PreparedKernelId`, `TensorId`, hardcoded `CUDA_0`, hardcoded VRAM/dtype capability advertisements, `TACHYON_MAGNETAR_CUDA` as hardware truth, and pseudo `MagnetarArena` residency.
-- Enforce fail-closed placement: an explicitly requested CUDA route must not silently fall back to Reference CPU. CUDA multi-token generation is allowed only through Magnetar's real `CudaProvider` and device-resident decode path.
-- Make dynamic lazy loading target-aware so requested CPU/GPU placement must match the actual loaded Magnetar binding.
-- Remove historical local inference compatibility from the active WIT/spec surface: LoRA adapter injection, per-call layer-wise memory profiles, handle-based layer execution, and local multi-device topology validation.
-- Keep the model broker format-neutral: it verifies and installs artifacts, writes provenance, publishes Magnetar-owned upload events, and does not detect GGUF/Safetensors or prewarm tenant LoRA adapters.
-- Replace Candle-oriented CUDA CI assertions with Magnetar production-loading CPU coverage and real GPU CUDA prefill coverage that cannot pass with zero selected tests.
-- Correct the prior archived cutover record by adding an explicit follow-up change rather than pretending the facade-based cutover was complete.
-
-## Capabilities
-
-### New Capabilities
-
-- None.
-
-### Modified Capabilities
-
-- `ai-inference`: Local Qwen inference changes from a Candle/facade boundary to the real Magnetar production ingestion, trust, tokenizer, ModelInstance, Provider, and generation path.
-- `github-actions`: GPU quality gates must run Magnetar CUDA production-loading checks and must fail when no GPU-critical tests are selected or no required hardware assertions actually ran.
-- `hardware-capabilities`: Mesh routing must consume real Magnetar Provider/Device metadata instead of Tachyon-fabricated Magnetar capability advertisements.
+- Replace Tachyon's model-specific Magnetar adapter boundary with a generic
+  Magnetar inference Component adapter pinned through the vendored Magnetar
+  submodule.
+- Remove direct `core-host` dependencies on concrete Magnetar loader and
+  Provider implementation crates.
+- Keep Component provenance, host-controlled trust, placement constraints, QoS,
+  admission, deadline policy, and streaming transport in Tachyon.
+- Keep model format parsing, tokenizer/chat template handling, model instance
+  lifecycle, execution planning, Provider construction, CUDA execution, and
+  generation semantics behind Magnetar.
+- Reject unsupported local tool-call and structured-output controls as invalid
+  Component invocations instead of rewriting them into prompts in Tachyon core.
+- Replace Candle-oriented canonical specs and GPU CI proof steps with Magnetar
+  Component CPU/GPU checks and zero-test guards.
 
 ## Impact
 
-- Affected code: `core-host/Cargo.toml`, `core-host/src/ai_inference.rs`, `core-host/src/ai_inference/magnetar_runtime.rs`, `systems/system-faas-model-broker`, AI inference tests, WIT contracts, and CI workflow commands.
-- Affected dependencies: add Magnetar crates from the pinned Magnetar revision: `magnetar-runtime` with `wasmtime-component-engine`, `magnetar-loader-huggingface`, `magnetar-provider-cpu`, and conditionally `magnetar-provider-cuda`.
-- Affected behavior: `magnetar:` Qwen bindings load through Magnetar production ingestion; non-Qwen, untrusted, unavailable CUDA, and unsupported request fields fail explicitly; Reference CPU may be used only when placement policy allows CPU.
-- Affected documentation/specs: canonical AI inference and GPU CI requirements must stop describing Candle as the active local inference path.
+- Affected specs: `ai-inference`, `github-actions`, `hardware-capabilities`,
+  `memory-delegation`, `ai-orchestration`.
+- Affected code: `core-host` local inference adapter, Magnetar vendored
+  inference Component facade, AI inference tests, Cargo feature graph.
+- Affected behavior: local `magnetar:` bindings are treated as inference
+  Component artifacts; explicit CUDA placement remains fail-closed; unsupported
+  local protocol controls are rejected rather than silently prompt-mutated.

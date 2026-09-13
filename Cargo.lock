@@ -1187,9 +1187,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "magnetar-loader-huggingface",
- "magnetar-provider-cpu",
- "magnetar-provider-cuda",
+ "magnetar-inference-component",
  "magnetar-runtime",
  "memmap2",
  "mockall",
@@ -5030,6 +5028,18 @@ checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 name = "magnetar-format-safetensors"
 version = "0.1.0"
 dependencies = [
+ "magnetar-runtime",
+ "serde_json",
+]
+
+[[package]]
+name = "magnetar-inference-component"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "magnetar-loader-huggingface",
+ "magnetar-provider-cpu",
+ "magnetar-provider-cuda",
  "magnetar-runtime",
  "serde_json",
 ]

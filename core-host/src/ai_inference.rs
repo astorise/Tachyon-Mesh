@@ -1008,13 +1008,13 @@ fn load_binding(binding: &IntegrityModelBinding) -> Result<LoadedModel> {
         ModelRuntime::Magnetar(Arc::new(runtime))
     } else if magnetar_runtime::is_magnetar_path(path) {
         return Err(anyhow!(
-            "unsupported Magnetar model binding `{}` at `{}`: expected a Qwen safetensors directory",
+            "unsupported Magnetar Component binding `{}` at `{}`: expected an authorized inference Component artifact directory",
             binding.alias,
             binding.path
         ));
     } else {
         return Err(anyhow!(
-            "unsupported AI model binding `{}` at `{}`: Magnetar cutover accepts explicit mock paths, openai upstream paths, or Qwen safetensors directories",
+            "unsupported AI binding `{}` at `{}`: local inference accepts explicit mock paths, openai upstream paths, or magnetar Component artifact directories",
             binding.alias,
             binding.path
         ));
@@ -1076,18 +1076,7 @@ fn execute_model(
 }
 
 pub(crate) fn detect_tool_call_parser(path: &Path) -> Option<&'static str> {
-    if let Some(declared) = read_declared_tool_call_parser(path) {
-        return Some(declared);
-    }
-    let config = std::fs::read_to_string(path.join("config.json")).ok()?;
-    let normalized = config.to_ascii_lowercase();
-    if normalized.contains("qwen") && normalized.contains("coder") {
-        Some("qwen_coder")
-    } else if normalized.contains("qwen") {
-        Some("qwen")
-    } else {
-        None
-    }
+    read_declared_tool_call_parser(path)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1439,18 +1428,9 @@ mod tests {
     }
 
     fn trust_tachyon_qwen_bundle(path: &Path) -> TrustStoreEnvGuard {
-        use ::magnetar_runtime::production_model_ingestion::{
-            ProductionModelArtifactIngestor, ProductionModelSource,
-        };
-
         let qwen_lock = qwen_interprocess_lock();
         let lock = trust_env_lock();
-        let source = ProductionModelSource::authorized_local_bundle(
-            ::magnetar_runtime::ModelArtifactSource::Tachyon("tachyon:test-fixture".to_owned()),
-            path.to_path_buf(),
-        );
-        let ingested = magnetar_loader_huggingface::HuggingFaceIngestor::new()
-            .ingest(&source)
+        let digest = magnetar_inference_component::local_bundle_manifest_digest(path)
             .expect("fixture should ingest before writing Tachyon trust policy");
         let trust_path = unique_model_dir("qwen-trust-policy").join("tachyon-model-trust.json");
         std::fs::create_dir_all(
@@ -1461,10 +1441,7 @@ mod tests {
         .expect("trust policy parent should be created");
         fs::write(
             &trust_path,
-            format!(
-                r#"{{"trusted_digests":["{}"]}}"#,
-                ingested.manifest.id.digest.value
-            ),
+            format!(r#"{{"trusted_digests":["{digest}"]}}"#),
         )
         .expect("trust sidecar should be written");
         let previous = std::env::var_os(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
@@ -1789,10 +1766,9 @@ mod tests {
     #[test]
     #[ignore = "run explicitly on a GPU runner guaranteed to have CUDA available"]
     fn magnetar_cuda_provider_hardware_required_guard() {
-        let provider = magnetar_provider_cuda::CudaProvider::new();
         assert!(
-            provider.is_available(),
-            "GPU CI selected this test but Magnetar CudaProvider is unavailable"
+            magnetar_inference_component::cuda_provider_available(),
+            "GPU CI selected this test but Magnetar CUDA provider is unavailable"
         );
     }
 
@@ -1800,10 +1776,9 @@ mod tests {
     #[test]
     #[ignore = "run explicitly on a GPU runner guaranteed to have CUDA available"]
     fn magnetar_qwen_binding_generates_first_token_on_real_cuda_provider() {
-        let provider = magnetar_provider_cuda::CudaProvider::new();
         assert!(
-            provider.is_available(),
-            "GPU CI selected this test but Magnetar CudaProvider is unavailable"
+            magnetar_inference_component::cuda_provider_available(),
+            "GPU CI selected this test but Magnetar CUDA provider is unavailable"
         );
         let model_dir = unique_model_dir("cuda-qwen-runtime");
         write_tiny_production_qwen_bundle(&model_dir);
@@ -1842,10 +1817,9 @@ mod tests {
     #[test]
     #[ignore = "run explicitly on a GPU runner guaranteed to have CUDA available"]
     fn magnetar_qwen_cuda_generates_multiple_tokens_on_real_cuda_provider() {
-        let provider = magnetar_provider_cuda::CudaProvider::new();
         assert!(
-            provider.is_available(),
-            "GPU CI selected this test but Magnetar CudaProvider is unavailable"
+            magnetar_inference_component::cuda_provider_available(),
+            "GPU CI selected this test but Magnetar CUDA provider is unavailable"
         );
         let model_dir = unique_model_dir("cuda-qwen-multitoken");
         write_tiny_production_qwen_bundle(&model_dir);
@@ -2080,7 +2054,7 @@ mod tests {
 
         let error = runtime
             .load_component_model("dynamic-qwen", AcceleratorKind::Gpu)
-            .expect_err("dynamic GPU load must fail closed when CudaProvider is unavailable");
+            .expect_err("dynamic GPU load must fail closed when CUDA placement is unavailable");
 
         assert!(
             error.contains("CUDA provider"),

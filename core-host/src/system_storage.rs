@@ -1783,8 +1783,11 @@ mod configured_binding_registry_tests {
         let (store, dir) = temp_store();
         let model_dir = dir.join("local-coder");
         std::fs::create_dir_all(&model_dir).expect("model dir");
-        std::fs::write(model_dir.join("config.json"), br#"{"model_type":"qwen3"}"#)
-            .expect("config");
+        std::fs::write(
+            model_dir.join(".tachyon-model.json"),
+            br#"{"tool_call_parser":"qwen"}"#,
+        )
+        .expect("metadata");
 
         let config = config_with(vec![binding(
             "local-coder",
@@ -1800,7 +1803,7 @@ mod configured_binding_registry_tests {
         let published: serde_json::Value = serde_json::from_slice(&published).expect("row json");
         assert_eq!(
             published["toolCallParser"], "qwen",
-            "the publisher must probe the real filesystem path, not `magnetar:<path>`"
+            "the publisher must strip `magnetar:` before reading explicit metadata"
         );
         let _ = fs::remove_dir_all(dir);
     }

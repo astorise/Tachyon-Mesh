@@ -1,15 +1,15 @@
 ## 1. Dependencies and Build Gates
 
-- [x] 1.1 Add pinned Magnetar dependencies for `magnetar-runtime`, `magnetar-loader-huggingface`, `magnetar-provider-cpu`, and optional `magnetar-provider-cuda` at `d4e3df841765fc1a520195dab2dd8b6bd8a92fb4`.
+- [x] 1.1 Add pinned Magnetar dependencies for `magnetar-runtime` and the generic inference Component adapter at `fabe36f34df5ae4f3c5ccd94e4b13eb1d5695ae8`.
 - [x] 1.2 Replace Candle compatibility feature aliases used for active inference with Magnetar-oriented feature gates while preserving non-AI default builds.
 - [x] 1.3 Verify `cargo check -p core-host --features ai-inference` resolves the pinned Magnetar graph.
 
 ## 2. Real Magnetar Adapter
 
-- [x] 2.1 Replace the local Magnetar facade types with a thin adapter over `ProductionModelSource`, `HuggingFaceIngestor`, `ModelTrustStore`, `production_qwen_fixture`, and Magnetar generation calls.
+- [x] 2.1 Replace the local Magnetar facade types with a thin adapter over Magnetar inference Component source, trust, placement, residency, and invocation calls.
 - [x] 2.2 Map Tachyon `magnetar:` model bindings to `ModelArtifactSource::Tachyon` authorized local bundles without parsing model artifacts in Tachyon.
-- [x] 2.3 Load the real Hugging Face tokenizer through `magnetar-loader-huggingface` and pass it to Magnetar's Qwen production fixture.
-- [x] 2.4 Use Reference CPU generation when route placement selects CPU and real `CudaProvider` generation when placement explicitly selects CUDA.
+- [x] 2.3 Keep tokenizer and chat-template loading behind Magnetar's inference Component adapter.
+- [x] 2.4 Forward CPU/CUDA as generic placement constraints instead of constructing concrete Providers in Tachyon core.
 
 ## 3. Fail-Closed Policy and Capabilities
 
@@ -20,9 +20,9 @@
 
 ## 4. Tests
 
-- [x] 4.1 Add CPU E2E coverage for Tachyon-shaped Qwen bundle ingestion through Magnetar, trust evaluation, tokenizer loading, fixture construction, and Reference CPU generation.
-- [x] 4.2 Add fail-closed tests for untrusted bundles, self-trusting bundles, non-Qwen bundles, unavailable CUDA, and unsupported request fields.
-- [x] 4.3 Add GPU-gated CUDA multi-token coverage through real `CudaProvider`.
+- [x] 4.1 Add CPU E2E coverage for Tachyon-shaped Component invocation through Magnetar, trust evaluation, residency, and CPU generation.
+- [x] 4.2 Add fail-closed tests for untrusted bundles, self-trusting bundles, unavailable CUDA, and unsupported request fields.
+- [x] 4.3 Add GPU-gated CUDA multi-token coverage through Magnetar's CUDA execution path.
 - [x] 4.4 Add a zero-test / hardware-required guard so GPU CI cannot pass when no critical CUDA assertion ran.
 
 ## 5. CI and Specification Cleanup
@@ -34,11 +34,11 @@
 
 ## 6. Magnetar Post-Closure Integration Update
 
-- [x] 6.1 Pin Magnetar to `d4e3df841765fc1a520195dab2dd8b6bd8a92fb4` after production loading, streaming, and device-resident CUDA multi-token decode landed upstream.
+- [x] 6.1 Pin Magnetar to `fabe36f34df5ae4f3c5ccd94e4b13eb1d5695ae8` after production loading, streaming, device-resident CUDA multi-token decode, and the generic inference Component adapter landed upstream.
 - [x] 6.2 Replace buffered/facade generation calls with `ProductionGenerationRequest` and provider-specific Magnetar generation entry points.
 - [x] 6.3 Map OpenAI chat messages to `PromptInput::ChatMessages` and map supported generation parameters and stop sequences into Magnetar contracts.
 - [x] 6.4 Use Magnetar streaming events and `GenerationStreamEvent::Token.text_delta` for Tachyon streaming instead of buffering full generation first.
-- [x] 6.5 Remove Tachyon's obsolete CUDA multi-token rejection and validate CUDA multi-token generation through the real `CudaProvider`.
+- [x] 6.5 Remove Tachyon's obsolete CUDA multi-token rejection and validate CUDA multi-token generation through Magnetar.
 - [x] 6.6 Move Tachyon model trust policy outside artifact bundles and reject self-trust attempts from model-local files.
 - [x] 6.7 Remove stale constrained-decoding WIT/spec/CI guards that referenced deleted local `FsmLogitProcessor` and `sample-constrained` surfaces.
 
@@ -54,11 +54,23 @@
 ## 8. PR #412 Production Closure
 
 - [x] 8.1 Preserve the full `guest-openai` host request envelope for local Magnetar models instead of rejecting Tachyon-owned control fields.
-- [x] 8.2 Restore functional local tool calling by making `tools` and `tool_choice` visible to Qwen prompt construction while keeping tool-call parsing in `guest-openai`.
+- [x] 8.2 Superseded by task 9.6: keep tool-call dialect semantics out of Tachyon core and fail closed unless the responsible guest/Component boundary handles them.
 - [x] 8.3 Wire `max_generation_ms` to real deadline enforcement for local Magnetar execution.
 - [x] 8.4 Either support structured-output controls on the Magnetar path or reject unsupported schema requests as invalid requests instead of runtime/server failures.
 - [x] 8.5 Replace per-request Magnetar Runtime/Provider/model materialization with a persistent loaded ModelInstance lifecycle.
 - [x] 8.6 Add sequential and concurrent tests proving one resident model is reused by multiple generation sessions.
-- [x] 8.7 Track the real Hugging Face Qwen checkpoint acceptance lane separately from fast synthetic fixture CI.
+- [x] 8.7 Track real model/checkpoint acceptance in Magnetar/Component lanes separately from fast Tachyon Component-boundary CI.
 - [x] 8.8 Remove provider-name string matching from accelerator classification.
 - [x] 8.9 Update PR/README documentation to the actual pinned Magnetar SHA and supported CUDA multi-token state.
+
+## 9. Component Boundary Closure
+
+- [x] 9.1 Replace the model-specific Tachyon adapter boundary with a generic Magnetar inference Component adapter.
+- [x] 9.2 Remove model-family, model-format, tokenizer, chat-template, model-instance, and model-architecture knowledge from `core-host/src/ai_inference/magnetar_runtime.rs`.
+- [x] 9.3 Remove direct `core-host` dependencies on concrete Magnetar loader and Provider crates; concrete loaders/providers are now behind Magnetar's Component adapter.
+- [x] 9.4 Move the checked-in inference Component registration behind Magnetar's adapter instead of embedding a model-specific Component artifact in Tachyon core.
+- [x] 9.5 Keep Tachyon's active local runtime state as a loaded inference Component handle, provider advertisement, placement, and routing metadata.
+- [x] 9.6 Move model execution controls such as tool-call dialect handling and structured-output guarantees out of Tachyon core; unsupported local controls now fail closed as invalid Component invocations.
+- [x] 9.7 Rewrite the canonical AI inference, memory delegation, and GitHub Actions specs so Tachyon owns Component transport, trust, routing, QoS, admission, generic placement constraints, and telemetry only.
+- [x] 9.8 Add Magnetar adapter tests covering payload mapping, deadline propagation, and fail-closed tool/structured-output controls outside Tachyon core.
+- [x] 9.9 Add compile validation proving `core-host --features magnetar-cuda` resolves through the generic Component adapter.

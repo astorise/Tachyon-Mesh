@@ -21,7 +21,7 @@ The Tachyon UI shell SHALL expose a `<tachyon-ai-panel>` web component for confi
 ## REMOVED Requirements
 
 ### Requirement: VRAM Priority Tiers
-**Reason**: Local safetensors layer residency is no longer an active Tachyon execution contract after the Magnetar cutover. Magnetar owns Provider memory management for production Qwen execution.
+**Reason**: Local model layer residency is no longer an active Tachyon execution contract after the Magnetar cutover. Magnetar owns Provider memory management for local Component execution.
 **Migration**: Keep placement and QoS policy in Tachyon; expose Magnetar-owned memory capabilities through Magnetar Provider contracts when needed.
 
 ### Requirement: Predictive Broker Prewarms Tenant LoRA
