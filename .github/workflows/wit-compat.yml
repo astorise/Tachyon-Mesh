@@ -60,6 +60,11 @@ jobs:
               package_input="$package_dir"
             fi
 
+            if [ ! -e "$wit" ]; then
+              echo "Deleted WIT file: $wit"
+              continue
+            fi
+
             if git cat-file -e "origin/$base_ref:$wit" 2>/dev/null; then
               wasm-tools component wit "$tmp/base/$package_input" --wasm -o "$tmp/old.wasm"
               wasm-tools component wit "$package_input" --wasm -o "$tmp/new.wasm"
