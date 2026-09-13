@@ -1,0 +1,15 @@
+package tachyon:mesh@2.0.0;
+
+/// Persistent index of inference Components available on this Tachyon node.
+/// User-facing guests may project these records into provider-specific APIs.
+interface component-registry {
+    record component-info {
+        alias: string,
+        engine: string,
+        vram-required-mb: u64,
+        status: string,
+        artifact-path: option<string>,
+    }
+
+    list-components: func() -> list<component-info>;
+}

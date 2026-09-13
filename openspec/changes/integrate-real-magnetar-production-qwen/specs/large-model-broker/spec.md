@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Model broker treats uploaded model artifacts as format-neutral
-`system-faas-model-broker` SHALL verify upload manifests, install artifact directories, write host-controlled provenance metadata, and publish a Magnetar-owned model upload event without deciding whether the bytes are GGUF, Safetensors, or another model format.
+`system-faas-model-broker` SHALL verify upload manifests, install artifact directories, write host-controlled provenance metadata, and publish a Magnetar-owned artifact upload event without deciding whether the bytes are GGUF, Safetensors, or another model format.
 
 #### Scenario: Upload commit does not infer model format
 - **WHEN** a model archive is committed successfully
@@ -10,7 +10,7 @@
 - **AND** it does not write a model `format` declaration into the provenance sidecar
 
 #### Scenario: Magnetar owns model format support
-- **WHEN** the broker publishes the model upload event
+- **WHEN** the broker publishes the artifact upload event
 - **THEN** the event identifies the installed path as a Magnetar artifact
 - **AND** format validation remains the responsibility of Magnetar production ingestion
 

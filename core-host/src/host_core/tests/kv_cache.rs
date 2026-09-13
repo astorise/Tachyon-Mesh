@@ -3,7 +3,7 @@ use crate::*;
 
 // ── store::CoreStore KV-cache unit tests ─────────────────────────────────────
 // These tests exercise the storage layer directly (no HTTP) and verify that
-// the model-based key namespacing isolates entries from different models.
+// the component-based key namespacing isolates entries from different components.
 
 fn open_test_store() -> Arc<store::CoreStore> {
     let dir = unique_test_dir("kv-cache-store");
@@ -33,7 +33,7 @@ fn kv_cache_returns_none_for_missing_key() {
 }
 
 #[test]
-fn kv_cache_entries_are_isolated_by_model() {
+fn kv_cache_entries_are_isolated_by_component() {
     let store = open_test_store();
     store
         .kv_cache_put("llama-3", "tenant-a", "ctx:001", b"llama_state", None)
@@ -93,9 +93,9 @@ fn kv_cache_delete_removes_entry() {
 }
 
 #[test]
-fn kv_cache_evict_model_removes_only_target_model() {
+fn kv_cache_evict_component_removes_only_target_component() {
     let store = open_test_store();
-    // Write entries for two different models.
+    // Write entries for two different components.
     for i in 0..3 {
         store
             .kv_cache_put("llama-3", "tenant-a", &format!("ctx:{i}"), b"llama", None)
@@ -114,7 +114,7 @@ fn kv_cache_evict_model_removes_only_target_model() {
     }
 
     let evicted = store
-        .kv_cache_evict_model("llama-3")
+        .kv_cache_evict_component("llama-3")
         .expect("eviction should succeed");
     assert_eq!(evicted, 3, "all llama entries should be evicted");
 
@@ -158,7 +158,7 @@ fn kv_cache_expired_entry_returns_none_on_read() {
 }
 
 #[test]
-fn kv_cache_stats_counts_live_entries_per_model() {
+fn kv_cache_stats_counts_live_entries_per_component() {
     let store = open_test_store();
     for i in 0..4 {
         store
@@ -178,24 +178,24 @@ fn kv_cache_stats_counts_live_entries_per_model() {
 
 // ── HTTP handler tests ───────────────────────────────────────────────────────
 
-fn make_kv_cache_config(model_ref: &str) -> IntegrityKvCacheConfig {
+fn make_kv_cache_config(component_ref: &str) -> IntegrityKvCacheConfig {
     IntegrityKvCacheConfig {
-        name: format!("cache-for-{model_ref}"),
-        model_ref: model_ref.to_owned(),
+        name: format!("cache-for-{component_ref}"),
+        component_ref: component_ref.to_owned(),
         max_ttl_seconds: None,
         eviction_policy: KvCacheEvictionPolicy::Lru,
         tenant_isolation: true,
     }
 }
 
-fn state_with_kv_cache(model_ref: &str) -> AppState {
+fn state_with_kv_cache(component_ref: &str) -> AppState {
     let mut config = IntegrityConfig::default_sealed();
-    config.kv_caches.push(make_kv_cache_config(model_ref));
+    config.kv_caches.push(make_kv_cache_config(component_ref));
     build_test_state(config, telemetry::init_test_telemetry())
 }
 
 #[tokio::test]
-async fn kv_cache_get_returns_404_for_unconfigured_model() {
+async fn kv_cache_get_returns_404_for_unconfigured_component() {
     let state = build_test_state(
         IntegrityConfig::default_sealed(),
         telemetry::init_test_telemetry(),
@@ -210,7 +210,7 @@ async fn kv_cache_get_returns_404_for_unconfigured_model() {
 }
 
 #[tokio::test]
-async fn kv_cache_put_returns_404_for_unconfigured_model() {
+async fn kv_cache_put_returns_404_for_unconfigured_component() {
     let state = build_test_state(
         IntegrityConfig::default_sealed(),
         telemetry::init_test_telemetry(),
@@ -226,8 +226,8 @@ async fn kv_cache_put_returns_404_for_unconfigured_model() {
 }
 
 #[tokio::test]
-async fn kv_cache_put_returns_503_when_model_not_hot() {
-    // Model is configured in kv_caches but not loaded (hot_model_aliases() = []
+async fn kv_cache_put_returns_503_when_component_not_hot() {
+    // Component is configured in kv_caches but not loaded (hot_component_aliases() = []
     // when ai-inference feature is disabled, which is the test build).
     let state = state_with_kv_cache("llama-3");
     let response = kv_cache::kv_cache_put_handler(
@@ -298,7 +298,7 @@ fn validate_kv_caches_rejects_empty_name() {
     let mut config = IntegrityConfig::default_sealed();
     config.kv_caches.push(IntegrityKvCacheConfig {
         name: "  ".to_owned(),
-        model_ref: "llama-3".to_owned(),
+        component_ref: "llama-3".to_owned(),
         max_ttl_seconds: None,
         eviction_policy: KvCacheEvictionPolicy::Lru,
         tenant_isolation: true,
@@ -307,16 +307,16 @@ fn validate_kv_caches_rejects_empty_name() {
 }
 
 #[test]
-fn validate_kv_caches_rejects_slash_in_model_ref() {
+fn validate_kv_caches_rejects_slash_in_component_ref() {
     let mut config = IntegrityConfig::default_sealed();
     config.kv_caches.push(IntegrityKvCacheConfig {
         name: "my-cache".to_owned(),
-        model_ref: "bad/model".to_owned(),
+        component_ref: "bad/component".to_owned(),
         max_ttl_seconds: None,
         eviction_policy: KvCacheEvictionPolicy::Lru,
         tenant_isolation: true,
     });
-    validate_kv_caches(&config).expect_err("slash in model_ref should fail");
+    validate_kv_caches(&config).expect_err("slash in component_ref should fail");
 }
 
 #[test]

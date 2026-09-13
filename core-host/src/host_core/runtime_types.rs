@@ -128,7 +128,7 @@ pub(crate) struct ComponentHostState {
     #[cfg(feature = "ai-inference")]
     pub(crate) ai_runtime: Option<Arc<ai_inference::AiInferenceRuntime>>,
     #[cfg(feature = "ai-inference")]
-    pub(crate) allowed_model_aliases: BTreeSet<String>,
+    pub(crate) allowed_component_aliases: BTreeSet<String>,
     /// Aliases this component may *see* in the registry, as opposed to the ones
     /// this route may execute.
     ///
@@ -140,14 +140,14 @@ pub(crate) struct ComponentHostState {
     ///
     /// Widened to the component, not to the node: the union over every route
     /// that targets a module this route targets. Execution stays sealed per
-    /// route through `allowed_model_aliases`, so a wider view buys no wider
+    /// route through `allowed_component_aliases`, so a wider view buys no wider
     /// reach.
     #[cfg(feature = "ai-inference")]
-    pub(crate) listable_model_aliases: BTreeSet<String>,
+    pub(crate) listable_component_aliases: BTreeSet<String>,
     #[cfg(feature = "ai-inference")]
-    pub(crate) accelerator_models: HashMap<u32, LoadedAcceleratorModel>,
+    pub(crate) accelerator_components: HashMap<u32, LoadedAcceleratorComponent>,
     #[cfg(feature = "ai-inference")]
-    pub(crate) next_accelerator_model_id: u32,
+    pub(crate) next_accelerator_component_id: u32,
     /// Set by `execute_streaming_component_guest` before calling
     /// `handle-request`. `None` on the buffered path — `get-streaming-response`
     /// returns an error, and the guest falls back to the buffered return value.
@@ -169,7 +169,7 @@ pub(crate) struct LocalMeshDispatchContext {
 
 #[cfg(feature = "ai-inference")]
 #[derive(Clone, Debug)]
-pub(crate) struct LoadedAcceleratorModel {
+pub(crate) struct LoadedAcceleratorComponent {
     pub(crate) alias: String,
     pub(crate) accelerator: ai_inference::AcceleratorKind,
 }

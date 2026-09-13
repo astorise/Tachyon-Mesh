@@ -57,7 +57,7 @@ fn validate_integrity_config_rejects_duplicate_routes() {
 #[test]
 fn validate_integrity_config_accepts_scheduler_policy_for_known_tenants() {
     let mut route = IntegrityRoute::user("/api/guest-ai");
-    route.adapter_id = Some("tenant-a".to_owned());
+    route.artifact_id = Some("tenant-a".to_owned());
     let mut config = IntegrityConfig::default_sealed();
     config.routes = vec![route];
     config.scheduler = SchedulerConfig {
@@ -136,7 +136,7 @@ fn default_scheduler_config_serializes_out_of_default_manifest() {
 #[test]
 fn validate_integrity_config_rejects_scheduler_zero_weight() {
     let mut route = IntegrityRoute::user("/api/guest-ai");
-    route.adapter_id = Some("tenant-a".to_owned());
+    route.artifact_id = Some("tenant-a".to_owned());
     let mut config = IntegrityConfig::default_sealed();
     config.routes = vec![route];
     config.scheduler.tenant_weights =
@@ -322,9 +322,9 @@ fn guest_openai_example_routes_validate_with_kv_scope() {
     // Regression guard for the `guest-openai` user FaaS example
     // (change `faas-openai-user-example`): the OpenAI surface and registry
     // endpoints are sealed user routes carrying a `scopes.kv` grant for the
-    // shared `ai-models-registry` table, and they must resolve to a guest
+    // shared `ai-components-registry` table, and they must resolve to a guest
     // function without runtime feature injection.
-    let scopes = json!({ "kv": ["ai-models-registry"] });
+    let scopes = json!({ "kv": ["ai-components-registry"] });
     let make = |path: &str, name: &str| {
         let mut route = IntegrityRoute::user(path);
         route.name = name.to_owned();
@@ -333,7 +333,7 @@ fn guest_openai_example_routes_validate_with_kv_scope() {
     };
     let mut config = IntegrityConfig::default_sealed();
     config.routes = vec![
-        make("/ai/v1/models", "openai-models"),
+        make("/ai/v1/components", "openai-components"),
         make("/ai/v1/chat/completions", "openai-chat"),
         make("/ai/v1/embeddings", "openai-embeddings"),
         make("/internal/guest-openai/register", "openai-registry"),
@@ -342,20 +342,20 @@ fn guest_openai_example_routes_validate_with_kv_scope() {
     let config = validate_integrity_config(config)
         .expect("guest-openai example routes with a kv scope must validate");
 
-    let models = config
-        .sealed_route("/ai/v1/models")
-        .expect("/ai/v1/models should remain sealed");
-    assert_eq!(models.role, RouteRole::User);
-    assert_eq!(models.name, "openai-models");
+    let components = config
+        .sealed_route("/ai/v1/components")
+        .expect("/ai/v1/components should remain sealed");
+    assert_eq!(components.role, RouteRole::User);
+    assert_eq!(components.name, "openai-components");
     assert!(config.sealed_route("/ai/v1/embeddings").is_some());
-    assert!(config.sealed_route("/v1/models").is_none());
+    assert!(config.sealed_route("/v1/components").is_none());
     assert!(config.sealed_route("/v1/chat/completions").is_none());
     assert!(config.sealed_route("/v1/embeddings").is_none());
     assert!(
         config
             .sealed_route("/internal/guest-openai/register")
             .is_some(),
-        "the model-broker register target must be a sealed route"
+        "the component-broker register target must be a sealed route"
     );
 }
 
@@ -835,7 +835,7 @@ fn validate_integrity_config_normalizes_route_volumes() {
         allowed_secrets: Vec::new(),
         targets: Vec::new(),
         resiliency: None,
-        models: Vec::new(),
+        inference_components: Vec::new(),
         domains: Vec::new(),
         min_instances: 0,
         max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
@@ -950,14 +950,14 @@ fn encrypted_volume_seal_hides_plaintext_and_prepare_restores_it() {
 }
 
 #[test]
-fn lora_training_job_exports_adapter_with_finops_metadata() {
-    let broker_dir = unique_test_dir("tachyon-lora-train");
-    std::env::set_var(MODEL_BROKER_DIR_ENV, &broker_dir);
+fn component_training_job_exports_artifact_with_finops_metadata() {
+    let broker_dir = unique_test_dir("tachyon-train-train");
+    std::env::set_var(ARTIFACT_BROKER_DIR_ENV, &broker_dir);
     let statuses = Arc::new(Mutex::new(HashMap::new()));
-    let job = LoraTrainingJob {
-        id: "lora-test".to_owned(),
+    let job = ComponentTrainingJob {
+        id: "train-test".to_owned(),
         tenant_id: "tenant-a".to_owned(),
-        base_model: "llama3".to_owned(),
+        base_component_ref: "llama3".to_owned(),
         dataset_volume: "training-data".to_owned(),
         dataset_path: "/datasets/a.jsonl".to_owned(),
         dataset_split: Some("train[:90%]".to_owned()),
@@ -966,18 +966,18 @@ fn lora_training_job_exports_adapter_with_finops_metadata() {
         seed: Some(7),
     };
 
-    let adapter_path =
-        execute_lora_training_job(&job, &statuses).expect("training job should export");
-    let payload = fs::read_to_string(&adapter_path).expect("adapter artifact should exist");
-    let value: Value = serde_json::from_str(&payload).expect("adapter artifact should be JSON");
+    let artifact_path =
+        execute_component_training_job(&job, &statuses).expect("training job should export");
+    let payload = fs::read_to_string(&artifact_path).expect("training artifact should exist");
+    let value: Value = serde_json::from_str(&payload).expect("training artifact should be JSON");
 
     assert_eq!(value["tenant_id"], "tenant-a");
-    assert_eq!(value["base_model"], "llama3");
+    assert_eq!(value["base_component_ref"], "llama3");
     assert_eq!(value["finops"]["cpu_fallback"], true);
     assert_eq!(value["finops"]["ram_spillover"], true);
-    assert!(adapter_path.ends_with(".safetensors"));
+    assert!(artifact_path.ends_with(".training.json"));
 
-    std::env::remove_var(MODEL_BROKER_DIR_ENV);
+    std::env::remove_var(ARTIFACT_BROKER_DIR_ENV);
     let _ = fs::remove_dir_all(broker_dir);
 }
 
@@ -1033,7 +1033,7 @@ fn validate_integrity_config_rejects_writable_user_route_volumes() {
         allowed_secrets: Vec::new(),
         targets: Vec::new(),
         resiliency: None,
-        models: Vec::new(),
+        inference_components: Vec::new(),
         domains: Vec::new(),
         min_instances: 0,
         max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,

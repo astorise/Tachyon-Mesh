@@ -113,7 +113,7 @@ The `validate_cross_layer.sh` script SHALL assert that the four core OpenAPI con
 - **WHEN** one of the checked routes is removed from the Axum router
 - **THEN** `validate_cross_layer.sh` exits with a non-zero status and names the missing route
 ### Requirement: OpenAPI schema MUST cover all ~35 admin routes
-The `ApiDoc` struct SHALL declare `#[utoipa::path]` stubs for all admin routes including KV-Partition V2, canary management, shadow diffs, chaos scenarios, enrollment, security (MFA/PAT/step-up), full IAM CRUD, KV-cache, and asset/model upload. At least 35 operations SHALL appear in the generated OpenAPI document.
+The `ApiDoc` struct SHALL declare `#[utoipa::path]` stubs for all admin routes including KV-Partition V2, canary management, shadow diffs, chaos scenarios, enrollment, security (MFA/PAT/step-up), full IAM CRUD, KV-cache, and asset/artifact upload. At least 35 operations SHALL appear in the generated OpenAPI document.
 
 #### Scenario: OpenAPI schema includes broad admin coverage
 - **WHEN** the generated OpenAPI document is inspected

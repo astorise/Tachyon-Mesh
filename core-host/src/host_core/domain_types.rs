@@ -114,7 +114,7 @@ pub(crate) struct TtlManagedPath {
     pub(crate) ttl: Duration,
 }
 
-pub(crate) static LORA_TRAINING_QUEUE: OnceLock<Arc<LoraTrainingQueue>> = OnceLock::new();
+pub(crate) static COMPONENT_TRAINING_QUEUE: OnceLock<Arc<ComponentTrainingQueue>> = OnceLock::new();
 pub(crate) static AI_INFERENCE_JOBS: OnceLock<Arc<Mutex<HashMap<String, AiInferenceJobStatus>>>> =
     OnceLock::new();
 
@@ -194,16 +194,16 @@ pub(crate) fn canary_rollouts() -> &'static Arc<Mutex<HashMap<String, Arc<Canary
     CANARY_ROLLOUTS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())))
 }
 
-pub(crate) struct LoraTrainingQueue {
-    pub(crate) sender: std::sync::mpsc::Sender<LoraTrainingJob>,
-    pub(crate) statuses: Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
+pub(crate) struct ComponentTrainingQueue {
+    pub(crate) sender: std::sync::mpsc::Sender<ComponentTrainingJob>,
+    pub(crate) statuses: Arc<Mutex<HashMap<String, ComponentTrainingJobStatus>>>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LoraTrainingJob {
+pub(crate) struct ComponentTrainingJob {
     pub(crate) id: String,
     pub(crate) tenant_id: String,
-    pub(crate) base_model: String,
+    pub(crate) base_component_ref: String,
     pub(crate) dataset_volume: String,
     pub(crate) dataset_path: String,
     pub(crate) dataset_split: Option<String>,
@@ -213,10 +213,10 @@ pub(crate) struct LoraTrainingJob {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum LoraTrainingJobStatus {
+pub(crate) enum ComponentTrainingJobStatus {
     Queued,
     Running { step: u32, total: u32 },
-    Completed { adapter_path: String },
+    Completed { artifact_path: String },
     Failed { message: String },
 }
 
@@ -371,7 +371,7 @@ pub(crate) fn is_default_route_qos(qos: &RouteQos) -> bool {
     Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Serialize,
 )]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum ModelDevice {
+pub(crate) enum ComponentPlacement {
     #[default]
     Cpu,
     Cuda,
@@ -380,7 +380,7 @@ pub(crate) enum ModelDevice {
     Tpu,
 }
 
-impl ModelDevice {
+impl ComponentPlacement {
     #[cfg_attr(not(feature = "ai-inference"), allow(dead_code))]
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
@@ -393,7 +393,7 @@ impl ModelDevice {
     }
 }
 
-/// How a model's forward pass is split across more than one accelerator.
+/// How a component's forward pass is split across more than one accelerator.
 /// Mirrors `gpu-distribution` in `wit/config-ai.wit`; the variant selected by
 /// a deployment's `hardware-strategy` is what the runtime reads to pick a
 /// tensor/pipeline/expert-parallel engine over the dense single-device path.
@@ -477,7 +477,7 @@ pub(crate) struct IntegrityRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resiliency: Option<ResiliencyConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) models: Vec<IntegrityModelBinding>,
+    pub(crate) inference_components: Vec<IntegrityInferenceComponentBinding>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) domains: Vec<String>,
     #[serde(default)]
@@ -513,9 +513,9 @@ pub(crate) struct IntegrityRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) shadow_target: Option<String>,
     /// Tenant key used by scheduler policies. Local inference Components do not
-    /// interpret this as an adapter or model-execution override.
+    /// interpret this as an artifact or component-execution override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) adapter_id: Option<String>,
+    pub(crate) artifact_id: Option<String>,
     /// When set, enables an automated canary rollout for this route. The host
     /// gradually shifts traffic from the current module (`name`) to
     /// `canary.next_version` according to the configured step schedule.
@@ -547,7 +547,7 @@ impl Default for IntegrityRoute {
             allowed_secrets: Vec::new(),
             targets: Vec::new(),
             resiliency: None,
-            models: Vec::new(),
+            inference_components: Vec::new(),
             domains: Vec::new(),
             min_instances: 0,
             max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
@@ -559,7 +559,7 @@ impl Default for IntegrityRoute {
             allow_overflow: false,
             distributed_rate_limit: None,
             shadow_target: None,
-            adapter_id: None,
+            artifact_id: None,
             canary: None,
             concurrency: ConcurrencyPolicy::default(),
             scopes: None,
@@ -634,7 +634,7 @@ pub(crate) struct ResourcePolicy {
     /// GPU VRAM reservation for the workload in MiB (scheduler-enforced).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) vram_mb: Option<u64>,
-    /// Optional GPU device affinity selector (e.g. "cuda:0", "hip:1", or a model substring).
+    /// Optional GPU device affinity selector (e.g. "cuda:0", "hip:1", or a component substring).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) gpu_affinity: Option<String>,
     #[serde(default, skip_serializing_if = "is_default_admission_strategy")]
@@ -683,21 +683,22 @@ pub(crate) struct IntegrityBatchTarget {
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub(crate) struct IntegrityModelBinding {
+pub(crate) struct IntegrityInferenceComponentBinding {
     pub(crate) alias: String,
-    /// Filesystem path to the model. Required for static bindings; ignored for
-    /// `dynamic` bindings, which load from `{tachyon_data}/models/{alias}`.
+    /// Filesystem path to the Component/artifact bundle. Required for static
+    /// bindings; ignored for `dynamic` bindings, which load by alias from the
+    /// configured artifact broker root.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) path: String,
-    #[serde(default, skip_serializing_if = "is_default_model_device")]
-    pub(crate) device: ModelDevice,
+    #[serde(default, skip_serializing_if = "is_default_component_placement")]
+    pub(crate) device: ComponentPlacement,
     #[serde(default, skip_serializing_if = "is_default_route_qos")]
     pub(crate) qos: RouteQos,
-    /// When true, the alias is sealed (authorised for the route) but the model
-    /// files are NOT eager-loaded at boot. They arrive later via a broker upload
-    /// and are lazily materialised from `{tachyon_data}/models/{alias}` on first
-    /// use. Static bindings (the default) are eager-loaded and fail fast at boot
-    /// if their `path` is missing or invalid.
+    /// When true, the alias is sealed (authorised for the route) but the
+    /// Component/artifact files are NOT eager-loaded at boot. They arrive later
+    /// via a broker upload and are lazily materialised by alias on first use.
+    /// Static bindings (the default) are eager-loaded and fail fast at boot if
+    /// their `path` is missing or invalid.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) dynamic: bool,
     /// Multi-accelerator execution strategy (mirrors `wit/config-ai.wit`'s
@@ -880,17 +881,17 @@ pub(crate) enum KvCacheEvictionPolicy {
 }
 
 /// Declares a token KV-cache that is bound to a specific LLM deployment.
-/// Writes are only accepted on nodes where `model_ref` is currently hot;
-/// the `model_ref` is used as the first segment of every storage key so
-/// entries from different models are physically isolated in the ReDB table.
+/// Writes are only accepted on nodes where `component_ref` is currently hot;
+/// the `component_ref` is used as the first segment of every storage key so
+/// entries from different components are physically isolated in the ReDB table.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 pub(crate) struct IntegrityKvCacheConfig {
     /// Logical name for this cache (used in admin APIs and metrics).
     pub(crate) name: String,
-    /// Alias of the LLM model this cache is bound to (must match a route's
-    /// model alias). Writes are refused with 503 if this model is not
+    /// Alias of the LLM component this cache is bound to (must match a route's
+    /// component alias). Writes are refused with 503 if this component is not
     /// currently loaded on the receiving node.
-    pub(crate) model_ref: String,
+    pub(crate) component_ref: String,
     /// Maximum TTL in seconds for individual cache entries (`None` = no expiry).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) max_ttl_seconds: Option<u64>,
@@ -1085,8 +1086,8 @@ pub(crate) struct IntegrityConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) asset_versions: BTreeMap<String, String>,
     /// LLM inference KV-caches declared for this node. Each entry binds a
-    /// cache to a specific model via `model_ref`; writes are only accepted
-    /// when that model is hot on the receiving node.
+    /// cache to a specific component via `component_ref`; writes are only accepted
+    /// when that Component is hot on the receiving node.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) kv_caches: Vec<IntegrityKvCacheConfig>,
     /// Declarative AI scheduler policy. Defaults preserve the pre-existing
@@ -1245,11 +1246,11 @@ mod hardware_strategy_tests {
 
     #[test]
     fn binding_without_hardware_strategy_defaults_to_single() {
-        // A config that predates the field must deserialize to the default
-        // single-device strategy.
-        let binding: IntegrityModelBinding =
-            serde_json::from_str(r#"{"alias":"m","path":"/models/m","device":"cpu"}"#)
-                .expect("legacy binding should deserialize");
+        // A binding without an explicit placement strategy deserializes to the
+        // default single-device strategy.
+        let binding: IntegrityInferenceComponentBinding =
+            serde_json::from_str(r#"{"alias":"m","path":"/components/m","device":"cpu"}"#)
+                .expect("binding should deserialize");
         assert_eq!(
             binding.hardware_strategy.distribution_mode,
             GpuDistribution::Single
@@ -1259,10 +1260,10 @@ mod hardware_strategy_tests {
 
     #[test]
     fn default_strategy_is_skipped_on_serialization() {
-        let binding = IntegrityModelBinding {
+        let binding = IntegrityInferenceComponentBinding {
             alias: "m".to_owned(),
-            path: "/models/m".to_owned(),
-            device: ModelDevice::Cpu,
+            path: "/components/m".to_owned(),
+            device: ComponentPlacement::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: HardwareStrategy::default(),
@@ -1276,10 +1277,10 @@ mod hardware_strategy_tests {
 
     #[test]
     fn device_affinity_strategy_round_trips() {
-        let binding = IntegrityModelBinding {
+        let binding = IntegrityInferenceComponentBinding {
             alias: "m".to_owned(),
-            path: "/models/m".to_owned(),
-            device: ModelDevice::Cuda,
+            path: "/components/m".to_owned(),
+            device: ComponentPlacement::Cuda,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: HardwareStrategy {
@@ -1289,7 +1290,8 @@ mod hardware_strategy_tests {
         };
         let json = serde_json::to_string(&binding).expect("serialize");
         assert!(json.contains("device_ids"));
-        let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
+        let restored: IntegrityInferenceComponentBinding =
+            serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored, binding);
         assert!(!restored.hardware_strategy.is_single());
     }

@@ -72,7 +72,7 @@ pub(crate) const DEFAULT_ROUTE_VERSION: &str = "0.0.0";
 pub(crate) const DEFAULT_TELEMETRY_SAMPLE_RATE: f64 = 0.0;
 pub(crate) const TDE_FILE_MAGIC: &[u8] = b"TACHYON-TDE-v1\0";
 pub(crate) const TDE_KEY_HEX_ENV: &str = "TDE_KEY_HEX";
-pub(crate) const MODEL_BROKER_DIR_ENV: &str = "MODEL_BROKER_DIR";
+pub(crate) const ARTIFACT_BROKER_DIR_ENV: &str = "ARTIFACT_BROKER_DIR";
 pub(crate) const AUTOSCALING_TICK_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const VOLUME_GC_TICK_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const DRAINING_REAPER_TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -186,8 +186,8 @@ pub(crate) fn is_default_volume_type(volume_type: &VolumeType) -> bool {
     *volume_type == VolumeType::Host
 }
 
-pub(crate) fn is_default_model_device(device: &ModelDevice) -> bool {
-    *device == ModelDevice::Cpu
+pub(crate) fn is_default_component_placement(device: &ComponentPlacement) -> bool {
+    *device == ComponentPlacement::Cpu
 }
 
 pub(crate) fn is_false(value: &bool) -> bool {

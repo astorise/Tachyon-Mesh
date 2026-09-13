@@ -70,7 +70,7 @@ a generic placement constraint and resolved behind Magnetar's Component API.
 
 ### Requirement: Model and protocol controls MUST stay outside Tachyon core
 The Tachyon core SHALL NOT translate tool-call dialects, structured-output
-schemas, tokenizer/chat-template behavior, or model-specific prompt formats.
+schemas, tokenizer/chat-template behavior, or Component-specific prompt formats.
 Those controls SHALL be handled or rejected by `guest-openai`, the Component, or
 Magnetar.
 
@@ -108,7 +108,7 @@ emit it as a fabricated streaming chunk.
 ### Requirement: Active WIT inference surface MUST stay Component-scoped
 The public `wit/ai/inference.wit` contract SHALL expose only the local
 inference request/response function needed by Tachyon's Magnetar-backed
-Component runtime. Historical LoRA adapter injection, per-call layer-wise memory
+Component runtime. Historical Component training adapter injection, per-call layer-wise memory
 profiles, handle-based layer execution, and local multi-device topology
 validation SHALL NOT remain in the active inference WIT package.
 
@@ -151,7 +151,7 @@ routing truth.
 
 ### Requirement: Candle engine hot-swaps adapter weights and bounds context-switching overhead
 **Reason**: Adapter execution through a Candle engine is not part of the real Magnetar Component cutover.
-**Migration**: LoRA and adapter multiplexing must be re-specified against Magnetar Components and Providers before being re-enabled for local production inference.
+**Migration**: Component training and adapter multiplexing must be re-specified against Magnetar Components and Providers before being re-enabled for local production inference.
 
 ### Requirement: `candle-cuda` MUST be documented as the single CUDA switch
 **Reason**: CUDA coverage for the active local inference path must use Magnetar Component/CUDA gates, not Candle feature switches.
@@ -161,6 +161,6 @@ routing truth.
 **Reason**: Layer-wise tensor handles and topology validation were historical Tachyon-local execution contracts. Active local execution now belongs behind Magnetar Component, model instance, prepared execution plan, memory manager, and Provider APIs.
 **Migration**: Keep routing and placement policy in Tachyon; express model execution topology through Magnetar contracts when those capabilities are exposed.
 
-### Requirement: Per-call LoRA adapter injection in local inference WIT
+### Requirement: Per-call Component training adapter injection in local inference WIT
 **Reason**: Per-call adapter overlays are not part of the current Magnetar Component integration and must not stay as a public local inference promise.
 **Migration**: Reintroduce adapter behavior only through explicit Magnetar Component/Provider support in a future change.

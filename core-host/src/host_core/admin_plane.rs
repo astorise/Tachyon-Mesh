@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 
 pub(crate) fn authenticated_routes(state: AppState) -> Router<AppState> {
     Router::new()
@@ -29,8 +29,8 @@ pub(crate) fn authenticated_routes(state: AppState) -> Router<AppState> {
         .route("/admin/shadow/diffs", get(admin_shadow_diffs_handler))
         .route("/admin/chaos/scenarios", post(admin_chaos_scenario_handler))
         .route(
-            "/admin/lora/training/{job_id}",
-            get(admin_lora_training_status_handler),
+            "/admin/training/jobs/{job_id}",
+            get(admin_training_status_handler),
         )
         .route(
             "/admin/manifest",
@@ -89,11 +89,11 @@ pub(crate) fn authenticated_routes(state: AppState) -> Router<AppState> {
         )
         .route("/admin/logs", get(auth::audit_log_handler))
         .route(
-            "/admin/kv-cache/{model}/stats",
+            "/admin/component-cache/{component}/stats",
             get(kv_cache::kv_cache_stats_handler),
         )
         .route(
-            "/admin/kv-cache/{model}",
+            "/admin/component-cache/{component}",
             delete(kv_cache::kv_cache_evict_handler),
         )
         .route("/admin/volumes/backup", post(admin_volume_backup_handler))
@@ -104,15 +104,15 @@ pub(crate) fn authenticated_routes(state: AppState) -> Router<AppState> {
         )
         .route("/admin/assets", post(system_storage::upload_asset_handler))
         .route(
-            "/admin/models/init",
+            "/admin/artifacts/init",
             post(system_storage::init_upload_handler),
         )
         .route(
-            "/admin/models/upload/{upload_id}",
+            "/admin/artifacts/upload/{upload_id}",
             put(system_storage::upload_chunk_handler),
         )
         .route(
-            "/admin/models/commit/{upload_id}",
+            "/admin/artifacts/commit/{upload_id}",
             post(system_storage::commit_upload_handler),
         )
         .route_layer(axum::middleware::from_fn_with_state(
@@ -256,7 +256,7 @@ mod schema_tests {
 
         for field in [
             "\"targets\"",
-            "\"models\"",
+            "\"components\"",
             "\"hardware_strategy\"",
             "\"distribution_mode\"",
             "\"device_ids\"",
@@ -357,7 +357,7 @@ pub(crate) async fn admin_shadow_diffs_handler() -> axum::Json<Vec<AdminShadowDi
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct AdminLoraTrainingStatus {
+pub(crate) struct AdminTrainingStatus {
     pub(crate) job_id: String,
     pub(crate) status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -365,60 +365,60 @@ pub(crate) struct AdminLoraTrainingStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) total: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) adapter_path: Option<String>,
+    pub(crate) artifact_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<String>,
 }
 
-pub(crate) async fn admin_lora_training_status_handler(
+pub(crate) async fn admin_training_status_handler(
     axum::extract::Path(job_id): axum::extract::Path<String>,
 ) -> Response {
-    let queue = lora_training_queue();
+    let queue = component_training_queue();
     let status = queue
         .statuses
         .lock()
-        .expect("LoRA training status map should not be poisoned")
+        .expect("Component training status map should not be poisoned")
         .get(&job_id)
         .cloned();
     let Some(status) = status else {
         return (
             StatusCode::NOT_FOUND,
-            format!("unknown LoRA training job `{job_id}`"),
+            format!("unknown Component training job `{job_id}`"),
         )
             .into_response();
     };
 
     let body = match status {
-        LoraTrainingJobStatus::Queued => AdminLoraTrainingStatus {
+        ComponentTrainingJobStatus::Queued => AdminTrainingStatus {
             job_id,
             status: "queued".to_owned(),
             step: None,
             total: None,
-            adapter_path: None,
+            artifact_path: None,
             error: None,
         },
-        LoraTrainingJobStatus::Running { step, total } => AdminLoraTrainingStatus {
+        ComponentTrainingJobStatus::Running { step, total } => AdminTrainingStatus {
             job_id,
             status: "running".to_owned(),
             step: Some(step),
             total: Some(total),
-            adapter_path: None,
+            artifact_path: None,
             error: None,
         },
-        LoraTrainingJobStatus::Completed { adapter_path } => AdminLoraTrainingStatus {
+        ComponentTrainingJobStatus::Completed { artifact_path } => AdminTrainingStatus {
             job_id,
             status: "completed".to_owned(),
             step: None,
             total: None,
-            adapter_path: Some(adapter_path),
+            artifact_path: Some(artifact_path),
             error: None,
         },
-        LoraTrainingJobStatus::Failed { message } => AdminLoraTrainingStatus {
+        ComponentTrainingJobStatus::Failed { message } => AdminTrainingStatus {
             job_id,
             status: "failed".to_owned(),
             step: None,
             total: None,
-            adapter_path: None,
+            artifact_path: None,
             error: Some(message),
         },
     };
@@ -630,7 +630,7 @@ pub(crate) async fn admin_chaos_scenario_handler(
         "network_partition",
         "pod_eviction",
         "cpu_pressure",
-        "lora_swap_failure",
+        "component_training_swap_failure",
         "node_isolation",
         "simulated_latency",
         "memory_pressure",

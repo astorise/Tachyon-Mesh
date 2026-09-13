@@ -26,7 +26,7 @@ build_and_stage() {
 }
 
 # ai-inference ─────────────────────────────────────────────────────────────────
-# The OpenAI adapter and model registry are now the `guest-openai` user FaaS
+# The OpenAI adapter and Component registry are now the `guest-openai` user FaaS
 # example (built via build-guest-artifacts.sh); only the broker and vector-search
 # remain feature-gated system components here.
 if has_feature "ai-inference"; then

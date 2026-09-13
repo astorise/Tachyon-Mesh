@@ -4,7 +4,7 @@
 //! It is the merger of the former `system-faas-openai-adapter` and
 //! `system-faas-ai-list-model` system FaaS into a single user-role example.
 //! Its `openai-faas-guest` world imports `kv-partition` (the shared
-//! `ai-models-registry` table is read and written directly — no separate
+//! `ai-components-registry` table is read and written directly — no separate
 //! registry FaaS and no outbound mesh hop) and `tachyon:accelerator/cpu`, so
 //! `/ai/v1/chat/completions` runs real inference on the host CPU accelerator.
 //!
@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 /// Shared kv-partition table holding the model registry. The route that backs
 /// this guest must declare a `scopes.kv` grant for this table name.
-const MODELS_TABLE: &str = "ai-models-registry";
+const MODELS_TABLE: &str = "ai-components-registry";
 
 // Registry endpoints (internal, called by model-broker / admin tooling).
 const ROUTE_REGISTER: &str = "/internal/guest-openai/register";
@@ -184,8 +184,14 @@ struct Usage {
     total_tokens: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HostTokenUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
+
 impl Usage {
-    fn from_host(reported: bindings::tachyon::accelerator::cpu::TokenUsage) -> Self {
+    fn from_host(reported: HostTokenUsage) -> Self {
         Self {
             prompt_tokens: reported.prompt_tokens,
             completion_tokens: reported.completion_tokens,
@@ -194,6 +200,46 @@ impl Usage {
                 .saturating_add(reported.completion_tokens),
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct HostGeneration {
+    text: String,
+    usage: Option<HostTokenUsage>,
+    finish_reason: Option<String>,
+    refusal: Option<String>,
+}
+
+fn metadata_value(metadata: &[(String, String)], key: &str) -> Option<String> {
+    metadata
+        .iter()
+        .find_map(|(candidate, value)| (candidate == key).then(|| value.clone()))
+}
+
+fn metadata_usage(metadata: &[(String, String)]) -> Option<HostTokenUsage> {
+    let prompt_tokens = metadata_value(metadata, "tachyon.usage.prompt_tokens")?
+        .parse()
+        .ok()?;
+    let completion_tokens = metadata_value(metadata, "tachyon.usage.completion_tokens")?
+        .parse()
+        .ok()?;
+    Some(HostTokenUsage {
+        prompt_tokens,
+        completion_tokens,
+    })
+}
+
+fn decode_invocation_result(
+    result: bindings::tachyon::accelerator::cpu::InvocationResult,
+) -> Result<HostGeneration, String> {
+    let text = String::from_utf8(result.payload)
+        .map_err(|error| format!("host Component returned non-UTF-8 text payload: {error}"))?;
+    Ok(HostGeneration {
+        text,
+        usage: metadata_usage(&result.metadata),
+        finish_reason: metadata_value(&result.metadata, "tachyon.finish_reason"),
+        refusal: metadata_value(&result.metadata, "tachyon.refusal"),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -602,20 +648,6 @@ struct OpenAiModelList {
 }
 
 #[derive(Debug, Serialize)]
-struct EmbeddingsResponse {
-    object: &'static str,
-    data: Vec<EmbeddingData>,
-    model: String,
-}
-
-#[derive(Debug, Serialize)]
-struct EmbeddingData {
-    object: &'static str,
-    embedding: Vec<f32>,
-    index: usize,
-}
-
-#[derive(Debug, Serialize)]
 struct OpenAiError {
     error: OpenAiErrorBody,
 }
@@ -777,38 +809,12 @@ fn handle_embeddings(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
         }
     };
 
-    let model_id = match bindings::tachyon::accelerator::cpu::load_model(alias) {
-        Ok(model_id) => model_id,
-        Err(error) => {
-            return Ok(openai_error_payload(
-                404,
-                format!("model `{}` is unavailable: {error}", request.model),
-                "model_not_found",
-            ))
-        }
-    };
-
-    let mut data = Vec::with_capacity(inputs.len());
-    for (index, input) in inputs.into_iter().enumerate() {
-        let embedding = match bindings::tachyon::accelerator::cpu::embed(model_id, &input) {
-            Ok(embedding) => embedding,
-            Err(error) => return Ok(generation_error_payload(&request.model, error)),
-        };
-        data.push(EmbeddingData {
-            object: "embedding",
-            embedding,
-            index,
-        });
-    }
-
-    let response = EmbeddingsResponse {
-        object: "list",
-        data,
-        model: request.model,
-    };
-    serde_json::to_vec(&response)
-        .map(|body| (200, body))
-        .map_err(|e| format!("failed to encode embeddings response: {e}"))
+    let _ = alias;
+    Ok(openai_error_payload(
+        400,
+        "embeddings require a Component that exposes an embeddings protocol; Tachyon core no longer provides a model-native embedding ABI".to_owned(),
+        "invalid_request_error",
+    ))
 }
 
 /// Run `/ai/v1/chat/completions` against the host CPU accelerator.
@@ -848,8 +854,8 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     // covers all three.
     request.adopt_registry_parser(registered);
 
-    let model_id = match bindings::tachyon::accelerator::cpu::load_model(&alias) {
-        Ok(model_id) => model_id,
+    let component_id = match bindings::tachyon::accelerator::cpu::load_component(&alias) {
+        Ok(component_id) => component_id,
         Err(error) => {
             return Ok(openai_error_payload(
                 404,
@@ -860,9 +866,9 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     };
 
     if request.stream == Some(true) {
-        handle_chat_completions_streaming(request, model_id)
+        handle_chat_completions_streaming(request, component_id)
     } else {
-        handle_chat_completions_buffered(request, model_id)
+        handle_chat_completions_buffered(request, component_id)
     }
 }
 
@@ -907,15 +913,20 @@ fn resolve_registered_model<'a>(requested: &str, models: &'a [ModelInfo]) -> Opt
 
 fn handle_chat_completions_buffered(
     request: ChatCompletionRequest,
-    model_id: u32,
+    component_id: u32,
 ) -> Result<(u16, Vec<u8>), String> {
     let generation = build_generation_request(&request)?;
     // `compute_detailed` rather than `compute`: same generation, but it also
     // carries the token counts. Unlike a stream, a buffered response has no
     // trailing frame to put them in, so they have to come back with the text.
     let completed =
-        match bindings::tachyon::accelerator::cpu::compute_detailed(model_id, &generation) {
-            Ok(completed) => completed,
+        match bindings::tachyon::accelerator::cpu::invoke(component_id, generation.as_bytes()) {
+            Ok(completed) => match decode_invocation_result(completed) {
+                Ok(completed) => completed,
+                Err(error) => {
+                    return Ok(openai_error_payload(502, error, "server_error"));
+                }
+            },
             Err(error) => return Ok(generation_error_payload(&request.model, error)),
         };
     // Structured calls win outright: the backend received them as fields, so
@@ -925,14 +936,7 @@ fn handle_chat_completions_buffered(
     // answering a question nobody put, and surfacing them would hand a client
     // that never opted in a `message.tool_calls` array plus a `tool_calls`
     // finish reason — a response shape it has no code path for.
-    let parsed = if completed.tool_calls.is_empty() || !request.has_tool_intent() {
-        parse_assistant_output(&request, &completed.text)
-    } else {
-        ParsedAssistantOutput {
-            content: completed.text.clone(),
-            tool_calls: adopt_host_tool_calls(completed.tool_calls),
-        }
-    };
+    let parsed = parse_assistant_output(&request, &completed.text);
     // Checked after both sources have been reconciled, so the rule covers a
     // call the host reported as a field and one recovered from the text alike:
     // either way it is an instruction the client has no code for.
@@ -998,7 +1002,7 @@ fn handle_chat_completions_buffered(
 /// status + headers first, then each SSE frame as it is produced.
 fn handle_chat_completions_streaming(
     request: ChatCompletionRequest,
-    model_id: u32,
+    component_id: u32,
 ) -> Result<(u16, Vec<u8>), String> {
     let writer = bindings::tachyon::mesh::response_body::get_streaming_response()
         .map_err(|e| format!("streaming not available for this request: {e}"))?;
@@ -1061,25 +1065,40 @@ fn handle_chat_completions_streaming(
     });
 
     let generation = build_generation_request(&request)?;
-    let token_stream =
-        match bindings::tachyon::accelerator::cpu::compute_stream(model_id, &generation) {
-            Ok(token_stream) => token_stream,
-            // The headers are already on the wire, so the status can no longer
-            // be changed — the failure is reported as an SSE error frame, which
-            // is what an OpenAI client reads mid-stream anyway.
-            Err(error) => {
-                write_sse_error(&writer, &request.model, error)?;
-                return Ok((200, Vec::new()));
-            }
-        };
+    let token_stream = match bindings::tachyon::accelerator::cpu::invoke_stream(
+        component_id,
+        generation.as_bytes(),
+    ) {
+        Ok(token_stream) => token_stream,
+        // The headers are already on the wire, so the status can no longer
+        // be changed — the failure is reported as an SSE error frame, which
+        // is what an OpenAI client reads mid-stream anyway.
+        Err(error) => {
+            write_sse_error(&writer, &request.model, error)?;
+            return Ok((200, Vec::new()));
+        }
+    };
 
-    // Tool calls the host recognised as structured data, kept aside until the
-    // stream ends: they are emitted as one `tool_calls` delta after the content,
-    // which is where an OpenAI client expects them.
-    let mut host_tool_calls = Vec::new();
     loop {
         match token_stream.next() {
-            Ok(Some(bindings::tachyon::accelerator::cpu::StreamEvent::Content(fragment))) => {
+            Ok(Some(bindings::tachyon::accelerator::cpu::StreamEvent::Payload(fragment))) => {
+                let fragment = match String::from_utf8(fragment) {
+                    Ok(fragment) => fragment,
+                    Err(error) => {
+                        write_sse_error(
+                            &writer,
+                            &request.model,
+                            bindings::tachyon::accelerator::cpu::InvocationError {
+                                message: format!(
+                                    "host Component returned non-UTF-8 stream payload: {error}"
+                                ),
+                                upstream_status: Some(502),
+                                invalid_request: false,
+                            },
+                        )?;
+                        return Ok((200, Vec::new()));
+                    }
+                };
                 let content = match gate.as_mut() {
                     Some(gate) => gate.push(&fragment),
                     None => Some(fragment),
@@ -1101,26 +1120,22 @@ fn handle_chat_completions_streaming(
                 };
                 write_sse_chunk(&writer, &chunk)?;
             }
-            // A refusal is not content and never goes through the tool-call
-            // gate: it cannot contain a call, and holding it back would delay
-            // the one part of the answer the client most needs promptly.
-            Ok(Some(bindings::tachyon::accelerator::cpu::StreamEvent::Refusal(refusal))) => {
-                let chunk = ChatCompletionChunk {
-                    usage: None,
-                    id: id.clone(),
-                    object: "chat.completion.chunk",
-                    created,
-                    model: request.model.clone(),
-                    choices: vec![ChunkChoice {
-                        index: 0,
-                        delta: ChunkDelta::refusal(refusal),
-                        finish_reason: None,
-                    }],
-                };
-                write_sse_chunk(&writer, &chunk)?;
-            }
-            Ok(Some(bindings::tachyon::accelerator::cpu::StreamEvent::ToolCall(call))) => {
-                host_tool_calls.push(call);
+            Ok(Some(bindings::tachyon::accelerator::cpu::StreamEvent::Metadata(metadata))) => {
+                if let Some(refusal) = metadata_value(&metadata, "tachyon.refusal") {
+                    let chunk = ChatCompletionChunk {
+                        usage: None,
+                        id: id.clone(),
+                        object: "chat.completion.chunk",
+                        created,
+                        model: request.model.clone(),
+                        choices: vec![ChunkChoice {
+                            index: 0,
+                            delta: ChunkDelta::refusal(refusal),
+                            finish_reason: None,
+                        }],
+                    };
+                    write_sse_chunk(&writer, &chunk)?;
+                }
             }
             Ok(None) => break,
             Err(error) => {
@@ -1141,11 +1156,7 @@ fn handle_chat_completions_streaming(
     // and adopting them here exposed a dispatchable `tool_calls` delta the
     // caller had explicitly forbidden. The buffered path grew this guard; the
     // streamed one adopted unconditionally.
-    let mut tool_calls = if request.has_tool_intent() {
-        adopt_host_tool_calls(host_tool_calls)
-    } else {
-        Vec::new()
-    };
+    let mut tool_calls = Vec::new();
     if let Some(gate) = gate {
         let (whole, sent, overflowed) = gate.finish();
         // The gate had to discard a fragment to stay within its retention
@@ -1160,7 +1171,7 @@ fn handle_chat_completions_streaming(
             write_sse_error(
                 &writer,
                 &request.model,
-                bindings::tachyon::accelerator::cpu::GenerationError {
+                bindings::tachyon::accelerator::cpu::InvocationError {
                     message: "the response exceeded the tool-call gate's retention limit before it could be parsed".to_owned(),
                     upstream_status: Some(502),
                     invalid_request: false,
@@ -1198,12 +1209,7 @@ fn handle_chat_completions_streaming(
         // for calls, so a response carrying both a real structured call and
         // prose that merely looks like one lost that prose, silently, on the
         // stream but not in the buffered reply.
-        let tail = unsent_tail(
-            &whole,
-            sent,
-            &parsed,
-            /* host_supplied_calls */ !tool_calls.is_empty(),
-        );
+        let tail = unsent_tail(&whole, sent, &parsed, /* host_supplied_calls */ false);
         if !tail.is_empty() {
             let chunk = ChatCompletionChunk {
                 usage: None,
@@ -1232,7 +1238,7 @@ fn handle_chat_completions_streaming(
         write_sse_error(
             &writer,
             &request.model,
-            bindings::tachyon::accelerator::cpu::GenerationError {
+            bindings::tachyon::accelerator::cpu::InvocationError {
                 message: format!("returned a call to `{name}`, which this request did not offer"),
                 upstream_status: Some(502),
                 invalid_request: false,
@@ -1243,7 +1249,8 @@ fn handle_chat_completions_streaming(
 
     // Read now rather than at the top: like `usage`, it is only known once the
     // stream has ended, which the loop above has just observed.
-    let host_finish_reason = token_stream.finish_reason();
+    let stream_metadata = token_stream.metadata();
+    let host_finish_reason = metadata_value(&stream_metadata, "tachyon.finish_reason");
     let finish_reason =
         resolve_finish_reason(host_finish_reason.as_deref(), !tool_calls.is_empty());
     if !tool_calls.is_empty() {
@@ -1291,7 +1298,7 @@ fn handle_chat_completions_streaming(
         .as_ref()
         .is_some_and(|options| options.include_usage)
     {
-        if let Some(reported) = token_stream.usage() {
+        if let Some(reported) = metadata_usage(&stream_metadata) {
             let usage_chunk = ChatCompletionChunk {
                 id,
                 object: "chat.completion.chunk",
@@ -1990,24 +1997,9 @@ fn ceil_char_boundary(text: &str, mut idx: usize) -> usize {
 /// only when the request happens to carry the nonstandard parser option, so a
 /// standard OpenAI client offering tools would get the raw JSON back as literal
 /// assistant prose.
-fn adopt_host_tool_calls(
-    calls: Vec<bindings::tachyon::accelerator::cpu::ToolCall>,
-) -> Vec<ToolCall> {
+#[cfg(test)]
+fn adopt_host_tool_calls(calls: Vec<ToolCall>) -> Vec<ToolCall> {
     calls
-        .into_iter()
-        .enumerate()
-        .map(|(index, call)| ToolCall {
-            // A provider that assigned no id gets one minted here, matching the
-            // parser's own scheme: the id is what a client echoes back on the
-            // tool result turn, so it cannot be left empty.
-            id: call.id.unwrap_or_else(|| format!("call_tachyon_{index}")),
-            kind: "function".to_owned(),
-            function: ToolCallFunction {
-                name: call.name,
-                arguments: call.arguments,
-            },
-        })
-        .collect()
 }
 
 /// The `finish_reason` a choice reports, given what the host said and whether
@@ -2535,7 +2527,7 @@ fn openai_error_payload(status: u16, message: String, kind: &'static str) -> (u1
 /// request that could never succeed.
 fn generation_error_payload(
     model: &str,
-    error: bindings::tachyon::accelerator::cpu::GenerationError,
+    error: bindings::tachyon::accelerator::cpu::InvocationError,
 ) -> (u16, Vec<u8>) {
     let message = format!("inference failed for model `{model}`: {}", error.message);
     let (status, kind) = match error.upstream_status {
@@ -2564,7 +2556,7 @@ fn generation_error_payload(
 fn write_sse_error(
     writer: &bindings::tachyon::mesh::response_body::StreamingResponse,
     model: &str,
-    error: bindings::tachyon::accelerator::cpu::GenerationError,
+    error: bindings::tachyon::accelerator::cpu::InvocationError,
 ) -> Result<(), String> {
     let (_status, body) = generation_error_payload(model, error);
     let frame = format!(
@@ -2811,7 +2803,7 @@ mod tests {
     }
 
     #[test]
-    fn resolves_openai_model_id_to_registry_alias() {
+    fn resolves_openai_component_id_to_registry_alias() {
         let mut model = registry_model("qwen2.5-0.5b-instruct", None);
         model.engine = "magnetar".to_owned();
         let models = vec![model];
@@ -3377,28 +3369,19 @@ mod tests {
         // own channel, so no dialect has to be guessed for them to survive —
         // which is what previously decided whether a call reached the client at
         // all or arrived as literal prose.
-        let calls = adopt_host_tool_calls(vec![bindings::tachyon::accelerator::cpu::ToolCall {
-            id: Some("c1".to_owned()),
-            name: "read_file".to_owned(),
-            arguments: r#"{"path":"a.rs"}"#.to_owned(),
+        let calls = adopt_host_tool_calls(vec![ToolCall {
+            id: "c1".to_owned(),
+            kind: "function".to_owned(),
+            function: ToolCallFunction {
+                name: "read_file".to_owned(),
+                arguments: r#"{"path":"a.rs"}"#.to_owned(),
+            },
         }]);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "c1");
         assert_eq!(calls[0].kind, "function");
         assert_eq!(calls[0].function.name, "read_file");
         assert_eq!(calls[0].function.arguments, r#"{"path":"a.rs"}"#);
-    }
-
-    #[test]
-    fn a_host_tool_call_without_an_id_is_given_one() {
-        // The id is what a client echoes back on the tool-result turn, so an
-        // empty one makes the call impossible to answer.
-        let calls = adopt_host_tool_calls(vec![bindings::tachyon::accelerator::cpu::ToolCall {
-            id: None,
-            name: "f".to_owned(),
-            arguments: "{}".to_owned(),
-        }]);
-        assert_eq!(calls[0].id, "call_tachyon_0");
     }
 
     #[test]
@@ -3509,7 +3492,7 @@ mod tests {
         // binding. A client picks the mesh alias and nothing else, so
         // `invalid_request_error` sends it hunting for a mistake in a request
         // it cannot change while the real fault goes unreported.
-        let not_found = bindings::tachyon::accelerator::cpu::GenerationError {
+        let not_found = bindings::tachyon::accelerator::cpu::InvocationError {
             message: "upstream said 404".to_owned(),
             upstream_status: Some(404),
             invalid_request: false,
@@ -3519,7 +3502,7 @@ mod tests {
 
         // A 400 really is about the forwarded parameters and stays the
         // caller's.
-        let rejected = bindings::tachyon::accelerator::cpu::GenerationError {
+        let rejected = bindings::tachyon::accelerator::cpu::InvocationError {
             message: "upstream said 400".to_owned(),
             upstream_status: Some(400),
             invalid_request: false,
@@ -3583,7 +3566,7 @@ mod tests {
 
     #[test]
     fn an_upstream_status_is_relayed_rather_than_flattened_into_a_500() {
-        let rate_limited = bindings::tachyon::accelerator::cpu::GenerationError {
+        let rate_limited = bindings::tachyon::accelerator::cpu::InvocationError {
             message: "upstream returned HTTP 429".to_owned(),
             upstream_status: Some(429),
             invalid_request: false,
@@ -3596,7 +3579,7 @@ mod tests {
         // A rejected request is the caller's to fix, not to retry.
         let (status, _) = generation_error_payload(
             "coder",
-            bindings::tachyon::accelerator::cpu::GenerationError {
+            bindings::tachyon::accelerator::cpu::InvocationError {
                 message: "upstream returned HTTP 400".to_owned(),
                 upstream_status: Some(400),
                 invalid_request: false,
@@ -3608,7 +3591,7 @@ mod tests {
         // must not reach the caller as its own authentication problem.
         let (status, _) = generation_error_payload(
             "coder",
-            bindings::tachyon::accelerator::cpu::GenerationError {
+            bindings::tachyon::accelerator::cpu::InvocationError {
                 message: "upstream returned HTTP 401".to_owned(),
                 upstream_status: Some(401),
                 invalid_request: false,
@@ -3619,7 +3602,7 @@ mod tests {
         // A local *host* failure has no remote status to relay and stays a 500.
         let (status, _) = generation_error_payload(
             "coder",
-            bindings::tachyon::accelerator::cpu::GenerationError {
+            bindings::tachyon::accelerator::cpu::InvocationError {
                 message: "model alias `coder` is not loaded".to_owned(),
                 upstream_status: None,
                 invalid_request: false,
@@ -3632,7 +3615,7 @@ mod tests {
         // retry a request that cannot succeed however many times it is sent.
         let (status, body) = generation_error_payload(
             "coder",
-            bindings::tachyon::accelerator::cpu::GenerationError {
+            bindings::tachyon::accelerator::cpu::InvocationError {
                 message: "max_new_tokens 8192 exceeds the binding ceiling".to_owned(),
                 upstream_status: None,
                 invalid_request: true,

@@ -51,7 +51,7 @@ with the field set documented in the design notes.
 - **GIVEN** a node of type `llm` is selected
 - **WHEN** `<tachyon-node-editor>` opens
 - **THEN** the form exposes a model-name input, a quantization select
-  (`INT4`, `INT8`, `FP16`), and a LoRA mode select (`dynamic`,
+  (`INT4`, `INT8`, `FP16`), and a Component training mode select (`dynamic`,
   `static`)
 
 #### Scenario: Editor commits changes back to the canvas

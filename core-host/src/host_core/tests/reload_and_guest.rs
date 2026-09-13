@@ -376,10 +376,10 @@ fn execute_legacy_guest_reads_stdin_for_tcp_echo_module() {
 #[test]
 fn execute_guest_ai_uses_preloaded_model_alias_and_returns_mock_text() {
     let mut route = IntegrityRoute::user("/api/guest-ai");
-    route.models = vec![IntegrityModelBinding {
+    route.inference_components = vec![IntegrityInferenceComponentBinding {
         alias: "llama3".to_owned(),
         path: "mock:llama3".to_owned(),
-        device: ModelDevice::Cuda,
+        device: ComponentPlacement::Cuda,
         qos: RouteQos::Standard,
         dynamic: false,
         hardware_strategy: Default::default(),
@@ -495,10 +495,10 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
         .with_test_writer()
         .try_init();
     let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
-    route.models = vec![IntegrityModelBinding {
+    route.inference_components = vec![IntegrityInferenceComponentBinding {
         alias: "llama3".to_owned(),
         path: "mock:llama3".to_owned(),
-        device: ModelDevice::Cpu,
+        device: ComponentPlacement::Cpu,
         qos: RouteQos::Standard,
         dynamic: false,
         hardware_strategy: Default::default(),
@@ -590,7 +590,7 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
 
     // Unlike a stream, a buffered response has no extra frame to break a naive
     // client with, so usage is unconditional here — OpenAI reports it the same
-    // way. The counts come back beside the text through `compute-detailed`.
+    // way. The counts come back beside the text through `invoke`.
     let buffered_usage = &ref_json["usage"];
     assert!(
         !buffered_usage.is_null(),
@@ -770,10 +770,10 @@ async fn streaming_guest_openai_disconnect_finishes_worker_without_done_frame() 
         .with_test_writer()
         .try_init();
     let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
-    route.models = vec![IntegrityModelBinding {
+    route.inference_components = vec![IntegrityInferenceComponentBinding {
         alias: "llama3".to_owned(),
         path: "mock:llama3".to_owned(),
-        device: ModelDevice::Cpu,
+        device: ComponentPlacement::Cpu,
         qos: RouteQos::Standard,
         dynamic: false,
         hardware_strategy: Default::default(),

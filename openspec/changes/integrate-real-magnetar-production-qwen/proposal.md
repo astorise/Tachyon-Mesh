@@ -10,7 +10,7 @@ semantics.
 
 ## What Changes
 
-- Replace Tachyon's model-specific Magnetar adapter boundary with a generic
+- Replace Tachyon's Component-specific Magnetar adapter boundary with a generic
   Magnetar inference Component adapter pinned through the vendored Magnetar
   submodule.
 - Resolve the inference Component as an explicit `*.component.wasm` artifact

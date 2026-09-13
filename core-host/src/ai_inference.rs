@@ -1,160 +1,26 @@
 #[path = "ai_inference/magnetar_runtime.rs"]
 mod magnetar_runtime;
-#[path = "ai_inference/upstream_openai.rs"]
-mod upstream_openai;
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, OnceLock, RwLock},
-    time::Duration,
+    sync::{Arc, Mutex, OnceLock, RwLock},
 };
 use wasmtime_wasi_nn::{
     witx::WasiNnCtx, Graph as WasiGraph, GraphRegistry, Registry as WasiRegistry,
 };
 
-use crate::{IntegrityConfig, IntegrityModelBinding, RouteQos};
+use crate::{IntegrityConfig, IntegrityInferenceComponentBinding, RouteQos};
 
-pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
 pub(crate) use magnetar_runtime::MAGNETAR_PATH_PREFIX;
 const COMPONENT_META_JSON: &str = ".tachyon-component.json";
 const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
-const UPSTREAM_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(crate) fn binding_runs_upstream(binding: &IntegrityModelBinding) -> bool {
-    !binding.dynamic && binding.path.trim().starts_with(UPSTREAM_SCHEME)
-}
-
-pub(crate) fn upstream_max_concurrency() -> usize {
-    std::env::var("TACHYON_UPSTREAM_MAX_CONCURRENCY")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(32)
-}
-
-static HOST_UPSTREAM_ADMISSION: OnceLock<Arc<UpstreamAdmission>> = OnceLock::new();
-
-fn host_upstream_admission() -> Arc<UpstreamAdmission> {
-    Arc::clone(HOST_UPSTREAM_ADMISSION.get_or_init(|| Arc::new(UpstreamAdmission::from_env())))
-}
-
-struct UpstreamAdmission {
-    state: Mutex<UpstreamAdmissionState>,
-    released: Condvar,
-    capacity: usize,
-    max_waiters: usize,
-}
-
-#[derive(Default)]
-struct UpstreamAdmissionState {
-    in_flight: usize,
-    waiting: usize,
-}
-
-#[derive(Debug)]
-enum UpstreamAdmissionError {
-    QueueFull { waiting: usize, limit: usize },
-    TimedOut { in_flight: usize, limit: usize },
-}
-
-impl std::fmt::Display for UpstreamAdmissionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::QueueFull { waiting, limit } => write!(
-                f,
-                "upstream request queue is full ({waiting} waiting, limit {limit})"
-            ),
-            Self::TimedOut { in_flight, limit } => write!(
-                f,
-                "upstream request queue is saturated ({in_flight} in flight, limit {limit}): retry, or raise `TACHYON_UPSTREAM_MAX_CONCURRENCY`"
-            ),
-        }
-    }
-}
-
-impl UpstreamAdmission {
-    fn new(capacity: usize) -> Self {
-        Self {
-            state: Mutex::new(UpstreamAdmissionState::default()),
-            released: Condvar::new(),
-            capacity: capacity.max(1),
-            max_waiters: capacity.max(1),
-        }
-    }
-
-    fn from_env() -> Self {
-        Self::new(upstream_max_concurrency())
-    }
-
-    fn acquire(&self) -> std::result::Result<UpstreamPermit<'_>, UpstreamAdmissionError> {
-        let mut state = self.state.lock().expect("upstream admission lock poisoned");
-        if state.in_flight >= self.capacity {
-            if state.waiting >= self.max_waiters {
-                return Err(UpstreamAdmissionError::QueueFull {
-                    waiting: state.waiting,
-                    limit: self.max_waiters,
-                });
-            }
-            state.waiting += 1;
-            let deadline = std::time::Instant::now() + UPSTREAM_ADMISSION_TIMEOUT;
-            loop {
-                if state.in_flight < self.capacity {
-                    break;
-                }
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    state.waiting -= 1;
-                    return Err(UpstreamAdmissionError::TimedOut {
-                        in_flight: state.in_flight,
-                        limit: self.capacity,
-                    });
-                }
-                let (next, _) = self
-                    .released
-                    .wait_timeout(state, remaining)
-                    .expect("upstream admission lock poisoned");
-                state = next;
-            }
-            state.waiting -= 1;
-        }
-        state.in_flight += 1;
-        Ok(UpstreamPermit { gate: self })
-    }
-
-    fn release(&self) {
-        let mut state = self.state.lock().expect("upstream admission lock poisoned");
-        state.in_flight = state.in_flight.saturating_sub(1);
-        drop(state);
-        self.released.notify_one();
-    }
-
-    fn waiting(&self) -> usize {
-        self.state
-            .lock()
-            .expect("upstream admission lock poisoned")
-            .waiting
-    }
-
-    #[cfg(test)]
-    fn in_flight(&self) -> usize {
-        self.state
-            .lock()
-            .expect("upstream admission lock poisoned")
-            .in_flight
-    }
-}
-
-struct UpstreamPermit<'a> {
-    gate: &'a UpstreamAdmission,
-}
-
-impl Drop for UpstreamPermit<'_> {
-    fn drop(&mut self) {
-        self.gate.release();
-    }
+pub(crate) fn binding_runs_upstream(binding: &IntegrityInferenceComponentBinding) -> bool {
+    let _ = binding;
+    false
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -170,12 +36,12 @@ pub(crate) enum AcceleratorKind {
 impl AcceleratorKind {
     pub(crate) const ALL: [Self; 5] = [Self::Cpu, Self::Gpu, Self::Npu, Self::Tpu, Self::Network];
 
-    pub(crate) fn from_model_device(device: &crate::ModelDevice) -> Self {
+    pub(crate) fn from_component_placement(device: &crate::ComponentPlacement) -> Self {
         match device {
-            crate::ModelDevice::Cpu => Self::Cpu,
-            crate::ModelDevice::Cuda | crate::ModelDevice::Metal => Self::Gpu,
-            crate::ModelDevice::Npu => Self::Npu,
-            crate::ModelDevice::Tpu => Self::Tpu,
+            crate::ComponentPlacement::Cpu => Self::Cpu,
+            crate::ComponentPlacement::Cuda | crate::ComponentPlacement::Metal => Self::Gpu,
+            crate::ComponentPlacement::Npu => Self::Npu,
+            crate::ComponentPlacement::Tpu => Self::Tpu,
         }
     }
 
@@ -318,31 +184,6 @@ impl GenerationError {
     }
 }
 
-impl From<upstream_openai::UpstreamError> for GenerationError {
-    fn from(error: upstream_openai::UpstreamError) -> Self {
-        let upstream_status = error.http_status();
-        let invalid_request =
-            matches!(error, upstream_openai::UpstreamError::InvalidRequest { .. });
-        Self {
-            message: error.to_string(),
-            upstream_status,
-            class: None,
-            invalid_request,
-        }
-    }
-}
-
-impl From<UpstreamAdmissionError> for GenerationError {
-    fn from(error: UpstreamAdmissionError) -> Self {
-        Self {
-            message: error.to_string(),
-            upstream_status: Some(429),
-            class: Some("upstream-admission".to_owned()),
-            invalid_request: false,
-        }
-    }
-}
-
 impl std::fmt::Display for GenerationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
@@ -470,46 +311,42 @@ impl GraphRegistry for MockPreloadedGraphRegistry {
 }
 
 #[derive(Clone)]
-enum ModelRuntime {
+enum ComponentRuntime {
     Mock { accelerator: AcceleratorKind },
     Magnetar(Arc<magnetar_runtime::MagnetarRuntime>),
-    Upstream(Arc<upstream_openai::UpstreamOpenAiRuntime>),
 }
 
 #[derive(Clone)]
-struct LoadedModel {
+struct LoadedInferenceComponent {
     alias: String,
     qos: RouteQos,
-    runtime: ModelRuntime,
+    runtime: ComponentRuntime,
 }
 
-impl LoadedModel {
+impl LoadedInferenceComponent {
     fn accelerator(&self) -> AcceleratorKind {
         match &self.runtime {
-            ModelRuntime::Mock { accelerator } => *accelerator,
-            ModelRuntime::Magnetar(runtime) => {
+            ComponentRuntime::Mock { accelerator } => *accelerator,
+            ComponentRuntime::Magnetar(runtime) => {
                 if magnetar_provider_is_cuda(runtime.provider()) {
                     AcceleratorKind::Gpu
                 } else {
                     AcceleratorKind::Cpu
                 }
             }
-            ModelRuntime::Upstream(_) => AcceleratorKind::Network,
         }
     }
 
     fn memory_residency(&self) -> AcceleratorMemoryResidency {
         match &self.runtime {
-            ModelRuntime::Mock {
+            ComponentRuntime::Mock {
                 accelerator: AcceleratorKind::Gpu,
             } => AcceleratorMemoryResidency::Vram,
-            ModelRuntime::Mock {
+            ComponentRuntime::Mock {
                 accelerator: AcceleratorKind::Npu | AcceleratorKind::Tpu,
             } => AcceleratorMemoryResidency::Sram,
-            ModelRuntime::Mock { .. } | ModelRuntime::Upstream(_) => {
-                AcceleratorMemoryResidency::HostRam
-            }
-            ModelRuntime::Magnetar(runtime) => {
+            ComponentRuntime::Mock { .. } => AcceleratorMemoryResidency::HostRam,
+            ComponentRuntime::Magnetar(runtime) => {
                 if magnetar_provider_is_cuda(runtime.provider()) {
                     AcceleratorMemoryResidency::Vram
                 } else {
@@ -522,10 +359,9 @@ impl LoadedModel {
 
 #[derive(Clone)]
 pub(crate) struct AiInferenceRuntime {
-    models: Arc<RwLock<HashMap<String, LoadedModel>>>,
-    dynamic_models_root: Option<PathBuf>,
+    inference_components: Arc<RwLock<HashMap<String, LoadedInferenceComponent>>>,
+    dynamic_components_root: Option<PathBuf>,
     queue_snapshots: Arc<RwLock<HashMap<AcceleratorKind, QueueTierSnapshot>>>,
-    upstream_admission: Arc<UpstreamAdmission>,
 }
 
 impl AiInferenceRuntime {
@@ -534,7 +370,7 @@ impl AiInferenceRuntime {
             config
                 .routes
                 .iter()
-                .flat_map(|route| route.models.iter())
+                .flat_map(|route| route.inference_components.iter())
                 .filter(|binding| binding_runs_upstream(binding))
                 .map(|binding| binding.alias.as_str()),
         )
@@ -544,11 +380,11 @@ impl AiInferenceRuntime {
         let mut sealed_aliases = HashSet::new();
         for route in &config.routes {
             if route
-                .adapter_id
+                .artifact_id
                 .as_deref()
-                .is_some_and(|adapter_id| !adapter_id.trim().is_empty())
+                .is_some_and(|artifact_id| !artifact_id.trim().is_empty())
                 && route
-                    .models
+                    .inference_components
                     .iter()
                     .any(|binding| binding.dynamic || !binding_runs_upstream(binding))
             {
@@ -557,10 +393,10 @@ impl AiInferenceRuntime {
                     route.path
                 ));
             }
-            for binding in &route.models {
+            for binding in &route.inference_components {
                 if !sealed_aliases.insert(binding.alias.clone()) {
                     return Err(anyhow!(
-                        "Integrity Validation Failed: model alias `{}` must be globally unique",
+                        "Integrity Validation Failed: component alias `{}` must be globally unique",
                         binding.alias
                     ));
                 }
@@ -569,7 +405,7 @@ impl AiInferenceRuntime {
                 }
                 if binding.path.trim().is_empty() {
                     return Err(anyhow!(
-                        "Integrity Validation Failed: static model alias `{}` requires a non-empty `path` (set `dynamic: true` for broker-uploaded models)",
+                        "Integrity Validation Failed: static component alias `{}` requires a non-empty `path` (set `dynamic: true` for broker-uploaded components)",
                         binding.alias
                     ));
                 }
@@ -578,60 +414,59 @@ impl AiInferenceRuntime {
             }
         }
         Ok(Self {
-            models: Arc::new(RwLock::new(models)),
-            dynamic_models_root: None,
+            inference_components: Arc::new(RwLock::new(models)),
+            dynamic_components_root: None,
             queue_snapshots: Arc::new(RwLock::new(HashMap::new())),
-            upstream_admission: host_upstream_admission(),
         })
     }
 
-    pub(crate) fn with_dynamic_models_root(mut self, root: Option<PathBuf>) -> Self {
-        self.dynamic_models_root = root;
+    pub(crate) fn with_dynamic_components_root(mut self, root: Option<PathBuf>) -> Self {
+        self.dynamic_components_root = root;
         self
     }
 
-    fn ensure_model_loaded(
+    fn ensure_component_loaded(
         &self,
         alias: &str,
         requested_accelerator: AcceleratorKind,
     ) -> Result<(), String> {
         if self
-            .models
+            .inference_components
             .read()
-            .expect("model registry lock poisoned")
+            .expect("component registry lock poisoned")
             .contains_key(alias)
         {
             return Ok(());
         }
-        let Some(root) = self.dynamic_models_root.as_ref() else {
-            return Err(format!("model alias `{alias}` is not loaded"));
+        let Some(root) = self.dynamic_components_root.as_ref() else {
+            return Err(format!("component alias `{alias}` is not loaded"));
         };
         let model_dir = root.join(alias);
         if !model_dir.is_dir() {
-            return Err(format!("model alias `{alias}` is not loaded"));
+            return Err(format!("component alias `{alias}` is not loaded"));
         }
-        let binding = IntegrityModelBinding {
+        let binding = IntegrityInferenceComponentBinding {
             alias: alias.to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: model_device_for_accelerator(requested_accelerator)?,
+            device: component_placement_for_accelerator(requested_accelerator)?,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
         };
         let model = load_binding(&binding).map_err(|error| format!("{error:#}"))?;
-        self.models
+        self.inference_components
             .write()
-            .expect("model registry lock poisoned")
+            .expect("component registry lock poisoned")
             .entry(alias.to_owned())
             .or_insert(model);
         Ok(())
     }
 
-    pub(crate) fn loaded_model_aliases(&self) -> Vec<String> {
+    pub(crate) fn loaded_component_aliases(&self) -> Vec<String> {
         let mut aliases = self
-            .models
+            .inference_components
             .read()
-            .expect("model registry lock poisoned")
+            .expect("component registry lock poisoned")
             .keys()
             .cloned()
             .collect::<Vec<_>>();
@@ -642,9 +477,9 @@ impl AiInferenceRuntime {
     pub(crate) fn build_wasi_nn_ctx(&self) -> WasiNnCtx {
         #[cfg(test)]
         let registry = WasiRegistry::from(MockPreloadedGraphRegistry::from_aliases(
-            self.models
+            self.inference_components
                 .read()
-                .expect("model registry lock poisoned")
+                .expect("component registry lock poisoned")
                 .keys()
                 .cloned()
                 .collect::<Vec<_>>(),
@@ -657,22 +492,14 @@ impl AiInferenceRuntime {
     pub(crate) fn supports_accelerator(&self, accelerator: AcceleratorKind) -> bool {
         matches!(accelerator, AcceleratorKind::Cpu)
             || self
-                .models
+                .inference_components
                 .read()
-                .expect("model registry lock poisoned")
+                .expect("component registry lock poisoned")
                 .values()
                 .any(|model| model.accelerator() == accelerator)
     }
 
     pub(crate) fn queue_tier_snapshot(&self, accelerator: AcceleratorKind) -> QueueTierSnapshot {
-        if matches!(accelerator, AcceleratorKind::Network) {
-            let waiting = self.upstream_admission.waiting().min(u32::MAX as usize) as u32;
-            return QueueTierSnapshot {
-                realtime: waiting,
-                standard: waiting,
-                batch: waiting,
-            };
-        }
         self.queue_snapshots
             .read()
             .expect("queue snapshots lock poisoned")
@@ -681,19 +508,22 @@ impl AiInferenceRuntime {
             .unwrap_or_default()
     }
 
-    pub(crate) fn load_component_model(
+    pub(crate) fn load_inference_component(
         &self,
         alias: &str,
         accelerator: AcceleratorKind,
     ) -> std::result::Result<(), String> {
-        self.ensure_model_loaded(alias, accelerator)?;
-        let models = self.models.read().expect("model registry lock poisoned");
+        self.ensure_component_loaded(alias, accelerator)?;
+        let models = self
+            .inference_components
+            .read()
+            .expect("component registry lock poisoned");
         let model = models
             .get(alias)
-            .ok_or_else(|| format!("model alias `{alias}` is not loaded"))?;
+            .ok_or_else(|| format!("component alias `{alias}` is not loaded"))?;
         if model.accelerator() != accelerator {
             return Err(format!(
-                "model alias `{alias}` is loaded for `{}` but `{}` was requested",
+                "component alias `{alias}` is loaded for `{}` but `{}` was requested",
                 model.accelerator().as_str(),
                 accelerator.as_str()
             ));
@@ -715,21 +545,18 @@ impl AiInferenceRuntime {
         alias: &str,
         prompt: &str,
     ) -> std::result::Result<ComponentGeneration, GenerationError> {
-        self.ensure_model_loaded(alias, AcceleratorKind::Cpu)
+        self.ensure_component_loaded(alias, AcceleratorKind::Cpu)
             .map_err(GenerationError::local)?;
         let model = self
-            .models
+            .inference_components
             .read()
-            .expect("model registry lock poisoned")
+            .expect("component registry lock poisoned")
             .get(alias)
             .cloned()
             .ok_or_else(|| {
-                GenerationError::local(format!("model alias `{alias}` is not loaded"))
+                GenerationError::local(format!("component alias `{alias}` is not loaded"))
             })?;
         let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
-        let _upstream_permit = matches!(&model.runtime, ModelRuntime::Upstream(_))
-            .then(|| self.upstream_admission.acquire())
-            .transpose()?;
         let output = execute_model(&model, prompt.as_bytes())?;
         let text = String::from_utf8(output.bytes)
             .map_err(|error| GenerationError::local(error.to_string()))?;
@@ -745,29 +572,23 @@ impl AiInferenceRuntime {
     pub(crate) fn embed_component_input(
         &self,
         alias: &str,
-        input: &str,
+        _input: &str,
     ) -> std::result::Result<Vec<f32>, GenerationError> {
-        self.ensure_model_loaded(alias, AcceleratorKind::Cpu)
+        self.ensure_component_loaded(alias, AcceleratorKind::Cpu)
             .map_err(GenerationError::local)?;
         let model = self
-            .models
+            .inference_components
             .read()
-            .expect("model registry lock poisoned")
+            .expect("component registry lock poisoned")
             .get(alias)
             .cloned()
             .ok_or_else(|| {
-                GenerationError::local(format!("model alias `{alias}` is not loaded"))
+                GenerationError::local(format!("component alias `{alias}` is not loaded"))
             })?;
         let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
-        match &model.runtime {
-            ModelRuntime::Upstream(runtime) => {
-                let _permit = self.upstream_admission.acquire()?;
-                runtime.embed(input).map_err(GenerationError::from)
-            }
-            _ => Err(GenerationError::invalid_request(format!(
-                "model `{alias}` does not expose dense text embeddings in the Magnetar cutover"
-            ))),
-        }
+        Err(GenerationError::invalid_request(format!(
+            "component `{alias}` does not expose dense text embeddings through the generic Tachyon invocation contract"
+        )))
     }
 
     pub(crate) fn stream_component_prompt(
@@ -776,23 +597,20 @@ impl AiInferenceRuntime {
         prompt: &str,
         sink: &mut dyn StreamSink,
     ) -> std::result::Result<StreamOutcome, GenerationError> {
-        self.ensure_model_loaded(alias, AcceleratorKind::Cpu)
+        self.ensure_component_loaded(alias, AcceleratorKind::Cpu)
             .map_err(GenerationError::local)?;
         let model = self
-            .models
+            .inference_components
             .read()
-            .expect("model registry lock poisoned")
+            .expect("component registry lock poisoned")
             .get(alias)
             .cloned()
             .ok_or_else(|| {
-                GenerationError::local(format!("model alias `{alias}` is not loaded"))
+                GenerationError::local(format!("component alias `{alias}` is not loaded"))
             })?;
         let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
-        let _upstream_permit = matches!(&model.runtime, ModelRuntime::Upstream(_))
-            .then(|| self.upstream_admission.acquire())
-            .transpose()?;
         match &model.runtime {
-            ModelRuntime::Mock { .. } => {
+            ComponentRuntime::Mock { .. } => {
                 if sink.is_live() {
                     sink.emit(StreamEvent::Content(MOCK_INFERENCE_RESPONSE));
                 }
@@ -802,7 +620,7 @@ impl AiInferenceRuntime {
                     MOCK_INFERENCE_RESPONSE,
                 ))))
             }
-            ModelRuntime::Magnetar(runtime) => {
+            ComponentRuntime::Magnetar(runtime) => {
                 let mut emit = |fragment: &str| {
                     if sink.is_live() {
                         sink.emit(StreamEvent::Content(fragment))
@@ -817,13 +635,6 @@ impl AiInferenceRuntime {
                 record_execution(&model.alias, runtime.executed_on(), result.is_ok());
                 result
             }
-            ModelRuntime::Upstream(runtime) => {
-                let result = runtime
-                    .generate_streaming(&[prompt.as_bytes()], sink)
-                    .map_err(GenerationError::from);
-                record_execution(&model.alias, runtime.executed_on(), result.is_ok());
-                result
-            }
         }
     }
 
@@ -831,13 +642,13 @@ impl AiInferenceRuntime {
         &self,
     ) -> Vec<magnetar_runtime::ProviderAdvertisement> {
         let mut advertisements = self
-            .models
+            .inference_components
             .read()
-            .expect("model registry lock poisoned")
+            .expect("component registry lock poisoned")
             .values()
             .filter_map(|model| match &model.runtime {
-                ModelRuntime::Magnetar(runtime) => Some(runtime.provider().clone()),
-                _ => None,
+                ComponentRuntime::Magnetar(runtime) => Some(runtime.provider().clone()),
+                ComponentRuntime::Mock { .. } => None,
             })
             .collect::<Vec<_>>();
         advertisements.sort_by(|a, b| {
@@ -876,22 +687,25 @@ impl AiInferenceRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) fn model_memory_residency(&self, alias: &str) -> Option<AcceleratorMemoryResidency> {
-        self.models
+    pub(crate) fn component_memory_residency(
+        &self,
+        alias: &str,
+    ) -> Option<AcceleratorMemoryResidency> {
+        self.inference_components
             .read()
-            .expect("model registry lock poisoned")
+            .expect("component registry lock poisoned")
             .get(alias)
-            .map(LoadedModel::memory_residency)
+            .map(LoadedInferenceComponent::memory_residency)
     }
 
     #[cfg(test)]
     pub(crate) fn magnetar_resident_debug(&self, alias: &str) -> Option<(String, usize)> {
-        self.models
+        self.inference_components
             .read()
-            .expect("model registry lock poisoned")
+            .expect("component registry lock poisoned")
             .get(alias)
             .and_then(|model| match &model.runtime {
-                ModelRuntime::Magnetar(runtime) => runtime.resident_debug().ok(),
+                ComponentRuntime::Magnetar(runtime) => runtime.resident_debug().ok(),
                 _ => None,
             })
     }
@@ -927,14 +741,14 @@ fn magnetar_generation_error(error: anyhow::Error) -> GenerationError {
     }
 }
 
-fn model_device_for_accelerator(
+fn component_placement_for_accelerator(
     accelerator: AcceleratorKind,
-) -> Result<crate::ModelDevice, String> {
+) -> Result<crate::ComponentPlacement, String> {
     match accelerator {
-        AcceleratorKind::Cpu => Ok(crate::ModelDevice::Cpu),
-        AcceleratorKind::Gpu => Ok(crate::ModelDevice::Cuda),
-        AcceleratorKind::Npu => Ok(crate::ModelDevice::Npu),
-        AcceleratorKind::Tpu => Ok(crate::ModelDevice::Tpu),
+        AcceleratorKind::Cpu => Ok(crate::ComponentPlacement::Cpu),
+        AcceleratorKind::Gpu => Ok(crate::ComponentPlacement::Cuda),
+        AcceleratorKind::Npu => Ok(crate::ComponentPlacement::Npu),
+        AcceleratorKind::Tpu => Ok(crate::ComponentPlacement::Tpu),
         AcceleratorKind::Network => Err("network accelerator cannot load local models".to_owned()),
     }
 }
@@ -984,7 +798,7 @@ fn adjust_queue_depth(
     }
 }
 
-struct ModelOutput {
+struct ComponentOutput {
     bytes: Vec<u8>,
     usage: Option<TokenUsage>,
     finish_reason: Option<String>,
@@ -992,20 +806,16 @@ struct ModelOutput {
     refusal: Option<String>,
 }
 
-fn load_binding(binding: &IntegrityModelBinding) -> Result<LoadedModel> {
+fn load_binding(binding: &IntegrityInferenceComponentBinding) -> Result<LoadedInferenceComponent> {
     let path = binding.path.trim();
     let runtime = if path == "mock" || path.starts_with("mock:") {
-        ModelRuntime::Mock {
-            accelerator: AcceleratorKind::from_model_device(&binding.device),
+        ComponentRuntime::Mock {
+            accelerator: AcceleratorKind::from_component_placement(&binding.device),
         }
-    } else if let Some(runtime) =
-        upstream_openai::UpstreamOpenAiRuntime::try_load(&binding.alias, path)?
-    {
-        ModelRuntime::Upstream(Arc::new(runtime))
     } else if let Some(runtime) =
         magnetar_runtime::MagnetarRuntime::try_load(&binding.alias, path, binding.device.as_str())?
     {
-        ModelRuntime::Magnetar(Arc::new(runtime))
+        ComponentRuntime::Magnetar(Arc::new(runtime))
     } else if magnetar_runtime::is_magnetar_path(path) {
         return Err(anyhow!(
             "unsupported Magnetar Component binding `{}` at `{}`: expected an authorized inference Component artifact directory",
@@ -1014,12 +824,12 @@ fn load_binding(binding: &IntegrityModelBinding) -> Result<LoadedModel> {
         ));
     } else {
         return Err(anyhow!(
-            "unsupported AI binding `{}` at `{}`: local inference accepts explicit mock paths, openai upstream paths, or magnetar Component artifact directories",
+            "unsupported AI binding `{}` at `{}`: local inference accepts explicit mock paths or magnetar Component artifact directories; remote provider protocols must run in a guest or Component",
             binding.alias,
             binding.path
         ));
     };
-    Ok(LoadedModel {
+    Ok(LoadedInferenceComponent {
         alias: binding.alias.clone(),
         qos: binding.qos,
         runtime,
@@ -1027,13 +837,13 @@ fn load_binding(binding: &IntegrityModelBinding) -> Result<LoadedModel> {
 }
 
 fn execute_model(
-    model: &LoadedModel,
+    model: &LoadedInferenceComponent,
     prompt: &[u8],
-) -> std::result::Result<ModelOutput, GenerationError> {
+) -> std::result::Result<ComponentOutput, GenerationError> {
     match &model.runtime {
-        ModelRuntime::Mock { .. } => {
+        ComponentRuntime::Mock { .. } => {
             record_execution(&model.alias, model.accelerator().as_str(), true);
-            Ok(ModelOutput {
+            Ok(ComponentOutput {
                 bytes: MOCK_INFERENCE_RESPONSE.as_bytes().to_vec(),
                 usage: Some(mock_token_usage(prompt, MOCK_INFERENCE_RESPONSE)),
                 finish_reason: None,
@@ -1041,13 +851,13 @@ fn execute_model(
                 refusal: None,
             })
         }
-        ModelRuntime::Magnetar(runtime) => {
+        ComponentRuntime::Magnetar(runtime) => {
             let result = runtime
                 .generate(&[prompt])
                 .map_err(magnetar_generation_error)
                 .map(|mut outputs| {
                     let (bytes, usage) = outputs.remove(0);
-                    ModelOutput {
+                    ComponentOutput {
                         bytes,
                         usage: Some(usage),
                         finish_reason: None,
@@ -1055,20 +865,6 @@ fn execute_model(
                         refusal: None,
                     }
                 });
-            record_execution(&model.alias, runtime.executed_on(), result.is_ok());
-            result
-        }
-        ModelRuntime::Upstream(runtime) => {
-            let result = runtime
-                .generate(&[prompt])
-                .map(|generation| ModelOutput {
-                    bytes: generation.bytes,
-                    usage: generation.usage,
-                    finish_reason: generation.finish_reason,
-                    tool_calls: generation.tool_calls,
-                    refusal: generation.refusal,
-                })
-                .map_err(GenerationError::from);
             record_execution(&model.alias, runtime.executed_on(), result.is_ok());
             result
         }
@@ -1129,7 +925,7 @@ fn mock_token_usage(prompt: &[u8], completion: &str) -> TokenUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{IntegrityRoute, ModelDevice};
+    use crate::{ComponentPlacement, IntegrityRoute};
     use std::{fs, io::Write};
 
     fn unique_model_dir(name: &str) -> PathBuf {
@@ -1468,10 +1264,10 @@ mod tests {
         write_tiny_production_qwen_bundle(&model_dir);
         let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
+        route.inference_components = vec![IntegrityInferenceComponentBinding {
             alias: "qwen2_5".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: ModelDevice::Cpu,
+            device: ComponentPlacement::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -1496,10 +1292,10 @@ mod tests {
         write_tiny_production_qwen_bundle(&model_dir);
         let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
+        route.inference_components = vec![IntegrityInferenceComponentBinding {
             alias: "qwen_resident".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: ModelDevice::Cpu,
+            device: ComponentPlacement::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -1534,10 +1330,10 @@ mod tests {
         write_tiny_production_qwen_bundle(&model_dir);
         let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
+        route.inference_components = vec![IntegrityInferenceComponentBinding {
             alias: "qwen_concurrent".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: ModelDevice::Cpu,
+            device: ComponentPlacement::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -1590,10 +1386,10 @@ mod tests {
         write_tiny_production_qwen_bundle(&model_dir);
         let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
+        route.inference_components = vec![IntegrityInferenceComponentBinding {
             alias: "qwen2_5".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: ModelDevice::Cpu,
+            device: ComponentPlacement::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -1621,10 +1417,10 @@ mod tests {
         write_tiny_production_qwen_bundle(&model_dir);
         let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
+        route.inference_components = vec![IntegrityInferenceComponentBinding {
             alias: "qwen-stream".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: ModelDevice::Cpu,
+            device: ComponentPlacement::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -1682,10 +1478,10 @@ mod tests {
         write_tiny_production_qwen_bundle(&model_dir);
         std::fs::write(model_dir.join("config.json"), br#"{"model_type":"llama"}"#)
             .expect("config should be written");
-        let error = match load_binding(&IntegrityModelBinding {
+        let error = match load_binding(&IntegrityInferenceComponentBinding {
             alias: "llama".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: ModelDevice::Cpu,
+            device: ComponentPlacement::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -1703,10 +1499,10 @@ mod tests {
         let _trust = without_tachyon_component_trust_store();
         let model_dir = unique_model_dir("untrusted-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
-        let error = match load_binding(&IntegrityModelBinding {
+        let error = match load_binding(&IntegrityInferenceComponentBinding {
             alias: "qwen-untrusted".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: ModelDevice::Cpu,
+            device: ComponentPlacement::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -1730,10 +1526,10 @@ mod tests {
         std::fs::remove_file(model_dir.join("qwen-real.component.wasm"))
             .expect("component artifact should be removable");
 
-        let error = match load_binding(&IntegrityModelBinding {
+        let error = match load_binding(&IntegrityInferenceComponentBinding {
             alias: "component-required".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: ModelDevice::Cpu,
+            device: ComponentPlacement::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -1763,10 +1559,10 @@ mod tests {
             .expect("embedded fake trust policy should be copied");
         std::env::remove_var(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
 
-        let error = match load_binding(&IntegrityModelBinding {
+        let error = match load_binding(&IntegrityInferenceComponentBinding {
             alias: "qwen-self-trusting".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: ModelDevice::Cpu,
+            device: ComponentPlacement::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -1790,10 +1586,10 @@ mod tests {
         let model_dir = unique_model_dir("cuda-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
         let _trust = trust_tachyon_component_artifact(&model_dir);
-        let error = match load_binding(&IntegrityModelBinding {
+        let error = match load_binding(&IntegrityInferenceComponentBinding {
             alias: "qwen-cuda".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: ModelDevice::Cuda,
+            device: ComponentPlacement::Cuda,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -1831,10 +1627,10 @@ mod tests {
         write_tiny_production_qwen_bundle(&model_dir);
         let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
+        route.inference_components = vec![IntegrityInferenceComponentBinding {
             alias: "qwen-cuda".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: ModelDevice::Cuda,
+            device: ComponentPlacement::Cuda,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -1872,10 +1668,10 @@ mod tests {
         write_tiny_production_qwen_bundle(&model_dir);
         let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
+        route.inference_components = vec![IntegrityInferenceComponentBinding {
             alias: "qwen-cuda".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
-            device: ModelDevice::Cuda,
+            device: ComponentPlacement::Cuda,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -1920,10 +1716,10 @@ mod tests {
         let error = match AiInferenceRuntime::from_config(&IntegrityConfig {
             routes: vec![{
                 let mut route = IntegrityRoute::user("/api/guest-ai");
-                route.models = vec![IntegrityModelBinding {
+                route.inference_components = vec![IntegrityInferenceComponentBinding {
                     alias: "llama".to_owned(),
                     path: model_dir.to_string_lossy().into_owned(),
-                    device: ModelDevice::Cpu,
+                    device: ComponentPlacement::Cpu,
                     qos: RouteQos::Standard,
                     dynamic: false,
                     hardware_strategy: Default::default(),
@@ -1945,11 +1741,11 @@ mod tests {
         let error = match AiInferenceRuntime::from_config(&IntegrityConfig {
             routes: vec![{
                 let mut route = IntegrityRoute::user("/api/guest-ai");
-                route.adapter_id = Some("adapter-a".to_owned());
-                route.models = vec![IntegrityModelBinding {
+                route.artifact_id = Some("artifact-a".to_owned());
+                route.inference_components = vec![IntegrityInferenceComponentBinding {
                     alias: "mock-model".to_owned(),
                     path: "mock".to_owned(),
-                    device: ModelDevice::Cpu,
+                    device: ComponentPlacement::Cpu,
                     qos: RouteQos::Standard,
                     dynamic: false,
                     hardware_strategy: Default::default(),
@@ -1968,19 +1764,19 @@ mod tests {
     #[test]
     fn dynamic_openai_placeholders_do_not_collide_as_upstream_credentials() {
         let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![
-            IntegrityModelBinding {
+        route.inference_components = vec![
+            IntegrityInferenceComponentBinding {
                 alias: "vendor-a".to_owned(),
                 path: "openai:http://placeholder.invalid/v1".to_owned(),
-                device: ModelDevice::Cpu,
+                device: ComponentPlacement::Cpu,
                 qos: RouteQos::Standard,
                 dynamic: true,
                 hardware_strategy: Default::default(),
             },
-            IntegrityModelBinding {
+            IntegrityInferenceComponentBinding {
                 alias: "vendor_a".to_owned(),
                 path: "openai:http://placeholder.invalid/v1".to_owned(),
-                device: ModelDevice::Cpu,
+                device: ComponentPlacement::Cpu,
                 qos: RouteQos::Standard,
                 dynamic: true,
                 hardware_strategy: Default::default(),
@@ -2002,10 +1798,10 @@ mod tests {
         let _trust = trust_tachyon_component_artifact(&model_dir);
         let runtime = AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed())
             .expect("runtime")
-            .with_dynamic_models_root(Some(root.clone()));
+            .with_dynamic_components_root(Some(root.clone()));
 
         runtime
-            .load_component_model("dynamic-cpu-qwen", AcceleratorKind::Cpu)
+            .load_inference_component("dynamic-cpu-qwen", AcceleratorKind::Cpu)
             .expect("dynamic CPU model should load through Reference CPU");
         let generation = runtime
             .compute_component_prompt("dynamic-cpu-qwen", r#"{"prompt":"hi","max_new_tokens":1}"#)
@@ -2027,10 +1823,10 @@ mod tests {
     #[test]
     fn requested_gpu_rejects_cpu_loaded_model() {
         let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
+        route.inference_components = vec![IntegrityInferenceComponentBinding {
             alias: "cpu-only".to_owned(),
             path: "mock".to_owned(),
-            device: ModelDevice::Cpu,
+            device: ComponentPlacement::Cpu,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -2042,7 +1838,7 @@ mod tests {
         .expect("runtime");
 
         let error = runtime
-            .load_component_model("cpu-only", AcceleratorKind::Gpu)
+            .load_inference_component("cpu-only", AcceleratorKind::Gpu)
             .expect_err("GPU request must not be satisfied by a CPU-loaded model");
 
         assert!(
@@ -2062,10 +1858,10 @@ mod tests {
         let _trust = trust_tachyon_component_artifact(&model_dir);
         let runtime = AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed())
             .expect("runtime")
-            .with_dynamic_models_root(Some(root.clone()));
+            .with_dynamic_components_root(Some(root.clone()));
 
         let error = runtime
-            .load_component_model("dynamic-qwen", AcceleratorKind::Gpu)
+            .load_inference_component("dynamic-qwen", AcceleratorKind::Gpu)
             .expect_err("dynamic GPU load must fail closed when CUDA placement is unavailable");
 
         assert!(
@@ -2074,7 +1870,7 @@ mod tests {
         );
         assert!(
             !runtime
-                .loaded_model_aliases()
+                .loaded_component_aliases()
                 .iter()
                 .any(|alias| alias == "dynamic-qwen"),
             "failed dynamic GPU load must not leave a CPU-loaded model behind"
@@ -2092,10 +1888,10 @@ mod tests {
         write_tiny_production_qwen_bundle(&model_dir);
         let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
-        route.models = vec![IntegrityModelBinding {
+        route.inference_components = vec![IntegrityInferenceComponentBinding {
             alias: "gpu-a".to_owned(),
             path: "mock".to_owned(),
-            device: ModelDevice::Cuda,
+            device: ComponentPlacement::Cuda,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -2105,11 +1901,11 @@ mod tests {
             ..IntegrityConfig::default_sealed()
         })
         .expect("runtime")
-        .with_dynamic_models_root(Some(root.clone()));
+        .with_dynamic_components_root(Some(root.clone()));
         assert!(runtime.supports_accelerator(AcceleratorKind::Gpu));
 
         let error = runtime
-            .load_component_model("dynamic-qwen-b", AcceleratorKind::Gpu)
+            .load_inference_component("dynamic-qwen-b", AcceleratorKind::Gpu)
             .expect_err(
                 "dynamic GPU load must not reuse CPU just because another GPU model exists",
             );
@@ -2120,7 +1916,7 @@ mod tests {
         );
         assert!(
             !runtime
-                .loaded_model_aliases()
+                .loaded_component_aliases()
                 .iter()
                 .any(|alias| alias == "dynamic-qwen-b"),
             "failed dynamic GPU load must not leave a CPU-loaded model behind"
@@ -2152,7 +1948,7 @@ mod tests {
     }
 
     #[test]
-    fn accelerator_support_is_derived_from_loaded_models() {
+    fn accelerator_support_is_derived_from_loaded_components() {
         let runtime =
             AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed()).expect("runtime");
 
@@ -2163,24 +1959,47 @@ mod tests {
     }
 
     #[test]
-    fn upstream_admission_bounds_concurrent_work() {
-        let gate = UpstreamAdmission::new(1);
-        {
-            let mut state = gate.state.lock().expect("admission lock");
-            state.in_flight = 1;
-            state.waiting = 1;
-        }
+    fn one_route_can_expose_two_distinct_inference_components() {
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.inference_components = vec![
+            IntegrityInferenceComponentBinding {
+                alias: "component-a".to_owned(),
+                path: "mock:component-a".to_owned(),
+                device: ComponentPlacement::Cpu,
+                qos: RouteQos::Standard,
+                dynamic: false,
+                hardware_strategy: Default::default(),
+            },
+            IntegrityInferenceComponentBinding {
+                alias: "component-b".to_owned(),
+                path: "mock:component-b".to_owned(),
+                device: ComponentPlacement::Cpu,
+                qos: RouteQos::Batch,
+                dynamic: false,
+                hardware_strategy: Default::default(),
+            },
+        ];
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect("two Components on the same route should load");
 
-        match gate.acquire() {
-            Err(UpstreamAdmissionError::QueueFull { waiting, limit }) => {
-                assert_eq!(waiting, 1);
-                assert_eq!(limit, 1);
-            }
-            _ => panic!("expected queue-full admission error"),
-        }
-
-        assert_eq!(gate.in_flight(), 1);
-        gate.release();
-        assert_eq!(gate.in_flight(), 0);
+        assert_eq!(
+            runtime.loaded_component_aliases(),
+            vec!["component-a".to_owned(), "component-b".to_owned()]
+        );
+        assert_eq!(
+            runtime
+                .compute_component_prompt("component-a", "ping")
+                .expect("component-a should invoke"),
+            MOCK_INFERENCE_RESPONSE
+        );
+        assert_eq!(
+            runtime
+                .compute_component_prompt("component-b", "ping")
+                .expect("component-b should invoke"),
+            MOCK_INFERENCE_RESPONSE
+        );
     }
 }

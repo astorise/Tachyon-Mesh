@@ -4,7 +4,7 @@ The previous corrective change replaced Tachyon's Candle-era local inference
 path with Magnetar production execution, but the first PR implementation still
 placed too much model knowledge in `core-host`: it directly referenced a model
 family, a Hugging Face loader, tokenizer files, concrete Providers, and a
-model-specific loaded-model type.
+Component-specific loaded-model type.
 
 The final boundary is now Component-centric:
 
@@ -17,7 +17,7 @@ Tachyon core
 
 Tachyon's core must be able to carry a new inference Component without adding
 model-family Rust code, tokenizer parsing, concrete Provider construction, or
-model-specific prompt shaping to `core-host`.
+Component-specific prompt shaping to `core-host`.
 
 ## Goals / Non-Goals
 
@@ -79,7 +79,7 @@ model-specific prompt shaping to `core-host`.
    - The local Component path rejects unsupported tool/structured-output
      controls as invalid invocations rather than converting them into prompt
      instructions.
-   - Historical adapter/LoRA bindings are not local inference controls; local
+   - Historical adapter/Component training bindings are not local inference controls; local
      routes that still declare them are rejected before runtime construction.
 
 6. **Replace Candle CI proof with Magnetar Component proof.**

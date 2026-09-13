@@ -1,58 +1,60 @@
 # ai-orchestration Specification
 
 ## Purpose
-Define the Tachyon UI controls and backend validation contract for AI orchestration, accelerator selection, and KV cache configuration.
+Define the Tachyon UI controls and backend validation contract for Component-centric AI orchestration, artifact publication, accelerator placement, and KV cache visibility.
+
 ## Requirements
+
 ### Requirement: AI Orchestration Panel
-The Tachyon UI shell SHALL expose a `<tachyon-ai-panel>` web component for configuring runtime-backed AI manifest fields through the shared dashboard base. The AI Orchestration view SHALL also host the `<tachyon-model-upload-panel>` control for uploading model files (see `ai-model-upload-ui`).
+The Tachyon UI shell SHALL expose a `<tachyon-ai-panel>` web component for configuring runtime-backed AI manifest fields through the shared dashboard base. The AI Orchestration view SHALL host artifact upload controls for staging inference Component artifacts and component payload bundles without making Tachyon parse or classify component formats.
 
 #### Scenario: Operator adjusts KV cache
 - **WHEN** the operator moves the KV cache slider
 - **THEN** the panel updates the visible cache value immediately without a backend round trip
 
 #### Scenario: Operator applies AI KV-cache configuration
-- **WHEN** the operator submits the AI panel with available model aliases
+- **WHEN** the operator submits the AI panel with available Component aliases
 - **THEN** the panel reads the active manifest through `get_manifest_config`
-- **AND** writes one `kv_caches` entry per available model alias without overwriting unrelated cache entries
+- **AND** writes one `kv_caches` entry per available Component alias without overwriting unrelated cache entries
 - **AND** applies the updated manifest through `apply_manifest_config`
-- **AND** the panel shows a feedback message explaining that experimental model controls are not runtime manifest fields until a matching `IntegrityConfig` field exists
+- **AND** the panel shows feedback that execution-specific component controls belong to the selected Component or Magnetar contract, not to Tachyon runtime manifest fields
 
-#### Scenario: AI view exposes the model-upload panel
-- **WHEN** the AI Orchestration view is rendered (with `has_ai` true)
-- **THEN** the `<tachyon-model-upload-panel>` control is present for uploading a model file
+#### Scenario: AI view exposes artifact upload
+- **WHEN** the AI Orchestration view is rendered with AI support enabled
+- **THEN** it exposes controls for uploading or selecting Component/artifact bundles
 
-### Requirement: AI Panel Hardware Strategy Bindings
-The Tachyon AI panel SHALL expose each route model binding from the active manifest and let operators configure the binding's `hardware_strategy` fields without using `ui_configurations` overlays.
+### Requirement: AI Panel Placement Bindings
+The Tachyon AI panel SHALL expose each route inference Component binding from the active manifest and let operators configure only generic placement fields that Tachyon owns.
 
-#### Scenario: Operator lists manifest model hardware bindings
+#### Scenario: Operator lists manifest Component placement bindings
 - **WHEN** the AI panel loads
 - **THEN** it reads the active manifest through `get_manifest_config`
-- **AND** lists every `routes[].models[]` binding that has an alias
-- **AND** it shows the cluster GPU count from `get_cluster_hardware_summary` as placement context
+- **AND** lists every `routes[].inference_components[]` binding that has an alias
+- **AND** it shows the cluster accelerator summary from `get_cluster_hardware_summary` as placement context
 
-#### Scenario: Operator applies a model hardware strategy
-- **WHEN** the operator edits a model binding's distribution mode, device IDs, stage ranges, expert map, pipeline depth, paged attention, CUDA graph decode, FlashInfer attention, prefill chunk tokens, or speculative draft settings
-- **THEN** the panel mutates only that binding's `models[].hardware_strategy` field in the active manifest
+#### Scenario: Operator applies Component placement
+- **WHEN** the operator edits a Component binding's accelerator placement, device IDs, QoS, or memory budget
+- **THEN** the panel mutates only Tachyon-owned placement fields on that `routes[].inference_components[]` entry
 - **AND** it applies the updated manifest through `apply_manifest_config`
-- **AND** it does not call `apply_configuration` or persist an AI payload under `ui_configurations`
+- **AND** it does not write component-format, tokenizer, layer topology, speculative decode, CUDA graph, or Provider-specific execution fields
 
-#### Scenario: Runtime rejects an unsupported hardware strategy
-- **WHEN** `apply_manifest_config` rejects a `hardware_strategy` because the selected runtime path is not available
+#### Scenario: Runtime rejects unsupported placement
+- **WHEN** `apply_manifest_config` rejects a placement because the selected Component or Magnetar provider cannot satisfy it
 - **THEN** the AI panel displays the returned rejection message in its feedback area
 
 ### Requirement: Hardware Accelerator Panel
-The Tachyon UI shell SHALL expose a `<tachyon-hardware-panel>` web component for live hardware and VRAM visibility. Hardware strategy edits SHALL live in the AI panel on `routes[].models[].hardware_strategy`.
+The Tachyon UI shell SHALL expose a `<tachyon-hardware-panel>` web component for live hardware and memory visibility. Placement edits SHALL live in the AI panel on `routes[].inference_components[]` and SHALL remain generic.
 
 #### Scenario: Operator inspects hardware status
 - **WHEN** the Hardware panel loads
 - **THEN** it reads live hardware status and metrics
-- **AND** it does not submit a `config-ai` payload
+- **AND** it does not submit a separate `config-ai` payload
 
 ### Requirement: AI runtime configuration validation follows IntegrityConfig schema
 The Tauri backend SHALL validate AI runtime configuration through the `IntegrityConfig` manifest apply path rather than a separate `config-ai` payload command.
 
 #### Scenario: Valid AI manifest applies
-- **WHEN** the backend receives an updated manifest containing valid `kv_caches` or model `hardware_strategy` fields
+- **WHEN** the backend receives an updated manifest containing valid `kv_caches` or inference Component placement fields
 - **THEN** it validates and applies the manifest through `apply_manifest_config`
 
 #### Scenario: Legacy AI payload command is absent
@@ -60,45 +62,27 @@ The Tauri backend SHALL validate AI runtime configuration through the `Integrity
 - **THEN** it does not call a legacy domain payload command
 - **AND** no AI payload is persisted under `ui_configurations`
 
-### Requirement: Dynamic VRAM TTL From Time-Series Heuristics
-The model broker SHALL calculate a dynamic volatile VRAM TTL from tenant prompt-history density for the current hour.
+### Requirement: Component registry WIT contract
+Tachyon Mesh SHALL define Component/artifact registry contracts that expose alias, engine, placement, availability, and status metadata for locally available inference Components without exposing Component-native loading or generation APIs from core.
 
-#### Scenario: High follow-up probability extends volatile TTL
-- **GIVEN** tenant prompt history shows a follow-up probability greater than `0.8`
-- **WHEN** a prompt finishes
-- **THEN** the broker SHALL select a volatile VRAM TTL of `1800` seconds
+#### Scenario: Registry exposes available Components
+- **GIVEN** a guest needs the local inference inventory
+- **WHEN** it reads the shared Component registry
+- **THEN** it receives Component records with alias, engine, resource requirement, status, and artifact path metadata
 
-#### Scenario: Standard follow-up probability keeps default TTL
-- **GIVEN** tenant prompt history shows a follow-up probability less than or equal to `0.8`
-- **WHEN** a prompt finishes
-- **THEN** the broker SHALL select the standard volatile VRAM TTL of `300` seconds
+### Requirement: OpenAI artifact listing
+The `guest-openai` user FaaS SHALL serve `/ai/v1/components` by reading the `ai-components-registry` `kv-partition` table directly and transforming each Tachyon Component record into an OpenAI-compatible component object. It SHALL NOT call a separate core Component registry FaaS.
 
-### Requirement: AI model registry WIT contract
-Tachyon Mesh SHALL define a `wit/ai/model-registry.wit` contract that exposes a `list-models` function returning model alias, engine, VRAM requirement, and status metadata for locally available inference models.
-
-#### Scenario: Registry exposes available models
-- **GIVEN** a system FaaS needs the local model inventory
-- **WHEN** it calls the model registry `list-models` function
-- **THEN** it receives a list of model records with alias, engine, VRAM requirement, and status fields
-
-### Requirement: OpenAI adapter model listing
-
-The `guest-openai` user FaaS SHALL serve `/ai/v1/models` by reading the `ai-models-registry` `kv-partition` table directly and transforming each Tachyon model record into an OpenAI-compatible model object. It SHALL NOT call a separate registry FaaS to obtain the model list.
-
-#### Scenario: Client lists OpenAI-compatible models
-
-- **GIVEN** the `ai-models-registry` table contains at least one available model
-- **WHEN** an authenticated client requests `/ai/v1/models`
+#### Scenario: Client lists OpenAI-compatible components
+- **GIVEN** the `ai-components-registry` table contains at least one available Component
+- **WHEN** an authenticated client requests `/ai/v1/components`
 - **THEN** `guest-openai` returns an OpenAI-compatible JSON response with `object: "list"` and a `data` array
-- **AND** each item includes an `id`, `object: "model"`, and `owned_by: "tachyon-mesh"`
+- **AND** each item includes an `id`, `object: "component"`, and `owned_by: "tachyon-mesh"`
 
-### Requirement: OpenAI adapter scope enforcement
-
-The OpenAI-compatible adapter SHALL require the requesting identity to have the `ai:model:read` scope before serving model registry data.
+### Requirement: OpenAI artifact scope enforcement
+The OpenAI-compatible artifact SHALL require the requesting identity to have the `ai:component:read` scope before serving OpenAI-compatible listing data.
 
 #### Scenario: Missing scope is rejected
-
-- **GIVEN** a client identity lacks the `ai:model:read` scope
-- **WHEN** it requests `/ai/v1/models`
-- **THEN** the adapter rejects the request without exposing model metadata
-
+- **GIVEN** a client identity lacks the `ai:component:read` scope
+- **WHEN** it requests `/ai/v1/components`
+- **THEN** the artifact rejects the request without exposing registry metadata

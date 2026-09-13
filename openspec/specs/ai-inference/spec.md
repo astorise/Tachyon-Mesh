@@ -73,7 +73,7 @@ implementation, or model instance type carried by the Component.
 - **WHEN** a route with local or dynamic AI bindings declares a historical
   adapter field
 - **THEN** Tachyon rejects that local inference runtime configuration
-- **AND** adapter or LoRA execution is not emulated by Tachyon core
+- **AND** adapter or Component training execution is not emulated by Tachyon core
 
 #### Scenario: Streaming is delegated to Magnetar Component events
 - **WHEN** a local request uses streaming
@@ -86,7 +86,7 @@ implementation, or model instance type carried by the Component.
 ### Requirement: Active WIT inference surface remains Component-scoped
 The public `wit/ai/inference.wit` contract SHALL expose only the local
 inference request/response function needed by Tachyon's Magnetar-backed
-Component runtime. Historical LoRA adapter injection, per-call layer-wise memory
+Component runtime. Historical Component training adapter injection, per-call layer-wise memory
 profiles, handle-based layer execution, local multi-device topology validation,
 and model-format-specific controls SHALL NOT remain in the active inference WIT
 package.
