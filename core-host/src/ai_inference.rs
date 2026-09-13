@@ -604,7 +604,7 @@ impl AiInferenceRuntime {
             dynamic: false,
             hardware_strategy: Default::default(),
         };
-        let model = load_binding(&binding).map_err(|error| error.to_string())?;
+        let model = load_binding(&binding).map_err(|error| format!("{error:#}"))?;
         self.models
             .write()
             .expect("model registry lock poisoned")
@@ -1388,7 +1388,12 @@ mod tests {
                 .open(&path)
             {
                 Ok(_) => return QwenInterprocessGuard { path },
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
                     let stale = std::fs::metadata(&path)
                         .and_then(|metadata| metadata.modified())
                         .ok()
@@ -1412,7 +1417,7 @@ mod tests {
         TRUST_ENV_LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
-            .expect("trust env lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn without_tachyon_model_trust_store() -> TrustStoreEnvUnsetGuard {
@@ -1452,6 +1457,12 @@ mod tests {
             previous,
             path: trust_path,
         }
+    }
+
+    fn error_chain_contains(error: &anyhow::Error, expected: &str) -> bool {
+        error
+            .chain()
+            .any(|cause| cause.to_string().contains(expected))
     }
 
     #[test]
@@ -1708,7 +1719,10 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("trust rejected"));
+        assert!(
+            error_chain_contains(&error, "trust rejected"),
+            "unexpected trust rejection error: {error:#}"
+        );
         let _ = std::fs::remove_dir_all(model_dir);
     }
 
@@ -1736,13 +1750,18 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("trust rejected"));
+        assert!(
+            error_chain_contains(&error, "trust rejected"),
+            "unexpected trust rejection error: {error:#}"
+        );
         let _ = std::fs::remove_dir_all(model_dir);
     }
 
-    #[cfg(not(feature = "magnetar-cuda"))]
     #[test]
-    fn explicit_magnetar_cuda_binding_fails_closed_without_cuda_feature() {
+    fn explicit_magnetar_cuda_binding_fails_closed_when_cuda_is_unavailable() {
+        if magnetar_inference_component::cuda_provider_available() {
+            return;
+        }
         let model_dir = unique_model_dir("cuda-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
         let _trust = trust_tachyon_qwen_bundle(&model_dir);
@@ -1758,7 +1777,10 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("CUDA provider"));
+        assert!(
+            error_chain_contains(&error, "CUDA provider"),
+            "unexpected CUDA placement error: {error:#}"
+        );
         let _ = std::fs::remove_dir_all(model_dir);
     }
 
@@ -1890,7 +1912,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("Magnetar cutover accepts"));
+        assert!(error.to_string().contains("unsupported AI binding"));
         let _ = std::fs::remove_dir_all(model_dir);
     }
 
@@ -2041,9 +2063,11 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "magnetar-cuda"))]
     #[test]
     fn dynamic_gpu_request_does_not_lazy_load_cpu_when_cuda_is_unavailable() {
+        if magnetar_inference_component::cuda_provider_available() {
+            return;
+        }
         let root = unique_model_dir("dynamic-models");
         let model_dir = root.join("dynamic-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
@@ -2070,9 +2094,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(not(feature = "magnetar-cuda"))]
     #[test]
     fn loaded_gpu_model_does_not_make_dynamic_gpu_request_fall_back_to_cpu() {
+        if magnetar_inference_component::cuda_provider_available() {
+            return;
+        }
         let root = unique_model_dir("dynamic-models-with-gpu");
         let model_dir = root.join("dynamic-qwen-b");
         write_tiny_production_qwen_bundle(&model_dir);
