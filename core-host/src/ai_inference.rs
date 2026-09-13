@@ -19,7 +19,7 @@ use crate::{IntegrityConfig, IntegrityModelBinding, RouteQos};
 
 pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
 pub(crate) use magnetar_runtime::MAGNETAR_PATH_PREFIX;
-const MODEL_META_JSON: &str = ".tachyon-model.json";
+const COMPONENT_META_JSON: &str = ".tachyon-component.json";
 const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
 const UPSTREAM_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -543,6 +543,20 @@ impl AiInferenceRuntime {
         let mut models = HashMap::new();
         let mut sealed_aliases = HashSet::new();
         for route in &config.routes {
+            if route
+                .adapter_id
+                .as_deref()
+                .is_some_and(|adapter_id| !adapter_id.trim().is_empty())
+                && route
+                    .models
+                    .iter()
+                    .any(|binding| binding.dynamic || !binding_runs_upstream(binding))
+            {
+                return Err(anyhow!(
+                    "Integrity Validation Failed: route `{}` uses legacy adapter binding with local AI inference; adapters must be implemented by the selected Magnetar Component",
+                    route.path
+                ));
+            }
             for binding in &route.models {
                 if !sealed_aliases.insert(binding.alias.clone()) {
                     return Err(anyhow!(
@@ -692,22 +706,15 @@ impl AiInferenceRuntime {
         alias: &str,
         prompt: &str,
     ) -> std::result::Result<String, GenerationError> {
-        self.compute_component_prompt_with_adapter(alias, prompt, None)
+        self.compute_component_prompt_generation(alias, prompt)
             .map(|generation| generation.text)
     }
 
-    pub(crate) fn compute_component_prompt_with_adapter(
+    pub(crate) fn compute_component_prompt_generation(
         &self,
         alias: &str,
         prompt: &str,
-        adapter_id: Option<&str>,
     ) -> std::result::Result<ComponentGeneration, GenerationError> {
-        if let Some(adapter_id) = adapter_id {
-            validate_lora_adapter_id(adapter_id).map_err(GenerationError::local)?;
-            return Err(GenerationError::invalid_request(format!(
-                "LoRA adapter `{adapter_id}` is not supported by the Magnetar cutover"
-            )));
-        }
         self.ensure_model_loaded(alias, AcceleratorKind::Cpu)
             .map_err(GenerationError::local)?;
         let model = self
@@ -767,15 +774,8 @@ impl AiInferenceRuntime {
         &self,
         alias: &str,
         prompt: &str,
-        adapter_id: Option<&str>,
         sink: &mut dyn StreamSink,
     ) -> std::result::Result<StreamOutcome, GenerationError> {
-        if let Some(adapter_id) = adapter_id {
-            validate_lora_adapter_id(adapter_id).map_err(GenerationError::local)?;
-            return Err(GenerationError::invalid_request(format!(
-                "LoRA adapter `{adapter_id}` is not supported by the Magnetar cutover"
-            )));
-        }
         self.ensure_model_loaded(alias, AcceleratorKind::Cpu)
             .map_err(GenerationError::local)?;
         let model = self
@@ -1075,7 +1075,7 @@ fn execute_model(
     }
 }
 
-pub(crate) fn detect_tool_call_parser(path: &Path) -> Option<&'static str> {
+pub(crate) fn declared_tool_call_metadata(path: &Path) -> Option<String> {
     read_declared_tool_call_parser(path)
 }
 
@@ -1085,20 +1085,11 @@ struct ModelMeta {
     tool_call_parser: Option<String>,
 }
 
-fn read_declared_tool_call_parser(root: &Path) -> Option<&'static str> {
-    let raw = std::fs::read(root.join(MODEL_META_JSON)).ok()?;
+fn read_declared_tool_call_parser(root: &Path) -> Option<String> {
+    let raw = std::fs::read(root.join(COMPONENT_META_JSON)).ok()?;
     let meta: ModelMeta = serde_json::from_slice(&raw).ok()?;
-    declared_tool_call_parser(meta.tool_call_parser.as_deref()?)
-}
-
-fn declared_tool_call_parser(value: &str) -> Option<&'static str> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "json" => Some("json"),
-        "qwen" => Some("qwen"),
-        "qwen_coder" => Some("qwen_coder"),
-        "mistral" => Some("mistral"),
-        _ => None,
-    }
+    let value = meta.tool_call_parser?.trim().to_owned();
+    (!value.is_empty()).then_some(value)
 }
 
 pub(crate) fn assert_no_credential_collisions<'a>(
@@ -1121,20 +1112,6 @@ pub(crate) fn assert_no_credential_collisions<'a>(
                 "multiple upstream aliases resolve to credential environment variable `{env_name}`"
             ));
         }
-    }
-    Ok(())
-}
-
-fn validate_lora_adapter_id(adapter_id: &str) -> std::result::Result<(), String> {
-    if adapter_id.is_empty()
-        || adapter_id.contains("..")
-        || adapter_id.contains('/')
-        || adapter_id.contains('\\')
-        || adapter_id.ends_with(".safetensors")
-    {
-        return Err(format!(
-            "adapter id `{adapter_id}` is not a valid identifier: use the adapter name without path separators, traversal, or extension"
-        ));
     }
     Ok(())
 }
@@ -1196,6 +1173,16 @@ mod tests {
 
     fn write_tiny_production_qwen_bundle(path: &Path) {
         fs::create_dir_all(path).expect("fixture dir should be created");
+        fs::write(
+            path.join("qwen-real.component.wasm"),
+            include_bytes!("../../vendor/Magnetar/magnetar-runtime/fixtures/components/qwen-real.component.wasm"),
+        )
+        .expect("Component artifact should be written");
+        fs::write(
+            path.join("qwen-real.component.wasm.magnetar-component.yaml"),
+            include_bytes!("../../vendor/Magnetar/magnetar-runtime/fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"),
+        )
+        .expect("Component artifact manifest should be written");
         let config_json = format!(
             r#"{{
                 "architectures": ["Qwen2ForCausalLM"],
@@ -1363,9 +1350,12 @@ mod tests {
     impl Drop for TrustStoreEnvGuard {
         fn drop(&mut self) {
             if let Some(previous) = self.previous.take() {
-                std::env::set_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV, previous);
+                std::env::set_var(
+                    magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
+                    previous,
+                );
             } else {
-                std::env::remove_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
+                std::env::remove_var(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
             }
             let _ = std::fs::remove_file(&self.path);
         }
@@ -1374,7 +1364,10 @@ mod tests {
     impl Drop for TrustStoreEnvUnsetGuard {
         fn drop(&mut self) {
             if let Some(previous) = self.previous.take() {
-                std::env::set_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV, previous);
+                std::env::set_var(
+                    magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
+                    previous,
+                );
             }
         }
     }
@@ -1420,11 +1413,11 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn without_tachyon_model_trust_store() -> TrustStoreEnvUnsetGuard {
+    fn without_tachyon_component_trust_store() -> TrustStoreEnvUnsetGuard {
         let qwen_lock = qwen_interprocess_lock();
         let lock = trust_env_lock();
-        let previous = std::env::var_os(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
-        std::env::remove_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
+        let previous = std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+        std::env::remove_var(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
         TrustStoreEnvUnsetGuard {
             _qwen_lock: qwen_lock,
             _lock: lock,
@@ -1432,12 +1425,13 @@ mod tests {
         }
     }
 
-    fn trust_tachyon_qwen_bundle(path: &Path) -> TrustStoreEnvGuard {
+    fn trust_tachyon_component_artifact(path: &Path) -> TrustStoreEnvGuard {
         let qwen_lock = qwen_interprocess_lock();
         let lock = trust_env_lock();
         let digest = magnetar_inference_component::local_bundle_manifest_digest(path)
             .expect("fixture should ingest before writing Tachyon trust policy");
-        let trust_path = unique_model_dir("qwen-trust-policy").join("tachyon-model-trust.json");
+        let trust_path =
+            unique_model_dir("component-trust-policy").join("tachyon-component-trust.json");
         std::fs::create_dir_all(
             trust_path
                 .parent()
@@ -1449,8 +1443,11 @@ mod tests {
             format!(r#"{{"trusted_digests":["{digest}"]}}"#),
         )
         .expect("trust sidecar should be written");
-        let previous = std::env::var_os(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
-        std::env::set_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV, &trust_path);
+        let previous = std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+        std::env::set_var(
+            magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
+            &trust_path,
+        );
         TrustStoreEnvGuard {
             _qwen_lock: qwen_lock,
             _lock: lock,
@@ -1469,7 +1466,7 @@ mod tests {
     fn magnetar_qwen_binding_generates_through_real_production_cpu_path() {
         let model_dir = unique_model_dir("qwen-runtime");
         write_tiny_production_qwen_bundle(&model_dir);
-        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
             alias: "qwen2_5".to_owned(),
@@ -1497,7 +1494,7 @@ mod tests {
     fn magnetar_qwen_reuses_resident_model_instance_across_requests() {
         let model_dir = unique_model_dir("qwen-resident-runtime");
         write_tiny_production_qwen_bundle(&model_dir);
-        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
             alias: "qwen_resident".to_owned(),
@@ -1535,7 +1532,7 @@ mod tests {
     fn magnetar_qwen_concurrent_requests_share_one_resident_model() {
         let model_dir = unique_model_dir("qwen-resident-concurrent-runtime");
         write_tiny_production_qwen_bundle(&model_dir);
-        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
             alias: "qwen_concurrent".to_owned(),
@@ -1591,7 +1588,7 @@ mod tests {
     fn magnetar_qwen_binding_maps_openai_messages_to_chat_prompt_input() {
         let model_dir = unique_model_dir("qwen-chat-runtime");
         write_tiny_production_qwen_bundle(&model_dir);
-        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
             alias: "qwen2_5".to_owned(),
@@ -1622,7 +1619,7 @@ mod tests {
     fn magnetar_streaming_stops_when_downstream_sink_disconnects() {
         let model_dir = unique_model_dir("qwen-stream-cancel");
         write_tiny_production_qwen_bundle(&model_dir);
-        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
             alias: "qwen-stream".to_owned(),
@@ -1660,7 +1657,6 @@ mod tests {
             .stream_component_prompt(
                 "qwen-stream",
                 r#"{"prompt":"hi","max_new_tokens":16}"#,
-                None,
                 &mut sink,
             )
             .expect("downstream stop should cancel Magnetar streaming cleanly");
@@ -1681,7 +1677,7 @@ mod tests {
 
     #[test]
     fn explicit_magnetar_binding_rejects_non_qwen_model_directory() {
-        let _trust = without_tachyon_model_trust_store();
+        let _trust = without_tachyon_component_trust_store();
         let model_dir = unique_model_dir("non-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
         std::fs::write(model_dir.join("config.json"), br#"{"model_type":"llama"}"#)
@@ -1704,7 +1700,7 @@ mod tests {
 
     #[test]
     fn explicit_magnetar_binding_rejects_untrusted_qwen_bundle() {
-        let _trust = without_tachyon_model_trust_store();
+        let _trust = without_tachyon_component_trust_store();
         let model_dir = unique_model_dir("untrusted-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
         let error = match load_binding(&IntegrityModelBinding {
@@ -1727,16 +1723,45 @@ mod tests {
     }
 
     #[test]
+    fn explicit_magnetar_binding_requires_external_component_artifact() {
+        let _trust = without_tachyon_component_trust_store();
+        let model_dir = unique_model_dir("missing-component-artifact");
+        write_tiny_production_qwen_bundle(&model_dir);
+        std::fs::remove_file(model_dir.join("qwen-real.component.wasm"))
+            .expect("component artifact should be removable");
+
+        let error = match load_binding(&IntegrityModelBinding {
+            alias: "component-required".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ModelDevice::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }) {
+            Ok(_) => panic!("Magnetar binding must not use an implicit Component artifact"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("must contain an explicit `*.component.wasm` artifact"),
+            "unexpected missing Component error: {error:#}"
+        );
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
     fn qwen_bundle_cannot_self_authorize_with_embedded_trust_policy() {
         let model_dir = unique_model_dir("self-trusting-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
-        let _trust = trust_tachyon_qwen_bundle(&model_dir);
-        let trust_path = std::env::var_os(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV)
+        let _trust = trust_tachyon_component_artifact(&model_dir);
+        let trust_path = std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV)
             .map(PathBuf::from)
             .expect("test trust policy should be configured");
-        std::fs::copy(&trust_path, model_dir.join(".tachyon-model-trust.json"))
+        std::fs::copy(&trust_path, model_dir.join(".tachyon-component-trust.json"))
             .expect("embedded fake trust policy should be copied");
-        std::env::remove_var(magnetar_runtime::TACHYON_MODEL_TRUST_STORE_ENV);
+        std::env::remove_var(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
 
         let error = match load_binding(&IntegrityModelBinding {
             alias: "qwen-self-trusting".to_owned(),
@@ -1764,7 +1789,7 @@ mod tests {
         }
         let model_dir = unique_model_dir("cuda-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
-        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_component_artifact(&model_dir);
         let error = match load_binding(&IntegrityModelBinding {
             alias: "qwen-cuda".to_owned(),
             path: format!("magnetar:{}", model_dir.display()),
@@ -1804,7 +1829,7 @@ mod tests {
         );
         let model_dir = unique_model_dir("cuda-qwen-runtime");
         write_tiny_production_qwen_bundle(&model_dir);
-        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
             alias: "qwen-cuda".to_owned(),
@@ -1845,7 +1870,7 @@ mod tests {
         );
         let model_dir = unique_model_dir("cuda-qwen-multitoken");
         write_tiny_production_qwen_bundle(&model_dir);
-        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
             alias: "qwen-cuda".to_owned(),
@@ -1862,10 +1887,9 @@ mod tests {
         })
         .expect("real Magnetar production Qwen CUDA bundle should load");
         let generation = runtime
-            .compute_component_prompt_with_adapter(
+            .compute_component_prompt_generation(
                 "qwen-cuda",
                 r#"{"prompt":"hi","max_new_tokens":16}"#,
-                None,
             )
             .expect("real Magnetar CUDA should generate multiple tokens device-resident");
 
@@ -1887,7 +1911,7 @@ mod tests {
 
     #[test]
     fn local_non_qwen_huggingface_style_directory_is_rejected() {
-        let _trust = without_tachyon_model_trust_store();
+        let _trust = without_tachyon_component_trust_store();
         let model_dir = unique_model_dir("non-qwen-hf");
         std::fs::create_dir_all(&model_dir).expect("fixture dir should be created");
         std::fs::write(model_dir.join("config.json"), br#"{"model_type":"llama"}"#)
@@ -1917,10 +1941,11 @@ mod tests {
     }
 
     #[test]
-    fn buffered_generation_rejects_lora_adapter_instead_of_ignoring_it() {
-        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+    fn local_inference_route_rejects_legacy_adapter_binding() {
+        let error = match AiInferenceRuntime::from_config(&IntegrityConfig {
             routes: vec![{
                 let mut route = IntegrityRoute::user("/api/guest-ai");
+                route.adapter_id = Some("adapter-a".to_owned());
                 route.models = vec![IntegrityModelBinding {
                     alias: "mock-model".to_owned(),
                     path: "mock".to_owned(),
@@ -1932,49 +1957,12 @@ mod tests {
                 route
             }],
             ..IntegrityConfig::default_sealed()
-        })
-        .expect("runtime");
+        }) {
+            Ok(_) => panic!("legacy adapter bindings must not enter local inference runtime"),
+            Err(error) => error,
+        };
 
-        let error = runtime
-            .compute_component_prompt_with_adapter("mock-model", "hello", Some("adapter-a"))
-            .expect_err("adapter injection must not silently use the base model");
-
-        assert!(error.invalid_request);
-        assert!(error.to_string().contains("not supported"));
-    }
-
-    #[test]
-    fn streaming_generation_rejects_lora_adapter_as_invalid_request() {
-        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
-            routes: vec![{
-                let mut route = IntegrityRoute::user("/api/guest-ai");
-                route.models = vec![IntegrityModelBinding {
-                    alias: "mock-model".to_owned(),
-                    path: "mock".to_owned(),
-                    device: ModelDevice::Cpu,
-                    qos: RouteQos::Standard,
-                    dynamic: false,
-                    hardware_strategy: Default::default(),
-                }];
-                route
-            }],
-            ..IntegrityConfig::default_sealed()
-        })
-        .expect("runtime");
-        struct TestSink;
-        impl StreamSink for TestSink {
-            fn emit(&mut self, _event: StreamEvent<'_>) -> StreamControl {
-                StreamControl::Continue
-            }
-        }
-        let mut sink = TestSink;
-
-        let error = runtime
-            .stream_component_prompt("mock-model", "hello", Some("adapter-a"), &mut sink)
-            .expect_err("streaming adapter injection must be a client error");
-
-        assert!(error.invalid_request);
-        assert!(error.to_string().contains("adapter-a"));
+        assert!(error.to_string().contains("adapter"));
     }
 
     #[test]
@@ -2011,7 +1999,7 @@ mod tests {
         let root = unique_model_dir("dynamic-cpu-models");
         let model_dir = root.join("dynamic-cpu-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
-        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_component_artifact(&model_dir);
         let runtime = AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed())
             .expect("runtime")
             .with_dynamic_models_root(Some(root.clone()));
@@ -2071,7 +2059,7 @@ mod tests {
         let root = unique_model_dir("dynamic-models");
         let model_dir = root.join("dynamic-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
-        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_component_artifact(&model_dir);
         let runtime = AiInferenceRuntime::from_config(&IntegrityConfig::default_sealed())
             .expect("runtime")
             .with_dynamic_models_root(Some(root.clone()));
@@ -2102,7 +2090,7 @@ mod tests {
         let root = unique_model_dir("dynamic-models-with-gpu");
         let model_dir = root.join("dynamic-qwen-b");
         write_tiny_production_qwen_bundle(&model_dir);
-        let _trust = trust_tachyon_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_component_artifact(&model_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.models = vec![IntegrityModelBinding {
             alias: "gpu-a".to_owned(),

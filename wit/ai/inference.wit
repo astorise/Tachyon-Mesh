@@ -7,14 +7,8 @@ package tachyon:mesh@2.0.0;
 /// multi-device behavior, and Provider execution belong to Magnetar.
 interface inference {
     record inference-request {
-        /// Foundation model alias as declared in the route's `models`.
-        model: string,
-        /// UTF-8 JSON request envelope or plain prompt bytes for the selected model.
-        prompt: list<u8>,
-        /// Maximum tokens to generate.
-        max-tokens: u32,
-        /// Sampling temperature (0.0-2.0).
-        temperature: f32,
+        /// Opaque invocation payload for the Component selected by the route.
+        payload: list<u8>,
     }
 
     record inference-response {

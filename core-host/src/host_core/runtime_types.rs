@@ -145,8 +145,6 @@ pub(crate) struct ComponentHostState {
     #[cfg(feature = "ai-inference")]
     pub(crate) listable_model_aliases: BTreeSet<String>,
     #[cfg(feature = "ai-inference")]
-    pub(crate) adapter_id: Option<String>,
-    #[cfg(feature = "ai-inference")]
     pub(crate) accelerator_models: HashMap<u32, LoadedAcceleratorModel>,
     #[cfg(feature = "ai-inference")]
     pub(crate) next_accelerator_model_id: u32,

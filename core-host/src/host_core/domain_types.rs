@@ -404,65 +404,21 @@ impl ModelDevice {
 pub(crate) enum GpuDistribution {
     #[default]
     Single,
-    TensorParallelism,
-    PipelineParallelism,
-    ExpertParallelism,
 }
 
-/// Multi-accelerator execution strategy for a model binding. Mirrors the
-/// `hardware-strategy` record in `wit/config-ai.wit`. The default (`single`
-/// with empty placement lists) preserves the pre-existing single-device load
-/// path byte-for-byte and is skipped during serialization, so configs that
-/// predate this field round-trip unchanged.
+/// Generic accelerator placement strategy for a Component binding.
 #[derive(
     Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Serialize,
 )]
 pub(crate) struct HardwareStrategy {
     #[serde(default)]
     pub(crate) distribution_mode: GpuDistribution,
-    /// Device IDs participating in a tensor/pipeline/expert-parallel plan.
-    /// Empty/ignored when `distribution_mode` is `single`.
+    /// Preferred device IDs for placement. Empty leaves selection to Magnetar.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) device_ids: Vec<u32>,
-    /// For pipeline-parallelism: inclusive (start, end) layer-index range per
-    /// device, indexed by position in `device_ids`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) stage_layer_ranges: Vec<(u32, u32)>,
-    /// For expert-parallelism: (expert_id, device_ids index) placement pairs.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) expert_device_map: Vec<(u32, u32)>,
-    /// Bounded number of micro-batches kept in flight across pipeline stages.
-    /// Ignored outside `pipeline_parallelism`.
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub(crate) pipeline_depth: u32,
-    /// Request block-paged KV cache attention. This is serialized only when
-    /// explicitly enabled; the active Magnetar path rejects unsupported KV
-    /// residency modes instead of falling back to a local implementation.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub(crate) paged_attention: bool,
-    /// Request CUDA Graph capture/replay for the steady-state decode step.
-    /// The active Magnetar path accepts this only after the Provider/runtime
-    /// contract exposes a supported capture mode.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub(crate) cuda_graph_decode: bool,
-    /// Request a fused decode-attention backend. This remains fail-closed until
-    /// the active Magnetar Provider reports support for that execution mode.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub(crate) flashinfer_attention: bool,
-    /// Optional prefill chunk size in tokens. `None` uses the runtime default
-    /// (8K tokens), `Some(0)` disables chunking and processes the prompt in a
-    /// single prefill forward.
+    /// Optional memory budget Tachyon may use for placement/admission only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) prefill_chunk_tokens: Option<u32>,
-    /// Optional local draft model directory used for speculative decoding.
-    /// The active Magnetar path rejects this until draft/verify decoding is a
-    /// supported production runtime capability.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub(crate) speculative_draft_model_path: String,
-    /// Number of draft tokens proposed before target verification. `0` uses the
-    /// runtime default.
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub(crate) speculative_draft_tokens: u32,
+    pub(crate) memory_limit_mb: Option<u64>,
 }
 
 impl HardwareStrategy {
@@ -472,15 +428,7 @@ impl HardwareStrategy {
     pub(crate) fn is_single(&self) -> bool {
         self.distribution_mode == GpuDistribution::Single
             && self.device_ids.is_empty()
-            && self.stage_layer_ranges.is_empty()
-            && self.expert_device_map.is_empty()
-            && self.pipeline_depth == 0
-            && !self.paged_attention
-            && !self.cuda_graph_decode
-            && !self.flashinfer_attention
-            && self.prefill_chunk_tokens.is_none()
-            && self.speculative_draft_model_path.is_empty()
-            && self.speculative_draft_tokens == 0
+            && self.memory_limit_mb.is_none()
     }
 }
 
@@ -568,8 +516,8 @@ pub(crate) struct IntegrityRoute {
     /// of primary traffic through `system-faas-shadow-proxy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) shadow_target: Option<String>,
-    /// Tenant-specific LoRA adapter to apply on top of the route's foundation model
-    /// at inference time. Per-call overrides may be passed via the inference WIT.
+    /// Tenant key used by scheduler policies. Local inference Components do not
+    /// interpret this as an adapter or model-execution override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) adapter_id: Option<String>,
     /// When set, enables an automated canary rollout for this route. The host
@@ -1331,7 +1279,7 @@ mod hardware_strategy_tests {
     }
 
     #[test]
-    fn tensor_parallel_strategy_round_trips() {
+    fn device_affinity_strategy_round_trips() {
         let binding = IntegrityModelBinding {
             alias: "m".to_owned(),
             path: "/models/m".to_owned(),
@@ -1339,119 +1287,12 @@ mod hardware_strategy_tests {
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: HardwareStrategy {
-                distribution_mode: GpuDistribution::TensorParallelism,
                 device_ids: vec![0, 1],
-                pipeline_depth: 0,
-                paged_attention: false,
-                cuda_graph_decode: false,
-                flashinfer_attention: false,
                 ..Default::default()
             },
         };
         let json = serde_json::to_string(&binding).expect("serialize");
-        assert!(json.contains("tensor_parallelism"));
-        let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(restored, binding);
-        assert!(!restored.hardware_strategy.is_single());
-    }
-
-    #[test]
-    fn paged_attention_strategy_round_trips_and_is_not_single() {
-        let binding = IntegrityModelBinding {
-            alias: "m".to_owned(),
-            path: "/models/m".to_owned(),
-            device: ModelDevice::Cuda,
-            qos: RouteQos::Standard,
-            dynamic: false,
-            hardware_strategy: HardwareStrategy {
-                paged_attention: true,
-                ..Default::default()
-            },
-        };
-        let json = serde_json::to_string(&binding).expect("serialize");
-        assert!(json.contains("paged_attention"));
-        let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(restored, binding);
-        assert!(!restored.hardware_strategy.is_single());
-    }
-
-    #[test]
-    fn cuda_graph_decode_strategy_round_trips_and_is_not_single() {
-        let binding = IntegrityModelBinding {
-            alias: "m".to_owned(),
-            path: "/models/m".to_owned(),
-            device: ModelDevice::Cuda,
-            qos: RouteQos::Standard,
-            dynamic: false,
-            hardware_strategy: HardwareStrategy {
-                cuda_graph_decode: true,
-                ..Default::default()
-            },
-        };
-        let json = serde_json::to_string(&binding).expect("serialize");
-        assert!(json.contains("cuda_graph_decode"));
-        let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(restored, binding);
-        assert!(!restored.hardware_strategy.is_single());
-    }
-
-    #[test]
-    fn flashinfer_attention_strategy_round_trips_and_is_not_single() {
-        let binding = IntegrityModelBinding {
-            alias: "m".to_owned(),
-            path: "/models/m".to_owned(),
-            device: ModelDevice::Cuda,
-            qos: RouteQos::Standard,
-            dynamic: false,
-            hardware_strategy: HardwareStrategy {
-                flashinfer_attention: true,
-                ..Default::default()
-            },
-        };
-        let json = serde_json::to_string(&binding).expect("serialize");
-        assert!(json.contains("flashinfer_attention"));
-        let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(restored, binding);
-        assert!(!restored.hardware_strategy.is_single());
-    }
-
-    #[test]
-    fn prefill_chunk_tokens_round_trips_and_is_not_single() {
-        let binding = IntegrityModelBinding {
-            alias: "m".to_owned(),
-            path: "/models/m".to_owned(),
-            device: ModelDevice::Cpu,
-            qos: RouteQos::Standard,
-            dynamic: false,
-            hardware_strategy: HardwareStrategy {
-                prefill_chunk_tokens: Some(4096),
-                ..Default::default()
-            },
-        };
-        let json = serde_json::to_string(&binding).expect("serialize");
-        assert!(json.contains("prefill_chunk_tokens"));
-        let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(restored, binding);
-        assert!(!restored.hardware_strategy.is_single());
-    }
-
-    #[test]
-    fn speculative_draft_strategy_round_trips_and_is_not_single() {
-        let binding = IntegrityModelBinding {
-            alias: "m".to_owned(),
-            path: "/models/m".to_owned(),
-            device: ModelDevice::Cpu,
-            qos: RouteQos::Standard,
-            dynamic: false,
-            hardware_strategy: HardwareStrategy {
-                speculative_draft_model_path: "/models/m-draft".to_owned(),
-                speculative_draft_tokens: 6,
-                ..Default::default()
-            },
-        };
-        let json = serde_json::to_string(&binding).expect("serialize");
-        assert!(json.contains("speculative_draft_model_path"));
-        assert!(json.contains("speculative_draft_tokens"));
+        assert!(json.contains("device_ids"));
         let restored: IntegrityModelBinding = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored, binding);
         assert!(!restored.hardware_strategy.is_single());

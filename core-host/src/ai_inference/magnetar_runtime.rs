@@ -1,9 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use magnetar_inference_component::{
-    ComponentProviderAdvertisement, InferenceComponentPlacement, InferenceComponentSource,
-    LoadedInferenceComponent,
+    ArtifactTrustPolicy, ComponentProviderAdvertisement, InferenceComponentArtifact,
+    InferenceComponentPlacement, InferenceComponentSource, LoadedInferenceComponent,
 };
-use magnetar_runtime::model::ModelTrustStore;
 use magnetar_runtime::GenerationStreamEvent;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -11,7 +10,7 @@ use std::path::{Path, PathBuf};
 use super::{StreamControl, TokenUsage};
 
 pub(crate) const MAGNETAR_PATH_PREFIX: &str = "magnetar:";
-pub(crate) const TACHYON_MODEL_TRUST_STORE_ENV: &str = "TACHYON_MODEL_TRUST_STORE";
+pub(crate) const TACHYON_COMPONENT_TRUST_STORE_ENV: &str = "TACHYON_COMPONENT_TRUST_STORE";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProviderAdvertisement {
@@ -61,11 +60,15 @@ impl MagnetarRuntime {
             format!("tachyon:{alias}"),
             root.clone(),
         );
-        let trust_store = tachyon_model_trust_store(&root)?;
-        let component = LoadedInferenceComponent::load(alias, source, trust_store, placement)
-            .with_context(|| {
-                format!("Magnetar failed to materialize resident inference Component for `{alias}`")
-            })?;
+        let artifact = component_artifact_from_root(&root)?;
+        let trust_policy = tachyon_component_trust_policy(&root)?;
+        let component =
+            LoadedInferenceComponent::load(alias, artifact, source, trust_policy, placement)
+                .with_context(|| {
+                    format!(
+                        "Magnetar failed to materialize resident inference Component for `{alias}`"
+                    )
+                })?;
         let provider = provider_advertisement(component.provider());
 
         Ok(Some(Self {
@@ -170,12 +173,59 @@ fn magnetar_root(path: &str) -> PathBuf {
     }
 }
 
-fn tachyon_model_trust_store(root: &Path) -> Result<ModelTrustStore> {
-    let Some(trust_path) = std::env::var_os(TACHYON_MODEL_TRUST_STORE_ENV).map(PathBuf::from)
-    else {
-        return Ok(ModelTrustStore::default());
+fn component_artifact_from_root(root: &Path) -> Result<InferenceComponentArtifact> {
+    let component_paths = std::fs::read_dir(root)
+        .with_context(|| {
+            format!(
+                "failed to read Magnetar Component artifact root `{}`",
+                root.display()
+            )
+        })?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".component.wasm"))
+        })
+        .collect::<Vec<_>>();
+
+    let component_path = match component_paths.as_slice() {
+        [path] => path,
+        [] => bail!(
+            "Magnetar binding root `{}` must contain an explicit `*.component.wasm` artifact",
+            root.display()
+        ),
+        _ => bail!(
+            "Magnetar binding root `{}` must contain exactly one `*.component.wasm` artifact",
+            root.display()
+        ),
     };
-    reject_trust_store_inside_artifact(root, &trust_path)?;
+    let manifest_path = component_path.with_file_name(format!(
+        "{}.magnetar-component.yaml",
+        component_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!(
+                "invalid Component artifact path `{}`",
+                component_path.display()
+            ))?
+    ));
+    let component_bytes = std::fs::read(component_path)
+        .with_context(|| format!("failed to read `{}`", component_path.display()))?;
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .with_context(|| format!("failed to read `{}`", manifest_path.display()))?;
+    Ok(InferenceComponentArtifact::from_bytes(
+        component_bytes,
+        manifest_bytes,
+    ))
+}
+
+fn tachyon_component_trust_policy(root: &Path) -> Result<ArtifactTrustPolicy> {
+    let Some(trust_path) = std::env::var_os(TACHYON_COMPONENT_TRUST_STORE_ENV).map(PathBuf::from)
+    else {
+        return Ok(ArtifactTrustPolicy::default());
+    };
+    reject_trust_policy_inside_artifact(root, &trust_path)?;
     let value = serde_json::from_slice::<Value>(
         &std::fs::read(&trust_path)
             .with_context(|| format!("failed to read `{}`", trust_path.display()))?,
@@ -190,7 +240,7 @@ fn tachyon_model_trust_store(root: &Path) -> Result<ModelTrustStore> {
                 trust_path.display()
             )
         })?;
-    let mut trust_store = ModelTrustStore::default();
+    let mut trust_policy = ArtifactTrustPolicy::default();
     for digest in trusted_digests {
         let digest = digest.as_str().ok_or_else(|| {
             anyhow!(
@@ -198,24 +248,24 @@ fn tachyon_model_trust_store(root: &Path) -> Result<ModelTrustStore> {
                 trust_path.display()
             )
         })?;
-        trust_store = trust_store.trust_digest(digest);
+        trust_policy = trust_policy.trust_digest(digest);
     }
-    Ok(trust_store)
+    Ok(trust_policy)
 }
 
-fn reject_trust_store_inside_artifact(root: &Path, trust_path: &Path) -> Result<()> {
+fn reject_trust_policy_inside_artifact(root: &Path, trust_path: &Path) -> Result<()> {
     let canonical_root = root
         .canonicalize()
-        .with_context(|| format!("failed to canonicalize model root `{}`", root.display()))?;
+        .with_context(|| format!("failed to canonicalize artifact root `{}`", root.display()))?;
     let canonical_trust_path = trust_path.canonicalize().with_context(|| {
         format!(
-            "failed to canonicalize Tachyon trust store `{}`",
+            "failed to canonicalize Tachyon Component trust policy `{}`",
             trust_path.display()
         )
     })?;
     if canonical_trust_path.starts_with(&canonical_root) {
         bail!(
-            "Tachyon model trust store `{}` must be controlled outside artifact root `{}`",
+            "Tachyon Component trust policy `{}` must be controlled outside artifact root `{}`",
             canonical_trust_path.display(),
             canonical_root.display()
         );

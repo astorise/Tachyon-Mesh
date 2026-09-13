@@ -20,6 +20,13 @@ Magnetar CUDA multi-token generation proof.
 - **AND** `core-host` does not depend directly on concrete Magnetar loader or
   Provider implementation crates
 
+#### Scenario: Quality blocks model knowledge in Tachyon core
+- **WHEN** the quality job runs for a non-Renovate change
+- **THEN** it executes an AI Component boundary validation guard
+- **AND** the guard fails if production `core-host` code reintroduces
+  model-family, tokenizer, model-format, model-execution, or compiled-in
+  default Component selection knowledge
+
 #### Scenario: GPU quality proves real Magnetar CUDA selection
 - **WHEN** the `cuda-quality` job runs on the self-hosted NVIDIA runner
 - **THEN** it compiles the `magnetar-cuda` feature

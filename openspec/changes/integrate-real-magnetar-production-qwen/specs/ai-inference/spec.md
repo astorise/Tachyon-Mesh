@@ -11,13 +11,22 @@ model architecture, concrete Provider implementation, or model instance type.
 #### Scenario: Component artifact loads through Magnetar
 - **WHEN** a binding points at a Tachyon-staged `magnetar:` Component artifact
   directory
-- **THEN** Tachyon hands the authorized source root and placement constraints to
-  Magnetar
+- **THEN** Tachyon resolves exactly one explicit `*.component.wasm` artifact
+  and its Magnetar Component manifest from that directory
+- **AND** Tachyon hands the Component artifact bytes, authorized source root,
+  trust policy, and placement constraints to Magnetar
 - **AND** Magnetar owns production ingestion, tokenizer loading, manifest
   normalization, model instance materialization, execution planning, and
   Provider execution behind the Component API
 - **AND** Tachyon does not parse model payload bytes, tokenizer metadata, model
   architecture tensors, or concrete Provider artifacts itself
+
+#### Scenario: Missing Component artifact fails closed
+- **WHEN** a `magnetar:` binding root does not contain an explicit
+  `*.component.wasm` artifact and matching Component manifest
+- **THEN** Tachyon rejects the binding
+- **AND** neither Tachyon nor the generic Magnetar adapter selects a compiled-in
+  default inference Component
 
 #### Scenario: Untrusted Component artifact fails before materialization
 - **WHEN** Magnetar inspects a Component artifact whose manifest is not trusted
@@ -26,8 +35,8 @@ model architecture, concrete Provider implementation, or model instance type.
 - **AND** Tachyon reports a trust-shaped local inference error
 
 #### Scenario: Artifact-local trust policy is ignored
-- **WHEN** a Tachyon-staged artifact contains a `tachyon-model-trust.json` or
-  `.tachyon-model-trust.json` file that trusts its own manifest digest
+- **WHEN** a Tachyon-staged artifact contains trust metadata that trusts its own
+  manifest digest
 - **THEN** Tachyon still treats the artifact as untrusted unless the
   host-controlled trust store outside the artifact root trusts that digest
 - **AND** artifacts cannot self-authorize by shipping trust metadata inside the

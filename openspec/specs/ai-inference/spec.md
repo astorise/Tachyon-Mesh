@@ -19,13 +19,21 @@ implementation, or model instance type carried by the Component.
 
 #### Scenario: Tachyon loads a local inference Component
 - **WHEN** a binding points at a `magnetar:` Component artifact directory
-- **THEN** Tachyon passes the authorized Component source, placement
-  constraints, and host-controlled trust policy to Magnetar
+- **THEN** Tachyon resolves exactly one explicit `*.component.wasm` artifact
+  and its Magnetar Component manifest from that directory
+- **AND** Tachyon passes the Component artifact bytes, authorized Component
+  source, placement constraints, and host-controlled trust policy to Magnetar
 - **AND** Magnetar owns any production ingestion, tokenizer loading, manifest
   normalization, model instance materialization, execution planning, and
   Provider execution needed by that Component
 - **AND** Tachyon does not parse model payloads, tokenizer files, model
   architecture metadata, or Provider-specific artifacts itself
+
+#### Scenario: Missing Component artifacts do not fall back to defaults
+- **WHEN** a local `magnetar:` binding root has no explicit
+  `*.component.wasm` artifact and matching Component manifest
+- **THEN** Tachyon rejects the binding
+- **AND** no generic adapter selects a compiled-in model Component as a default
 
 #### Scenario: Magnetar trust policy is explicit
 - **WHEN** Magnetar inspects a Component artifact whose manifest digest is not
@@ -60,6 +68,12 @@ implementation, or model instance type carried by the Component.
   control or rejects it as an invalid request
 - **AND** Tachyon does not advertise structured-output capability unless the
   responsible inference layer guarantees or validates the result
+
+#### Scenario: Legacy adapter bindings are not local inference controls
+- **WHEN** a route with local or dynamic AI bindings declares a historical
+  adapter field
+- **THEN** Tachyon rejects that local inference runtime configuration
+- **AND** adapter or LoRA execution is not emulated by Tachyon core
 
 #### Scenario: Streaming is delegated to Magnetar Component events
 - **WHEN** a local request uses streaming

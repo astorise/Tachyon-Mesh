@@ -154,8 +154,6 @@ impl ComponentHostState {
             #[cfg(feature = "ai-inference")]
             listable_model_aliases: listable,
             #[cfg(feature = "ai-inference")]
-            adapter_id: route.adapter_id.clone(),
-            #[cfg(feature = "ai-inference")]
             accelerator_models: HashMap::new(),
             #[cfg(feature = "ai-inference")]
             next_accelerator_model_id: 1,
@@ -339,11 +337,7 @@ impl ComponentHostState {
                     "AI inference runtime is unavailable for this component",
                 )
             })?
-            .compute_component_prompt_with_adapter(
-                &loaded.alias,
-                &prompt,
-                self.adapter_id.as_deref(),
-            )
+            .compute_component_prompt_generation(&loaded.alias, &prompt)
     }
 
     /// Resolve a guest-held model handle to the alias it was opened for.
@@ -404,7 +398,6 @@ impl ComponentHostState {
     ) -> std::result::Result<StreamedGeneration, ai_inference::GenerationError> {
         let loaded = self.resolve_accelerator_model(expected_accelerator, model_id)?;
         let alias = loaded.alias.clone();
-        let adapter_id = self.adapter_id.clone();
         let ai_runtime = Arc::clone(self.ai_runtime.as_ref().ok_or_else(|| {
             ai_inference::GenerationError::local(
                 "AI inference runtime is unavailable for this component",
@@ -466,12 +459,7 @@ impl ComponentHostState {
                     stalled: &generation_stalled,
                     reported_stall: false,
                 };
-                match ai_runtime.stream_component_prompt(
-                    &alias,
-                    &prompt,
-                    adapter_id.as_deref(),
-                    &mut sink,
-                ) {
+                match ai_runtime.stream_component_prompt(&alias, &prompt, &mut sink) {
                     // An absent count means the backend could not measure, and
                     // stays absent in the slot: `usage()` then reports nothing
                     // rather than zeros, which a client would read as a
@@ -3447,10 +3435,10 @@ struct ModelRegistryRecord<'a> {
     status: &'a str,
     model_path: &'a str,
     /// See the matching field on `RegistryModelInfo` in `system_storage.rs`:
-    /// `guest-openai` reads this to pick a tool-call parser instead of
-    /// pattern-matching the alias.
+    /// Tachyon publishes artifact-declared parser metadata opaquely and does
+    /// not interpret model-family dialects in core.
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_parser: Option<&'a str>,
+    tool_call_parser: Option<String>,
 }
 
 impl system_component_bindings::tachyon::mesh::model_events::Host for ComponentHostState {

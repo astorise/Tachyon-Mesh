@@ -353,14 +353,11 @@ struct RegistryModelInfo<'a> {
     /// unknown fields, so adding it does not disturb the reader.
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<&'a str>,
-    /// Tool-call dialect this checkpoint emits, resolved from its sidecar or
-    /// its chat template. `guest-openai` reads it to pick a parser instead of
-    /// pattern-matching the alias, which is what made tool calling depend on
-    /// how a model happened to be named. Absent when the model does not
-    /// declare one, or is an upstream binding (which applies its own template
-    /// and returns already-structured calls).
+    /// Opaque tool-call parser metadata declared by the artifact sidecar.
+    /// Tachyon does not interpret dialect names; `guest-openai`, Magnetar, or
+    /// the Component boundary owns that protocol decision.
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_parser: Option<&'a str>,
+    tool_call_parser: Option<String>,
     /// Set on a *reservation* row: the alias is still the manifest's, but no
     /// runtime is serving it right now. Written for the length of a hot-reload
     /// swap, and overwritten by the real row when publication follows.
@@ -383,7 +380,7 @@ struct RegistryModelInfo<'a> {
 /// classify a checkpoint with, so the field stays absent and `guest-openai`
 /// falls back to its own resolution — the same behaviour as a model that
 /// declares nothing.
-pub(crate) fn binding_tool_call_parser(path: &str) -> Option<&'static str> {
+pub(crate) fn binding_tool_call_parser(path: &str) -> Option<String> {
     let path = path.trim();
     if path == "mock" || path.starts_with("mock:") {
         return None;
@@ -396,7 +393,7 @@ pub(crate) fn binding_tool_call_parser(path: &str) -> Option<&'static str> {
         let metadata_path = path
             .strip_prefix(crate::ai_inference::MAGNETAR_PATH_PREFIX)
             .unwrap_or(path);
-        crate::ai_inference::detect_tool_call_parser(std::path::Path::new(metadata_path))
+        crate::ai_inference::declared_tool_call_metadata(std::path::Path::new(metadata_path))
     }
     #[cfg(not(feature = "ai-inference"))]
     {
@@ -414,97 +411,15 @@ const REGISTRY_SOURCE_CONFIG: &str = "config";
 /// model id — not just metadata.
 #[cfg(feature = "ai-inference")]
 fn binding_engine_label(path: &str) -> &'static str {
-    // Classify the same trimmed value `UpstreamEndpoint::parse` accepts, or a
-    // path with leading whitespace loads as a working upstream while the
-    // registry advertises it as `safetensors/<alias>`.
     let path = path.trim();
     if path.starts_with(crate::ai_inference::UPSTREAM_SCHEME) {
         "openai"
     } else if path == "mock" || path.starts_with("mock:") {
         "mock"
+    } else if path.starts_with(crate::ai_inference::MAGNETAR_PATH_PREFIX) {
+        "magnetar"
     } else {
-        // Probe the directory once and classify by what is actually in it. The
-        // label is part of the public model id (`{engine}/{alias}`), so an
-        // ONNX embedding directory advertised as `safetensors` gives clients
-        // wrong format metadata.
-        // The sidecar wins, because `resolve_model_format` treats it as
-        // authoritative when loading. Probing extensions first made the public
-        // `{engine}/{alias}` id disagree with the backend actually selected —
-        // a directory declaring `safetensors` while still holding a stale
-        // `.gguf` advertised itself as `gguf/<alias>` and then loaded
-        // safetensors.
-        let mut has_gguf = false;
-        let mut has_onnx = false;
-        if let Ok(entries) = std::path::Path::new(path).read_dir() {
-            for entry in entries.flatten() {
-                match entry.path().extension().and_then(|ext| ext.to_str()) {
-                    Some(ext) if ext.eq_ignore_ascii_case("gguf") => has_gguf = true,
-                    Some(ext) if ext.eq_ignore_ascii_case("onnx") => has_onnx = true,
-                    _ => {}
-                }
-            }
-        }
-        // ONNX outranks the sidecar, because the loader never asks the sidecar
-        // about it. The ONNX embedding probe runs first and resolves
-        // its file by `model_file`, then `model.onnx`, then any `.onnx` in the
-        // directory — the declared format is consulted nowhere in that path. A
-        // directory declaring `safetensors` beside a usable ONNX therefore
-        // loaded the embedding backend while advertising `safetensors/<alias>`,
-        // and the label is half the public `{engine}/{alias}` id, not just
-        // metadata.
-        //
-        // "Usable" is that runtime's own bar: without `tokenizer.json` it
-        // declines and the next probe takes over, so the declaration is honest
-        // again and wins below.
-        if has_onnx && std::path::Path::new(path).join("tokenizer.json").is_file() {
-            return "onnx";
-        }
-        if let Some(declared) = declared_model_format(path) {
-            return declared;
-        }
-        // ONNX first, because that is the order the host probes in: the ONNX
-        // embedding loader runs before the GGUF
-        // runtime and accepts a bare `.onnx` file with no sidecar. Preferring
-        // GGUF here labelled a directory `gguf/<alias>` while requests for it
-        // executed the ONNX embedding backend — and the label is half the
-        // public `{engine}/{alias}` id, not just metadata.
-        match (has_onnx, has_gguf) {
-            (true, _) => "onnx",
-            (false, true) => "gguf",
-            (false, false) => "safetensors",
-        }
-    }
-}
-
-/// The format a model directory declares in its `.tachyon-model.json` sidecar,
-/// when it declares one this publisher can name.
-///
-/// Gated with its only caller: `binding_engine_label` classifies manifest
-/// bindings, which only exist on an `ai-inference` build, and CI compiles the
-/// default build with `-D dead_code`.
-#[cfg(feature = "ai-inference")]
-fn declared_model_format(path: &str) -> Option<&'static str> {
-    #[derive(serde::Deserialize)]
-    struct Sidecar {
-        #[serde(default)]
-        format: String,
-    }
-
-    let raw = fs::read(std::path::Path::new(path).join(".tachyon-model.json")).ok()?;
-    let sidecar: Sidecar = serde_json::from_slice(&raw).ok()?;
-    match sidecar.format.trim().to_ascii_lowercase().as_str() {
-        "gguf" => Some("gguf"),
-        "safetensors" => Some("safetensors"),
-        // Omitting this let a directory declaring ONNX but still holding a
-        // stale `.gguf` fall through to extension probing, which gives GGUF
-        // precedence — while the loader tries the embedding runtime first and
-        // honours the sidecar. The row then advertised `gguf/<alias>` for a
-        // backend that is ONNX.
-        "onnx" => Some("onnx"),
-        // Anything else — absent, empty, or a value the loader would itself
-        // reject — falls through to probing, which is what happened before the
-        // sidecar existed.
-        _ => None,
+        "local"
     }
 }
 
@@ -1029,8 +944,9 @@ fn stored_row_still_current(core_store: &crate::store::CoreStore, alias: &str, p
     // `toolCallParser`. Reading the Rust field name here would have found
     // nothing every time and withdrawn every parser-declaring binding on every
     // reload — a silent availability cost, in the code meant to avoid one.
+    let declared_parser = binding_tool_call_parser(path);
     stored("engine").as_deref() == Some(binding_engine_label(path))
-        && stored("toolCallParser").as_deref() == binding_tool_call_parser(path)
+        && stored("toolCallParser").as_deref() == declared_parser.as_deref()
 }
 
 /// Withdraw configured rows the incoming config will not serve identically.
@@ -1459,11 +1375,10 @@ mod configured_binding_registry_tests {
         );
         assert_eq!(binding_engine_label("mock:demo"), "mock");
         assert_eq!(binding_engine_label("mock"), "mock");
-        // A directory that does not exist cannot be probed for a `.gguf`, so it
-        // falls back to the safetensors label rather than guessing.
+        assert_eq!(binding_engine_label("/models/does-not-exist"), "local");
         assert_eq!(
-            binding_engine_label("/models/does-not-exist"),
-            "safetensors"
+            binding_engine_label("magnetar:/models/component"),
+            "magnetar"
         );
     }
 
@@ -1570,7 +1485,7 @@ mod configured_binding_registry_tests {
             .expect("read")
             .expect("row");
         let entry: serde_json::Value = serde_json::from_slice(&raw).expect("json");
-        assert_eq!(entry["engine"], "safetensors");
+        assert_eq!(entry["engine"], "local");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1647,44 +1562,34 @@ mod configured_binding_registry_tests {
     }
 
     #[test]
-    fn an_onnx_sidecar_is_authoritative_over_a_stale_gguf_file() {
+    fn local_component_sidecar_does_not_change_engine_label() {
         let (_store, dir) = temp_store();
-        let model_dir = dir.join("onnx-embed");
-        fs::create_dir_all(&model_dir).expect("model dir");
+        let model_dir = dir.join("component-artifact");
+        fs::create_dir_all(&model_dir).expect("artifact dir");
         fs::write(
-            model_dir.join(".tachyon-model.json"),
-            serde_json::json!({ "format": "onnx" }).to_string(),
+            model_dir.join(".tachyon-component.json"),
+            serde_json::json!({ "tool_call_parser": "opaque-parser" }).to_string(),
         )
         .expect("sidecar");
-        // A leftover checkpoint from a previous upload. Extension probing gives
-        // GGUF precedence, but the loader tries the embedding runtime first and
-        // honours the sidecar — so the row would have advertised `gguf/<alias>`
-        // for a backend that is ONNX.
-        fs::write(model_dir.join("stale.gguf"), b"not read").expect("stale gguf");
-        fs::write(model_dir.join("model.onnx"), b"not read").expect("onnx");
 
         assert_eq!(
             binding_engine_label(model_dir.to_str().expect("utf-8 path")),
-            "onnx"
+            "local"
         );
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn sidecar_less_probing_follows_the_loaders_onnx_first_order() {
+    fn local_file_extensions_do_not_change_engine_label() {
         let (_store, dir) = temp_store();
-        let model_dir = dir.join("onnx-no-sidecar");
-        fs::create_dir_all(&model_dir).expect("model dir");
-        // No sidecar at all, and a leftover checkpoint beside the ONNX one.
-        // The host probes the embedding runtime first and it
-        // accepts a bare `.onnx`, so labelling this `gguf/<alias>` advertised a
-        // backend that would never run.
-        fs::write(model_dir.join("stale.gguf"), b"not read").expect("stale gguf");
-        fs::write(model_dir.join("model.onnx"), b"not read").expect("onnx");
+        let model_dir = dir.join("extension-noise");
+        fs::create_dir_all(&model_dir).expect("artifact dir");
+        fs::write(model_dir.join("legacy-a.gguf"), b"not read").expect("opaque file");
+        fs::write(model_dir.join("legacy-b.onnx"), b"not read").expect("opaque file");
 
         assert_eq!(
             binding_engine_label(model_dir.to_str().expect("utf-8 path")),
-            "onnx"
+            "local"
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -1741,13 +1646,13 @@ mod configured_binding_registry_tests {
         let (store, dir) = temp_store();
         let model_dir = dir.join("qwen-coder");
         std::fs::create_dir_all(&model_dir).expect("model dir");
-        let sidecar = model_dir.join(".tachyon-model.json");
+        let sidecar = model_dir.join(".tachyon-component.json");
         std::fs::write(&sidecar, br#"{"tool_call_parser":"qwen"}"#).expect("write sidecar");
 
         let path = model_dir.to_string_lossy().into_owned();
         assert_eq!(
             binding_tool_call_parser(&path),
-            Some("qwen"),
+            Some("qwen".to_owned()),
             "the sidecar is what the publisher reads the dialect from"
         );
         let config = config_with(vec![binding("qwen-coder", &path, false)]);
@@ -1784,7 +1689,7 @@ mod configured_binding_registry_tests {
         let model_dir = dir.join("local-coder");
         std::fs::create_dir_all(&model_dir).expect("model dir");
         std::fs::write(
-            model_dir.join(".tachyon-model.json"),
+            model_dir.join(".tachyon-component.json"),
             br#"{"tool_call_parser":"qwen"}"#,
         )
         .expect("metadata");
@@ -1815,7 +1720,7 @@ mod configured_binding_registry_tests {
         let model_dir = dir.join("qwen-coder");
         std::fs::create_dir_all(&model_dir).expect("model dir");
         std::fs::write(
-            model_dir.join(".tachyon-model.json"),
+            model_dir.join(".tachyon-component.json"),
             br#"{"tool_call_parser":"qwen"}"#,
         )
         .expect("write sidecar");
@@ -2086,15 +1991,12 @@ mod configured_binding_registry_tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The engine label has to name the backend that will answer.
+    /// The engine label names only Tachyon-owned routing classes.
     ///
-    /// It is half the public `{engine}/{alias}` id, so a directory advertised
-    /// as `safetensors/<alias>` while the ONNX embedding backend executes is a
-    /// listing that lies about where a prompt goes. The sidecar is
-    /// authoritative for the loaders that read it — and
-    /// the ONNX embedding probe, which runs first, never does.
+    /// Local artifact contents and sidecar hints are opaque to the registry
+    /// publisher; Magnetar or the selected Component owns format decisions.
     #[test]
-    fn a_usable_onnx_outranks_a_sidecar_the_loader_will_not_consult() {
+    fn local_artifact_label_ignores_model_format_markers() {
         let dir = std::env::temp_dir().join(format!(
             "tachyon-engine-label-{}-{}",
             std::process::id(),
@@ -2107,32 +2009,29 @@ mod configured_binding_registry_tests {
         let path = dir.to_string_lossy().to_string();
 
         fs::write(
-            dir.join(".tachyon-model.json"),
+            dir.join(".tachyon-component.json"),
             br#"{"format":"safetensors"}"#,
         )
         .expect("sidecar");
         assert_eq!(
             binding_engine_label(&path),
-            "safetensors",
-            "with nothing else to go on the declaration stands"
+            "local",
+            "component sidecar metadata must not classify the local engine"
         );
 
-        // An ONNX file alone is not enough: the embedding runtime needs a
-        // tokenizer, and without one it declines and the declaration is honest.
-        fs::write(dir.join("model.onnx"), b"not really onnx").expect("onnx");
+        // Legacy format-looking files are opaque payloads at this boundary.
+        fs::write(dir.join("model.onnx"), b"not really onnx").expect("opaque file");
         assert_eq!(
             binding_engine_label(&path),
-            "safetensors",
-            "an ONNX the embedding runtime would decline does not change what answers"
+            "local",
+            "local artifact contents must not classify the local engine"
         );
 
-        // With the tokenizer the embedding runtime claims the directory, and
-        // the label has to say so.
-        fs::write(dir.join("tokenizer.json"), b"{}").expect("tokenizer");
+        fs::write(dir.join("tokenizer.json"), b"{}").expect("opaque side file");
         assert_eq!(
             binding_engine_label(&path),
-            "onnx",
-            "the label must name the backend the loader's probe order selects"
+            "local",
+            "tokenizer-looking files remain opaque to Tachyon core"
         );
 
         let _ = fs::remove_dir_all(dir);
@@ -2521,7 +2420,7 @@ mod registry_casing_tests {
             status: "available",
             model_path: "/data/tachyon_data/models/tinyllama",
             source: None,
-            tool_call_parser: Some("qwen"),
+            tool_call_parser: Some("qwen".to_owned()),
             withdrawn: false,
         };
         let bytes = serde_json::to_vec(&info).expect("serialize registry entry");

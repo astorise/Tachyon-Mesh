@@ -13,6 +13,9 @@ semantics.
 - Replace Tachyon's model-specific Magnetar adapter boundary with a generic
   Magnetar inference Component adapter pinned through the vendored Magnetar
   submodule.
+- Resolve the inference Component as an explicit `*.component.wasm` artifact
+  from the Tachyon-staged binding root and pass that artifact to Magnetar;
+  the generic adapter no longer selects a compiled-in default Component.
 - Remove direct `core-host` dependencies on concrete Magnetar loader and
   Provider implementation crates.
 - Keep Component provenance, host-controlled trust, placement constraints, QoS,
@@ -22,8 +25,11 @@ semantics.
   generation semantics behind Magnetar.
 - Reject unsupported local tool-call and structured-output controls as invalid
   Component invocations instead of rewriting them into prompts in Tachyon core.
+- Reject historical local adapter bindings before runtime construction; adapter
+  behavior must be implemented by the selected Component/Magnetar contract.
 - Replace Candle-oriented canonical specs and GPU CI proof steps with Magnetar
-  Component CPU/GPU checks and zero-test guards.
+  Component CPU/GPU checks, zero-test guards, and an architecture guard that
+  prevents model knowledge from re-entering production `core-host` paths.
 
 ## Impact
 

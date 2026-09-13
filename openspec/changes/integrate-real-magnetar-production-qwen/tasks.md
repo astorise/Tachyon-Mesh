@@ -74,3 +74,15 @@
 - [x] 9.7 Rewrite the canonical AI inference, memory delegation, and GitHub Actions specs so Tachyon owns Component transport, trust, routing, QoS, admission, generic placement constraints, and telemetry only.
 - [x] 9.8 Add Magnetar adapter tests covering payload mapping, deadline propagation, and fail-closed tool/structured-output controls outside Tachyon core.
 - [x] 9.9 Add compile validation proving `core-host --features magnetar-cuda` resolves through the generic Component adapter.
+
+## 10. True External Component Closure
+
+- [x] 10.1 Make the inference Component an explicit runtime artifact selected outside Magnetar's model implementation.
+- [x] 10.2 Resolve the selected `*.component.wasm` and sidecar manifest from the Tachyon-staged artifact root and pass the bytes to Magnetar.
+- [x] 10.3 Remove the implicit/default Qwen Component from the generic `LoadedInferenceComponent` loading path.
+- [x] 10.4 Rename Tachyon's trust boundary to Component/artifact trust and keep host-controlled trust outside artifact roots.
+- [x] 10.5 Remove tool-call dialect interpretation from `core-host`; the registry only transports opaque Component metadata.
+- [x] 10.6 Replace the active Tachyon inference WIT payload with an opaque Component invocation contract.
+- [x] 10.7 Remove model-execution controls from active Tachyon core configuration and keep only generic placement constraints.
+- [x] 10.8 Add tests proving explicit Component artifacts are required and legacy local adapter bindings are rejected before execution.
+- [x] 10.9 Add a CI architecture guard preventing model-family, tokenizer, model-format, model-execution, and compiled-in default Component knowledge from re-entering production core paths.

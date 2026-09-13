@@ -1,104 +1,35 @@
 package tachyon:ai-config@1.1.0;
 
 interface config-ai {
-    enum engine-backend {
+    enum placement-backend {
         cpu,
         cuda,
         metal,
+        npu,
+        tpu,
         auto-detect,
     }
 
-    /// `tensor-parallelism`/`pipeline-parallelism`/`expert-parallelism` are
-    /// executable, not configuration-only. Tachyon validates requested
-    /// placement against discovered devices and delegates supported execution
-    /// to Magnetar. Unsupported placement modes fail closed instead of using a
-    /// local compatibility runtime. Real GPU execution requires the
-    /// `magnetar-cuda` build and is exercised on the CUDA CI lane.
-    enum gpu-distribution {
-        single,
-        tensor-parallelism,
-        pipeline-parallelism,
-        expert-parallelism,
-    }
-
-    enum sharing-mode {
-        isolated,
-        lora-multiplexing,
-    }
-
-    record engine-config {
-        backend: engine-backend,
-        quantization: option<string>,
-        max-context-window: u32,
-        flash-attention: bool,
-    }
-
-    record hardware-strategy {
-        multi-gpu: bool,
-        distribution-mode: gpu-distribution,
-        /// Device IDs participating in a tensor/pipeline/expert-parallel plan.
-        /// Empty/ignored when `distribution-mode` is `single`.
+    record placement-strategy {
+        backend: placement-backend,
         device-ids: list<u32>,
-        /// For pipeline-parallelism: inclusive (start, end) layer-index range
-        /// per device, indexed by position in `device-ids`.
-        stage-layer-ranges: list<tuple<u32, u32>>,
-        /// For expert-parallelism: (expert-id, device-ids index) placement pairs.
-        expert-device-map: list<tuple<u32, u32>>,
-        /// Bounded number of micro-batches kept in flight across pipeline
-        /// stages. Ignored outside `pipeline-parallelism`.
-        pipeline-depth: u32,
-        /// Request block-paged KV-cache attention. Tachyon accepts this
-        /// declarative knob only when the active runtime supports the matching
-        /// block allocator and per-sequence block table.
-        paged-attention: bool,
-        /// Request CUDA Graph capture/replay for the steady-state decode step.
-        /// Tachyon rejects this until its GPU decode loop has fixed shapes,
-        /// stable device buffers, and a Provider-supported capture path.
-        cuda-graph-decode: bool,
-        /// Request an optional fused decode-attention backend. Tachyon rejects
-        /// this until Magnetar exposes a matching Provider capability.
-        flashinfer-attention: bool,
-        /// Optional prefill chunk size in tokens. Absent uses Tachyon's
-        /// default (8192 tokens), `some(0)` disables chunked prefill.
-        prefill-chunk-tokens: option<u32>,
-        /// Optional local model directory for speculative decoding. When set,
-        /// core-host loads this draft model beside the target model and uses a
-        /// greedy propose/verify loop; unsupported request modes fall back to
-        /// the target-only decode path.
-        speculative-draft-model-path: string,
-        /// Maximum draft tokens proposed before target verification. `0` uses
-        /// the runtime default.
-        speculative-draft-tokens: u32,
+        memory-limit-mb: option<u64>,
     }
 
-    record lora-adapter {
+    record component-deployment {
         name: string,
-        asset-ref: string,
-        routing-header-key: string,
-        routing-header-value: string,
-    }
-
-    record sharing-strategy {
-        mode: sharing-mode,
-        base-model-memory-lock: bool,
-        adapters: list<lora-adapter>,
-    }
-
-    record model-deployment {
-        name: string,
-        asset-ref: string,
-        engine: engine-config,
-        strategy: hardware-strategy,
-        sharing: sharing-strategy,
+        component-ref: string,
+        artifact-ref: string,
+        placement: placement-strategy,
     }
 
     record ai-configuration {
-        deployments: list<model-deployment>,
+        deployments: list<component-deployment>,
     }
 
     validate-ai-config: func(config: ai-configuration) -> result<_, string>;
     get-ai-config: func() -> result<ai-configuration, string>;
-    apply-model-deployment: func(deployment: model-deployment) -> result<_, string>;
+    apply-component-deployment: func(deployment: component-deployment) -> result<_, string>;
 }
 
 world ai-orchestration-config {
