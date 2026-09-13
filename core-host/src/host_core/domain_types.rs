@@ -432,10 +432,6 @@ impl HardwareStrategy {
     }
 }
 
-fn is_zero_u32(value: &u32) -> bool {
-    *value == 0
-}
-
 fn is_false(value: &bool) -> bool {
     !*value
 }
