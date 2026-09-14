@@ -10,7 +10,7 @@ hot-reload (`reload_runtime_from_disk`). Routes already present in the config
 MUST NOT be duplicated. When built with `--features ai-inference`, the injected
 AI bundle SHALL contain only `/system/model-broker`; it SHALL NOT inject
 `/system/ai-list-model` or `/system/ai-openai-adapter`, which are no longer
-system FaaS — the OpenAI surface and model registry are the `guest-openai` user
+system FaaS — the OpenAI surface and Component registry are the `guest-openai` user
 FaaS example (see `openai-compatible-faas`).
 
 #### Scenario: ai-inference binary activates the broker route only

@@ -138,27 +138,27 @@ fn keda_pending_signal_boosts_when_route_is_saturated() {
 fn validate_integrity_config_normalizes_model_bindings() {
     let mut config = IntegrityConfig::default_sealed();
     let mut route = IntegrityRoute::user("/api/guest-ai");
-    route.models = vec![IntegrityModelBinding {
+    route.inference_components = vec![IntegrityInferenceComponentBinding {
         alias: " llama3 ".to_owned(),
         path: "  /models/llama3.gguf ".to_owned(),
-        device: ModelDevice::Cuda,
+        device: ComponentPlacement::Cuda,
         qos: RouteQos::Standard,
         dynamic: false,
         hardware_strategy: Default::default(),
     }];
     config.routes = vec![route];
 
-    let config = validate_integrity_config(config).expect("model bindings should validate");
+    let config = validate_integrity_config(config).expect("component bindings should validate");
     let route = config
         .sealed_route("/api/guest-ai")
         .expect("AI route should stay available");
 
     assert_eq!(
-        route.models,
-        vec![IntegrityModelBinding {
+        route.inference_components,
+        vec![IntegrityInferenceComponentBinding {
             alias: "llama3".to_owned(),
             path: "/models/llama3.gguf".to_owned(),
-            device: ModelDevice::Cuda,
+            device: ComponentPlacement::Cuda,
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -170,27 +170,28 @@ fn validate_integrity_config_normalizes_model_bindings() {
 fn validate_integrity_config_preserves_dynamic_model_bindings_without_paths() {
     let mut config = IntegrityConfig::default_sealed();
     let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
-    route.models = vec![IntegrityModelBinding {
+    route.inference_components = vec![IntegrityInferenceComponentBinding {
         alias: " qwen-dynamic ".to_owned(),
         path: String::new(),
-        device: ModelDevice::Cpu,
+        device: ComponentPlacement::Cpu,
         qos: RouteQos::Standard,
         dynamic: true,
         hardware_strategy: Default::default(),
     }];
     config.routes = vec![route];
 
-    let config = validate_integrity_config(config).expect("dynamic model bindings should validate");
+    let config =
+        validate_integrity_config(config).expect("dynamic component bindings should validate");
     let route = config
         .sealed_route("/ai/v1/chat/completions")
         .expect("OpenAI chat route should stay available");
 
     assert_eq!(
-        route.models,
-        vec![IntegrityModelBinding {
+        route.inference_components,
+        vec![IntegrityInferenceComponentBinding {
             alias: "qwen-dynamic".to_owned(),
             path: String::new(),
-            device: ModelDevice::Cpu,
+            device: ComponentPlacement::Cpu,
             qos: RouteQos::Standard,
             dynamic: true,
             hardware_strategy: Default::default(),
@@ -202,10 +203,10 @@ fn validate_integrity_config_preserves_dynamic_model_bindings_without_paths() {
 fn validate_integrity_config_rejects_static_model_bindings_without_paths() {
     let mut config = IntegrityConfig::default_sealed();
     let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
-    route.models = vec![IntegrityModelBinding {
+    route.inference_components = vec![IntegrityInferenceComponentBinding {
         alias: "qwen-static".to_owned(),
         path: String::new(),
-        device: ModelDevice::Cpu,
+        device: ComponentPlacement::Cpu,
         qos: RouteQos::Standard,
         dynamic: false,
         hardware_strategy: Default::default(),
@@ -213,7 +214,7 @@ fn validate_integrity_config_rejects_static_model_bindings_without_paths() {
     config.routes = vec![route];
 
     let error = validate_integrity_config(config)
-        .expect_err("static model bindings without paths must be rejected");
+        .expect_err("static component bindings without paths must be rejected");
     assert!(error
         .to_string()
         .contains("must include a non-empty `path`"));
@@ -222,19 +223,19 @@ fn validate_integrity_config_rejects_static_model_bindings_without_paths() {
 #[test]
 fn validate_integrity_config_rejects_duplicate_model_aliases_across_routes() {
     let mut first = IntegrityRoute::user("/api/guest-ai");
-    first.models = vec![IntegrityModelBinding {
+    first.inference_components = vec![IntegrityInferenceComponentBinding {
         alias: "shared".to_owned(),
         path: "/models/shared-a.gguf".to_owned(),
-        device: ModelDevice::Cpu,
+        device: ComponentPlacement::Cpu,
         qos: RouteQos::Standard,
         dynamic: false,
         hardware_strategy: Default::default(),
     }];
     let mut second = IntegrityRoute::user("/api/assistant");
-    second.models = vec![IntegrityModelBinding {
+    second.inference_components = vec![IntegrityInferenceComponentBinding {
         alias: "shared".to_owned(),
         path: "/models/shared-b.gguf".to_owned(),
-        device: ModelDevice::Metal,
+        device: ComponentPlacement::Metal,
         qos: RouteQos::Standard,
         dynamic: false,
         hardware_strategy: Default::default(),
@@ -244,9 +245,9 @@ fn validate_integrity_config_rejects_duplicate_model_aliases_across_routes() {
         routes: vec![first, second],
         ..IntegrityConfig::default_sealed()
     })
-    .expect_err("duplicate model aliases should fail validation");
+    .expect_err("duplicate component aliases should fail validation");
 
-    assert!(error.to_string().contains("model alias `shared`"));
+    assert!(error.to_string().contains("component alias `shared`"));
 }
 
 #[test]
@@ -644,7 +645,7 @@ fn validate_integrity_config_rejects_zero_max_concurrency() {
         allowed_secrets: Vec::new(),
         targets: Vec::new(),
         resiliency: None,
-        models: Vec::new(),
+        inference_components: Vec::new(),
         domains: Vec::new(),
         min_instances: 0,
         max_concurrency: 0,
