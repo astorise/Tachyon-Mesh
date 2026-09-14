@@ -427,8 +427,15 @@ const REGISTRY_SOURCE_CONFIG: &str = "config";
 /// component id — not just metadata.
 #[cfg(feature = "ai-inference")]
 fn binding_engine_label(path: &str) -> &'static str {
+    // The `openai:` scheme is classified here, not in `ai_inference`: that
+    // module stays Component-centric and upstream-protocol agnostic, but the
+    // registry still has to tell clients which alias points at a remote
+    // OpenAI-compatible endpoint versus a local artifact.
+    const OPENAI_SCHEME: &str = "openai:";
     let path = path.trim();
-    if path == "mock" || path.starts_with("mock:") {
+    if path.starts_with(OPENAI_SCHEME) {
+        "openai"
+    } else if path == "mock" || path.starts_with("mock:") {
         "mock"
     } else if path.starts_with(crate::ai_inference::MAGNETAR_PATH_PREFIX) {
         "magnetar"
