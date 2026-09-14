@@ -14,13 +14,13 @@ use wasmtime_wasi_nn::{
 
 use crate::{IntegrityConfig, IntegrityInferenceComponentBinding, RouteQos};
 
+pub(crate) const UPSTREAM_SCHEME: &str = "openai:";
 pub(crate) use magnetar_runtime::MAGNETAR_PATH_PREFIX;
 const COMPONENT_META_JSON: &str = ".tachyon-component.json";
 const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
 
 pub(crate) fn binding_runs_upstream(binding: &IntegrityInferenceComponentBinding) -> bool {
-    let _ = binding;
-    false
+    !binding.dynamic && binding.path.trim().starts_with(UPSTREAM_SCHEME)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
