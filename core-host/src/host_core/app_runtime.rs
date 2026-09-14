@@ -1341,17 +1341,11 @@ mod requested_component_alias_tests {
     #[test]
     fn the_qos_lane_follows_the_engine_qualified_component_a_client_asked_for() {
         let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
-        let mut local = component_binding("local-llama");
-        local.device = ComponentPlacement::Cuda;
-        let mut upstream = component_binding("qwen3-coder");
-        upstream.path = "openai:http://127.0.0.1:8080/v1".to_owned();
-        // Non-dynamic, because that is what makes the path a destination: the
-        // broker overwrites a `dynamic` binding's path with the directory its
-        // upload landed in, so one written `openai:…` still runs locally. The
-        // shared fixture above is dynamic for the alias-resolution test, which
-        // needs no paths at all.
-        upstream.dynamic = false;
-        route.inference_components = vec![local, upstream];
+        let mut first = component_binding("local-llama");
+        first.device = ComponentPlacement::Cpu;
+        let mut requested_binding = component_binding("qwen3-coder");
+        requested_binding.device = ComponentPlacement::Cuda;
+        route.inference_components = vec![first, requested_binding];
 
         let requested =
             resolve_requested_component_alias(&route, Some("openai/qwen3-coder".to_owned()));
@@ -1359,7 +1353,7 @@ mod requested_component_alias_tests {
             .expect("a route with bindings has a profile");
         assert_eq!(
             profile.accelerator,
-            ai_inference::AcceleratorKind::Network,
+            ai_inference::AcceleratorKind::Gpu,
             "admission must watch the lane the request actually runs on, not the route's first binding"
         );
     }
@@ -1421,21 +1415,11 @@ pub(crate) fn route_mesh_qos_profile(
                 .find(|binding| binding.alias.eq_ignore_ascii_case(alias))
         })
         .or_else(|| route.inference_components.first())?;
-    // The lane the work actually queues on, not the device the binding
-    // declares. An `openai:` upstream runs on no local accelerator and is
-    // scheduled on `Network`; reading its declared `cpu`/`cuda` here made mesh
-    // admission watch an idle local queue while the network queue filled, so a
-    // saturated upstream never redirected a request to a healthier peer.
-    //
-    // `binding_runs_upstream` rather than the prefix: a `dynamic` binding's
-    // path is a placeholder the broker overwrites, so one written
-    // `openai:…` still runs its uploaded checkpoint locally, and calling that
-    // `Network` hid a real GPU queue from admission.
-    let accelerator = if ai_inference::binding_runs_upstream(binding) {
-        ai_inference::AcceleratorKind::Network
-    } else {
-        ai_inference::AcceleratorKind::from_component_placement(&binding.device)
-    };
+    // The lane the work actually queues on: the device the *requested*
+    // binding declares, not the route's first binding. Falling back to the
+    // first binding here made mesh admission watch the wrong queue whenever
+    // a client asked for a component other than the route's default.
+    let accelerator = ai_inference::AcceleratorKind::from_component_placement(&binding.device);
     Some(RouteMeshQosProfile {
         accelerator,
         qos: binding.qos,
@@ -2542,111 +2526,6 @@ pub(crate) async fn enforce_resource_admission(
     }))
 }
 
-/// Whether every component this route can run lives behind an `openai:` upstream.
-///
-/// Deliberately "every", not "the first": a route mixing an upstream with a
-/// local checkpoint still has something on the local device, and exempting it
-/// would let that component bypass the admission its neighbours obey. A route with
-/// no components at all is not upstream-only — it has nothing to be upstream about,
-/// and the ordinary path already ignores it.
-#[cfg(all(test, feature = "ai-inference"))]
-mod vram_admission_scope_tests {
-    use super::*;
-
-    fn route_with(paths: &[&str]) -> IntegrityRoute {
-        IntegrityRoute {
-            path: "/ai".to_owned(),
-            inference_components: paths
-                .iter()
-                .map(|path| IntegrityInferenceComponentBinding {
-                    alias: "coder".to_owned(),
-                    path: (*path).to_owned(),
-                    device: ComponentPlacement::Cpu,
-                    qos: RouteQos::Standard,
-                    dynamic: false,
-                    hardware_strategy: HardwareStrategy::default(),
-                })
-                .collect(),
-            ..Default::default()
-        }
-    }
-
-    /// Local VRAM pressure says nothing about a route served from upstreams.
-    ///
-    /// Rejecting one with `vram-saturated` invents a failure: the provider is
-    /// healthy, the request would have succeeded, and the client is handed a
-    /// 503 naming a resource its request never touches.
-    #[test]
-    fn only_a_route_served_entirely_from_upstreams_skips_vram_admission() {
-        assert!(route_is_entirely_upstream(&route_with(&[
-            "openai:http://a.invalid/v1"
-        ])));
-        assert!(route_is_entirely_upstream(&route_with(&[
-            "openai:http://a.invalid/v1",
-            "openai:http://b.invalid/v1",
-        ])));
-
-        // One local checkpoint is enough to keep the check: exempting a mixed
-        // route would let that component bypass the admission its neighbours obey.
-        assert!(!route_is_entirely_upstream(&route_with(&[
-            "openai:http://a.invalid/v1",
-            "/components/local",
-        ])));
-        assert!(!route_is_entirely_upstream(&route_with(&[
-            "/components/local"
-        ])));
-
-        // A route with no components is not upstream-only — it has nothing to be
-        // upstream about, and the ordinary path already ignores it.
-        assert!(!route_is_entirely_upstream(&route_with(&[])));
-    }
-
-    /// A `dynamic` binding's path is a placeholder, not a destination.
-    ///
-    /// The broker overwrites it: `ensure_component_loaded` swaps it for the
-    /// directory the upload landed in, so the checkpoint runs locally on the
-    /// device the binding seals. Reading the `openai:` prefix alone therefore
-    /// exempted a route holding real VRAM from the refusal that protects it,
-    /// and pointed mesh QoS at an idle network lane while a GPU queue filled.
-    #[test]
-    fn a_dynamic_binding_is_local_however_its_path_reads() {
-        let mut route = route_with(&["openai:http://a.invalid/v1"]);
-        route.inference_components[0].dynamic = true;
-        route.inference_components[0].device = ComponentPlacement::Cuda;
-
-        assert!(
-            !route_is_entirely_upstream(&route),
-            "a dynamic binding runs its uploaded checkpoint locally, so the VRAM refusal applies"
-        );
-        assert_eq!(
-            route_mesh_qos_profile(&route, None).map(|profile| profile.accelerator),
-            Some(ai_inference::AcceleratorKind::Gpu),
-            "and it queues on the device it sealed, not on the network lane"
-        );
-
-        // The non-dynamic case is unchanged: that path *is* where requests go.
-        route.inference_components[0].dynamic = false;
-        assert!(route_is_entirely_upstream(&route));
-        assert_eq!(
-            route_mesh_qos_profile(&route, None).map(|profile| profile.accelerator),
-            Some(ai_inference::AcceleratorKind::Network)
-        );
-    }
-}
-
-#[cfg(feature = "ai-inference")]
-fn route_is_entirely_upstream(route: &IntegrityRoute) -> bool {
-    // Not the `openai:` prefix: a `dynamic` binding carrying one still runs an
-    // uploaded checkpoint on a local device, so a route made entirely of those
-    // would have skipped the critical-VRAM refusal while holding the very VRAM
-    // the refusal exists to protect.
-    !route.inference_components.is_empty()
-        && route
-            .inference_components
-            .iter()
-            .all(ai_inference::binding_runs_upstream)
-}
-
 /// Returns a rejection `RouteExecutionResult` when VRAM pressure is critical
 /// for routes that drive AI inference, or `None` to allow the request through.
 ///
@@ -2661,16 +2540,6 @@ pub(crate) fn enforce_vram_admission(
     state: &AppState,
     route: &IntegrityRoute,
 ) -> Option<RouteExecutionResult> {
-    // A route served entirely from upstreams holds no local VRAM, so local
-    // pressure says nothing about whether it can run. Rejecting it with
-    // `vram-saturated` invented a failure: the remote provider was healthy, the
-    // request would have succeeded, and the client got a 503 naming a resource
-    // its request never touches. Local components on the same route keep the check,
-    // which is why this asks about every binding rather than the first.
-    #[cfg(feature = "ai-inference")]
-    if route_is_entirely_upstream(route) {
-        return None;
-    }
     match state.memory_governor.vram_pressure() {
         memory_governor::MemoryPressure::Critical => {
             tracing::warn!(
