@@ -256,7 +256,7 @@ mod schema_tests {
 
         for field in [
             "\"targets\"",
-            "\"components\"",
+            "\"inference_components\"",
             "\"hardware_strategy\"",
             "\"distribution_mode\"",
             "\"device_ids\"",
