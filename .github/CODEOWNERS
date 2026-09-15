@@ -1,0 +1,29 @@
+# Code owners for Tachyon-Mesh.
+#
+# The last matching pattern in this file wins, so put broad, catch-all
+# patterns first and more specific overrides below them, per
+# https://docs.github.com/articles/about-code-owners/
+
+# Default owner for anything not matched more specifically below.
+*                               @astorise
+
+# Auth, identity and crypto — the highest-blast-radius surface in the repo.
+/core-host/src/auth.rs          @astorise
+/core-host/src/identity/        @astorise
+/systems/system-faas-authn/     @astorise
+/systems/system-faas-authz/     @astorise
+
+# The host/guest contract. A change here can silently break every guest.
+/wit/                           @astorise
+
+# CI/CD, release signing, and dependency/license policy.
+/.github/workflows/             @astorise
+/deny.toml                      @astorise
+/renovate.json                  @astorise
+/Dockerfile*                    @astorise
+/scripts/get-tachyon.sh         @astorise
+/scripts/get-tachyon.ps1        @astorise
+
+# Repository governance itself.
+/SECURITY.md                    @astorise
+/.github/CODEOWNERS             @astorise

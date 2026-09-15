@@ -2,6 +2,7 @@
 name = "core-host"
 version = "1.0.0"
 edition = "2021"
+license.workspace = true
 
 [features]
 default = ["admin-plane", "ring"]

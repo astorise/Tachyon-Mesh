@@ -6,7 +6,7 @@ Tachyon is a next-generation, ultra-lightweight Service Mesh written in Rust. It
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Build Status](https://github.com/astorise/tachyon-mesh/actions/workflows/ci.yml/badge.svg)](https://github.com/astorise/tachyon-mesh/actions)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-blue.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.98.1-blue.svg)](https://www.rust-lang.org)
 [![WASM](https://img.shields.io/badge/wasm-wasip2-purple.svg)](https://webassembly.org/)
 
 ---

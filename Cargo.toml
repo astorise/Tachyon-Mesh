@@ -73,6 +73,9 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+license = "MIT"
+
 [patch.crates-io]
 # Temporary security patches until crates.io releases include quick-xml >= 0.41.
 object_store = { git = "https://github.com/apache/arrow-rs-object-store.git", rev = "fd44ebb9c1158660795ec22d7b11acf31c3fe113" }
