@@ -89,6 +89,29 @@ fi
   || die "SHA-256 checksum mismatch — the archive is corrupt or tampered with."
 ok "Checksum verified"
 
+# ── Verify cosign signature (optional — proves the archive came from this
+# repo's release workflow, not just that it matches a checksum served from
+# the same place) ──────────────────────────────────────────────────────────
+if command -v cosign >/dev/null 2>&1; then
+  info "Verifying cosign signature..."
+  BUNDLE_URL="${URL}.bundle"
+  BUNDLE_HTTP_CODE=$(curl -fsSL -w "%{http_code}" -o "${TMP}/${TARBALL}.bundle" "$BUNDLE_URL" 2>&1) || true
+  if [[ "$BUNDLE_HTTP_CODE" != "200" ]]; then
+    die "cosign is installed but the signature bundle could not be fetched (HTTP ${BUNDLE_HTTP_CODE}).
+  URL: ${BUNDLE_URL}
+  Re-run without cosign on PATH to skip this check, or verify manually once the bundle is available."
+  fi
+  cosign verify-blob \
+    --bundle "${TMP}/${TARBALL}.bundle" \
+    --certificate-identity-regexp "^https://github\\.com/${REPO}/\\.github/workflows/release\\.yml@" \
+    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+    "${TMP}/${TARBALL}" \
+    || die "cosign signature verification failed — the archive does not match a signature from this repo's release workflow."
+  ok "Signature verified"
+else
+  info "cosign not found on PATH — skipping signature verification (SHA-256 checksum above still applies). Install cosign (https://docs.sigstore.dev/cosign/installation/) to also verify the archive was signed by this repo's release workflow."
+fi
+
 # ── Extract ───────────────────────────────────────────────────────────────────
 info "Extracting to ${TARGET_DIR}..."
 mkdir -p "$TARGET_DIR"

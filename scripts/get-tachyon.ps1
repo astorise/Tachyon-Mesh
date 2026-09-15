@@ -65,6 +65,35 @@ if ($ActualHash -ne $ExpectedHash) {
 }
 Write-Ok "Checksum verified"
 
+# ── 3c. Verify cosign signature (optional — proves the archive came from
+# this repo's release workflow, not just that it matches a checksum served
+# from the same place) ─────────────────────────────────────────────────────
+$Cosign = Get-Command cosign -ErrorAction SilentlyContinue
+if ($Cosign) {
+    Write-Info "Verifying cosign signature..."
+    $BundleUrl = "$DownloadUrl.bundle"
+    $TmpBundle = Join-Path $env:TEMP "tachyon-mesh-$([System.IO.Path]::GetRandomFileName()).bundle"
+    try {
+        Invoke-WebRequest -Uri $BundleUrl -OutFile $TmpBundle -UseBasicParsing
+    } catch {
+        Remove-Item $TmpZip -Force -ErrorAction SilentlyContinue
+        Write-Fail "cosign is installed but the signature bundle could not be fetched.`n  URL: $BundleUrl`n  Re-run without cosign on PATH to skip this check, or verify manually once the bundle is available."
+    }
+    & cosign verify-blob `
+        --bundle $TmpBundle `
+        --certificate-identity-regexp "^https://github\.com/$Repo/\.github/workflows/release\.yml@" `
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" `
+        $TmpZip
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item $TmpZip, $TmpBundle -Force -ErrorAction SilentlyContinue
+        Write-Fail "cosign signature verification failed — the archive does not match a signature from this repo's release workflow."
+    }
+    Remove-Item $TmpBundle -Force -ErrorAction SilentlyContinue
+    Write-Ok "Signature verified"
+} else {
+    Write-Info "cosign not found on PATH — skipping signature verification (SHA-256 checksum above still applies). Install cosign (https://docs.sigstore.dev/cosign/installation/) to also verify the archive was signed by this repo's release workflow."
+}
+
 # ── 4. Extract ────────────────────────────────────────────────────────────────
 Write-Info "Extracting to $Dir..."
 New-Item -ItemType Directory -Path $Dir -Force | Out-Null

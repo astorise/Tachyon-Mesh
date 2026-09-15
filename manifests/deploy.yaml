@@ -1,3 +1,8 @@
+# Tachyon Mesh — Quick Start deployment.
+# Usage: kubectl apply -f manifests/deploy.yaml
+#
+# For a hardened, namespaced, GPU-enabled deployment with a NetworkPolicy
+# perimeter, see deploy-gpu-hardened.yaml instead.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -12,12 +17,63 @@ spec:
       labels:
         app: tachyon-host
     spec:
+      # ── Pod-level security context (Restricted Pod Security Standard) ──────
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
       containers:
         - name: core-host
           image: ghcr.io/astorise/tachyon-mesh:latest
           imagePullPolicy: Always
+
+          # ── Container-level security context ──────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
           ports:
             - containerPort: 8080
+
+          env:
+            # readOnlyRootFilesystem: true means core-host's default
+            # manifest path ("integrity.lock", relative to /app — not
+            # writable here) can no longer double as the anchor for every
+            # state directory derived from it: auth state
+            # (auth::auth_state_dir), the core store
+            # (host_core::core_store_path), and the buffered-request spool
+            # (host_core::buffered_request_spool_dir) all resolve relative
+            # to the manifest's parent directory, and AuthManager::new()
+            # treats a failed create_dir_all there as fatal. Pointing the
+            # manifest itself at the one writable mount moves all three at
+            # once.
+            - name: TACHYON_INTEGRITY_MANIFEST
+              value: /tmp/integrity.lock
+
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+
+          volumeMounts:
+            # Backs TACHYON_INTEGRITY_MANIFEST above — the one writable path
+            # under readOnlyRootFilesystem: true. Ephemeral like the rest of
+            # this Deployment (no PVC): state does not survive a pod
+            # restart, matching this manifest's behavior before this change
+            # (nothing under /app was persisted either).
+            - name: tmp-vol
+              mountPath: /tmp
+
           readinessProbe:
             tcpSocket:
               port: 8080
@@ -28,6 +84,10 @@ spec:
               port: 8080
             initialDelaySeconds: 15
             periodSeconds: 20
+
+      volumes:
+        - name: tmp-vol
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -41,46 +101,3 @@ spec:
       port: 8080
       protocol: TCP
       targetPort: 8080
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: legacy-deployment
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: legacy-mock
-  template:
-    metadata:
-      labels:
-        app: legacy-mock
-    spec:
-      containers:
-        - name: legacy-mock
-          image: legacy-mock:test
-          imagePullPolicy: Never
-          env:
-            - name: FAAS_URL
-              value: http://tachyon-service:8080/metrics
-          ports:
-            - containerPort: 8081
-          readinessProbe:
-            httpGet:
-              path: /ping
-              port: 8081
-            periodSeconds: 2
-            failureThreshold: 15
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: legacy-service
-spec:
-  selector:
-    app: legacy-mock
-  ports:
-    - name: http
-      port: 8081
-      protocol: TCP
-      targetPort: 8081
