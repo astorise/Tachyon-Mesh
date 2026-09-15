@@ -24,16 +24,28 @@ concurrency:
 # RUSTFLAGS and CARGO_TERM_COLOR are repeated per-job so each job's env block
 # is self-contained and readable without cross-referencing.
 
-# ── Renovate compile-only fast lane ──────────────────────────────────────────
-# Dependency-update PRs (head branch `renovate/**`) only need to prove the tree
-# still compiles; the full lint/test/GPU suite made them impossible to merge
-# because cuda-quality queues on the resource-limited arc-gpu-runners. On these
-# PRs the four required checks (build-guests, security-audit, quality,
-# cuda-quality) still run but quality/cuda-quality drop to `cargo check`,
-# fips-tests becomes a compile check, and every other job is skipped outright
-# (a `skipped` job conclusion satisfies branch protection). Detection uses the
-# head branch prefix — not the actor — so a human re-running or pushing a fix
-# to a Renovate branch stays in the same lane.
+# ── Renovate fast lane ────────────────────────────────────────────────────────
+# Dependency-update PRs (head branch `renovate/**`) don't need the full
+# test/GPU suite; that made them impossible to merge because cuda-quality
+# queues on the resource-limited arc-gpu-runners. On these PRs the four
+# required checks (build-guests, security-audit, quality, cuda-quality) still
+# run, fips-tests becomes a compile check, and every other job is skipped
+# outright (a `skipped` job conclusion satisfies branch protection). Detection
+# uses the head branch prefix — not the actor — so a human re-running or
+# pushing a fix to a Renovate branch stays in the same lane.
+#
+# quality/cuda-quality's clippy steps stay on (not a bare `cargo check`): the
+# `push` run on `main` right after a Renovate merge always runs the strict
+# lint, so a lint this lane skipped only defers that failure to `main` for
+# everyone instead of avoiding it (see issue #416, which this fixed after #415
+# proved it out — a dependency bump grew `hyper::Response`'s size past
+# `clippy::result_large_err`'s threshold, merged green on its Renovate PR, and
+# broke `main` for five days). The lane instead allows the two lint families a
+# semver-compatible dependency bump can legitimately trigger with no change to
+# our own code — a dependency type crossing a size threshold
+# (`clippy::result_large_err`), or a newly-`#[deprecated]` dependency API
+# (`deprecated`) — so `main` and every Renovate PR are always held to the same
+# bar for everything else.
 
 jobs:
   # ── 1. Build WASM guest artifacts once ──────────────────────────────────────
@@ -294,16 +306,16 @@ jobs:
         # Keep the general quality gate on ubuntu-latest CPU runners: CUDA is
         # validated separately by the arc-gpu-runners job below. `--all-features`
         # would enable core-host/candle-cuda and require nvcc on this runner.
-        if: env.RENOVATE_PR != 'true'
-        run: cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used
-
-      # Compile-only stand-in for the lint above on Renovate PRs: a dep bump
-      # can surface new deprecation warnings in our code that `-D warnings`
-      # would turn into failures, and the fast lane only gates on "does it
-      # still compile".
-      - name: Compile workspace (Renovate compile-only lane)
-        if: env.RENOVATE_PR == 'true'
-        run: cargo check --workspace --all-targets --features core-host/ai-inference
+        #
+        # Runs on Renovate PRs too — see the "Renovate fast lane" note at the
+        # top of this file for why, and for what -A deprecated
+        # -A clippy::result_large_err allows on that lane specifically.
+        run: |
+          if [ "${RENOVATE_PR}" = "true" ]; then
+            cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used -A deprecated -A clippy::result_large_err
+          else
+            cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used
+          fi
 
       - name: Cross-Layer Validation
         if: env.RENOVATE_PR != 'true'
@@ -437,8 +449,14 @@ jobs:
         run: cargo check -p core-host --features candle-cuda
 
       - name: Lint Candle CUDA host build
-        if: env.RENOVATE_PR != 'true'
-        run: cargo clippy -p core-host --features candle-cuda --all-targets -- -D warnings -D clippy::unwrap_used
+        # Runs on Renovate PRs too — see the "Renovate fast lane" note at the
+        # top of this file.
+        run: |
+          if [ "${RENOVATE_PR}" = "true" ]; then
+            cargo clippy -p core-host --features candle-cuda --all-targets -- -D warnings -D clippy::unwrap_used -A deprecated -A clippy::result_large_err
+          else
+            cargo clippy -p core-host --features candle-cuda --all-targets -- -D warnings -D clippy::unwrap_used
+          fi
 
       # Compile test binaries separately so execution-proof timeouts only
       # cover the GPU operation, not a cold Candle CUDA compilation.
