@@ -18,3 +18,7 @@ sha2 = "0.11"
 sysinfo = "0.39"
 tar = "0.4"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "sync"] }
+# reqwest::Url is a re-export of url::Url, but not of url::Host — declared
+# directly here so `allows_insecure_local_tls` can match on it. Already in
+# the lockfile transitively via reqwest, so this pins no new version.
+url = "2.5"

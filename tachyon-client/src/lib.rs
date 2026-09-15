@@ -4657,6 +4657,14 @@ fn build_http_client(config: &InstanceConfig) -> Result<reqwest::Client> {
 
     if allows_insecure_local_tls(&url) {
         builder = builder.danger_accept_invalid_certs(true);
+    } else if insecure_tls_override_is_set() {
+        eprintln!(
+            "tachyon-client: TACHYON_INSECURE_TLS is set — skipping certificate verification for `{}`. \
+             This accepts ANY certificate for this host, including one presented by an on-path attacker. \
+             Use only for a trusted network you control.",
+            config.url.trim()
+        );
+        builder = builder.danger_accept_invalid_certs(true);
     }
 
     if let Some(identity_bytes) = config.mtls_cert.as_deref() {
@@ -4726,23 +4734,52 @@ fn public_connection_config(url: &str, cert: Option<Vec<u8>>) -> InstanceConfig 
     }
 }
 
+/// True only for hosts an on-path attacker cannot meaningfully be
+/// positioned against: loopback. An attacker who can already run code on
+/// this machine has bigger problems than a bypassed cert check here, so
+/// this case alone is safe to accept automatically.
+///
+/// Every other private/link-local host used to be included here too
+/// (`ip.is_private() || ip.is_link_local()`, plus a hardcoded
+/// `home-lab-k3s.wsl` hostname and any `*.wsl` suffix), which covers
+/// essentially every self-hosted, homelab and in-cluster deployment this
+/// project targets — i.e. almost the entire private IPv4 space, including
+/// the cloud instance-metadata range (169.254.0.0/16). An on-path attacker
+/// on any of those networks could downgrade the connection and read the
+/// admin bearer token this client attaches to every request. See
+/// `insecure_tls_override_is_set` for the (opt-in, loud) replacement.
 fn allows_insecure_local_tls(url: &reqwest::Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-
-    if host.eq_ignore_ascii_case("localhost")
-        || host.eq_ignore_ascii_case("home-lab-k3s.wsl")
-        || host.ends_with(".wsl")
-    {
-        return true;
+    // `url::Url::host()` hands back an already-parsed `Host::Ipv4`/`Ipv6`, so
+    // this doesn't need to re-parse a host string as an `IpAddr` — which,
+    // for an IPv6 host, `Url::host_str()` returns bracketed (`"[::1]"`) and
+    // `IpAddr::from_str` rejects outright, silently treating every IPv6
+    // loopback URL as non-loopback.
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
     }
+}
 
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
-        Ok(IpAddr::V6(ip)) => ip.is_loopback(),
-        Err(_) => false,
-    }
+/// Opt-in escape hatch for connecting to a private/link-local or `.wsl` host
+/// presenting a certificate this process doesn't otherwise trust — a
+/// homelab or in-cluster self-signed cert, typically. Off by default: unlike
+/// loopback, an attacker *can* be positioned on a private network, so
+/// bypassing verification there — even just for hosts in RFC1918 space —
+/// defeats TLS for every admin token this client sends. An operator who
+/// needs this sets `TACHYON_INSECURE_TLS=1` explicitly and gets a warning on
+/// every connection it applies to, so the tradeoff is visible rather than
+/// silent.
+///
+/// This is an interim answer until certificate pinning
+/// (`InstanceConfig`/UI already collect a `custom_ca`, unused today — see
+/// issue #421) lets a homelab CA be trusted without disabling verification
+/// altogether.
+fn insecure_tls_override_is_set() -> bool {
+    std::env::var("TACHYON_INSECURE_TLS")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE"))
+        .unwrap_or(false)
 }
 
 fn validate_connection_config(config: &InstanceConfig) -> Result<()> {
@@ -5060,17 +5097,34 @@ mod tests {
     }
 
     #[test]
-    fn allows_insecure_tls_for_loopback_and_homelab_wsl_hosts() {
-        let loopback = reqwest::Url::parse("https://127.0.0.1:4000").expect("loopback URL");
+    fn allows_insecure_tls_for_loopback_only() {
+        let loopback_v4 = reqwest::Url::parse("https://127.0.0.1:4000").expect("loopback URL");
+        let loopback_v6 = reqwest::Url::parse("https://[::1]:4000").expect("loopback v6 URL");
+        let localhost = reqwest::Url::parse("https://localhost:4000").expect("localhost URL");
+
+        assert!(allows_insecure_local_tls(&loopback_v4));
+        assert!(allows_insecure_local_tls(&loopback_v6));
+        assert!(allows_insecure_local_tls(&localhost));
+    }
+
+    #[test]
+    fn denies_insecure_tls_for_private_link_local_and_wsl_hosts_without_opt_in() {
+        // These used to be silently accepted — that's most of RFC1918, the
+        // project's stated homelab/Kubernetes deployment targets, plus any
+        // attacker-selectable `.wsl` hostname. See issue #421: none of these
+        // should bypass verification without an explicit opt-in.
+        let private_ip = reqwest::Url::parse("https://192.168.1.10:9443").expect("private URL");
+        let link_local = reqwest::Url::parse("https://169.254.1.5:9443").expect("link-local URL");
         let homelab = reqwest::Url::parse("https://home-lab-k3s.wsl").expect("homelab URL");
         let nested = reqwest::Url::parse("https://edge.home-lab-k3s.wsl").expect("nested URL");
         let wsl_private_ip =
             reqwest::Url::parse("https://172.18.194.89:20001").expect("WSL private IP URL");
 
-        assert!(allows_insecure_local_tls(&loopback));
-        assert!(allows_insecure_local_tls(&homelab));
-        assert!(allows_insecure_local_tls(&nested));
-        assert!(allows_insecure_local_tls(&wsl_private_ip));
+        assert!(!allows_insecure_local_tls(&private_ip));
+        assert!(!allows_insecure_local_tls(&link_local));
+        assert!(!allows_insecure_local_tls(&homelab));
+        assert!(!allows_insecure_local_tls(&nested));
+        assert!(!allows_insecure_local_tls(&wsl_private_ip));
     }
 
     #[test]
@@ -5078,6 +5132,26 @@ mod tests {
         let public = reqwest::Url::parse("https://example.com").expect("public URL");
 
         assert!(!allows_insecure_local_tls(&public));
+    }
+
+    #[test]
+    fn insecure_tls_override_reads_the_env_var() {
+        // No other test in this crate reads or writes TACHYON_INSECURE_TLS,
+        // so no cross-test synchronization is needed for this process-global
+        // env var.
+        std::env::remove_var("TACHYON_INSECURE_TLS");
+        assert!(!insecure_tls_override_is_set());
+
+        std::env::set_var("TACHYON_INSECURE_TLS", "1");
+        assert!(insecure_tls_override_is_set());
+
+        std::env::set_var("TACHYON_INSECURE_TLS", "true");
+        assert!(insecure_tls_override_is_set());
+
+        std::env::set_var("TACHYON_INSECURE_TLS", "0");
+        assert!(!insecure_tls_override_is_set());
+
+        std::env::remove_var("TACHYON_INSECURE_TLS");
     }
 
     #[test]
