@@ -706,6 +706,19 @@ pub(crate) async fn handle_udp_layer4_datagram(
     Ok(())
 }
 
+/// Bound on how many frames may sit between the socket and the guest, in
+/// either direction, before the slower side applies backpressure. Both
+/// channels used to be unbounded (`std::sync::mpsc::channel()` for incoming,
+/// `tokio::sync::mpsc::unbounded_channel()` for outgoing): a client sending
+/// faster than its guest drains `incoming`, or a guest emitting faster than
+/// the socket drains `outgoing`, grew host memory without limit — one
+/// authenticated client on any `websockets`-enabled route could OOM the
+/// whole node, taking every other tenant down with it. 64 matches this
+/// codebase's other per-connection channel bound
+/// (`component_hosts::STREAM_CHANNEL_CAPACITY`).
+#[cfg(feature = "websockets")]
+const WEBSOCKET_CHANNEL_CAPACITY: usize = 64;
+
 #[cfg(feature = "websockets")]
 pub(crate) async fn handle_websocket_connection(
     state: AppState,
@@ -754,9 +767,10 @@ pub(crate) async fn handle_websocket_connection(
     let component_instance_pre_cache = Arc::clone(&runtime.component_instance_pre_cache);
     let legacy_instance_pre_cache = Arc::clone(&runtime.legacy_instance_pre_cache);
     let linker_cache = Arc::clone(&runtime.linker_cache);
-    let (incoming_tx, incoming_rx) = std::sync::mpsc::channel::<HostWebSocketFrame>();
+    let (incoming_tx, incoming_rx) =
+        tokio::sync::mpsc::channel::<HostWebSocketFrame>(WEBSOCKET_CHANNEL_CAPACITY);
     let (outgoing_tx, mut outgoing_rx) =
-        tokio::sync::mpsc::unbounded_channel::<HostWebSocketFrame>();
+        tokio::sync::mpsc::channel::<HostWebSocketFrame>(WEBSOCKET_CHANNEL_CAPACITY);
     let (mut writer, mut reader) = socket.split();
 
     let reader_handle = tokio::spawn(async move {
@@ -765,13 +779,18 @@ pub(crate) async fn handle_websocket_connection(
                 Ok(message) => {
                     let frame = websocket_message_to_host_frame(message);
                     let should_close = matches!(frame, HostWebSocketFrame::Close);
-                    if incoming_tx.send(frame).is_err() || should_close {
+                    // A bounded async send: once the guest's blocking-thread
+                    // consumer falls behind and the channel fills, this
+                    // yields here instead of buffering unboundedly — which
+                    // stops draining the socket, which is what applies
+                    // backpressure to the client over TCP.
+                    if incoming_tx.send(frame).await.is_err() || should_close {
                         break;
                     }
                 }
                 Err(error) => {
                     tracing::warn!("WebSocket receive failed: {error}");
-                    let _ = incoming_tx.send(HostWebSocketFrame::Close);
+                    let _ = incoming_tx.send(HostWebSocketFrame::Close).await;
                     break;
                 }
             }

@@ -837,8 +837,8 @@ pub(crate) fn execute_websocket_guest(
     engine: &Engine,
     route: &IntegrityRoute,
     function_name: &str,
-    incoming: std::sync::mpsc::Receiver<HostWebSocketFrame>,
-    outgoing: tokio::sync::mpsc::UnboundedSender<HostWebSocketFrame>,
+    incoming: tokio::sync::mpsc::Receiver<HostWebSocketFrame>,
+    outgoing: tokio::sync::mpsc::Sender<HostWebSocketFrame>,
     execution: &GuestExecutionContext,
 ) -> std::result::Result<(), ExecutionError> {
     let module_path =
@@ -874,8 +874,8 @@ pub(crate) fn execute_websocket_component_guest(
     route: &IntegrityRoute,
     component_path: &Path,
     component: &Component,
-    incoming: std::sync::mpsc::Receiver<HostWebSocketFrame>,
-    outgoing: tokio::sync::mpsc::UnboundedSender<HostWebSocketFrame>,
+    incoming: tokio::sync::mpsc::Receiver<HostWebSocketFrame>,
+    outgoing: tokio::sync::mpsc::Sender<HostWebSocketFrame>,
     execution: &GuestExecutionContext,
 ) -> std::result::Result<(), ExecutionError> {
     let shape = route_scope_shape(route);

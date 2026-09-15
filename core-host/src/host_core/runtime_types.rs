@@ -984,8 +984,8 @@ pub(crate) enum HostWebSocketFrame {
 
 #[cfg(feature = "websockets")]
 pub(crate) struct HostWebSocketConnection {
-    pub(crate) incoming: std::sync::mpsc::Receiver<HostWebSocketFrame>,
-    pub(crate) outgoing: tokio::sync::mpsc::UnboundedSender<HostWebSocketFrame>,
+    pub(crate) incoming: tokio::sync::mpsc::Receiver<HostWebSocketFrame>,
+    pub(crate) outgoing: tokio::sync::mpsc::Sender<HostWebSocketFrame>,
 }
 
 /// Pre-populated by `execute_streaming_component_guest` before the WASM call.
