@@ -5,12 +5,23 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/astorise/tachyon-mesh/main/scripts/get-tachyon.sh | bash
-#   bash scripts/get-tachyon.sh [--version v1.2.3] [--dir /usr/local/bin]
+#   bash scripts/get-tachyon.sh [--version v1.2.3] [--dir /usr/local/bin] [--variant ai]
+#
+# --variant selects which of the release's feature builds to fetch (see
+# publish-server-binaries in .github/workflows/release.yml):
+#   default    admin-plane + ring (the plain Quick Start build; this is the
+#              default when --variant is omitted)
+#   fips       --no-default-features --features fips
+#   http3      --features http3
+#   security   --features rate-limit,resiliency,mtls,secrets-vault,websockets
+#   ai         --features ai-inference (not built for windows or linux/aarch64)
+#   no-default --no-default-features
 set -euo pipefail
 
 REPO="astorise/tachyon-mesh"
 TARGET_DIR="."
 VERSION=""
+VARIANT="default"
 
 for arg in "$@"; do
   case "$arg" in
@@ -18,6 +29,8 @@ for arg in "$@"; do
     --version)   shift; VERSION="${1:-}" ;;
     --dir=*)     TARGET_DIR="${arg#*=}" ;;
     --dir)       shift; TARGET_DIR="${1:-}" ;;
+    --variant=*) VARIANT="${arg#*=}" ;;
+    --variant)   shift; VARIANT="${1:-}" ;;
   esac
 done
 
@@ -30,6 +43,16 @@ RED=$(tput setaf 1 2>/dev/null || true)
 info() { echo "${CYAN}${BOLD}» $*${RESET}"; }
 ok()   { echo "${GREEN}✔  $*${RESET}"; }
 die()  { echo "${RED}${BOLD}✘  $*${RESET}" >&2; exit 1; }
+
+case "$VARIANT" in
+  default)    VARIANT_SUFFIX="" ;;
+  fips)       VARIANT_SUFFIX="-fips" ;;
+  http3)      VARIANT_SUFFIX="-http3" ;;
+  security)   VARIANT_SUFFIX="-security" ;;
+  ai)         VARIANT_SUFFIX="-ai" ;;
+  no-default) VARIANT_SUFFIX="-no-default" ;;
+  *) die "Unknown --variant '${VARIANT}'. Expected one of: default, fips, http3, security, ai, no-default." ;;
+esac
 
 # ── Prerequisites ─────────────────────────────────────────────────────────────
 command -v curl >/dev/null 2>&1 || die "curl is required but not installed."
@@ -59,10 +82,10 @@ case "$OS" in
   *) die "Unsupported OS: $OS. Use scripts/setup.ps1 on Windows." ;;
 esac
 
-TARBALL="tachyon-mesh-${VERSION}-${OS}-${ARCH}.tar.gz"
+TARBALL="tachyon-mesh-${VERSION}-${OS}-${ARCH}${VARIANT_SUFFIX}.tar.gz"
 URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
 CHECKSUM_URL="${URL}.sha256"
-ok "Platform: ${OS}/${ARCH}"
+ok "Platform: ${OS}/${ARCH} (variant: ${VARIANT})"
 
 # ── Download ──────────────────────────────────────────────────────────────────
 info "Downloading ${TARBALL}..."

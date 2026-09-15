@@ -1,10 +1,23 @@
 # get-tachyon.ps1 — Zero-build installer for Tachyon-Mesh on Windows
 # Usage:
 #   irm https://raw.githubusercontent.com/astorise/tachyon-mesh/main/scripts/get-tachyon.ps1 | iex
-#   .\scripts\get-tachyon.ps1 [-Version v1.2.3] [-Dir C:\Tools\tachyon]
+#   .\scripts\get-tachyon.ps1 [-Version v1.2.3] [-Dir C:\Tools\tachyon] [-Variant http3]
+#
+# -Variant selects which of the release's feature builds to fetch (see
+# publish-server-binaries in .github/workflows/release.yml):
+#   default    admin-plane + ring (the plain Quick Start build; this is the
+#              default when -Variant is omitted)
+#   fips       --no-default-features --features fips
+#   http3      --features http3
+#   security   --features rate-limit,resiliency,mtls,secrets-vault,websockets
+#   no-default --no-default-features
+# ("ai" is not offered here: publish-server-binaries excludes windows-x86_64
+# from the -features ai matrix cell, so no Windows -ai archive is published.)
 param(
     [string]$Version = "",
-    [string]$Dir     = "."
+    [string]$Dir     = ".",
+    [ValidateSet("default", "fips", "http3", "security", "no-default")]
+    [string]$Variant = "default"
 )
 $ErrorActionPreference = "Stop"
 
@@ -13,6 +26,13 @@ function Write-Ok    { param($msg) Write-Host "OK  $msg" -ForegroundColor Green 
 function Write-Fail  { param($msg) Write-Host "FAIL $msg" -ForegroundColor Red; exit 1 }
 
 $Repo = "astorise/tachyon-mesh"
+$VariantSuffix = switch ($Variant) {
+    "default"    { "" }
+    "fips"       { "-fips" }
+    "http3"      { "-http3" }
+    "security"   { "-security" }
+    "no-default" { "-no-default" }
+}
 
 # ── 1. Resolve version ────────────────────────────────────────────────────────
 if ($Version -eq "") {
@@ -28,11 +48,12 @@ Write-Ok "Version: $Version"
 
 # ── 2. Build download URL ─────────────────────────────────────────────────────
 # Matches the artifact produced by publish-server-binaries in release.yml:
-#   tachyon-mesh-{VERSION}-windows-x86_64.zip
+#   tachyon-mesh-{VERSION}-windows-x86_64[-variant].zip
 $VersionNoV = $Version -replace '^v', ''
-$ZipName    = "tachyon-mesh-${VersionNoV}-windows-x86_64.zip"
+$ZipName    = "tachyon-mesh-${VersionNoV}-windows-x86_64${VariantSuffix}.zip"
 $DownloadUrl    = "https://github.com/$Repo/releases/download/$Version/$ZipName"
 $ChecksumUrl    = "$DownloadUrl.sha256"
+Write-Ok "Variant: $Variant"
 
 Write-Info "Downloading $ZipName..."
 
