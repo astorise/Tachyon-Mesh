@@ -65,12 +65,26 @@ pub(crate) struct AuthClaims {
 /// (method, path) the caller wanted to access. Hashing the token keeps the raw
 /// secret out of the cache key space — a memory dump exposes only the digest.
 ///
-/// Bounded to 16 384 entries so a token-spoofing flood cannot OOM the host. Time-
-/// to-idle of 5 minutes is well below the typical PAT lifetime; mutations issued
-/// via `system-faas-authz` invalidate matching entries through the
-/// `authz_purge_outbox` table, so the steady-state worst case is "5 minutes of
-/// stale access" only when the host is also network-partitioned from its own
-/// outbox storage, which is impossible by construction (redb is in-process).
+/// Bounded to 16 384 entries so a token-spoofing flood cannot OOM the host.
+/// Mutations issued via `system-faas-authz` invalidate matching entries
+/// through the `authz_purge_outbox` table, so revocation / role change / ban
+/// take effect on the next request regardless of these durations.
+///
+/// Two independent time bounds, for two independent risks:
+/// - `time_to_idle` (5 minutes): evicts an entry nobody has used recently, so
+///   a spoofing flood that stops hitting a given (token, method, path) can't
+///   hold that slot forever.
+/// - `time_to_live` (60 seconds): evicts an entry no matter how often it's
+///   used. Idle time alone doesn't bound staleness against *expiry* — a
+///   token polled every few minutes would keep resetting its idle timer and
+///   stay accepted long after its own `exp` passed, since nothing here
+///   re-checks expiry on a cache hit (`identity-payload`, returned by
+///   `validate-token`, carries no expiry field to check). The TTL forces a
+///   real `authenticate()` call at least once a minute, which does check it.
+///   This bounds staleness, it doesn't eliminate it — real expiry-aware
+///   invalidation needs `expires-at` added to `identity-payload` in
+///   `wit/authn.wit` and threaded through the authn component; see
+///   issue #422 for the follow-up.
 #[derive(Clone)]
 pub(crate) struct AuthDecisionCache {
     inner: moka::sync::Cache<AuthDecisionKey, AuthDecision>,
@@ -95,6 +109,7 @@ impl AuthDecisionCache {
             inner: moka::sync::Cache::builder()
                 .max_capacity(16_384)
                 .time_to_idle(Duration::from_secs(300))
+                .time_to_live(Duration::from_secs(60))
                 .support_invalidation_closures()
                 .build(),
         }
