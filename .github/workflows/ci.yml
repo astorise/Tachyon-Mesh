@@ -586,14 +586,46 @@ jobs:
       - name: Unpack guest artifacts
         run: tar -xzf wasm-guests.tar.gz
 
-      # tachyon-ui is a Tauri desktop app with no unit tests (covered by
-      # Playwright E2E in e2e.yml). Excluding it avoids pulling in GTK/WebKit
-      # system libraries that are only needed in the quality job.
+      # tachyon-ui is a Tauri desktop app; its Rust side has no unit tests of
+      # its own (the crate is a thin Tauri command shim over tachyon-client,
+      # which this run does cover) and pulls in GTK/WebKit system libraries
+      # that are only needed in the quality job. Its TypeScript side has its
+      # own tests, run by the `ui` job below (plus Playwright E2E in
+      # e2e.yml) — Cargo's `--exclude` doesn't reach those either way.
       - name: Run tests
         run: cargo nextest run --workspace --exclude tachyon-ui
 
       - name: Run doc tests
         run: cargo test --doc --workspace --exclude tachyon-ui
+
+  # ── 4b. tachyon-ui TypeScript (needs nothing — pure npm, runs in parallel) ───
+  # Type-checks and unit-tests the UI's TypeScript side. Separate from `test`
+  # above (which only covers Rust) and from e2e.yml's Playwright job (which is
+  # path-filtered to tachyon-ui/** and so never runs against a core-host
+  # change that breaks a UI contract) — this job has no path filter and no
+  # `needs`, so it runs on every push and PR regardless of what changed.
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: tachyon-ui/package-lock.json
+
+      - name: Install npm dependencies
+        working-directory: tachyon-ui
+        run: npm ci
+
+      - name: Type-check
+        working-directory: tachyon-ui
+        run: npx tsc --noEmit
+
+      - name: Run tests
+        working-directory: tachyon-ui
+        run: npm test
 
   # ── 5. Coverage (needs quality + guests, runs in parallel with test) ─────────
   # Separate job gives a fresh disk so the large llvm-cov instrumented tree
