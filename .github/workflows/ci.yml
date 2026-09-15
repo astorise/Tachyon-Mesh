@@ -169,21 +169,13 @@ jobs:
           tool: cargo-audit,cargo-deny
 
       - name: Run cargo audit
-        # RUSTSEC-2023-0071 (rsa Marvin attack) targets RSA private-key
-        # decryption timing; we only verify JWT signatures with public keys
-        # (no private-key ops), so it does not apply. RUSTSEC-2024-0429 is in
-        # glib's VariantStrIter; glib is present through the desktop/Tauri GTK
-        # dependency tree, not the headless runtime path. RUSTSEC-2026-0204
-        # (published 2026-07-06) is an invalid-pointer dereference in
-        # crossbeam-epoch's `fmt::Pointer` impl for `Atomic`/`Shared`, reached
-        # only by formatting those types for Debug/Display; Tachyon's
-        # dependency tree never does that. Remove this ignore once a fixed
-        # crossbeam-epoch (advisory says >=0.9.20) is picked up.
-        run: >
-          cargo audit
-          --ignore RUSTSEC-2023-0071
-          --ignore RUSTSEC-2024-0429
-          --ignore RUSTSEC-2026-0204
+        # Ignored advisories are declared in .cargo/audit.toml (auto-discovered
+        # by cargo-audit, no --ignore flags needed here) rather than as CLI
+        # flags in this step, so there is one file to read for "what's
+        # suppressed and why" instead of this step's own history. See that
+        # file, and deny.toml's [advisories].ignore, which is the canonical
+        # list for anything cargo-deny also needs to ignore (issue #428).
+        run: cargo audit
 
       - name: Run cargo deny
         run: cargo deny check advisories bans sources
