@@ -25,20 +25,19 @@ concurrency:
 # is self-contained and readable without cross-referencing.
 
 # ── Renovate fast lane ────────────────────────────────────────────────────────
-# Dependency-update PRs (head branch `renovate/**`) don't need the full
-# test/GPU suite; that made them impossible to merge because cuda-quality
-# queues on the resource-limited arc-gpu-runners. On these PRs the four
-# required checks (build-guests, security-audit, quality, cuda-quality) still
-# run, fips-tests becomes a compile check, and every other job is skipped
-# outright (a `skipped` job conclusion satisfies branch protection). Detection
-# uses the head branch prefix — not the actor — so a human re-running or
-# pushing a fix to a Renovate branch stays in the same lane.
+# Dependency-update PRs (head branch `renovate/**`) don't need the full test
+# suite. On these PRs the required checks (build-guests, security-audit,
+# quality) still run, fips-tests becomes a compile check, and every other job
+# is skipped outright (a `skipped` job conclusion satisfies branch
+# protection). Detection uses the head branch prefix — not the actor — so a
+# human re-running or pushing a fix to a Renovate branch stays in the same
+# lane.
 #
-# quality/cuda-quality's clippy steps stay on (not a bare `cargo check`): the
-# `push` run on `main` right after a Renovate merge always runs the strict
-# lint, so a lint this lane skipped only defers that failure to `main` for
-# everyone instead of avoiding it (see issue #416, which this fixed after #415
-# proved it out — a dependency bump grew `hyper::Response`'s size past
+# quality's clippy step stays on (not a bare `cargo check`): the `push` run
+# on `main` right after a Renovate merge always runs the strict lint, so a
+# lint this lane skipped only defers that failure to `main` for everyone
+# instead of avoiding it (see issue #416, which this fixed after #415 proved
+# it out — a dependency bump grew `hyper::Response`'s size past
 # `clippy::result_large_err`'s threshold, merged green on its Renovate PR, and
 # broke `main` for five days). The lane instead allows the two lint families a
 # semver-compatible dependency bump can legitimately trigger with no change to
@@ -46,6 +45,18 @@ concurrency:
 # (`clippy::result_large_err`), or a newly-`#[deprecated]` dependency API
 # (`deprecated`) — so `main` and every Renovate PR are always held to the same
 # bar for everything else.
+#
+# There used to be a fourth required check, cuda-quality, which built and
+# tested the CUDA-enabled Candle inference backend on a self-hosted GPU
+# runner. That backend (core-host/src/ai_inference_legacy_candle.rs and the
+# candle-cuda/candle-metal/nvfp4-cuda features) was already orphaned from the
+# build — never actually compiled since the Magnetar cutover (#411) — and has
+# been deleted rather than revived (issue #418); local model execution
+# currently only supports proxying to an OpenAI-compatible upstream
+# (`openai:` bindings). cuda-quality and gpu-acceptance.yml went with it.
+# `cuda-quality` still needs removing from this repository's branch
+# protection required-checks list — that's a repo setting, not something a
+# workflow file change can do.
 
 jobs:
   # ── 1. Build WASM guest artifacts once ──────────────────────────────────────
@@ -295,9 +306,12 @@ jobs:
           done
 
       - name: Lint workspace (CPU features)
-        # Keep the general quality gate on ubuntu-latest CPU runners: CUDA is
-        # validated separately by the arc-gpu-runners job below. `--all-features`
-        # would enable core-host/candle-cuda and require nvcc on this runner.
+        # Explicit feature flag rather than --all-features mostly for
+        # symmetry with the per-feature compile-only loop above and the
+        # feature-matrix-tests job's matrix, which do need to stay CPU-only
+        # explicit lists (ebpf-loader needs Linux, the historical
+        # candle-cuda/candle-metal GPU backends this comment used to warn
+        # about no longer exist at all — see issue #418).
         #
         # Runs on Renovate PRs too — see the "Renovate fast lane" note at the
         # top of this file for why, and for what -A deprecated
@@ -316,21 +330,6 @@ jobs:
       - name: Check ai-inference host build
         run: cargo check -p core-host --features ai-inference
 
-      - name: Verify constrained decoding is implemented, not just specified
-        # openspec/specs/core-host/spec.md requires native constrained decoding
-        # behind ai-inference. The previous attempt at this (archived change
-        # 2026-05-16-ai-constrained-decoding) merged the spec text with 0 lines
-        # of matching code. Guard against that drift recurring: the FSM/logit
-        # masking engine must exist in core-host/src, and the WIT contract must
-        # expose `sample-constrained`.
-        run: |
-          grep -rq "FsmLogitProcessor" core-host/src
-          grep -q "sample-constrained" wit/ai/inference.wit
-
-      - name: Test real Candle LLM fixture
-        if: env.RENOVATE_PR != 'true'
-        run: cargo test -p core-host --features ai-inference --bin core-host real_candle_llm_runtime
-
       # Build the guest the streaming integration test drives, then run it. The
       # test resolves `target/wasm32-wasip2/release/guest_openai.wasm`; with
       # TACHYON_REQUIRE_GUEST_OPENAI set it fails hard instead of skipping if the
@@ -344,196 +343,6 @@ jobs:
         env:
           TACHYON_REQUIRE_GUEST_OPENAI: "1"
         run: cargo test -p core-host --features ai-inference --bin core-host streaming_guest_openai -- --nocapture
-
-  # ── 3b. CUDA quality gate (requires the self-hosted ARC GPU runner) ────────
-  # This job owns the CUDA-enabled Candle build so the default ubuntu-latest
-  # quality job can stay CPU-only while still validating GPU ONNX inference code.
-  cuda-quality:
-    runs-on: arc-gpu-runners
-    env:
-      CARGO_TERM_COLOR: always
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      RUSTFLAGS: "-D dead_code"
-      # Renovate compile-only fast lane (see top of file): this runner is the
-      # scarce resource, so dependency PRs only run the `cargo check` steps —
-      # clippy and every GPU execution proof are skipped.
-      RENOVATE_PR: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/') }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: cuda-quality
-          # Keep the expensive CUDA dependency build when a later GPU proof
-          # fails or times out, so the next run can resume from the cache.
-          cache-on-failure: true
-
-      # The ARC GPU runner on Talos has the NVIDIA driver (nvidia-smi works) but
-      # cudarc/candle-kernels need `nvcc` from the CUDA toolkit at build time.
-      # The toolkit's bin dir is not always on PATH for the job's non-login
-      # shell, so discover nvcc (PATH, then the usual roots, then a bounded
-      # filesystem search) and export its bin dir + CUDA_PATH/CUDA_HOME. Print
-      # diagnostics so a genuinely missing toolkit is easy to spot in the log.
-      - name: Put CUDA toolkit on PATH
-        run: |
-          echo "PATH=$PATH"
-          echo "CUDA_HOME=${CUDA_HOME:-<unset>} CUDA_PATH=${CUDA_PATH:-<unset>}"
-          nvcc_bin=""
-          # 1. Already on PATH?
-          if command -v nvcc >/dev/null 2>&1; then
-            nvcc_bin="$(command -v nvcc)"
-          fi
-          # 2. Well-known install roots.
-          if [ -z "$nvcc_bin" ]; then
-            for cuda in "${CUDA_HOME:-}" "${CUDA_PATH:-}" \
-                        /usr/local/cuda /usr/local/cuda-* \
-                        /opt/cuda /opt/cuda-* /usr/lib/cuda /usr/cuda; do
-              if [ -n "$cuda" ] && [ -x "$cuda/bin/nvcc" ]; then
-                nvcc_bin="$cuda/bin/nvcc"
-                break
-              fi
-            done
-          fi
-          # 3. Last resort: bounded search of likely roots.
-          if [ -z "$nvcc_bin" ]; then
-            nvcc_bin="$(find /usr /opt -maxdepth 5 -name nvcc -type f -executable 2>/dev/null | head -n1 || true)"
-          fi
-          if [ -z "$nvcc_bin" ]; then
-            echo "::error::nvcc not found on this runner. The CUDA *toolkit* (not just the driver) must be installed in the arc-gpu-runners image. nvidia-smi alone is not enough — candle-kernels/cudarc compile .cu kernels with nvcc at build time."
-            echo "--- diagnostics ---"
-            echo "ls /usr/local:"; ls -la /usr/local 2>/dev/null || true
-            echo "ls /opt:";       ls -la /opt 2>/dev/null || true
-            echo "dpkg cuda pkgs:"; dpkg -l 2>/dev/null | grep -i cuda || echo "  (none)"
-            exit 1
-          fi
-          cuda_root="$(dirname "$(dirname "$nvcc_bin")")"
-          echo "Found nvcc at $nvcc_bin (CUDA root: $cuda_root)"
-          echo "$(dirname "$nvcc_bin")" >> "$GITHUB_PATH"
-          echo "CUDA_PATH=$cuda_root" >> "$GITHUB_ENV"
-          echo "CUDA_HOME=$cuda_root" >> "$GITHUB_ENV"
-
-      - name: Verify CUDA toolchain
-        run: |
-          nvidia-smi
-          nvcc --version
-
-      # candle-onnx's build script compiles the ONNX .proto and needs `protoc`.
-      # The CPU jobs get it from `apt-get install protobuf-compiler`, but this
-      # GPU runner image is RPM/UBI-based (no apt), so install protoc in a
-      # distro-agnostic way. Skipped if the runner image already ships protoc.
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Check Candle CUDA host build
-        run: cargo check -p core-host --features candle-cuda
-
-      # Renovate fast lane: also prove the FlashInfer kernel crate still
-      # compiles against the updated deps. On regular runs this compile is
-      # covered by the FlashInfer test steps below, which the fast lane skips.
-      - name: Check Candle CUDA + FlashInfer host build (Renovate compile-only lane)
-        if: env.RENOVATE_PR == 'true'
-        run: cargo check -p core-host --features candle-cuda
-
-      - name: Lint Candle CUDA host build
-        # Runs on Renovate PRs too — see the "Renovate fast lane" note at the
-        # top of this file.
-        run: |
-          if [ "${RENOVATE_PR}" = "true" ]; then
-            cargo clippy -p core-host --features candle-cuda --all-targets -- -D warnings -D clippy::unwrap_used -A deprecated -A clippy::result_large_err
-          else
-            cargo clippy -p core-host --features candle-cuda --all-targets -- -D warnings -D clippy::unwrap_used
-          fi
-
-      # Compile test binaries separately so execution-proof timeouts only
-      # cover the GPU operation, not a cold Candle CUDA compilation.
-      - name: Build Candle CUDA test binaries
-        if: env.RENOVATE_PR != 'true'
-        run: cargo test -p core-host --bin core-host --features candle-cuda --no-run
-
-      # Proves the tensor-parallel all-reduce path issues a real NCCL
-      # AllReduce on this runner's real GPU (via ncclCommInitAll loopback
-      # ranks, see parallel.rs), not just that candle-cuda compiles/lints.
-      - name: Run CUDA NCCL all-reduce proof
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 10
-        run: cargo test -p core-host --bin core-host --features candle-cuda nccl_all_reduce_matches_cpu_staged_reference -- --nocapture
-
-      # Proves the single-device Llama path (enable-single-device-llama-cuda-execution)
-      # actually loads weights and runs a real autoregressive decode on this
-      # runner's GPU instead of falling back to `Device::Cpu`.
-      - name: Run single-device Llama CUDA execution proof
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 15
-        run: cargo test -p core-host --bin core-host --features candle-cuda single_device_llama_executes_on_a_real_cuda_device -- --nocapture
-
-      # Proves hardware_strategy.paged_attention (wire-paged-attention-decode-path)
-      # actually attaches cache.set_paged_kv and runs a real decode through
-      # flash_attn_varlen_paged_windowed on this runner's GPU, including a
-      # second request reusing the same shared block pool.
-      - name: Run paged-attention CUDA execution proof
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 15
-        run: cargo test -p core-host --bin core-host --features candle-cuda single_device_llama_paged_attention_generates_a_real_decode_on_cuda -- --nocapture
-
-      # Proves cuda_graph_decode fails closed without paged_attention and for
-      # GGUF, which has no paged GPU cache (wire-cuda-graph-decode's Section 2.1 gate).
-      - name: Run CUDA Graph decode gate proof
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 10
-        run: cargo test -p core-host --bin core-host --features candle-cuda cuda_graph_decode_strategy_is_rejected -- --nocapture
-
-      # Proves hardware_strategy.cuda_graph_decode (wire-cuda-graph-decode)
-      # actually captures and replays the steady-state decode step through
-      # candle_core::CudaGraph on this runner's GPU (CudaGraphDecodeSession:
-      # warm-up, capture, first replay, then plain replays), and that its
-      # output matches the non-captured paged-attention path's greedy decode
-      # for the same checkpoint/prompt — not just that it runs without error.
-      - name: Run CUDA Graph decode capture/replay execution proof
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 20
-        run: cargo test -p core-host --bin core-host --features candle-cuda single_device_llama_cuda_graph_decode_generates_a_real_captured_decode_on_cuda -- --nocapture
-
-      # FlashInfer adds its own CUDA crate, so prepare those test binaries
-      # before applying the execution-proof timeout below.
-      - name: Build FlashInfer CUDA test binaries
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 30
-        run: cargo test -p core-host --bin core-host --features candle-cuda --no-run
-
-      # Proves hardware_strategy.flashinfer_attention (wire-flashinfer-decode-attention)
-      # actually dispatches through candle-flashinfer-kernels::flashinfer_decode_attention
-      # for the decode step on this runner's GPU, and that its output matches the
-      # dense (non-flashinfer) path's greedy decode for the same checkpoint/prompt.
-      - name: Run FlashInfer decode-attention CUDA execution proof
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 15
-        run: cargo test -p core-host --bin core-host --features candle-cuda single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda -- --nocapture
-
-      - name: Run FlashInfer/paged-attention combination rejection proof
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 10
-        run: cargo test -p core-host --bin core-host --features candle-cuda flashinfer_attention_and_paged_attention_combination_is_rejected -- --nocapture
-
-      # The CUTLASS headers used to be cloned here because this repository
-      # compiled its own NVFP4 kernel. `candle-nvfp4-kernels` owns that now and
-      # brings its own build, so the checkout and the include-dir hand-off are
-      # both gone.
-      # Synthetic tensors, no checkpoint: this asks only whether the native
-      # kernel agrees with the scalar fallback on the runner's own device.
-      # candle #3831 removed the compute-capability floor that used to keep it
-      # opt-in, and candle's own suite owns the hardware question now, so it
-      # runs on every PR against whatever GPU the pool hands us.
-      - name: Run native NVFP4 parity and telemetry proof
-        if: env.RENOVATE_PR != 'true'
-        env:
-          TACHYON_NVFP4_CUDA_SMOKE: "1"
-        run: cargo test -p core-host --features candle-cuda nvfp4_cuda -- --nocapture
 
   # ── 4. Tests (needs quality + guests) ───────────────────────────────────────
   # Runs the full workspace nextest suite — including the core-host chaos
@@ -766,13 +575,12 @@ jobs:
           # build (transport stack included); this one is the maximally
           # minimal floor.
           - "--no-default-features"
-          # "All CPU features": every feature except the two GPU backends —
-          # `candle-cuda`, which pulls in cudarc and needs `nvcc` (validated
-          # separately by the cuda-quality job on the GPU runner), and
-          # `candle-metal`, which needs macOS. Both kernel crates are built
-          # here regardless: they ride in on `ai-inference` and compile as pure
-          # Rust. A bare `--all-features` would break on these CPU-only
-          # runners. Mirrors publish-docker-images' "-all-features" variant.
+          # "All CPU features": every feature this workspace still defines.
+          # Explicit list rather than `--all-features` mostly to mirror
+          # publish-docker-images' "-all-features" variant and stay resilient
+          # to a future feature that does need non-CPU hardware — there
+          # isn't one today (the candle-cuda/candle-metal GPU backends this
+          # comment used to exclude no longer exist at all; see issue #418).
           - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
@@ -840,13 +648,12 @@ jobs:
         features:
           - ""
           - "--no-default-features"
-          # "All CPU features": every feature except the two GPU backends —
-          # `candle-cuda`, which pulls in cudarc and needs `nvcc` (validated
-          # separately by the cuda-quality job on the GPU runner), and
-          # `candle-metal`, which needs macOS. Both kernel crates are built
-          # here regardless: they ride in on `ai-inference` and compile as pure
-          # Rust. A bare `--all-features` would break on these CPU-only
-          # runners. Mirrors publish-docker-images' "-all-features" variant.
+          # "All CPU features": every feature this workspace still defines.
+          # Explicit list rather than `--all-features` mostly to mirror
+          # publish-docker-images' "-all-features" variant and stay resilient
+          # to a future feature that does need non-CPU hardware — there
+          # isn't one today (the candle-cuda/candle-metal GPU backends this
+          # comment used to exclude no longer exist at all; see issue #418).
           - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"

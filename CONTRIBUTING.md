@@ -9,7 +9,6 @@ Before a pull request can merge, it must be up to date with `main` and pass the
 required GitHub Actions status checks:
 
 - `quality`
-- `cuda-quality`
 - `security-audit`
 - `build-guests`
 
