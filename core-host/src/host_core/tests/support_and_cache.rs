@@ -2,7 +2,7 @@ pub(super) use crate::*;
 
 pub(super) use axum::{body::Body, http::Request};
 use ed25519_dalek::{Signer, SigningKey};
-pub(super) use http_body_util::{BodyExt, Full};
+pub(super) use http_body_util::Full;
 use proptest::prelude::*;
 use prost::Message;
 use rcgen::{

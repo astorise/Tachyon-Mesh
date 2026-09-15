@@ -994,11 +994,50 @@ pub(crate) async fn admin_status_handler(State(state): State<crate::AppState>) -
     )
 }
 
+/// Error type for the IAM admin handlers below. `axum::response::Response`
+/// (`hyper::Response<axum::body::Body>`) is at least 128 bytes, so returning
+/// it directly as a `Result::Err` makes every one of these `async fn`s carry
+/// that weight on its stack frame regardless of whether the call succeeds
+/// (`clippy::result_large_err`). Boxing it keeps the `Err` variant at one
+/// pointer while still satisfying axum's `Handler` blanket impl for
+/// `Result<T, E>` via the `IntoResponse`/`From<Response>` impls below.
+/// `Deref`/`DerefMut` to the inner `Response` mean callers (tests included)
+/// can still use the full `Response` API — `.status()`, `.headers()`, etc. —
+/// without reaching into a `.0` field.
+#[derive(Debug)]
+pub(crate) struct BoxedErrorResponse(Box<Response>);
+
+impl std::ops::Deref for BoxedErrorResponse {
+    type Target = Response;
+
+    fn deref(&self) -> &Response {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for BoxedErrorResponse {
+    fn deref_mut(&mut self) -> &mut Response {
+        &mut self.0
+    }
+}
+
+impl IntoResponse for BoxedErrorResponse {
+    fn into_response(self) -> Response {
+        *self.0
+    }
+}
+
+impl From<Response> for BoxedErrorResponse {
+    fn from(response: Response) -> Self {
+        Self(Box::new(response))
+    }
+}
+
 #[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn generate_recovery_codes_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<RecoveryCodeRequest>,
-) -> Result<Json<RecoveryCodeResponse>, Response> {
+) -> Result<Json<RecoveryCodeResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let username = payload.username;
@@ -1023,7 +1062,7 @@ pub(crate) async fn generate_recovery_codes_handler(
 pub(crate) async fn validate_registration_token_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<ValidateRegistrationTokenRequest>,
-) -> Result<Json<RegistrationTokenClaimsResponse>, Response> {
+) -> Result<Json<RegistrationTokenClaimsResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let token = payload.token;
@@ -1047,7 +1086,7 @@ pub(crate) async fn validate_registration_token_handler(
 pub(crate) async fn stage_signup_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<StageSignupRequest>,
-) -> Result<Json<StagedUserSessionResponse>, Response> {
+) -> Result<Json<StagedUserSessionResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
 
@@ -1069,7 +1108,7 @@ pub(crate) async fn stage_signup_handler(
 pub(crate) async fn finalize_enrollment_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<FinalizeEnrollmentRequest>,
-) -> Result<Json<FinalizeEnrollmentResponse>, Response> {
+) -> Result<Json<FinalizeEnrollmentResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let session_id = payload.session_id;
@@ -1095,7 +1134,7 @@ pub(crate) async fn finalize_enrollment_handler(
 pub(crate) async fn stage_login_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<StageLoginRequest>,
-) -> Result<Json<StagedLoginSessionResponse>, Response> {
+) -> Result<Json<StagedLoginSessionResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let username = payload.username;
@@ -1147,7 +1186,7 @@ pub(crate) async fn stage_login_handler(
 pub(crate) async fn finalize_login_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<FinalizeLoginRequest>,
-) -> Result<Json<FinalizeEnrollmentResponse>, Response> {
+) -> Result<Json<FinalizeEnrollmentResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let session_id = payload.session_id;
@@ -1201,14 +1240,15 @@ pub(crate) async fn finalize_login_handler(
 pub(crate) async fn issue_step_up_session_handler(
     Extension(claims): Extension<AuthClaims>,
     Json(payload): Json<StepUpSessionRequest>,
-) -> Result<Json<StepUpSessionResponse>, Response> {
+) -> Result<Json<StepUpSessionResponse>, BoxedErrorResponse> {
     let totp_code = payload.totp_code.trim();
     if totp_code.len() != 6 || !totp_code.chars().all(|digit| digit.is_ascii_digit()) {
         return Err((
             StatusCode::BAD_REQUEST,
             "MFA code must contain exactly 6 digits",
         )
-            .into_response());
+            .into_response()
+            .into());
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1231,7 +1271,7 @@ pub(crate) async fn issue_step_up_session_handler(
 pub(crate) async fn regenerate_account_security_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
-) -> Result<Json<RecoveryCodeResponse>, Response> {
+) -> Result<Json<RecoveryCodeResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let username = claims.subject;
@@ -1258,7 +1298,7 @@ pub(crate) async fn issue_pat_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
     Json(payload): Json<IssuePatRequest>,
-) -> Result<Json<IssuePatResponse>, Response> {
+) -> Result<Json<IssuePatResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let subject = claims.subject;
@@ -1288,7 +1328,7 @@ pub(crate) async fn issue_pat_handler(
 pub(crate) async fn consume_recovery_code_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<ConsumeRecoveryCodeRequest>,
-) -> Result<Json<ConsumeRecoveryCodeResponse>, Response> {
+) -> Result<Json<ConsumeRecoveryCodeResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let username = payload.username;
@@ -1315,7 +1355,7 @@ pub(crate) async fn consume_recovery_code_handler(
 pub(crate) async fn list_users_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
-) -> Result<Json<Vec<IamUserSummaryResponse>>, Response> {
+) -> Result<Json<Vec<IamUserSummaryResponse>>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let actor = claims.subject.clone();
@@ -1358,7 +1398,7 @@ pub(crate) async fn update_user_handler(
     Extension(claims): Extension<AuthClaims>,
     axum::extract::Path(username): axum::extract::Path<String>,
     Json(payload): Json<UpdateUserRequest>,
-) -> Result<Json<IamUserSummaryResponse>, Response> {
+) -> Result<Json<IamUserSummaryResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let actor = claims.subject.clone();
@@ -1410,7 +1450,7 @@ pub(crate) async fn delete_user_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
     axum::extract::Path(username): axum::extract::Path<String>,
-) -> Result<StatusCode, Response> {
+) -> Result<StatusCode, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let actor = claims.subject.clone();
@@ -1457,7 +1497,7 @@ pub(crate) async fn delete_user_handler(
 pub(crate) async fn list_groups_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
-) -> Result<Json<Vec<IamGroupSummaryResponse>>, Response> {
+) -> Result<Json<Vec<IamGroupSummaryResponse>>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let actor = claims.subject.clone();
@@ -1499,7 +1539,7 @@ pub(crate) async fn upsert_group_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
     Json(payload): Json<UpsertGroupRequest>,
-) -> Result<Json<IamGroupSummaryResponse>, Response> {
+) -> Result<Json<IamGroupSummaryResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let actor = claims.subject.clone();
@@ -1544,7 +1584,7 @@ pub(crate) async fn delete_group_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
     axum::extract::Path(name): axum::extract::Path<String>,
-) -> Result<StatusCode, Response> {
+) -> Result<StatusCode, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let actor = claims.subject.clone();
