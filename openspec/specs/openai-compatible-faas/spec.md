@@ -31,17 +31,24 @@ included in the route's sealed dynamic model bindings.
   the structured conversation and sampling parameters to the host, and returns
   an OpenAI-shaped `chat.completion`
 
-#### Scenario: Embeddings returns OpenAI-compatible vectors
+#### Scenario: Embeddings returns OpenAI-compatible vectors via an upstream binding
+
+> The Candle ONNX embeddings primitive this scenario originally described
+> (`candle_onnx_backend.rs`/`candle_embedding_runtime.rs`) was orphaned from
+> the build by the Magnetar cutover and has since been deleted rather than
+> revived (issue #418) — it never actually ran. Local/Magnetar-backed
+> embedding models return a typed "does not expose dense text embeddings in
+> the Magnetar cutover" error (`core-host/src/ai_inference.rs`). Embeddings
+> work today only via an `openai:` upstream binding, forwarded as described
+> below.
 
 - **GIVEN** a sealed static or dynamic model alias the route is allowed to use
-- **AND** that alias resolves to an ONNX embedding model directory containing
-  `tokenizer.json` and a model file such as `model.onnx`
+- **AND** that alias is bound to an `openai:` upstream (an OpenAI-compatible
+  server that itself serves embeddings)
 - **WHEN** a client requests `POST /ai/v1/embeddings` naming that model with a
   single string or list of strings
-- **THEN** `guest-openai` loads the model on the CPU accelerator, calls the host
-  Candle ONNX embeddings primitive once per input, applies masked pooling and
-  L2 normalization, and returns an OpenAI-shaped `list` of `embedding` objects
-  preserving input order
+- **THEN** `guest-openai` forwards the request to the upstream's `/embeddings`
+  route and returns its OpenAI-shaped `list` of `embedding` objects
 
 #### Scenario: Listed dynamic model is authorized for chat
 

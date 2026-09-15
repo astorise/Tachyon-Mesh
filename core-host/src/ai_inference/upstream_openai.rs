@@ -1,12 +1,13 @@
 //! Passthrough backend for an OpenAI-compatible upstream inference server.
 //!
-//! Tachyon's native Candle runtime only executes the checkpoint formats and
-//! architectures it has verified loaders for. This backend covers the rest of
-//! the ecosystem — llama.cpp's `llama-server`, vLLM, SGLang, or any other
-//! server speaking the OpenAI chat-completions wire format — by forwarding the
-//! host's own generation request to it and returning the generated text
-//! unchanged. The mesh keeps ownership of routing, QoS, authorisation, and the
-//! `/ai/v1` surface; only the tensor math moves out of process.
+//! The Magnetar local runtime only executes the checkpoint formats and
+//! architectures it has verified loaders for (see issue #417 for the state of
+//! that path). This backend covers the rest of the ecosystem — llama.cpp's
+//! `llama-server`, vLLM, SGLang, or any other server speaking the OpenAI
+//! chat-completions wire format — by forwarding the host's own generation
+//! request to it and returning the generated text unchanged. The mesh keeps
+//! ownership of routing, QoS, authorisation, and the `/ai/v1` surface; only
+//! the tensor math moves out of process.
 //!
 //! A binding opts in through its `path`, exactly like the `mock:` scheme:
 //!
@@ -372,13 +373,13 @@ pub(crate) fn assert_no_credential_collisions<'a>(
     Ok(())
 }
 
-/// The host generation request, mirroring `candle_llm_runtime`'s private
-/// `GenerationRequest` field for field.
+/// The host generation request, matching the shape the host's own
+/// generation path accepts.
 ///
 /// It is deliberately a separate type rather than a shared one: this backend
-/// must accept exactly the same request envelope the native runtime accepts, and
-/// keeping its own copy means a future native-only field cannot silently change
-/// what gets forwarded to a third-party server.
+/// must accept exactly the same request envelope a native local runtime
+/// would, and keeping its own copy means a future native-only field cannot
+/// silently change what gets forwarded to a third-party server.
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct HostGenerationRequest {
     #[serde(default)]

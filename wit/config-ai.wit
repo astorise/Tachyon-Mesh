@@ -8,20 +8,16 @@ interface config-ai {
         auto-detect,
     }
 
-    /// `tensor-parallelism`/`pipeline-parallelism`/`expert-parallelism` are
-    /// executable, not configuration-only. The runtime now wires this
-    /// `hardware-strategy` into model loading: `candle_llm_runtime::try_load`
-    /// reads it, validates the plan against discovered hardware, and selects
-    /// the matching engine (see
-    /// `openspec/changes/2026-06-22-wire-model-parallel-runtime-dispatch`).
-    /// Status by mode: `tensor-parallelism` runs the full autoregressive
-    /// decode loop; `pipeline-parallelism` is loaded and prefill-correct but
-    /// its decode loop is a disclosed follow-up (generation returns a typed
-    /// error until then); `expert-parallelism` is validated and placed but
-    /// rejected at load until a full MoE checkpoint loader lands (only the
-    /// verified per-expert primitive exists today). Real GPU execution,
-    /// multi-GPU VRAM telemetry, and the NCCL all-reduce require the
-    /// `candle-cuda` build and are exercised on the CUDA CI lane.
+    /// Status note (issues #417, #418): the Candle-backed engine that used to
+    /// wire `tensor-parallelism`/`pipeline-parallelism`/`expert-parallelism`
+    /// into real model loading (`candle_llm_runtime::try_load` reading this
+    /// `hardware-strategy`, validating it against discovered hardware, and
+    /// selecting the matching engine) was orphaned from the compiled build by
+    /// the Magnetar cutover (#411) and has since been deleted rather than
+    /// restored unverified. None of it runs today; local model execution via
+    /// Magnetar accepts only `single`-distribution Qwen safetensors
+    /// directories, and these modes are accepted here as configuration but
+    /// not executed.
     enum gpu-distribution {
         single,
         tensor-parallelism,
@@ -55,25 +51,30 @@ interface config-ai {
         /// Bounded number of micro-batches kept in flight across pipeline
         /// stages. Ignored outside `pipeline-parallelism`.
         pipeline-depth: u32,
-        /// Request block-paged KV-cache attention. Tachyon accepts this
-        /// declarative knob only when its runtime has wired Candle's paged
-        /// flash-attn API to a block allocator and per-sequence block table.
+        /// Request block-paged KV-cache attention. Accepted and stored, but
+        /// currently inert: the Candle backend that would have wired a paged
+        /// flash-attn API to a block allocator and per-sequence block table
+        /// was deleted (issue #418), and no runtime implements this today
+        /// (issue #417).
         paged-attention: bool,
         /// Request CUDA Graph capture/replay for the steady-state decode step.
-        /// Tachyon rejects this until its GPU decode loop has fixed shapes,
-        /// stable device buffers, and a direct `candle-core` CudaGraph path.
+        /// Accepted and stored, but currently inert: the Candle backend this
+        /// targeted was deleted (issue #418), and no runtime implements this
+        /// today (issue #417).
         cuda-graph-decode: bool,
-        /// Request the optional Candle FlashInfer-style decode-attention
-        /// backend. Tachyon rejects this until the model decode path is wired
-        /// to `candle-flashinfer-kernels`.
+        /// Request the optional FlashInfer-style decode-attention backend.
+        /// Accepted and stored, but currently inert: the Candle backend this
+        /// targeted was deleted (issue #418), and no runtime implements this
+        /// today (issue #417).
         flashinfer-attention: bool,
         /// Optional prefill chunk size in tokens. Absent uses Tachyon's
         /// default (8192 tokens), `some(0)` disables chunked prefill.
         prefill-chunk-tokens: option<u32>,
-        /// Optional local model directory for speculative decoding. When set,
-        /// core-host loads this draft model beside the target model and uses a
-        /// greedy propose/verify loop; unsupported request modes fall back to
-        /// the target-only decode path.
+        /// Optional local model directory for speculative decoding. Accepted
+        /// and stored, but currently inert: the Candle backend that used to
+        /// load this draft model beside the target model for a greedy
+        /// propose/verify loop was deleted (issue #418), and no runtime
+        /// implements speculative decoding today (issue #417).
         speculative-draft-model-path: string,
         /// Maximum draft tokens proposed before target verification. `0` uses
         /// the runtime default.

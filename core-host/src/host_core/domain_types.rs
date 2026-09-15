@@ -436,19 +436,23 @@ pub(crate) struct HardwareStrategy {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub(crate) pipeline_depth: u32,
     /// Request block-paged KV cache attention instead of the contiguous
-    /// per-request KV cache. This is serialized only when explicitly enabled;
-    /// the runtime rejects it until the Candle paged flash-attn path is wired
-    /// through Tachyon's block allocator and block table.
+    /// per-request KV cache. This is serialized only when explicitly enabled.
+    /// No runtime currently implements it: the Candle paged flash-attn
+    /// backend this targeted was deleted (issue #418) without being wired
+    /// through Tachyon's block allocator and block table, and the Magnetar
+    /// path (issue #417) does not implement it either. Accepted and stored,
+    /// but otherwise inert today.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) paged_attention: bool,
     /// Request CUDA Graph capture/replay for the steady-state decode step.
-    /// This requires the forked Candle `CudaGraph` API plus a GPU decode loop
-    /// with fixed tensor shapes and stable device buffers.
+    /// This targeted the forked Candle `CudaGraph` API, deleted with issue
+    /// #418; no runtime implements this today. Accepted and stored, but
+    /// otherwise inert.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) cuda_graph_decode: bool,
     /// Request the forked Candle FlashInfer-style decode-attention backend.
-    /// This is rejected until Tachyon's model decode path can pass single-token
-    /// Q/K/V tensors to `candle-flashinfer-kernels`.
+    /// That backend was deleted with issue #418; no runtime implements this
+    /// today. Accepted and stored, but otherwise inert.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) flashinfer_attention: bool,
     /// Optional prefill chunk size in tokens. `None` uses the runtime default
@@ -457,8 +461,9 @@ pub(crate) struct HardwareStrategy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) prefill_chunk_tokens: Option<u32>,
     /// Optional local draft model directory used for speculative decoding.
-    /// When set, the Candle backend loads this smaller model beside the target
-    /// model and uses it only for greedy propose/verify decoding.
+    /// This targeted the deleted Candle backend (issue #418); no runtime
+    /// implements speculative decoding today. Accepted and stored, but
+    /// otherwise inert.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) speculative_draft_model_path: String,
     /// Number of draft tokens proposed before target verification. `0` uses the

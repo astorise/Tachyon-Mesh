@@ -37,8 +37,17 @@ The Tachyon AI panel SHALL expose each route model binding from the active manif
 - **AND** it does not call `apply_configuration` or persist an AI payload under `ui_configurations`
 
 #### Scenario: Runtime rejects an unsupported hardware strategy
-- **WHEN** `apply_manifest_config` rejects a `hardware_strategy` because the selected Candle runtime path is not available
+- **WHEN** `apply_manifest_config` rejects a `hardware_strategy` because the selected runtime path is not available
 - **THEN** the AI panel displays the returned rejection message in its feedback area
+
+> **Status note (issues #417, #418):** `apply_manifest_config` currently
+> accepts and stores `paged_attention`, `cuda_graph_decode`,
+> `flashinfer_attention`, and `speculative_draft_model_path` without
+> validating them against any runtime's actual capabilities — the Candle
+> backend these fields targeted was deleted (#418), and no rejection path
+> exists today. This scenario describes intended behavior, not current
+> behavior; setting any of these fields is currently a silent no-op rather
+> than an error.
 
 ### Requirement: Hardware Accelerator Panel
 The Tachyon UI shell SHALL expose a `<tachyon-hardware-panel>` web component for live hardware and VRAM visibility. Hardware strategy edits SHALL live in the AI panel on `routes[].models[].hardware_strategy`.

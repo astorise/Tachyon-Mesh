@@ -444,16 +444,17 @@ fn binding_engine_label(path: &str) -> &'static str {
                 }
             }
         }
-        // ONNX outranks the sidecar, because the loader never asks the sidecar
-        // about it. `CandleEmbeddingRuntime::try_load` runs first and resolves
-        // its file by `model_file`, then `model.onnx`, then any `.onnx` in the
-        // directory — the declared format is consulted nowhere in that path. A
-        // directory declaring `safetensors` beside a usable ONNX therefore
-        // loaded the embedding backend while advertising `safetensors/<alias>`,
-        // and the label is half the public `{engine}/{alias}` id, not just
-        // metadata.
+        // ONNX outranks the sidecar. This mirrors the probe order the
+        // now-deleted Candle embedding runtime used to apply (issue #418):
+        // resolve by `model_file`, then `model.onnx`, then any `.onnx` in the
+        // directory, consulting the declared format nowhere in that path. The
+        // live loader today only admits Qwen safetensors directories through
+        // Magnetar (see `ai_inference.rs`), so this ONNX/GGUF classification
+        // no longer corresponds to a runnable backend — it is kept only to
+        // keep the public `{engine}/{alias}` label honest about what is on
+        // disk, not to predict what will load.
         //
-        // "Usable" is that runtime's own bar: without `tokenizer.json` it
+        // "Usable" is that historical bar: without `tokenizer.json` it
         // declines and the next probe takes over, so the declaration is honest
         // again and wins below.
         if has_onnx && std::path::Path::new(path).join("tokenizer.json").is_file() {
@@ -462,12 +463,12 @@ fn binding_engine_label(path: &str) -> &'static str {
         if let Some(declared) = declared_model_format(path) {
             return declared;
         }
-        // ONNX first, because that is the order `CandleBackendModel::load`
-        // probes in: `CandleEmbeddingRuntime::try_load` runs before the GGUF
-        // runtime and accepts a bare `.onnx` file with no sidecar. Preferring
-        // GGUF here labelled a directory `gguf/<alias>` while requests for it
-        // executed the ONNX embedding backend — and the label is half the
-        // public `{engine}/{alias}` id, not just metadata.
+        // ONNX first, mirroring the now-deleted Candle loader's historical
+        // probe order (issue #418): its embedding runtime ran before the
+        // GGUF runtime and accepted a bare `.onnx` file with no sidecar.
+        // Preferring GGUF here would label a directory `gguf/<alias>` for
+        // what that order would have loaded as ONNX — and the label is half
+        // the public `{engine}/{alias}` id, not just metadata.
         match (has_onnx, has_gguf) {
             (true, _) => "onnx",
             (false, true) => "gguf",
@@ -1676,9 +1677,10 @@ mod configured_binding_registry_tests {
         let model_dir = dir.join("onnx-no-sidecar");
         fs::create_dir_all(&model_dir).expect("model dir");
         // No sidecar at all, and a leftover checkpoint beside the ONNX one.
-        // `CandleBackendModel::load` probes the embedding runtime first and it
-        // accepts a bare `.onnx`, so labelling this `gguf/<alias>` advertised a
-        // backend that would never run.
+        // The now-deleted Candle loader (issue #418) probed its embedding
+        // runtime first and accepted a bare `.onnx`, so labelling this
+        // `gguf/<alias>` would have advertised a backend that would never
+        // run under that order.
         fs::write(model_dir.join("stale.gguf"), b"not read").expect("stale gguf");
         fs::write(model_dir.join("model.onnx"), b"not read").expect("onnx");
 
@@ -2088,8 +2090,8 @@ mod configured_binding_registry_tests {
     /// It is half the public `{engine}/{alias}` id, so a directory advertised
     /// as `safetensors/<alias>` while the ONNX embedding backend executes is a
     /// listing that lies about where a prompt goes. The sidecar is
-    /// authoritative for the loaders that read it — and
-    /// `CandleEmbeddingRuntime::try_load`, which runs first, never does.
+    /// authoritative for the loaders that read it — and the now-deleted
+    /// Candle embedding runtime (issue #418), which ran first, never did.
     #[test]
     fn a_usable_onnx_outranks_a_sidecar_the_loader_will_not_consult() {
         let dir = std::env::temp_dir().join(format!(

@@ -2,6 +2,8 @@
 
 ## Purpose
 TBD - created by archiving change expand-candle-model-architecture-support. Update Purpose after archive.
+> **Status note (issues #417, #418):** every requirement in this file describes the Candle-backed local inference engine, which was orphaned from the compiled build by the Magnetar cutover (#411) — none of it ran in CI from that point on — and has since been deleted rather than restored unverified. Nothing below is implemented in the current build; local model execution is a real, open gap (#417) until it's rebuilt on the Magnetar path.
+
 ## Requirements
 ### Requirement: The runtime MUST select text-generation backends from normalized architecture metadata
 

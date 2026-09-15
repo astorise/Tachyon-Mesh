@@ -137,6 +137,13 @@ The `core-host` binary SHALL provide a `schema` command that writes `integrity-c
 - **AND** each schema contains a `$id` under `https://github.com/astorise/tachyon-mesh/releases/download/v1.2.3/`
 
 ### Requirement: core-host MUST expose a zero-copy layer-wise inference WIT contract
+> **Status note (issue #418):** the WIT contract described below exists in
+> `wit/ai/inference.wit`, but its host-side implementation was part of the
+> Candle-backed local inference engine deleted with issue #418's cleanup —
+> there is no `load-layer`/`forward-layer`/`drop-tensor` host implementation
+> anywhere in `core-host/src` today. A guest calling this interface has
+> nothing to answer it.
+
 The project SHALL define `wit/ai/inference.wit` in the existing `tachyon:mesh@1.1.0` WIT package and SHALL expose a `layer-execution` interface with opaque `tensor-handle` values so Wasm guests can sequence model layers without copying intermediate tensors through linear memory.
 
 #### Scenario: Guest orchestrates layer-wise execution through tensor handles
@@ -152,6 +159,18 @@ The `core-host` crate SHALL keep heavyweight AI dependencies behind the `ai-infe
 - **THEN** execution fails gracefully with an error naming the missing `ai-inference` feature
 
 ### Requirement: core-host MUST support native constrained decoding behind ai-inference
+> **Status note (issues #418, #420):** the implementation this requirement
+> describes (`FsmLogitProcessor` in `samplers.rs`/`candle_llm_runtime.rs`)
+> was part of the Candle-backed local inference engine deleted with issue
+> #418's cleanup. `sample-constrained` remains declared in
+> `wit/ai/inference.wit`, but nothing in `core-host/src` implements it. The
+> CI guard this requirement calls for (see the scenario below) was a
+> textual `grep` over `core-host/src` — it could not, and did not, detect
+> that the code it was checking for had already stopped being compiled
+> (issue #420); it has been removed rather than pointed at a guard that
+> would need to become far more sophisticated to mean anything (asserting
+> on a compiled symbol or a test that actually ran, not source text).
+
 The `core-host` crate SHALL keep constrained decoding dependencies optional under the `ai-inference` feature, extend `wit/ai/inference.wit` with `sample-constrained`, and provide a native logit processor that compiles JSON Schema strings into cached FSM state before masking invalid token logits. CI SHALL verify that this requirement is implemented in code whenever it is asserted in the spec, so the requirement cannot be merged as spec text without a corresponding implementation.
 
 #### Scenario: Guest samples logits with an optional JSON Schema
@@ -169,6 +188,14 @@ The `core-host` crate SHALL keep constrained decoding dependencies optional unde
 - **AND** the build fails if either symbol is absent, preventing a recurrence of a merged spec requirement with no matching implementation
 
 ### Requirement: Candle LLM dependencies MUST remain feature-gated
+> **Status note (issue #418):** the Candle LLM runtime, its tokenizer
+> dependency, and the pinned `astorise/candle` fork this requirement
+> describes have been deleted — they were orphaned from the build by the
+> Magnetar cutover (#411) and never actually compiled. No Cargo.toml in
+> this workspace declares `candle-core`/`candle-nn`/`candle-onnx`/
+> `candle-transformers`/`tokenizer` today, gated or otherwise; the scenarios
+> below describe a reverted implementation, not current build behavior.
+
 The `core-host` crate SHALL keep tokenizer and Candle text-generation dependencies optional under the existing `ai-inference` feature and SHALL keep the default host build free of those dependencies.
 
 #### Scenario: Default host build excludes Candle LLM runtime
