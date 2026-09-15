@@ -67,7 +67,7 @@ export class TachyonAuthStepCredentials extends HTMLElement {
     this.root.innerHTML = `
       <form id="cred-form" class="space-y-3" aria-label="${t("iam.login.form-label")}">
         <label for="cred-url" class="sr-only">${t("iam.placeholder.url")}</label>
-        <input type="text" id="cred-url" value="${this.savedUrl}" placeholder="${t("iam.placeholder.url")}" aria-required="true" autocomplete="url"
+        <input type="text" id="cred-url" placeholder="${t("iam.placeholder.url")}" aria-required="true" autocomplete="url"
           class="w-full bg-slate-950 border border-slate-700 p-3 rounded-lg text-white text-sm font-mono" />
 
         <label for="cred-username" class="sr-only">${t("iam.placeholder.username")}</label>
@@ -102,6 +102,14 @@ export class TachyonAuthStepCredentials extends HTMLElement {
         </button>
       </form>
     `;
+    // `savedUrl` is set through the property below, never interpolated into
+    // the template above: it can come from a persisted credential
+    // (restoreCredentials) or from the parent orchestrator (setUrl), so
+    // it's untrusted for HTML — a value containing `"` would otherwise break
+    // out of the `value="..."` attribute. Re-applied here so a re-render
+    // (e.g. on a language change) doesn't lose it.
+    const input = this.root.getElementById("cred-url") as HTMLInputElement | null;
+    if (input) input.value = this.savedUrl;
   }
 
   private bindEvents(): void {

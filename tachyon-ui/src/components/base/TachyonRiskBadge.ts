@@ -31,11 +31,12 @@ export class TachyonRiskBadge extends HTMLElement {
     const sim = this.getAttribute("sim-scenario") || "";
     const colors = COLORS[level] || COLORS.low;
     const escTooltip = tooltip.replace(/"/g, "&quot;");
+    const escSim = sim.replace(/"/g, "&quot;");
     this.innerHTML = `
       <span
         class="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-mono ${colors.bg} ${colors.text} cursor-help"
         title="${escTooltip}"
-        data-sim-scenario="${sim}"
+        data-sim-scenario="${escSim}"
       >
         ${level === "low" ? "●" : level === "medium" ? "▲" : "■"}
         ${colors.label}
