@@ -2,8 +2,6 @@
 
 ## Purpose
 TBD - created by archiving change async-edge-lora-training. Update Purpose after archive.
-> **Status note (issues #417, #418):** every requirement in this file describes the Candle-backed local inference engine, which was orphaned from the compiled build by the Magnetar cutover (#411) — none of it ran in CI from that point on — and has since been deleted rather than restored unverified. Nothing below is implemented in the current build; local model execution is a real, open gap (#417) until it's rebuilt on the Magnetar path.
-
 ## Requirements
 ### Requirement: WASM FaaS can submit a low-priority LoRA fine-tuning job
 The Mesh SHALL expose a `wit/ai/training.wit` interface that allows a Wasm guest to submit a LoRA fine-tuning job to a local low-priority queue served by `system-faas-buffer`, without blocking the host or the inference critical path.

@@ -2,8 +2,6 @@
 
 ## Purpose
 Layer-wise streaming inference: O(1) VRAM footprint via memory-mapped weight loading, prefill batching, and ring-buffer decode pipeline with KV-Cache host-RAM paging.
-> **Status note (issues #417, #418):** every requirement in this file describes the Candle-backed local inference engine, which was orphaned from the compiled build by the Magnetar cutover (#411) — none of it ran in CI from that point on — and has since been deleted rather than restored unverified. Nothing below is implemented in the current build; local model execution is a real, open gap (#417) until it's rebuilt on the Magnetar path.
-
 ## Requirements
 ### Requirement: Layer-wise inference and pipeline behavior MUST be specified
 The project SHALL update `wit/ai/inference.wit` and the core AI inference implementation so layer-wise streaming inference can maintain an O(1) VRAM footprint via memory-mapped weight loading, prefill batching, asynchronous decode pipelining, and KV-cache host-RAM paging.

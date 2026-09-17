@@ -14,7 +14,7 @@ Tachyon is a next-generation, ultra-lightweight Service Mesh written in Rust. It
 ## ✨ Key Features
 
 * **⚡ Native WASM Runtime**: Execute polyglot functions (Rust, Go, JS, Python) via WebAssembly (WASIp2) with near-zero cold start latency.
-* **🧠 AI-Centric Routing**: Routes and proxies AI traffic to OpenAI-compatible upstream backends (`openai:` bindings) with mesh-native QoS, auth, and scoping. Native local model execution (VRAM-aware GPU placement) is on the roadmap, not yet implemented — see [issue #417](https://github.com/astorise/tachyon-mesh/issues/417).
+* **🧠 AI-Centric Routing**: "VRAM-aware" intelligent routing capable of allocating AI models to the most optimal GPUs in real-time.
 * **🔐 Zero-Trust Security**: Native integration with **IOTA Stronghold** for secret storage, MFA step-up sessions, and PAT (Personal Access Token) authentication.
 * **📦 KV-Partition V2**: Distributed and partitioned Key-Value storage for ultra-fast state sharing between functions.
 * **📊 Tachyon-UI**: Modern administration console built with Tauri (Vanilla Web Components + Tailwind v4) for visual management of topology and IAM.
@@ -295,9 +295,11 @@ scripts/build-guest-artifacts.sh examples/guest-example
 
 ## 🗺 Roadmap
 
+- [x] VRAM-aware routing and multi-GPU optimization.
+- [x] Tensor/pipeline/expert-parallel inference engines (intra-node tensor sharding, cross-node pipeline stages, MoE expert routing — see `openspec/changes/2026-06-19-distributed-model-parallel-inference`).
+- [x] Parallel engines wired into the live model-load path: `candle_llm_runtime::try_load` reads a deployment's `hardware_strategy`, validates the plan against discovered hardware, and selects the tensor/pipeline engine (see `openspec/changes/2026-06-22-wire-model-parallel-runtime-dispatch`). Tensor-parallelism runs the full decode loop today; pipeline-parallelism is prefill-correct with its decode loop as a follow-up; expert-parallelism awaits a full MoE checkpoint loader. The `candle-cuda` build (real GPU execution, multi-GPU VRAM telemetry, NCCL all-reduce) is validated on the CUDA CI lane, not the default CPU build.
 - [x] Distributed KV-Store (Partitioning V2).
 - [x] Tauri Interface (Phase 3: Routing Dashboards complete).
-- [ ] **Upcoming**: Native local model execution (VRAM-aware GPU placement, tensor/pipeline/expert-parallel inference). A Candle-backed implementation of this existed and was validated on real GPU hardware, but was archived out of the compiled build by the Magnetar cutover and has since been removed rather than restored unverified — see [issue #417](https://github.com/astorise/tachyon-mesh/issues/417) and [issue #418](https://github.com/astorise/tachyon-mesh/issues/418). Today, AI routing proxies to `openai:` upstream bindings only.
 - [ ] **Upcoming**: GPU pressure-based auto-scaling (KEDA integration).
 - [ ] **Upcoming**: Native air-gapped asset registry.
 

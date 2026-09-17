@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 const MODEL_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 /// Host dispatch sidecar written into each unpacked model directory. Mirrors
-/// `core-host`'s `ai_inference::MODEL_META_JSON` — the broker performs the
+/// `core-host`'s `candle_llm_runtime::MODEL_META_JSON` — the broker performs the
 /// format *detection* and records the result; the host honours the declared
 /// value (and still validates the bytes through the matching loader).
 const MODEL_META_JSON: &str = ".tachyon-model.json";

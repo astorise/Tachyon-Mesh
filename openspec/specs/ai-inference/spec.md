@@ -2,21 +2,6 @@
 
 ## Purpose
 TBD - created by archiving change ai-inference-wasinn. Update Purpose after archive.
-
-> **Status note (see issues #417, #418):** many requirements below describe
-> the Candle-backed local inference engine (`candle-onnx`,
-> `candle_llm_runtime`, tensor/pipeline/expert-parallel execution, LoRA
-> adapters, NVFP4/ModelOpt, speculative decoding, CUDA Graph/FlashInfer
-> decode, and the `candle-cuda`/`candle-flashinfer` Cargo features). That
-> engine was orphaned from the compiled build by the Magnetar cutover (#411)
-> — none of it ran in CI from that point on — and has since been deleted
-> rather than restored unverified. Requirements naming Candle, CUDA,
-> tensor/pipeline/expert-parallel, LoRA-on-Candle, or NVFP4/ModelOpt describe
-> that reverted implementation, not current behavior; local model execution
-> is a real, open gap (#417) until it's rebuilt on the Magnetar path. Model
-> registry, routing, scheduling, and `openai:` upstream-proxy requirements
-> elsewhere in this file are unaffected and remain current.
-
 ## Requirements
 ### Requirement: Host optionally exposes WASI-NN imports to legacy guests
 The `core-host` runtime SHALL define an `ai-inference` Cargo feature that links the `wasi_ephemeral_nn` preview1 host functions for legacy WASI guests without changing the default host build. The feature SHALL use `candle-onnx` (pure Rust) as the ONNX inference backend, making `--features ai-inference` compatible with musl libc targets.
