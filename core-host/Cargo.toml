@@ -19,14 +19,14 @@ default = ["admin-plane", "ring"]
 # admin-plane node via Tachyon Studio.
 admin-plane = []
 # Magnetar-only inference cutover. Local model execution accepts Qwen
-# safetensors through the Magnetar facade. The Candle backend this feature
-# used to also cover (candle-cuda/candle-metal/nvfp4-cuda/candle-flashinfer)
-# was orphaned from the build by that cutover — never actually compiled —
-# and has been deleted rather than revived (issue #418); local execution is
-# a real, tracked gap (issue #417) until it lands on the Magnetar path.
+# safetensors through the Magnetar facade; legacy Candle modules are retained
+# outside the compiled path for reference during the migration.
 ai-inference = [
     "dep:wasmtime-wasi-nn",
 ]
+# Compatibility aliases kept for old build commands during the Magnetar cutover.
+# They no longer enable backend code.
+candle-flashinfer = ["ai-inference"]
 ebpf-loader = ["dep:aya"]
 # `experimental` gates unwired v1.1 stubs (QUIC safetensors replication, predictive
 # VRAM helpers, BaaS scratch tables) so they are excluded from the default build but
@@ -35,6 +35,9 @@ experimental = []
 fips = ["tokio-rustls/aws_lc_rs", "tokio-rustls/fips"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tower", "dep:tokio-stream"]
 mtls = []
+candle-cuda = ["ai-inference"]
+candle-metal = ["ai-inference"]
+nvfp4-cuda = ["ai-inference"]
 rate-limit = ["dep:governor", "dep:forwarded-header-value"]
 resiliency = ["dep:tower"]
 ring = ["tokio-rustls/ring", "tokio-rustls/tls12"]

@@ -26,8 +26,8 @@
 ## Checklist
 
 - [ ] This PR is up to date with `main`.
-- [ ] `quality`, `security-audit`, and `build-guests` are expected to pass
-      (or I've explained why one legitimately won't).
+- [ ] `quality`, `cuda-quality`, `security-audit`, and `build-guests` are
+      expected to pass (or I've explained why one legitimately won't).
 - [ ] Any behavior change is reflected in `CHANGELOG.md` and, if it affects a
       documented capability, the relevant `docs/` page or `openspec/specs/`
       requirement.
