@@ -26,6 +26,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       # k3d + two Docker image builds is disk-heavy on the standard runner
       # (mirrors integration.yml's cleanup step).

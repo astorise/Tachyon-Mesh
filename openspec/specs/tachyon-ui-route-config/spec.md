@@ -82,19 +82,19 @@ The Tachyon-UI SHALL provide route detail controls that write supported `Integri
 #### Scenario: Operator edits route scale and runtime fields
 - **WHEN** an operator expands a route in the Routing panel and saves the Route scale & runtime form
 - **THEN** Tachyon-UI writes `routes[].min_instances`, `routes[].max_concurrency`, `routes[].env`, and `routes[].domains` on the owning route
-- **AND** the submitted payload does not place route-level fields under `routes[].models[]`
-- **AND** it leaves all model bindings on the route unchanged
+- **AND** the submitted payload does not place route-level fields under `routes[].inference_components[]`
+- **AND** it leaves all Component bindings on the route unchanged
 
 #### Scenario: Operator edits model QoS on a route
 - **WHEN** an operator saves a model policy row for a route-bound model
-- **THEN** Tachyon-UI writes the model binding field `routes[].models[].qos` only on the matching model entry
+- **THEN** Tachyon-UI writes the Component binding field `routes[].inference_components[].qos` only on the matching model entry
 - **AND** it leaves `routes[].min_instances`, `routes[].max_concurrency`, `routes[].env`, and `routes[].domains` unchanged on the owning route
-- **AND** it leaves other model bindings on the route unchanged
+- **AND** it leaves other Component bindings on the route unchanged
 
 #### Scenario: Model policy QoS input is constrained to backend-supported classes
 - **WHEN** an operator edits the QoS field in a model policy row
 - **THEN** Tachyon-UI presents a constrained selector with an empty default plus `RealTime`, `Standard`, and `Batch`
-- **AND** the empty default omits `routes[].models[].qos` so the backend default `Standard` applies
+- **AND** the empty default omits `routes[].inference_components[].qos` so the backend default `Standard` applies
 - **AND** the manifest controller rejects any value outside `RealTime`, `Standard`, or `Batch` before calling `apply_manifest_config`
 - **AND** the validation error identifies the model QoS field and accepted values
 

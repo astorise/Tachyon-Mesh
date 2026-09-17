@@ -13,6 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          submodules: recursive
           fetch-depth: 0
 
       - name: Install wasm-tools
@@ -57,6 +58,11 @@ jobs:
             package_dir="$(dirname "$wit")"
             if [ "$package_dir" != "wit" ] && [ "$package_dir" != "sdk/wit" ]; then
               package_input="$package_dir"
+            fi
+
+            if [ ! -e "$wit" ]; then
+              echo "Deleted WIT file: $wit"
+              continue
             fi
 
             if git cat-file -e "origin/$base_ref:$wit" 2>/dev/null; then

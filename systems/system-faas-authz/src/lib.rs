@@ -57,8 +57,8 @@ fn required_scopes(action: &str, resource: &str) -> Vec<&'static str> {
     if resource == "/admin/assets" {
         return vec!["deploy:wasm"];
     }
-    if resource.starts_with("/admin/models/") {
-        return vec!["deploy:models"];
+    if resource.starts_with("/admin/artifacts/") {
+        return vec!["deploy:wasm"];
     }
     if resource == "/admin/security/pats" {
         return vec!["manage:tokens"];

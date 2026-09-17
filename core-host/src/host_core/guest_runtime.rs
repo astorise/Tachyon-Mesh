@@ -1461,14 +1461,14 @@ pub(crate) fn execute_system_component_guest(
                 "failed to add scaling metrics functions to system component linker",
             )
         })?;
-        system_component_bindings::tachyon::mesh::model_events::add_to_linker::<
+        system_component_bindings::tachyon::mesh::artifact_events::add_to_linker::<
             ComponentHostState,
             ComponentHostState,
         >(&mut l, |s: &mut ComponentHostState| s)
         .map_err(|e| {
             guest_execution_error(
                 e,
-                "failed to add model-events functions to system component linker",
+                "failed to add artifact-events functions to system component linker",
             )
         })?;
         // Authorization-gated: URL validated against scopes.http per call.

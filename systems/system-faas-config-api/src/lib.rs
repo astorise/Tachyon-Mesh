@@ -375,39 +375,23 @@ pub fn validate_ai_config<T>(_config: T) -> Result<(), String> {
     Ok(())
 }
 
-pub fn apply_model_deployment<T>(_deployment: T) -> Result<(), String> {
+pub fn apply_component_deployment<T>(_deployment: T) -> Result<(), String> {
     Ok(())
 }
 
-/// Maps a WIT `hardware-strategy` record into the shared, hardware-agnostic
-/// `parallel_topology::ParallelExecutionPlan`, then runs `validate_plan_shape`
-/// against it. This component has no access to live hardware topology (it is
-/// a Wasm guest), so only structural shape is checked here; hardware-aware
-/// checks (`validate_parallel_topology`) run in `core-host` once the plan is
-/// actually dispatched against discovered devices.
-fn validate_hardware_strategy(
-    strategy: &ai_contract::exports::tachyon::ai_config::config_ai::HardwareStrategy,
+fn validate_placement_strategy(
+    placement: &ai_contract::exports::tachyon::ai_config::config_ai::PlacementStrategy,
 ) -> Result<(), String> {
-    use ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution;
-    use parallel_topology::{ParallelExecutionPlan, ParallelStrategy};
-
-    let parallel_strategy = match strategy.distribution_mode {
-        GpuDistribution::Single => ParallelStrategy::None,
-        GpuDistribution::TensorParallelism => ParallelStrategy::TensorParallel,
-        GpuDistribution::PipelineParallelism => ParallelStrategy::PipelineParallel,
-        GpuDistribution::ExpertParallelism => ParallelStrategy::ExpertParallel,
-    };
-
-    let plan = ParallelExecutionPlan {
-        strategy: parallel_strategy,
-        device_ids: strategy.device_ids.clone(),
-        stage_layer_ranges: strategy.stage_layer_ranges.clone(),
-        expert_device_map: strategy.expert_device_map.clone(),
-        required_vram_bytes_per_device: 0,
-        pipeline_depth: strategy.pipeline_depth,
-    };
-
-    parallel_topology::validate_plan_shape(&plan)
+    let mut seen = std::collections::BTreeSet::new();
+    for device_id in &placement.device_ids {
+        if !seen.insert(*device_id) {
+            return Err(format!("device id `{device_id}` is listed more than once"));
+        }
+    }
+    if matches!(placement.memory_limit_mb, Some(0)) {
+        return Err("memory-limit-mb must be greater than zero when set".to_owned());
+    }
+    Ok(())
 }
 
 impl ai_contract::exports::tachyon::ai_config::config_ai::Guest for AiConfigComponent {
@@ -415,7 +399,7 @@ impl ai_contract::exports::tachyon::ai_config::config_ai::Guest for AiConfigComp
         config: ai_contract::exports::tachyon::ai_config::config_ai::AiConfiguration,
     ) -> Result<(), String> {
         for deployment in &config.deployments {
-            validate_hardware_strategy(&deployment.strategy)?;
+            validate_placement_strategy(&deployment.placement)?;
         }
         Ok(())
     }
@@ -425,10 +409,10 @@ impl ai_contract::exports::tachyon::ai_config::config_ai::Guest for AiConfigComp
         Err("AI configuration store is not wired in this component yet".to_owned())
     }
 
-    fn apply_model_deployment(
-        deployment: ai_contract::exports::tachyon::ai_config::config_ai::ModelDeployment,
+    fn apply_component_deployment(
+        deployment: ai_contract::exports::tachyon::ai_config::config_ai::ComponentDeployment,
     ) -> Result<(), String> {
-        validate_hardware_strategy(&deployment.strategy)
+        validate_placement_strategy(&deployment.placement)
     }
 }
 
@@ -731,98 +715,44 @@ mod tests {
     }
 
     #[test]
-    fn ai_config_scaffold_accepts_model_deployments() {
+    fn ai_config_scaffold_accepts_component_deployments() {
         validate_ai_config(()).expect("AI config scaffold accepts payloads");
-        apply_model_deployment(()).expect("AI deployment scaffold accepts payloads");
+        apply_component_deployment(()).expect("AI deployment scaffold accepts payloads");
     }
 
-    fn hardware_strategy(
-        distribution_mode: ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution,
+    fn placement_strategy(
         device_ids: Vec<u32>,
-        stage_layer_ranges: Vec<(u32, u32)>,
-        expert_device_map: Vec<(u32, u32)>,
-        pipeline_depth: u32,
-    ) -> ai_contract::exports::tachyon::ai_config::config_ai::HardwareStrategy {
-        ai_contract::exports::tachyon::ai_config::config_ai::HardwareStrategy {
-            multi_gpu: !device_ids.is_empty(),
-            distribution_mode,
+        memory_limit_mb: Option<u64>,
+    ) -> ai_contract::exports::tachyon::ai_config::config_ai::PlacementStrategy {
+        ai_contract::exports::tachyon::ai_config::config_ai::PlacementStrategy {
+            backend: ai_contract::exports::tachyon::ai_config::config_ai::PlacementBackend::Cpu,
             device_ids,
-            stage_layer_ranges,
-            expert_device_map,
-            pipeline_depth,
-            paged_attention: false,
-            cuda_graph_decode: false,
-            flashinfer_attention: false,
-            prefill_chunk_tokens: None,
-            speculative_draft_model_path: String::new(),
-            speculative_draft_tokens: 0,
+            memory_limit_mb,
         }
     }
 
     #[test]
-    fn single_gpu_strategy_always_validates() {
-        use ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution;
-
-        let strategy = hardware_strategy(GpuDistribution::Single, vec![], vec![], vec![], 0);
-        validate_hardware_strategy(&strategy).expect("single-device plan is always valid");
+    fn empty_placement_strategy_validates() {
+        let strategy = placement_strategy(vec![], None);
+        validate_placement_strategy(&strategy).expect("default placement is valid");
     }
 
     #[test]
-    fn tensor_parallel_strategy_rejects_a_single_device() {
-        use ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution;
-
-        let strategy = hardware_strategy(
-            GpuDistribution::TensorParallelism,
-            vec![0],
-            vec![],
-            vec![],
-            0,
-        );
-        validate_hardware_strategy(&strategy).expect_err("tensor-parallel requires >= 2 devices");
+    fn placement_strategy_rejects_duplicate_device_ids() {
+        let strategy = placement_strategy(vec![0, 0], None);
+        validate_placement_strategy(&strategy).expect_err("duplicate device IDs are invalid");
     }
 
     #[test]
-    fn pipeline_parallel_strategy_accepts_contiguous_stage_ranges() {
-        use ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution;
-
-        let strategy = hardware_strategy(
-            GpuDistribution::PipelineParallelism,
-            vec![0, 1],
-            vec![(0, 5), (6, 10)],
-            vec![],
-            4,
-        );
-        validate_hardware_strategy(&strategy).expect("contiguous pipeline stages are valid");
+    fn placement_strategy_accepts_device_affinity_and_memory_limit() {
+        let strategy = placement_strategy(vec![0, 1], Some(1024));
+        validate_placement_strategy(&strategy).expect("device affinity is valid");
     }
 
     #[test]
-    fn pipeline_parallel_strategy_rejects_non_contiguous_stage_ranges() {
-        use ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution;
-
-        let strategy = hardware_strategy(
-            GpuDistribution::PipelineParallelism,
-            vec![0, 1],
-            vec![(0, 5), (7, 10)],
-            vec![],
-            4,
-        );
-        validate_hardware_strategy(&strategy)
-            .expect_err("non-contiguous pipeline stages must be rejected");
-    }
-
-    #[test]
-    fn expert_parallel_strategy_rejects_out_of_bounds_device_index() {
-        use ai_contract::exports::tachyon::ai_config::config_ai::GpuDistribution;
-
-        let strategy = hardware_strategy(
-            GpuDistribution::ExpertParallelism,
-            vec![0, 1],
-            vec![],
-            vec![(0, 0), (1, 5)],
-            0,
-        );
-        validate_hardware_strategy(&strategy)
-            .expect_err("expert-device-map index must reference a declared device-id");
+    fn placement_strategy_rejects_zero_memory_limit() {
+        let strategy = placement_strategy(vec![], Some(0));
+        validate_placement_strategy(&strategy).expect_err("zero memory limit is invalid");
     }
 
     #[test]

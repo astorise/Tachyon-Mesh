@@ -3,6 +3,37 @@
 ## Purpose
 TBD - created by archiving change github-actions. Update Purpose after archive.
 ## Requirements
+### Requirement: CI validates Magnetar Component inference without vacuous GPU success
+The CI workflow SHALL validate Tachyon's active local inference path through a
+Magnetar Component boundary. CPU quality SHALL run focused coverage proving a
+Tachyon binding can delegate an authorized Component invocation to Magnetar. The
+GPU quality job SHALL build and lint the `magnetar-cuda` feature, verify that
+its GPU-critical test filters select non-empty test sets, run a
+hardware-required CUDA availability guard through Magnetar, and run the
+Magnetar CUDA multi-token generation proof.
+
+#### Scenario: CPU quality covers Magnetar Component invocation
+- **WHEN** the quality job runs without GPU hardware
+- **THEN** it executes a Tachyon-to-Magnetar Component invocation test
+- **AND** that test uses Magnetar-owned ingestion, trust, residency, and
+  execution instead of a local legacy text-generation path
+- **AND** `core-host` does not depend directly on concrete Magnetar loader or
+  Provider implementation crates
+
+#### Scenario: Quality blocks model knowledge in Tachyon core
+- **WHEN** the quality job runs for a non-Renovate change
+- **THEN** it executes an AI Component boundary validation guard
+- **AND** the guard fails if production `core-host` code reintroduces
+  model-family, tokenizer, model-format, model-execution, or compiled-in
+  default Component selection knowledge
+
+#### Scenario: GPU quality proves real Magnetar CUDA selection
+- **WHEN** the `cuda-quality` job runs on the self-hosted NVIDIA runner
+- **THEN** it compiles the `magnetar-cuda` feature
+- **AND** it fails before execution if any critical Magnetar CUDA test filter selects zero tests
+- **AND** it runs a real CUDA availability guard through Magnetar
+- **AND** it runs the Magnetar CUDA multi-token proof for at least sixteen generated tokens
+
 ### Requirement: Repository provides a GitHub Actions CI workflow for the main branch
 The repository SHALL define a GitHub Actions workflow at `.github/workflows/ci.yml` that runs on pushes to `main` and pull requests targeting `main`.
 

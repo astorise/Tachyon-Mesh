@@ -161,27 +161,27 @@ The MCP server SHALL expose tools for deploying and managing WASM functions, rea
 - **THEN** the rollout is aborted and traffic reverts to the stable version
 
 ### Requirement: MCP exposes LLM KV-cache administration tools
-The MCP server SHALL expose LLM inference KV-cache administration tools backed by the core-host `/admin/kv-cache/{model}` endpoints, distinct from the KV-Partition V2 tools.
+The MCP server SHALL expose LLM inference KV-cache administration tools backed by the core-host `/admin/component-cache/{component}` endpoints, distinct from the KV-Partition V2 tools.
 
-#### Scenario: Agent reads KV-cache stats for a model
-- **WHEN** an MCP client calls `tachyon_kv_cache_stats` with `model: "llama-3"`
+#### Scenario: Agent reads KV-cache stats for a Component
+- **WHEN** an MCP client calls `tachyon_kv_cache_stats` with `component: "llama-3"`
 - **THEN** the MCP server calls `tachyon_client::kv_cache_stats("llama-3")`
-- **AND** the client queries `GET /admin/kv-cache/llama-3/stats`
-- **AND** the tool returns `model`, `entryCount`, `totalBytes`, and `expiredCount` in the JSON tool result
+- **AND** the client queries `GET /admin/component-cache/llama-3/stats`
+- **AND** the tool returns `component`, `entryCount`, `totalBytes`, and `expiredCount` in the JSON tool result
 - **AND** `hitRate` is optional when the core-host endpoint does not expose hit/miss counters
 
-#### Scenario: Agent flushes a model KV-cache
-- **WHEN** an MCP client calls `tachyon_kv_cache_flush` with `model: "llama-3"`
+#### Scenario: Agent flushes a component KV-cache
+- **WHEN** an MCP client calls `tachyon_kv_cache_flush` with `component: "llama-3"`
 - **THEN** the MCP server calls `tachyon_client::kv_cache_flush("llama-3")`
-- **AND** the client issues `DELETE /admin/kv-cache/llama-3`
-- **AND** the tool returns the model and number of evicted entries
+- **AND** the client issues `DELETE /admin/component-cache/llama-3`
+- **AND** the tool returns the component and number of evicted entries
 
 #### Scenario: KV-cache flush is rate-limited as a mutator
 - **WHEN** `tachyon_kv_cache_flush` exhausts its per-minute mutator bucket
 - **THEN** further calls return the structured rate-limit error (`-32002`) with `retry_after_ms`
 
 ### Requirement: MCP exposes read-only vector search for RAG agents
-The MCP server SHALL expose a `tachyon_vector_search` JSON-RPC tool for agent-facing RAG queries. The tool SHALL require `query`, `index`, and `top_k`, SHALL accept optional `route_path`, `embedding_model`, `chat_model`, and request-local `documents`, and SHALL delegate through `tachyon_client::vector_search` to a configured Tachyon route that implements the RAG/vector HTTP contract. The default route SHALL be `/api/guest-rag-vector`, overridable per call via `route_path` or per process via `TACHYON_MCP_VECTOR_SEARCH_PATH`. The delegated client request SHALL include an internal request identifier so temporary RAG vector documents are isolated per tool call. The tool SHALL be read-only from MCP's perspective and SHALL use the read-oriented rate-limit bucket.
+The MCP server SHALL expose a `tachyon_vector_search` JSON-RPC tool for agent-facing RAG queries. The tool SHALL require `query`, `index`, and `top_k`, SHALL accept optional `route_path`, `embedding_component`, `chat_component`, and request-local `documents`, and SHALL delegate through `tachyon_client::vector_search` to a configured Tachyon route that implements the RAG/vector HTTP contract. The default route SHALL be `/api/guest-rag-vector`, overridable per call via `route_path` or per process via `TACHYON_MCP_VECTOR_SEARCH_PATH`. The delegated client request SHALL include an internal request identifier so temporary RAG vector documents are isolated per tool call. The tool SHALL be read-only from MCP's perspective and SHALL use the read-oriented rate-limit bucket.
 
 #### Scenario: Agent calls vector search with required arguments
 - **WHEN** an MCP client calls `tachyon_vector_search` with `query`, `index`, and `top_k`
@@ -221,7 +221,7 @@ A Rust integration test at `tachyon-mcp/tests/mcp_e2e_runner.rs` SHALL spawn the
 - **AND** `tachyon_dryrun_manifest.inputSchema.properties` is a non-empty object (dynamic manifest schema injected)
 
 ### Requirement: tachyon_hardware_status MUST include GPU topology in its response
-The `tachyon_hardware_status` MCP tool SHALL return a JSON payload that includes a `gpus` array. Each entry SHALL carry `id`, `model`, `vramTotalMb`, `vramUsedMb`, and `computeUtilization`. When no GPU management library is linked, VRAM values SHALL default to 0 rather than being omitted.
+The `tachyon_hardware_status` MCP tool SHALL return a JSON payload that includes a `gpus` array. Each entry SHALL carry `id`, `component`, `vramTotalMb`, `vramUsedMb`, and `computeUtilization`. When no GPU management library is linked, VRAM values SHALL default to 0 rather than being omitted.
 
 #### Scenario: Response includes gpus array
 - **GIVEN** the cluster node has `CUDA_VISIBLE_DEVICES=0` set
@@ -318,7 +318,7 @@ The Tachyon MCP server SHALL provide a `recommend_concurrency_policy` tool that 
 The Tachyon MCP server SHALL provide a `tachyon_patch_route` JSON-RPC tool that accepts `route_path`, a JSON object `patch`, and optional `dry_run`, reads the live manifest, recursively merges the patch into the matching `IntegrityRoute` using JSON Merge Patch semantics, validates the patched manifest, and applies it through the admin manifest API when `dry_run` is false.
 
 #### Scenario: Route patch applies configurable route fields
-- **WHEN** an AI agent calls `tachyon_patch_route` with `route_path: "/api/billing"` and `patch: {"concurrency":{"mode":"mesh-singleton","on_conflict":"queue"},"adapter_id":"tenant-a"}`
+- **WHEN** an AI agent calls `tachyon_patch_route` with `route_path: "/api/billing"` and `patch: {"concurrency":{"mode":"mesh-singleton","on_conflict":"queue"},"artifact_id":"tenant-a"}`
 - **THEN** the MCP server merges those fields into the matching route without replacing unrelated nested fields
 - **AND** validates the patched manifest before applying it
 - **AND** posts the updated manifest through the existing admin manifest path
@@ -364,20 +364,20 @@ The Tachyon MCP server SHALL provide a `tachyon_patch_manifest` JSON-RPC tool th
 - **WHEN** `tachyon_patch_manifest` is called more often than its per-minute mutator budget allows
 - **THEN** further calls return the rate-limited error (`-32002`) until the bucket refills
 
-### Requirement: The MCP server exposes an upload_model tool
-The `tachyon-mcp` binary SHALL register a `tachyon_upload_model` JSON-RPC tool that accepts a required string `path` argument — an absolute local path to a model directory (weights plus `tokenizer.json`, and `config.json` for safetensors) or a single self-contained file on the MCP host — and delegates to `tachyon_client::push_large_model(path)`, returning the resulting server-side model path in the tool result content. The tool's `inputSchema` SHALL declare `required: ["path"]`, the missing-`path` case SHALL be rejected before any cluster call, and the tool SHALL be governed by the same tight per-minute rate-limit budget as other large, hash-verified mutators.
+### Requirement: The MCP server exposes an upload_component tool
+The `tachyon-mcp` binary SHALL register a `tachyon_upload_component` JSON-RPC tool that accepts a required string `path` argument — an absolute local path to a component directory (weights plus `tokenizer.json`, and `config.json` for safetensors) or a single self-contained file on the MCP host — and delegates to `tachyon_client::push_large_component(path)`, returning the resulting server-side component path in the tool result content. The tool's `inputSchema` SHALL declare `required: ["path"]`, the missing-`path` case SHALL be rejected before any cluster call, and the tool SHALL be governed by the same tight per-minute rate-limit budget as other large, hash-verified mutators.
 
-#### Scenario: Upload delegates to the model broker
-- **WHEN** the MCP server receives a `tools/call` for `tachyon_upload_model` with a string `path`
-- **THEN** it calls `tachyon_client::push_large_model(path)`
-- **AND** returns the broker's server-side model path in the result content
+#### Scenario: Upload delegates to the artifact broker
+- **WHEN** the MCP server receives a `tools/call` for `tachyon_upload_component` with a string `path`
+- **THEN** it calls `tachyon_client::push_large_component(path)`
+- **AND** returns the broker's server-side component path in the result content
 
 #### Scenario: Missing path is rejected before dispatch
-- **WHEN** a `tachyon_upload_model` call omits the `path` argument
+- **WHEN** a `tachyon_upload_component` call omits the `path` argument
 - **THEN** the server returns an invalid-params error (`-32602`) without contacting the cluster
 
 #### Scenario: Upload is rate-limited as a heavy mutator
-- **WHEN** `tachyon_upload_model` is called more often than its per-minute budget allows
+- **WHEN** `tachyon_upload_component` is called more often than its per-minute budget allows
 - **THEN** further calls return the rate-limited error (`-32002`) until the bucket refills
 
 ## Requirements (s3-storage-backup)

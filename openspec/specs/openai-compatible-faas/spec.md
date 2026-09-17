@@ -1,7 +1,7 @@
 # openai-compatible-faas Specification
 
 ## Purpose
-Define the user-space OpenAI-compatible FaaS surface, its model registry
+Define the user-space OpenAI-compatible FaaS surface, its Component registry
 ownership, streaming behavior, and the decoupled static chat UI example that
 dogfoods Tachyon FaaS for browser delivery.
 ## Requirements
@@ -14,7 +14,7 @@ FaaS (`guest-openai`) built against the `faas-guest` WIT world. It SHALL expose
 `/v1/chat/completions`, or `/v1/embeddings` routes. It SHALL NOT be a system FaaS
 injected by a compile-time feature flag. A dynamic model advertised by the
 registry SHALL be usable by the chat and embeddings routes when that alias is
-included in the route's sealed dynamic model bindings.
+included in the route's sealed dynamic Component bindings.
 
 #### Scenario: Model listing returns OpenAI-compatible shape
 
@@ -39,8 +39,8 @@ included in the route's sealed dynamic model bindings.
 - **WHEN** a client requests `POST /ai/v1/embeddings` naming that model with a
   single string or list of strings
 - **THEN** `guest-openai` loads the model on the CPU accelerator, calls the host
-  Candle ONNX embeddings primitive once per input, applies masked pooling and
-  L2 normalization, and returns an OpenAI-shaped `list` of `embedding` objects
+  ONNX embeddings primitive once per input, applies masked pooling and L2
+  normalization, and returns an OpenAI-shaped `list` of `embedding` objects
   preserving input order
 
 #### Scenario: Listed dynamic model is authorized for chat
@@ -72,23 +72,23 @@ included in the route's sealed dynamic model bindings.
 
 ### Requirement: Registry ownership via kv-partition
 
-`guest-openai` SHALL own the model registry by reading and writing the `ai-models-registry` `kv-partition` table directly. It SHALL serve the register, list, and deregister operations previously served by `system-faas-ai-list-model`, with no separate registry FaaS and no outbound mesh call to list models.
+`guest-openai` SHALL own the Component registry by reading and writing the `ai-components-registry` `kv-partition` table directly. It SHALL serve the register, list, and deregister operations previously served by `system-faas-ai-list-model`, with no separate registry FaaS and no outbound mesh call to list models.
 
 #### Scenario: Register persists a model
 
 - **WHEN** a register request is received with a valid model record
-- **THEN** `guest-openai` writes the record to the `ai-models-registry` table keyed by alias
+- **THEN** `guest-openai` writes the record to the `ai-components-registry` table keyed by alias
 - **AND** the model becomes listable
 
 #### Scenario: Deregister removes a model
 
 - **WHEN** a deregister request is received for an existing alias
-- **THEN** `guest-openai` deletes that key from the `ai-models-registry` table
+- **THEN** `guest-openai` deletes that key from the `ai-components-registry` table
 - **AND** the model no longer appears in the listing
 
 ### Requirement: Fresh registry reads
 
-`guest-openai` SHALL read the `ai-models-registry` table on every list request and SHALL NOT cache the model list in guest memory across requests, so that a model registered on any instance is visible on the next list from any instance.
+`guest-openai` SHALL read the `ai-components-registry` table on every list request and SHALL NOT cache the model list in guest memory across requests, so that a model registered on any instance is visible on the next list from any instance.
 
 #### Scenario: Newly registered model is visible immediately
 
@@ -104,28 +104,28 @@ included in the route's sealed dynamic model bindings.
 
 ### Requirement: Scope-gated registry table access
 
-The `guest-openai` route SHALL declare deployment scopes that grant `kv` access to the `ai-models-registry` table. Table access is gated by deployment scopes, not by guest role; a guest without that grant SHALL be denied access to the table.
+The `guest-openai` route SHALL declare deployment scopes that grant `kv` access to the `ai-components-registry` table. Table access is gated by deployment scopes, not by guest role; a guest without that grant SHALL be denied access to the table.
 
 #### Scenario: Granted route opens the table
 
-- **GIVEN** the `guest-openai` route declares a `scopes.kv` grant for `ai-models-registry`
+- **GIVEN** the `guest-openai` route declares a `scopes.kv` grant for `ai-components-registry`
 - **WHEN** it opens the table
 - **THEN** the open succeeds and reads/writes proceed
 
 #### Scenario: Ungranted guest is denied
 
-- **GIVEN** a guest route without a `scopes.kv` grant for `ai-models-registry`
+- **GIVEN** a guest route without a `scopes.kv` grant for `ai-components-registry`
 - **WHEN** it attempts to open the table
 - **THEN** the host denies the open with a scope-denial error and records a scope denial
 
 ### Requirement: Upload notification persists to the shared registry
 
-`system-faas-model-broker` SHALL notify `guest-openai` over HTTP when a newly uploaded model becomes available, targeting the internal register endpoint, so the model is recorded in the shared `ai-models-registry` table and becomes listable.
+`system-faas-model-broker` SHALL notify `guest-openai` over HTTP when a newly uploaded model becomes available, targeting the internal register endpoint, so the model is recorded in the shared `ai-components-registry` table and becomes listable.
 
 #### Scenario: Broker upload makes a model listable
 
-- **WHEN** `model-broker` completes a model upload and notifies `guest-openai`'s register endpoint
-- **THEN** the model is written to `ai-models-registry`
+- **WHEN** `model-broker` completes a artifact upload and notifies `guest-openai`'s register endpoint
+- **THEN** the model is written to `ai-components-registry`
 - **AND** a subsequent `GET /ai/v1/models` includes that model
 
 ### Requirement: Chat completion sampling parameters
@@ -261,5 +261,5 @@ for assistant responses.
 - **THEN** the topology includes the static `/chat` route, the
   `/ai/v1/models` route, the `/ai/v1/chat/completions` route, and the internal
   `/ai/v1/embeddings` route, and the internal `guest-openai` registration route
-  backed by the shared `ai-models-registry` table
+  backed by the shared `ai-components-registry` table
 
