@@ -5,6 +5,11 @@ interface authn {
         subject: string,
         roles: list<string>,
         scopes: list<string>,
+        // Unix timestamp the underlying credential stops being valid at.
+        // `none` when the credential type carries no expiry. Lets a caller
+        // that caches a positive decision re-check real expiry without
+        // calling validate-token again.
+        expires-at: option<u64>,
     }
 
     record registration-token-claims {

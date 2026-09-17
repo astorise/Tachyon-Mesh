@@ -59,6 +59,11 @@ pub(crate) struct AuthClaims {
     pub(crate) subject: String,
     pub(crate) roles: Vec<String>,
     pub(crate) scopes: Vec<String>,
+    /// Unix timestamp the underlying credential stops being valid at, from
+    /// `identity-payload`'s `expires-at`. `None` for credential types that
+    /// carry no expiry. Used by `AuthDecisionCache` to re-check real expiry
+    /// on a cache hit instead of only bounding staleness by TTL.
+    pub(crate) expires_at: Option<u64>,
 }
 
 /// In-process cache of full authn+authz decisions, keyed by SHA-256(token) plus the
@@ -75,16 +80,15 @@ pub(crate) struct AuthClaims {
 ///   a spoofing flood that stops hitting a given (token, method, path) can't
 ///   hold that slot forever.
 /// - `time_to_live` (60 seconds): evicts an entry no matter how often it's
-///   used. Idle time alone doesn't bound staleness against *expiry* — a
-///   token polled every few minutes would keep resetting its idle timer and
-///   stay accepted long after its own `exp` passed, since nothing here
-///   re-checks expiry on a cache hit (`identity-payload`, returned by
-///   `validate-token`, carries no expiry field to check). The TTL forces a
-///   real `authenticate()` call at least once a minute, which does check it.
-///   This bounds staleness, it doesn't eliminate it — real expiry-aware
-///   invalidation needs `expires-at` added to `identity-payload` in
-///   `wit/authn.wit` and threaded through the authn component; see
-///   issue #422 for the follow-up.
+///   used, as a backstop for credential types with no expiry at all
+///   (`identity-payload`'s `expires-at` is `None`).
+///
+/// For a credential that does carry an expiry, `get()` checks it against the
+/// wall clock on every lookup and treats an expired entry as a miss — a
+/// token polled every few minutes no longer stays accepted past its own
+/// `exp` just because it keeps resetting the idle timer. This closed the gap
+/// issue #422 tracked (`expires-at` on `identity-payload`, threaded through
+/// the authn component into `AuthClaims`).
 #[derive(Clone)]
 pub(crate) struct AuthDecisionCache {
     inner: moka::sync::Cache<AuthDecisionKey, AuthDecision>,
@@ -128,9 +132,23 @@ impl AuthDecisionCache {
     }
 
     fn get(&self, token: &str, method: &str, path: &str) -> Option<AuthClaims> {
-        self.inner
-            .get(&Self::key(token, method, path))
-            .map(|d| d.claims)
+        let key = Self::key(token, method, path);
+        let decision = self.inner.get(&key)?;
+        if let Some(expires_at) = decision.claims.expires_at {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(u64::MAX);
+            if now >= expires_at {
+                // Real expiry has passed even though the cache entry itself
+                // hasn't hit its TTL — evict it now rather than waiting, so a
+                // concurrent lookup for the same key doesn't also get a stale
+                // hit before the TTL sweep runs.
+                self.inner.invalidate(&key);
+                return None;
+            }
+        }
+        Some(decision.claims)
     }
 
     fn put(&self, token: &str, method: &str, path: &str, claims: AuthClaims) {
@@ -717,6 +735,7 @@ impl AuthManager {
                 subject: claims.subject,
                 roles: claims.roles,
                 scopes: claims.scopes,
+                expires_at: claims.expires_at,
             })
             .map_err(map_authn_error)
     }
@@ -1837,6 +1856,7 @@ mod tests {
             subject: subject.to_owned(),
             roles: roles.iter().map(|r| (*r).to_owned()).collect(),
             scopes: Vec::new(),
+            expires_at: None,
         }
     }
 
@@ -1881,6 +1901,40 @@ mod tests {
         // Different method/path is a cache miss.
         assert!(cache.get("tok-1", "POST", "/api/x").is_none());
         assert!(cache.get("tok-1", "GET", "/api/y").is_none());
+    }
+
+    #[test]
+    fn cache_hit_with_a_past_expiry_is_treated_as_a_miss() {
+        let cache = AuthDecisionCache::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_secs();
+        let mut claims = fresh_claims("alice", &["admin"]);
+        claims.expires_at = Some(now.saturating_sub(1));
+        cache.put("tok-1", "GET", "/api/x", claims);
+
+        // A real expiry in the past is caught even though the cache entry's
+        // own TTL/idle window hasn't elapsed — this is the gap issue #422
+        // tracked: nothing used to re-check expiry on a cache hit.
+        assert!(cache.get("tok-1", "GET", "/api/x").is_none());
+    }
+
+    #[test]
+    fn cache_hit_with_a_future_expiry_is_still_served() {
+        let cache = AuthDecisionCache::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_secs();
+        let mut claims = fresh_claims("alice", &["admin"]);
+        claims.expires_at = Some(now + 3600);
+        cache.put("tok-1", "GET", "/api/x", claims);
+
+        let got = cache
+            .get("tok-1", "GET", "/api/x")
+            .expect("not yet expired");
+        assert_eq!(got.subject, "alice");
     }
 
     #[test]
