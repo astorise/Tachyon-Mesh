@@ -58,8 +58,20 @@ const MODEL_PREP_PROGRESS_BYTES: u64 = 64 * 1024 * 1024;
 pub struct InstanceConfig {
     pub url: String,
     pub token: String,
+    /// Client identity presented for mutual TLS. Distinct from `custom_ca`:
+    /// this is what the client shows the server, not what the client trusts
+    /// the server's certificate against. Nothing in tachyon-ui collects a
+    /// private key today, so this stays `None` in every real call path;
+    /// exercised only by this crate's own tests.
     pub mtls_cert: Option<Vec<u8>>,
     pub mtls_key: Option<Vec<u8>>,
+    /// PEM-encoded CA certificate to trust as a root, in addition to the
+    /// platform's own trust store. Lets a homelab node with a self-signed
+    /// certificate be trusted specifically, instead of the all-or-nothing
+    /// choice between the public CA store and `danger_accept_invalid_certs`
+    /// (see `insecure_tls_override_is_set`). tachyon-ui persists this as
+    /// "custom CA" via `save_custom_ca`/`load_custom_ca` (issue #421).
+    pub custom_ca: Option<Vec<u8>>,
 }
 
 static CONNECTION_STATE: OnceLock<RwLock<Option<InstanceConfig>>> = OnceLock::new();
@@ -2980,13 +2992,14 @@ pub async fn remove_overlay_resource(name: &str) -> Result<()> {
 pub async fn set_connection(
     url: String,
     token: String,
-    cert: Option<Vec<u8>>,
+    custom_ca: Option<Vec<u8>>,
 ) -> Result<(), String> {
     let config = InstanceConfig {
         url: url.trim().to_owned(),
         token: token.trim().to_owned(),
-        mtls_cert: cert,
+        mtls_cert: None,
         mtls_key: None,
+        custom_ca,
     };
     validate_connection_config(&config).map_err(|error| error.to_string())?;
     fetch_remote_status(&config)
@@ -3004,10 +3017,10 @@ pub async fn authn_login(
     url: &str,
     username: &str,
     password: &str,
-    cert: Option<Vec<u8>>,
+    custom_ca: Option<Vec<u8>>,
 ) -> Result<AuthLoginResponse> {
     let normalized_username = normalize_operator_name(username)?;
-    let config = public_connection_config(url, cert);
+    let config = public_connection_config(url, custom_ca);
     let client = build_http_client(&config)?;
     let response = client
         .post(build_endpoint_url(&config.url, AUTH_LOGIN_STAGE_PATH)?)
@@ -3046,9 +3059,9 @@ pub async fn finalize_login(
     url: &str,
     session_id: &str,
     totp_code: &str,
-    cert: Option<Vec<u8>>,
+    custom_ca: Option<Vec<u8>>,
 ) -> Result<AuthLoginResponse> {
-    let config = public_connection_config(url, cert.clone());
+    let config = public_connection_config(url, custom_ca.clone());
     let client = build_http_client(&config)?;
     let response = client
         .post(build_endpoint_url(&config.url, AUTH_LOGIN_FINALIZE_PATH)?)
@@ -3074,7 +3087,7 @@ pub async fn finalize_login(
 
     let payload: FinalizeEnrollmentResponse = serde_json::from_slice(&body)
         .context("failed to decode login finalization response payload")?;
-    set_connection(config.url.clone(), payload.token, cert)
+    set_connection(config.url.clone(), payload.token, custom_ca)
         .await
         .map_err(anyhow::Error::msg)?;
 
@@ -3107,9 +3120,9 @@ pub async fn verify_session_totp(totp_code: &str) -> Result<MfaSessionToken> {
 pub async fn validate_registration_token(
     url: &str,
     token: &str,
-    cert: Option<Vec<u8>>,
+    custom_ca: Option<Vec<u8>>,
 ) -> Result<RegistrationTokenClaims> {
-    let config = public_connection_config(url, cert);
+    let config = public_connection_config(url, custom_ca);
     let client = build_http_client(&config)?;
     let response = client
         .post(build_endpoint_url(&config.url, AUTH_SIGNUP_VALIDATE_PATH)?)
@@ -3142,9 +3155,9 @@ pub async fn stage_signup(
     last_name: &str,
     username: &str,
     password: &str,
-    cert: Option<Vec<u8>>,
+    custom_ca: Option<Vec<u8>>,
 ) -> Result<StagedSignupSession> {
-    let config = public_connection_config(url, cert);
+    let config = public_connection_config(url, custom_ca);
     let client = build_http_client(&config)?;
     let response = client
         .post(build_endpoint_url(&config.url, AUTH_SIGNUP_STAGE_PATH)?)
@@ -3178,9 +3191,9 @@ pub async fn finalize_enrollment(
     url: &str,
     session_id: &str,
     totp_code: &str,
-    cert: Option<Vec<u8>>,
+    custom_ca: Option<Vec<u8>>,
 ) -> Result<AuthLoginResponse> {
-    let config = public_connection_config(url, cert.clone());
+    let config = public_connection_config(url, custom_ca.clone());
     let client = build_http_client(&config)?;
     let response = client
         .post(build_endpoint_url(&config.url, AUTH_SIGNUP_FINALIZE_PATH)?)
@@ -3206,7 +3219,7 @@ pub async fn finalize_enrollment(
 
     let payload: FinalizeEnrollmentResponse = serde_json::from_slice(&body)
         .context("failed to decode enrollment-finalize response payload")?;
-    set_connection(config.url.clone(), payload.token, cert)
+    set_connection(config.url.clone(), payload.token, custom_ca)
         .await
         .map_err(anyhow::Error::msg)?;
 
@@ -4671,6 +4684,12 @@ fn build_http_client(config: &InstanceConfig) -> Result<reqwest::Client> {
         builder = builder.identity(parse_identity(identity_bytes, config.mtls_key.as_deref())?);
     }
 
+    if let Some(ca_bytes) = config.custom_ca.as_deref() {
+        let ca_cert = reqwest::Certificate::from_pem(ca_bytes)
+            .context("failed to parse custom CA certificate as PEM")?;
+        builder = builder.add_root_certificate(ca_cert);
+    }
+
     let client = builder
         .build()
         .context("failed to build authenticated HTTP client")?;
@@ -4696,7 +4715,15 @@ fn http_client_cache_key(config: &InstanceConfig) -> String {
         .as_deref()
         .map(short_hash)
         .unwrap_or_else(|| "none".to_owned());
-    format!("{}|cert:{cert_hash}|key:{key_hash}", config.url.trim())
+    let ca_hash = config
+        .custom_ca
+        .as_deref()
+        .map(short_hash)
+        .unwrap_or_else(|| "none".to_owned());
+    format!(
+        "{}|cert:{cert_hash}|key:{key_hash}|ca:{ca_hash}",
+        config.url.trim()
+    )
 }
 
 fn short_hash(bytes: &[u8]) -> String {
@@ -4725,12 +4752,13 @@ fn build_endpoint_url(base_url: &str, path: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
-fn public_connection_config(url: &str, cert: Option<Vec<u8>>) -> InstanceConfig {
+fn public_connection_config(url: &str, custom_ca: Option<Vec<u8>>) -> InstanceConfig {
     InstanceConfig {
         url: url.trim().to_owned(),
         token: String::new(),
-        mtls_cert: cert,
+        mtls_cert: None,
         mtls_key: None,
+        custom_ca,
     }
 }
 
@@ -4824,6 +4852,7 @@ mod tests {
             token: "token-a".to_owned(),
             mtls_cert: Some(b"cert-a".to_vec()),
             mtls_key: Some(b"key-a".to_vec()),
+            custom_ca: Some(b"ca-a".to_vec()),
         };
         let same_transport = InstanceConfig {
             token: "token-b".to_owned(),
@@ -4831,6 +4860,10 @@ mod tests {
         };
         let different_identity = InstanceConfig {
             mtls_cert: Some(b"cert-b".to_vec()),
+            ..base.clone()
+        };
+        let different_ca = InstanceConfig {
+            custom_ca: Some(b"ca-b".to_vec()),
             ..base.clone()
         };
 
@@ -4842,6 +4875,60 @@ mod tests {
             http_client_cache_key(&base),
             http_client_cache_key(&different_identity)
         );
+        assert_ne!(
+            http_client_cache_key(&base),
+            http_client_cache_key(&different_ca)
+        );
+    }
+
+    // Throwaway self-signed cert (openssl req -x509 -newkey ed25519 -nodes
+    // -days 3650), not tied to any real host — only used here to exercise
+    // PEM parsing, never presented over a real connection.
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+        MIIBSDCB+6ADAgECAhRWF+Olqkhod4SN+SVV86xkTSnQtzAFBgMrZXAwGjEYMBYG\n\
+        A1UEAwwPdGFjaHlvbi10ZXN0LWNhMB4XDTI2MDkxNzIxMDMwOFoXDTM2MDkxNDIx\n\
+        MDMwOFowGjEYMBYGA1UEAwwPdGFjaHlvbi10ZXN0LWNhMCowBQYDK2VwAyEAPrFz\n\
+        Lgiep/2kJI+0QQBccVOfejVgtDp7QHxBOVK/K5KjUzBRMB0GA1UdDgQWBBSoYK+B\n\
+        nekPUdslR1Sssmga5nwhkzAfBgNVHSMEGDAWgBSoYK+BnekPUdslR1Sssmga5nwh\n\
+        kzAPBgNVHRMBAf8EBTADAQH/MAUGAytlcANBAGSJaRfuR8DMC2pempfLzlXGHAhO\n\
+        cx2h7w1P6uP5QKtkOILBo7h2W0CvRd5r3h1BfqRRtUM/TqMAulalbULGgQQ=\n\
+        -----END CERTIFICATE-----\n";
+
+    #[test]
+    fn build_http_client_accepts_a_valid_custom_ca() {
+        let config = InstanceConfig {
+            url: "https://example.invalid".to_owned(),
+            token: "token".to_owned(),
+            mtls_cert: None,
+            mtls_key: None,
+            custom_ca: Some(TEST_CA_PEM.as_bytes().to_vec()),
+        };
+        build_http_client(&config).expect("a valid PEM CA should build a client");
+    }
+
+    #[test]
+    fn build_http_client_rejects_a_malformed_custom_ca() {
+        // Correctly PEM-framed but not valid DER inside — reqwest's rustls
+        // backend defers all real parsing past `Certificate::from_pem` (that
+        // constructor just stores the raw bytes) to `ClientBuilder::build()`,
+        // and input with no `-----BEGIN CERTIFICATE-----` marker at all is
+        // silently treated as zero certificates rather than an error, so a
+        // bare byte string like `b"not a certificate"` doesn't exercise the
+        // failure path this test wants.
+        let malformed_pem = "-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydA==not-valid-base64!!!\n-----END CERTIFICATE-----\n";
+        let config = InstanceConfig {
+            url: "https://example.invalid".to_owned(),
+            token: "token".to_owned(),
+            mtls_cert: None,
+            mtls_key: None,
+            custom_ca: Some(malformed_pem.as_bytes().to_vec()),
+        };
+        let error = build_http_client(&config)
+            .expect_err("malformed PEM content must not be silently accepted");
+        // anyhow::Error's Display only shows the outermost .context(); the
+        // underlying reqwest/rustls message ("invalid certificate encoding")
+        // is further down the chain.
+        assert!(format!("{error:#}").contains("invalid certificate"));
     }
 
     #[test]

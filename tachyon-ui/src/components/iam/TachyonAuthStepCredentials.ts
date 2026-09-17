@@ -6,6 +6,9 @@ export type CredentialsSubmittedDetail = {
   url: string;
   username: string;
   password: string;
+  // Despite the name, this is the custom CA certificate to trust for this
+  // connection (see currentCert() below), not an mTLS client identity —
+  // it flows through to the Rust side's `custom_ca` handling (issue #421).
   cert: number[] | null;
 };
 
