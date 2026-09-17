@@ -204,6 +204,8 @@ export class TachyonRoutingPanel extends TachyonConfigDashboard {
         const concPanel = document.createElement("tachyon-concurrency-policy-panel") as HTMLElement;
         concPanel.setAttribute("route-path", route.path);
         const routePolicy = document.createElement("div");
+        // renderRoutePolicy() wraps every dynamic field in this.escape().
+        // eslint-disable-next-line no-restricted-properties
         routePolicy.innerHTML = this.renderRoutePolicy(route.path);
         const volPanel = document.createElement("tachyon-volumes-panel") as HTMLElement;
         volPanel.setAttribute("route-path", route.path);

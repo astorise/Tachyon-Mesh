@@ -6,6 +6,10 @@
 
 export type RiskLevel = "low" | "medium" | "high";
 
+function escapeAttr(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 const COLORS: Record<RiskLevel, { bg: string; text: string; label: string }> = {
   low: { bg: "bg-emerald-900/40", text: "text-emerald-300", label: "Low Risk" },
   medium: { bg: "bg-amber-900/40", text: "text-amber-300", label: "Medium Risk" },
@@ -30,8 +34,10 @@ export class TachyonRiskBadge extends HTMLElement {
     const tooltip = this.getAttribute("tooltip") || "";
     const sim = this.getAttribute("sim-scenario") || "";
     const colors = COLORS[level] || COLORS.low;
-    const escTooltip = tooltip.replace(/"/g, "&quot;");
-    const escSim = sim.replace(/"/g, "&quot;");
+    const escTooltip = escapeAttr(tooltip);
+    const escSim = escapeAttr(sim);
+    // escapeAttr() covers every interpolated value below.
+    // eslint-disable-next-line no-restricted-properties
     this.innerHTML = `
       <span
         class="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-mono ${colors.bg} ${colors.text} cursor-help"

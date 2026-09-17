@@ -45,6 +45,8 @@ export class TachyonAppShellModalRoot extends HTMLElement {
   }
 
   connectedCallback(): void {
+    // Static custom-element tags only, no interpolated data.
+    // eslint-disable-next-line no-restricted-properties
     this.root.innerHTML = `
       <tachyon-guided-tour></tachyon-guided-tour>
       <tachyon-toast-manager></tachyon-toast-manager>

@@ -326,6 +326,7 @@ export class TachyonTopologyCanvas extends HTMLElement {
     const transform = `translate(${this.panX}px,${this.panY}px) scale(${this.zoom})`;
 
     // Static structure — edges and nodes are appended via DOM API below.
+    // eslint-disable-next-line no-restricted-properties
     this.root.innerHTML = `
       <div id="canvas-outer" class="relative h-[540px] w-full overflow-hidden rounded-lg border border-slate-800 bg-slate-950/60 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.08),transparent_50%)]" style="cursor:grab;">
         <div id="canvas-viewport" style="position:absolute;transform-origin:0 0;width:${VIRTUAL_W}px;height:${VIRTUAL_H}px;transform:${transform};">
@@ -533,12 +534,20 @@ export class TachyonNodeEditor extends HTMLElement {
 
   private render(): void {
     if (!this.node) {
+      // Static placeholder, no interpolated data.
+      // eslint-disable-next-line no-restricted-properties
       this.root.innerHTML = `
         <aside class="hidden"></aside>
       `;
       return;
     }
     const theme = themeFor(this.node.type);
+    // theme comes from the fixed NODE_THEMES lookup table (safe fallback for
+    // any unknown type); the rest is t() i18n lookups and
+    // renderTypeFields()'s own static, per-type field markup — field values
+    // are set via .value afterward (see populateFieldValues()), never
+    // interpolated here.
+    // eslint-disable-next-line no-restricted-properties
     this.root.innerHTML = `
       <aside class="fixed right-0 top-0 h-screen w-96 z-40 border-l border-slate-800 bg-slate-950/95 backdrop-blur-xl p-5 overflow-y-auto">
         <header class="flex items-center justify-between mb-5">

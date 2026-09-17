@@ -64,6 +64,10 @@ export class TachyonAuthStepCredentials extends HTMLElement {
   }
 
   private render(): void {
+    // Static structure and t() i18n lookups only — no dynamic data. Values
+    // (saved URL, username, etc.) are set via .value after render, never
+    // interpolated here.
+    // eslint-disable-next-line no-restricted-properties
     this.root.innerHTML = `
       <form id="cred-form" class="space-y-3" aria-label="${t("iam.login.form-label")}">
         <label for="cred-url" class="sr-only">${t("iam.placeholder.url")}</label>

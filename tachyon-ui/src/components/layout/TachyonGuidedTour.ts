@@ -60,6 +60,8 @@ export class TachyonGuidedTour extends HTMLElement {
   }
 
   private render(): void {
+    // Static structure, t() i18n lookups, and a boolean-driven class only.
+    // eslint-disable-next-line no-restricted-properties
     this.root.innerHTML = `
       <section id="tour-layer" class="${this.running ? "fixed" : "hidden"} inset-0 z-[150] bg-slate-950/80 text-slate-200 backdrop-blur-sm">
         <div id="tour-highlight" class="pointer-events-none fixed rounded-lg border-2 border-cyan-400 shadow-[0_0_32px_rgba(34,211,238,0.45)]"></div>

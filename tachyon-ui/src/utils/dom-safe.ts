@@ -28,7 +28,6 @@ export function el<K extends keyof HTMLElementTagNameMap>(
       node.setAttribute(key, String(value));
     } else if (key in node) {
       // For type, value, id, etc. that are direct properties.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (node as any)[key] = value;
     } else {
       node.setAttribute(key, String(value));

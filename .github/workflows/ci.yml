@@ -615,6 +615,20 @@ jobs:
         working-directory: tachyon-ui
         run: npx tsc --noEmit
 
+      - name: Lint (XSS guard)
+        # eslint.config.mjs's no-restricted-properties rule is the guard
+        # against raw innerHTML/outerHTML assignment (issue #423's class of
+        # bug). It never ran in CI before this step existed — see issue #424:
+        # ESLint wasn't installed, there was no lint script, and
+        # @typescript-eslint/parser hard-refuses this project's TypeScript 7
+        # at module-load time with no config escape hatch
+        # (https://github.com/typescript-eslint/typescript-eslint/issues/10940).
+        # `npm ci`'s postinstall (scripts/link-eslint-ts6.mjs) works around
+        # that by giving the parser its own TypeScript 6 side by side with
+        # the real TS7 `tsc` above uses.
+        working-directory: tachyon-ui
+        run: npm run lint
+
       - name: Run tests
         working-directory: tachyon-ui
         run: npm test

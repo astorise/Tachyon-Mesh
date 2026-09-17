@@ -28,6 +28,8 @@ export class TachyonChatPanel extends HTMLElement {
   }
 
   private render(): void {
+    // Static structure and t() i18n lookups only — no dynamic data.
+    // eslint-disable-next-line no-restricted-properties
     this.root.innerHTML = `
       <section class="flex min-h-[calc(100vh-8rem)] flex-col gap-4 text-slate-300">
         <header class="flex flex-col gap-1">

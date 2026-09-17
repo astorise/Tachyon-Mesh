@@ -148,6 +148,11 @@ export class TachyonAppShell extends HTMLElement {
     this.visibleRoute = "";
     // configLinks are now rendered by TachyonAppShellNav; the variable is kept
     // for reference during incremental adoption but is no longer inserted here.
+    // Every interpolated value below is either a t() i18n lookup, a
+    // whitelisted route name (normalizeRoute() only ever returns "dashboard"
+    // or a known listComponentRoutes() entry), a fixed boolean-driven string,
+    // or escape()-wrapped (activeUser).
+    // eslint-disable-next-line no-restricted-properties
     this.root.innerHTML = `
       <section id="shell" class="hidden fixed inset-0 z-30 h-screen w-screen bg-slate-950 text-slate-300">
         <a href="#main-content" class="skip-nav">${t("shell.skip-nav")}</a>
@@ -171,7 +176,7 @@ export class TachyonAppShell extends HTMLElement {
               </label>
               <button id="btn-help-tour" type="button" class="inline-flex h-8 w-8 items-center justify-center rounded border border-cyan-500/40 bg-cyan-500/10 font-mono text-sm font-semibold text-cyan-300 hover:bg-cyan-500/20" title="${t("shell.help")}" aria-label="${t("shell.help")}">?</button>
               <span class="text-xs uppercase tracking-[0.2em] text-slate-500" aria-hidden="true">${t("shell.operator")}</span>
-              <span id="shell-user" class="text-sm text-cyan-300 font-mono" aria-label="${t("shell.user-label")}: ${this.activeUser}">${this.activeUser}</span>
+              <span id="shell-user" class="text-sm text-cyan-300 font-mono" aria-label="${t("shell.user-label")}: ${this.escape(this.activeUser)}">${this.escape(this.activeUser)}</span>
             </div>
           </header>
           <main id="main-content" tabindex="-1" class="min-h-0 flex-1 overflow-y-auto p-8 opacity-0" aria-label="${t("shell.main-label")}">
@@ -346,6 +351,8 @@ export class TachyonAppShell extends HTMLElement {
     loader.setAttribute("aria-atomic", "true");
     loader.className =
       "absolute inset-0 flex items-center justify-center z-50 bg-slate-950/40";
+    // Static spinner markup, no interpolated data.
+    // eslint-disable-next-line no-restricted-properties
     loader.innerHTML = `
       <div class="flex flex-col items-center gap-3">
         <span class="sr-only">Applying configuration, please wait…</span>
@@ -446,6 +453,10 @@ export class TachyonAppShell extends HTMLElement {
       this.render();
       this.restoreStartedState();
     }
+  }
+
+  private escape(value: string): string {
+    return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
 }
 

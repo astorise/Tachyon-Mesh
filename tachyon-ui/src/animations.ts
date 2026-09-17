@@ -23,6 +23,12 @@ window.addEventListener("route-change", (event) => {
     duration: 0.16,
     ease: "power1.in",
     onComplete: () => {
+      // No current dispatcher fires "route-change" with this {path, renderer,
+      // container} shape (routing moved to TachyonAppShell's hashchange
+      // handling) — unreachable today, kept only in case a caller still
+      // relies on it. If one is added, renderer() must return only trusted,
+      // pre-escaped markup, same as every other innerHTML site in this app.
+      // eslint-disable-next-line no-restricted-properties
       container.innerHTML = renderer();
       const router = (window as unknown as { tachyonRouter?: { initRoute(path: string): void } }).tachyonRouter;
       router?.initRoute(path);
