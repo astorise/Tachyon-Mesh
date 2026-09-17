@@ -280,7 +280,16 @@ jobs:
         if: env.RENOVATE_PR != 'true'
         run: cargo fmt --all -- --check
 
-      - name: Check core-host feature builds (compile-only)
+      - name: Check core-host feature builds
+        # Was a compile-only `cargo check` loop, so a warning specific to one
+        # of these features (e.g. only surfacing without ai-inference, or
+        # only under http3) reached main unnoticed — the only feature build
+        # actually held to -D warnings was the ai-inference lane above
+        # (issue #432). feature-matrix-tests/-artifacts below build and test
+        # --no-default-features (the worker-dataplane-profile floor) but
+        # never lint it, so it gets its own explicit clippy invocation here
+        # rather than joining this loop, which is additive `--features`
+        # flags on top of the default set.
         run: |
           for feature in \
             http3 \
@@ -291,8 +300,9 @@ jobs:
             secrets-vault \
             websockets
           do
-            cargo check -p core-host --features "$feature"
+            cargo clippy -p core-host --all-targets --features "$feature" -- -D warnings -D clippy::unwrap_used
           done
+          cargo clippy -p core-host --all-targets --no-default-features -- -D warnings -D clippy::unwrap_used
 
       - name: Lint workspace (CPU features)
         # Keep the general quality gate on ubuntu-latest CPU runners: CUDA is
