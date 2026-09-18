@@ -837,8 +837,8 @@ pub(crate) fn execute_websocket_guest(
     engine: &Engine,
     route: &IntegrityRoute,
     function_name: &str,
-    incoming: std::sync::mpsc::Receiver<HostWebSocketFrame>,
-    outgoing: tokio::sync::mpsc::UnboundedSender<HostWebSocketFrame>,
+    incoming: tokio::sync::mpsc::Receiver<HostWebSocketFrame>,
+    outgoing: tokio::sync::mpsc::Sender<HostWebSocketFrame>,
     execution: &GuestExecutionContext,
 ) -> std::result::Result<(), ExecutionError> {
     let module_path =
@@ -874,8 +874,8 @@ pub(crate) fn execute_websocket_component_guest(
     route: &IntegrityRoute,
     component_path: &Path,
     component: &Component,
-    incoming: std::sync::mpsc::Receiver<HostWebSocketFrame>,
-    outgoing: tokio::sync::mpsc::UnboundedSender<HostWebSocketFrame>,
+    incoming: tokio::sync::mpsc::Receiver<HostWebSocketFrame>,
+    outgoing: tokio::sync::mpsc::Sender<HostWebSocketFrame>,
     execution: &GuestExecutionContext,
 ) -> std::result::Result<(), ExecutionError> {
     let shape = route_scope_shape(route);
@@ -1461,14 +1461,14 @@ pub(crate) fn execute_system_component_guest(
                 "failed to add scaling metrics functions to system component linker",
             )
         })?;
-        system_component_bindings::tachyon::mesh::model_events::add_to_linker::<
+        system_component_bindings::tachyon::mesh::artifact_events::add_to_linker::<
             ComponentHostState,
             ComponentHostState,
         >(&mut l, |s: &mut ComponentHostState| s)
         .map_err(|e| {
             guest_execution_error(
                 e,
-                "failed to add model-events functions to system component linker",
+                "failed to add artifact-events functions to system component linker",
             )
         })?;
         // Authorization-gated: URL validated against scopes.http per call.

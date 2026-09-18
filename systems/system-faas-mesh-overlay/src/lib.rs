@@ -374,7 +374,7 @@ fn local_heartbeat() -> HardwareHeartbeat {
             },
         },
         active_faas_count: snapshot.active_instances,
-        supported_models: snapshot.hot_models,
+        supported_components: snapshot.hot_inference_components,
         capability_mask: snapshot.capability_mask,
         capabilities: snapshot.capabilities,
         secure: std::env::var(OVERLAY_SHARED_SECRET_ENV).is_ok(),
@@ -551,11 +551,14 @@ impl RoutingTable {
             .filter(|peer| peer.status == "online" && peer.secure)
             .filter(|peer| !requirements.gpu_required || peer.hardware.gpu.present)
             .filter(|peer| {
-                requirements.supported_model.as_ref().is_none_or(|model| {
-                    peer.supported_models
-                        .iter()
-                        .any(|candidate| candidate.eq_ignore_ascii_case(model))
-                })
+                requirements
+                    .supported_component
+                    .as_ref()
+                    .is_none_or(|model| {
+                        peer.supported_components
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(model))
+                    })
             })
             .min_by_key(|peer| {
                 (
@@ -577,7 +580,7 @@ impl RoutingTable {
                     peer.base_url.trim_end_matches('/'),
                     DEFAULT_ROUTE_PATH
                 ),
-                hot_models: peer.supported_models.clone(),
+                hot_inference_components: peer.supported_components.clone(),
                 effective_pressure: peer
                     .hardware
                     .gpu
@@ -595,7 +598,7 @@ struct PeerRequirements {
     #[serde(default)]
     gpu_required: bool,
     #[serde(default)]
-    supported_model: Option<String>,
+    supported_component: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -605,7 +608,7 @@ struct HardwareHeartbeat {
     base_url: String,
     hardware: Hardware,
     active_faas_count: u32,
-    supported_models: Vec<String>,
+    supported_components: Vec<String>,
     #[serde(default)]
     capability_mask: u64,
     #[serde(default)]
@@ -641,7 +644,7 @@ struct RouteOverrideDescriptor {
 #[derive(Clone, Debug, Serialize)]
 struct RouteOverrideCandidate {
     destination: String,
-    hot_models: Vec<String>,
+    hot_inference_components: Vec<String>,
     effective_pressure: u8,
     capability_mask: u64,
     capabilities: Vec<String>,

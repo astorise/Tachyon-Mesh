@@ -49,10 +49,58 @@ spec:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+
+      # ── Pod-level security context (Restricted Pod Security Standard) ──────
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      # A ConfigMap volume mounts read-only, but core-host's manifest path
+      # also anchors every state directory it derives (auth state, core
+      # store, buffered-request spool, host identity key) — those need a
+      # writable parent. This copies the ConfigMap's integrity.lock into the
+      # writable state-vol emptyDir once at pod start, so the main container
+      # can point TACHYON_INTEGRITY_MANIFEST at a location that is both
+      # pre-populated with the real signed manifest and writable.
+      initContainers:
+        - name: copy-integrity-lock
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - cp /config/integrity.lock /state/integrity.lock
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: integrity-lock
+              mountPath: /config
+              readOnly: true
+            - name: state-vol
+              mountPath: /state
+
       containers:
         - name: core-host
           image: ghcr.io/astorise/tachyon-mesh:latest
           imagePullPolicy: Always
+
+          # ── Container-level security context ──────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
           ports:
             - name: http
               containerPort: 8080
@@ -64,6 +112,10 @@ spec:
             # Bind address
             - name: TACHYON_HOST_ADDRESS
               value: "0.0.0.0:8080"
+            # See the copy-integrity-lock init container above: this is the
+            # writable copy it makes of the ConfigMap-sourced manifest.
+            - name: TACHYON_INTEGRITY_MANIFEST
+              value: /state/integrity.lock
           resources:
             requests:
               memory: "4Gi"
@@ -76,9 +128,15 @@ spec:
           volumeMounts:
             - name: model-cache
               mountPath: /var/lib/tachyon/models
-            - name: integrity-lock
-              mountPath: /app/integrity.lock
-              subPath: integrity.lock
+            - name: state-vol
+              mountPath: /state
+            # readOnlyRootFilesystem: true also removes the writable /tmp
+            # core-host's UDS peer-discovery registry defaults to
+            # (/tmp/tachyon/peers) — sockets, so kept off state-vol
+            # deliberately in case that volume type ever changes; local
+            # emptyDir always supports UNIX sockets.
+            - name: tmp-vol
+              mountPath: /tmp
           readinessProbe:
             tcpSocket:
               port: 8080
@@ -97,6 +155,14 @@ spec:
         - name: integrity-lock
           configMap:
             name: tachyon-integrity-lock
+        # Writable copy the init container populates from the read-only
+        # ConfigMap above; also anchors core-host's derived state
+        # directories. Ephemeral (no PVC): this Deployment has none today,
+        # matching its behavior before this change.
+        - name: state-vol
+          emptyDir: {}
+        - name: tmp-vol
+          emptyDir: {}
 
 ---
 apiVersion: v1

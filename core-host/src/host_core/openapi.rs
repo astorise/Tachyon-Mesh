@@ -122,11 +122,11 @@ pub(crate) struct AuditLogEntry {
         // KV-Cache
         get_admin_kv_cache_stats,
         delete_admin_kv_cache,
-        // Assets / models
+        // Assets / components
         post_admin_assets,
-        post_admin_models_init,
-        put_admin_models_upload,
-        post_admin_models_commit,
+        post_admin_components_init,
+        put_admin_components_upload,
+        post_admin_components_commit,
         // Schema & docs
         get_admin_schema_manifest,
         get_admin_schema_openapi,
@@ -153,7 +153,7 @@ pub(crate) struct AuditLogEntry {
         (name = "identity",   description = "Node identity and enrollment"),
         (name = "security",   description = "Operator security actions (MFA, PATs, step-up)"),
         (name = "iam",        description = "Identity and access management"),
-        (name = "assets",     description = "Asset and model upload"),
+        (name = "assets",     description = "Asset and artifact upload"),
         (name = "schema",     description = "Schema and documentation endpoints"),
     )
 )]
@@ -372,21 +372,21 @@ fn get_admin_logs() {}
 
 // KV-Cache
 
-#[utoipa::path(get, path = "/admin/kv-cache/{model}/stats", tag = "status",
-    params(("model" = String, Path, description = "Model reference identifier")),
+#[utoipa::path(get, path = "/admin/component-cache/{component}/stats", tag = "status",
+    params(("component" = String, Path, description = "Component reference identifier")),
     security(("bearer_token" = [])),
     responses((status = 200, description = "KV-cache statistics"), (status = 401, description = "Unauthorized")))]
 #[allow(dead_code)]
 fn get_admin_kv_cache_stats() {}
 
-#[utoipa::path(delete, path = "/admin/kv-cache/{model}", tag = "status",
-    params(("model" = String, Path, description = "Model reference identifier")),
+#[utoipa::path(delete, path = "/admin/component-cache/{component}", tag = "status",
+    params(("component" = String, Path, description = "Component reference identifier")),
     security(("bearer_token" = [])),
     responses((status = 204, description = "KV-cache evicted"), (status = 401, description = "Unauthorized")))]
 #[allow(dead_code)]
 fn delete_admin_kv_cache() {}
 
-// Assets & models
+// Assets & components
 
 #[utoipa::path(post, path = "/admin/assets", tag = "assets",
     security(("bearer_token" = [])),
@@ -395,27 +395,27 @@ fn delete_admin_kv_cache() {}
 #[allow(dead_code)]
 fn post_admin_assets() {}
 
-#[utoipa::path(post, path = "/admin/models/init", tag = "assets",
+#[utoipa::path(post, path = "/admin/artifacts/init", tag = "assets",
     security(("bearer_token" = [])),
     request_body(content = serde_json::Value, description = "Upload init request { name, size_bytes }"),
     responses((status = 200, description = "Upload session created, returns upload_id"), (status = 401, description = "Unauthorized")))]
 #[allow(dead_code)]
-fn post_admin_models_init() {}
+fn post_admin_components_init() {}
 
-#[utoipa::path(put, path = "/admin/models/upload/{upload_id}", tag = "assets",
+#[utoipa::path(put, path = "/admin/artifacts/upload/{upload_id}", tag = "assets",
     params(("upload_id" = String, Path, description = "Upload session identifier")),
     security(("bearer_token" = [])),
     request_body(content = String, description = "Chunk bytes"),
     responses((status = 204, description = "Chunk received"), (status = 401, description = "Unauthorized")))]
 #[allow(dead_code)]
-fn put_admin_models_upload() {}
+fn put_admin_components_upload() {}
 
-#[utoipa::path(post, path = "/admin/models/commit/{upload_id}", tag = "assets",
+#[utoipa::path(post, path = "/admin/artifacts/commit/{upload_id}", tag = "assets",
     params(("upload_id" = String, Path, description = "Upload session identifier")),
     security(("bearer_token" = [])),
-    responses((status = 200, description = "Model committed"), (status = 401, description = "Unauthorized")))]
+    responses((status = 200, description = "Component committed"), (status = 401, description = "Unauthorized")))]
 #[allow(dead_code)]
-fn post_admin_models_commit() {}
+fn post_admin_components_commit() {}
 
 // Schema & docs
 

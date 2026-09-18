@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/astorise/tachyon-mesh/security/advisories/new
+    about: Please don't open a public issue for a security vulnerability — use private reporting (see SECURITY.md).

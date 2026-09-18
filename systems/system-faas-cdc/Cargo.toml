@@ -2,9 +2,10 @@
 name = "system-faas-cdc"
 version = "1.0.0"
 edition = "2021"
+license.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = "0.60"
+wit-bindgen = "0.61"

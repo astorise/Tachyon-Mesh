@@ -53,7 +53,7 @@ export class TachyonHardwarePanel extends TachyonConfigDashboard {
     this.renderTemplate(`
       <section class="p-6 space-y-6 text-slate-300">
         <div data-stagger-panel class="border-l-4 border-cyan-500 pl-4 flex flex-col gap-1">
-          ${this.liveStatus ? `<span class="text-[10px] font-mono text-emerald-400/80">RAM: ${this.liveStatus.availableRamMb} / ${this.liveStatus.totalRamMb} MiB free · Accelerators: ${this.liveStatus.accelerators.join(", ") || "—"}</span>` : ""}
+          ${this.liveStatus ? `<span class="text-[10px] font-mono text-emerald-400/80">RAM: ${this.liveStatus.availableRamMb} / ${this.liveStatus.totalRamMb} MiB free · Accelerators: ${this.escape(this.liveStatus.accelerators.join(", ")) || "—"}</span>` : ""}
           <h2 class="text-2xl font-bold text-slate-100">${t("hardware.title")}</h2>
           <p class="text-sm font-mono text-slate-400">${t("hardware.subtitle")}</p>
         </div>
@@ -149,6 +149,10 @@ export class TachyonHardwarePanel extends TachyonConfigDashboard {
     this.root.getElementById("btn-vram-refresh")?.addEventListener("click", () => {
       void this.refreshVram();
     });
+  }
+
+  private escape(value: string): string {
+    return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
 
   private async refreshVram(): Promise<void> {

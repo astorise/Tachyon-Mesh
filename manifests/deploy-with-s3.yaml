@@ -62,6 +62,19 @@ spec:
       labels:
         app: tachyon-host
     spec:
+      # ── Pod-level security context (Restricted Pod Security Standard) ──────
+      # Applies to every container below, including the rclone init/sidecar
+      # — fsGroup is what makes the tachyon-auth-state PVC and the /data
+      # emptyDir writable by this UID; core-host's own manifest path
+      # (TACHYON_INTEGRITY_MANIFEST) already resolves under /data, so no
+      # further redirect is needed here.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       initContainers:
       - name: s3-restore
         image: rclone/rclone:latest

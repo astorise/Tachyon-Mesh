@@ -5,10 +5,19 @@ all-features = true
 unmaintained = "workspace"
 unsound = "workspace"
 yanked = "deny"
+# `cargo deny check advisories` fails on any entry here it doesn't actually
+# encounter in the current dependency graph (`advisory-not-detected` /
+# `yanked-not-detected`) — useful (it means an entry's own "remove once
+# fixed" note has come due), but it also means this list can only hold what
+# `cargo deny` itself currently needs, not everything `cargo audit` ignores
+# too (RUSTSEC-2024-0429 lives in .cargo/audit.toml instead, for exactly
+# that reason — see the comment there). Two entries were found stale this
+# way while fixing #428 and are already gone: RUSTSEC-2026-0204
+# (crossbeam-epoch — already at 0.9.21, past the advisory's own >=0.9.20
+# fix) and the chacha20@0.10.0 yank (fixed by bumping to the non-yanked
+# 0.10.2, `cargo update -p chacha20@0.10.0 --precise 0.10.2`).
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing side-channel applies to RSA private-key decryption; system-faas-node-registry uses rsa only for RS256 JWT signature VERIFICATION with public keys (no private-key ops), so it is not exploitable here. No fixed rsa release is available yet." },
-    { id = "RUSTSEC-2026-0204", reason = "Invalid-pointer dereference in crossbeam-epoch's fmt::Pointer impl for Atomic/Shared, reached only via Debug/Display formatting of those types; Tachyon's dependency tree never formats them. Remove once a fixed crossbeam-epoch (advisory says >=0.9.20) is picked up." },
-    { crate = "chacha20@0.10.0", reason = "Transitive dependency of rand 0.10.2, including via wasmtime-wasi 46.0.3. rand 0.10.2 is the latest 0.10 release and does not have a compatible non-yanked chacha20 replacement yet." },
 ]
 
 [licenses]
@@ -44,6 +53,5 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/apache/arrow-rs-object-store.git",
-    "https://github.com/astorise/candle",
     "https://github.com/ebarnard/rust-plist.git",
 ]

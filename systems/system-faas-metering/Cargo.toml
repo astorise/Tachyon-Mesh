@@ -2,6 +2,7 @@
 name = "system-faas-metering"
 version = "1.0.0"
 edition = "2021"
+license.workspace = true
 
 [lib]
 name = "system_faas_metering"
@@ -9,4 +10,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 serde_json = "1"
-wit-bindgen = "0.60"
+wit-bindgen = "0.61"

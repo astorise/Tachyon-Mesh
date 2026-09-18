@@ -1,0 +1,28 @@
+# cargo-audit config (auto-discovered from `.cargo/audit.toml` relative to
+# the workspace root — no --config flag needed). See ci.yml's security-audit
+# job, which runs a bare `cargo audit` and relies on this file.
+#
+# Prefer deny.toml over adding an entry here: this list only exists for
+# advisories `cargo deny check advisories` doesn't independently flag for
+# the same crate/version (so putting them in deny.toml would fail it with
+# `advisory-not-detected` — deny.toml treats an ignore entry that's never
+# encountered as an error, not a no-op). Everything else lives in deny.toml,
+# the canonical list, with a `reason` next to each entry; this file's
+# comments exist only to explain why an entry is here instead of there.
+#
+# cargo-audit's schema doesn't support a `reason` field the way deny.toml's
+# does — ids only, so context goes in comments instead.
+[advisories]
+ignore = [
+    # Also ignored in deny.toml — RSA Marvin timing side-channel targets
+    # private-key decryption; system-faas-node-registry uses rsa only for
+    # RS256 JWT signature verification with public keys.
+    "RUSTSEC-2023-0071",
+
+    # cargo-audit-only: in glib's VariantStrIter. glib is present through
+    # the desktop/Tauri GTK dependency tree, not the headless core-host
+    # runtime path. cargo-deny doesn't currently flag this crate/version at
+    # all (its dependency-graph walk differs), so it has no home in
+    # deny.toml.
+    "RUSTSEC-2024-0429",
+]

@@ -211,7 +211,7 @@ async fn voip_gate_delegates_bridge_to_healthier_peer_when_local_l4_is_saturated
             "tpu_rt_load": 0_u32,
             "tpu_standard_load": 0_u32,
             "tpu_batch_load": 0_u32,
-            "hot_models": [],
+            "hot_inference_components": [],
             "dropped_events": 0_u64,
             "last_status": 200_u16,
             "total_duration_us": 0_u64,

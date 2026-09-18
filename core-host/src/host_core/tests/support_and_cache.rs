@@ -1,8 +1,12 @@
 pub(super) use crate::*;
 
+// Body is only read by sibling test modules gated behind features absent
+// from --no-default-features (admin-plane, rate-limit, ...); unused, not
+// dead, under that build.
+#[allow(unused_imports)]
 pub(super) use axum::{body::Body, http::Request};
 use ed25519_dalek::{Signer, SigningKey};
-pub(super) use http_body_util::{BodyExt, Full};
+pub(super) use http_body_util::Full;
 use proptest::prelude::*;
 use prost::Message;
 use rcgen::{
@@ -825,7 +829,7 @@ pub(super) fn volume_test_route(host_path: &std::path::Path, readonly: bool) -> 
         allowed_secrets: Vec::new(),
         targets: Vec::new(),
         resiliency: None,
-        models: Vec::new(),
+        inference_components: Vec::new(),
         domains: Vec::new(),
         min_instances: 0,
         max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
@@ -858,7 +862,7 @@ pub(super) fn logger_test_route(host_path: &std::path::Path) -> IntegrityRoute {
         allowed_secrets: Vec::new(),
         targets: Vec::new(),
         resiliency: None,
-        models: Vec::new(),
+        inference_components: Vec::new(),
         domains: Vec::new(),
         min_instances: 0,
         max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
@@ -994,7 +998,7 @@ pub(super) fn scoped_volume_test_route(
         allowed_secrets: Vec::new(),
         targets: Vec::new(),
         resiliency: None,
-        models: Vec::new(),
+        inference_components: Vec::new(),
         domains: Vec::new(),
         min_instances: 0,
         max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
@@ -1033,7 +1037,7 @@ pub(super) fn storage_broker_test_route(host_path: &std::path::Path) -> Integrit
             requires: default_route_capabilities(),
         }],
         resiliency: None,
-        models: Vec::new(),
+        inference_components: Vec::new(),
         domains: Vec::new(),
         min_instances: 0,
         max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
@@ -1072,7 +1076,7 @@ pub(super) fn metering_test_route(host_path: &std::path::Path) -> IntegrityRoute
             requires: default_route_capabilities(),
         }],
         resiliency: None,
-        models: Vec::new(),
+        inference_components: Vec::new(),
         domains: Vec::new(),
         min_instances: 0,
         max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
@@ -1117,7 +1121,7 @@ pub(super) fn cert_manager_test_route(host_path: &std::path::Path) -> IntegrityR
             requires: default_route_capabilities(),
         }],
         resiliency: None,
-        models: Vec::new(),
+        inference_components: Vec::new(),
         domains: Vec::new(),
         min_instances: 0,
         max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
@@ -1150,7 +1154,7 @@ pub(super) fn tcp_echo_test_route(max_concurrency: u32) -> IntegrityRoute {
         allowed_secrets: Vec::new(),
         targets: Vec::new(),
         resiliency: None,
-        models: Vec::new(),
+        inference_components: Vec::new(),
         domains: Vec::new(),
         min_instances: 0,
         max_concurrency,
@@ -1173,7 +1177,7 @@ pub(super) fn udp_echo_test_route(max_concurrency: u32) -> IntegrityRoute {
         allowed_secrets: Vec::new(),
         targets: Vec::new(),
         resiliency: None,
-        models: Vec::new(),
+        inference_components: Vec::new(),
         domains: Vec::new(),
         min_instances: 0,
         max_concurrency,
@@ -1212,7 +1216,7 @@ pub(super) fn hibernating_ram_route(host_path: &std::path::Path) -> IntegrityRou
         allowed_secrets: Vec::new(),
         targets: Vec::new(),
         resiliency: None,
-        models: Vec::new(),
+        inference_components: Vec::new(),
         domains: Vec::new(),
         min_instances: 0,
         max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,
@@ -1248,7 +1252,7 @@ pub(super) fn ttl_managed_volume_route(
         allowed_secrets: Vec::new(),
         targets: Vec::new(),
         resiliency: None,
-        models: Vec::new(),
+        inference_components: Vec::new(),
         domains: Vec::new(),
         min_instances: 0,
         max_concurrency: DEFAULT_ROUTE_MAX_CONCURRENCY,

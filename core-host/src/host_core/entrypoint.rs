@@ -29,7 +29,43 @@ pub(crate) async fn run() -> Result<()> {
     }
 }
 
+/// Logs which optional Cargo features this binary was built with, once, at
+/// the top of every `serve_host` run. Six release archives ship from the
+/// same Dockerfile/release workflow with different feature sets (default,
+/// `-fips`, `-http3`, `-security`, `-ai`, `-no-default`; see release.yml's
+/// `publish-server-binaries` matrix), and the Quick Start installer always
+/// fetches the unsuffixed default build — so a route or capability an
+/// operator expects (HTTP/3, AI inference, WebSockets, mTLS, rate limiting)
+/// can simply not be compiled in, with no other signal short of reading the
+/// release matrix. This makes that visible without needing to.
+fn log_compiled_features() {
+    let features: &[(&str, bool)] = &[
+        ("admin-plane", cfg!(feature = "admin-plane")),
+        ("ai-inference", cfg!(feature = "ai-inference")),
+        ("ebpf-loader", cfg!(feature = "ebpf-loader")),
+        ("fips", cfg!(feature = "fips")),
+        ("http3", cfg!(feature = "http3")),
+        ("mtls", cfg!(feature = "mtls")),
+        ("rate-limit", cfg!(feature = "rate-limit")),
+        ("resiliency", cfg!(feature = "resiliency")),
+        ("s3-persistence", cfg!(feature = "s3-persistence")),
+        ("secrets-vault", cfg!(feature = "secrets-vault")),
+        ("websockets", cfg!(feature = "websockets")),
+    ];
+    let enabled: Vec<&str> = features
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(name, _)| *name)
+        .collect();
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        features = %enabled.join(","),
+        "core-host starting"
+    );
+}
+
 pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
+    log_compiled_features();
     let manifest_path = integrity_manifest_path();
     let (export_sender, export_receiver) = mpsc::channel(TELEMETRY_EXPORT_QUEUE_CAPACITY);
     let telemetry =
@@ -79,7 +115,10 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
     // registry write failure must not stop the node from booting, and requests
     // to these aliases work either way.
     #[cfg(feature = "ai-inference")]
-    crate::system_storage::publish_configured_model_bindings(core_store.as_ref(), &runtime.config);
+    crate::system_storage::publish_configured_component_bindings(
+        core_store.as_ref(),
+        &runtime.config,
+    );
     let host_key_path = manifest_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))

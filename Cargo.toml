@@ -71,7 +71,11 @@ members = [
     "tachyon-mcp",
     "turboquant-sys",
 ]
+exclude = ["vendor/Magnetar"]
 resolver = "2"
+
+[workspace.package]
+license = "MIT"
 
 [patch.crates-io]
 # Temporary security patches until crates.io releases include quick-xml >= 0.41.

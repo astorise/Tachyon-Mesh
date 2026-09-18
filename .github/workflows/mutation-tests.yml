@@ -20,6 +20,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -75,6 +77,8 @@ jobs:
             id: 8
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
 

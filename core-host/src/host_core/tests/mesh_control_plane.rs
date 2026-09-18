@@ -195,7 +195,7 @@ async fn model_aware_gossip_prefers_peer_with_matching_hot_model() {
             "ram_pressure": 10_u8,
             "active_instances": 1_u32,
             "allocated_memory_pages": 1_u32,
-            "hot_models": ["mistral"],
+            "hot_inference_components": ["mistral"],
             "dropped_events": 0_u64,
             "last_status": 200_u16,
             "total_duration_us": 0_u64,
@@ -214,7 +214,7 @@ async fn model_aware_gossip_prefers_peer_with_matching_hot_model() {
             "ram_pressure": 20_u8,
             "active_instances": 1_u32,
             "allocated_memory_pages": 1_u32,
-            "hot_models": ["llama3"],
+            "hot_inference_components": ["llama3"],
             "dropped_events": 0_u64,
             "last_status": 200_u16,
             "total_duration_us": 0_u64,
@@ -242,14 +242,14 @@ async fn model_aware_gossip_prefers_peer_with_matching_hot_model() {
         .with_state(Arc::clone(&wrong_capture));
     let wrong_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("wrong-model peer should bind");
+        .expect("wrong-component peer should bind");
     let wrong_address = wrong_listener
         .local_addr()
-        .expect("wrong-model peer should expose an address");
+        .expect("wrong-component peer should expose an address");
     let wrong_server = tokio::spawn(async move {
         axum::serve(wrong_listener, wrong_app)
             .await
-            .expect("wrong-model peer should stay up");
+            .expect("wrong-component peer should stay up");
     });
 
     let right_capture = Arc::new(Mutex::new(PeerCapture::default()));
@@ -259,14 +259,14 @@ async fn model_aware_gossip_prefers_peer_with_matching_hot_model() {
         .with_state(Arc::clone(&right_capture));
     let right_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("matching-model peer should bind");
+        .expect("matching-component peer should bind");
     let right_address = right_listener
         .local_addr()
-        .expect("matching-model peer should expose an address");
+        .expect("matching-component peer should expose an address");
     let right_server = tokio::spawn(async move {
         axum::serve(right_listener, right_app)
             .await
-            .expect("matching-model peer should stay up");
+            .expect("matching-component peer should stay up");
     });
 
     let host_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -278,10 +278,10 @@ async fn model_aware_gossip_prefers_peer_with_matching_hot_model() {
 
     let mut user_route =
         targeted_route("/api/guest-ai", vec![weighted_target("guest-example", 100)]);
-    user_route.models = vec![IntegrityModelBinding {
+    user_route.inference_components = vec![IntegrityInferenceComponentBinding {
         alias: "llama3".to_owned(),
         path: "mock:llama3".to_owned(),
-        device: ModelDevice::Cuda,
+        device: ComponentPlacement::Cuda,
         qos: RouteQos::RealTime,
         dynamic: false,
         hardware_strategy: Default::default(),
@@ -360,7 +360,7 @@ async fn model_aware_gossip_prefers_peer_with_matching_hot_model() {
     let response = Client::new()
         .post(format!("http://{host_address}/api/guest-ai"))
         .header("x-tachyon-model", "llama3")
-        .body("hot-model-request")
+        .body("hot-component-request")
         .send()
         .await
         .expect("host request should succeed");
@@ -372,12 +372,15 @@ async fn model_aware_gossip_prefers_peer_with_matching_hot_model() {
 
     let wrong_capture = wrong_capture
         .lock()
-        .expect("wrong-model capture should not be poisoned");
+        .expect("wrong-component capture should not be poisoned");
     assert!(wrong_capture.bodies.is_empty());
     let right_capture = right_capture
         .lock()
-        .expect("matching-model capture should not be poisoned");
-    assert_eq!(right_capture.bodies, vec!["hot-model-request".to_owned()]);
+        .expect("matching-component capture should not be poisoned");
+    assert_eq!(
+        right_capture.bodies,
+        vec!["hot-component-request".to_owned()]
+    );
 
     host_server.abort();
     wrong_server.abort();
@@ -411,7 +414,7 @@ async fn model_aware_gossip_keeps_request_local_when_no_peer_has_hot_model() {
             "ram_pressure": 10_u8,
             "active_instances": 1_u32,
             "allocated_memory_pages": 1_u32,
-            "hot_models": ["mistral"],
+            "hot_inference_components": ["mistral"],
             "dropped_events": 0_u64,
             "last_status": 200_u16,
             "total_duration_us": 0_u64,
@@ -458,10 +461,10 @@ async fn model_aware_gossip_keeps_request_local_when_no_peer_has_hot_model() {
 
     let mut user_route =
         targeted_route("/api/guest-ai", vec![weighted_target("guest-example", 100)]);
-    user_route.models = vec![IntegrityModelBinding {
+    user_route.inference_components = vec![IntegrityInferenceComponentBinding {
         alias: "llama3".to_owned(),
         path: "mock:llama3".to_owned(),
-        device: ModelDevice::Cuda,
+        device: ComponentPlacement::Cuda,
         qos: RouteQos::RealTime,
         dynamic: false,
         hardware_strategy: Default::default(),
@@ -634,14 +637,14 @@ async fn capability_routing_skips_override_candidates_without_required_capabilit
         candidates: vec![
             RouteOverrideCandidate {
                 destination: format!("http://{wrong_address}/api/guest-example"),
-                hot_models: Vec::new(),
+                hot_inference_components: Vec::new(),
                 effective_pressure: 5,
                 capability_mask: Capabilities::CORE_WASI,
                 capabilities: vec!["core:wasi".to_owned()],
             },
             RouteOverrideCandidate {
                 destination: format!("http://{right_address}/api/guest-example"),
-                hot_models: Vec::new(),
+                hot_inference_components: Vec::new(),
                 effective_pressure: 10,
                 capability_mask: Capabilities::CORE_WASI | Capabilities::ACCEL_CUDA,
                 capabilities: vec!["core:wasi".to_owned(), "accel:cuda".to_owned()],
@@ -778,19 +781,19 @@ async fn mesh_qos_router_forwards_realtime_gpu_requests_to_prefixed_override() {
         .expect("host listener should expose an address");
 
     let mut route = targeted_route("/api/guest-ai", vec![weighted_target("guest-example", 100)]);
-    route.models = vec![
-        IntegrityModelBinding {
+    route.inference_components = vec![
+        IntegrityInferenceComponentBinding {
             alias: "gpu-live-chat".to_owned(),
             path: "mock:gpu-live-chat".to_owned(),
-            device: ModelDevice::Cuda,
+            device: ComponentPlacement::Cuda,
             qos: RouteQos::RealTime,
             dynamic: false,
             hardware_strategy: Default::default(),
         },
-        IntegrityModelBinding {
+        IntegrityInferenceComponentBinding {
             alias: "gpu-batch".to_owned(),
             path: "mock:gpu-batch".to_owned(),
-            device: ModelDevice::Cuda,
+            device: ComponentPlacement::Cuda,
             qos: RouteQos::Batch,
             dynamic: false,
             hardware_strategy: Default::default(),
@@ -892,19 +895,19 @@ async fn mesh_qos_router_keeps_batch_gpu_requests_local_below_remote_threshold()
         .expect("host listener should expose an address");
 
     let mut route = targeted_route("/api/guest-ai", vec![weighted_target("guest-example", 100)]);
-    route.models = vec![
-        IntegrityModelBinding {
+    route.inference_components = vec![
+        IntegrityInferenceComponentBinding {
             alias: "gpu-live-chat".to_owned(),
             path: "mock:gpu-live-chat".to_owned(),
-            device: ModelDevice::Cuda,
+            device: ComponentPlacement::Cuda,
             qos: RouteQos::RealTime,
             dynamic: false,
             hardware_strategy: Default::default(),
         },
-        IntegrityModelBinding {
+        IntegrityInferenceComponentBinding {
             alias: "gpu-batch".to_owned(),
             path: "mock:gpu-batch".to_owned(),
-            device: ModelDevice::Cuda,
+            device: ComponentPlacement::Cuda,
             qos: RouteQos::Batch,
             dynamic: false,
             hardware_strategy: Default::default(),

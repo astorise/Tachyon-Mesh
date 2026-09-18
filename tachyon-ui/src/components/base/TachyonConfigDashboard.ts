@@ -13,7 +13,14 @@ export abstract class TachyonConfigDashboard extends HTMLElement {
     this.applyStyles();
   }
 
+  // Every current caller (18 panel/dashboard subclasses) passes a template
+  // built entirely from static markup and either an `escape()`/`escHtml()`-
+  // wrapped dynamic value or a `t()` i18n lookup — audited call by call
+  // (issue #424). A future caller must keep that discipline: interpolate
+  // untrusted or backend-sourced data only through an escape helper, never
+  // raw.
   protected renderTemplate(html: string): void {
+    // eslint-disable-next-line no-restricted-properties
     this.root.innerHTML = html;
   }
 
@@ -71,6 +78,8 @@ export abstract class TachyonConfigDashboard extends HTMLElement {
       : this.root.firstElementChild;
 
     if (container) {
+      // Static skeleton markup, no interpolated data.
+      // eslint-disable-next-line no-restricted-properties
       container.innerHTML = `
         <div class="p-6 w-full space-y-3" aria-busy="true" aria-label="Loading…">
           <div class="skeleton-text w-1/3"></div>

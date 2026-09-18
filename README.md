@@ -6,7 +6,7 @@ Tachyon is a next-generation, ultra-lightweight Service Mesh written in Rust. It
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Build Status](https://github.com/astorise/tachyon-mesh/actions/workflows/ci.yml/badge.svg)](https://github.com/astorise/tachyon-mesh/actions)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-blue.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.98.1-blue.svg)](https://www.rust-lang.org)
 [![WASM](https://img.shields.io/badge/wasm-wasip2-purple.svg)](https://webassembly.org/)
 
 ---
@@ -44,7 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/astorise/tachyon-mesh/main/scripts/
 ./core-host
 ```
 
-Optional: pin a version with `--version v1.2.3` or choose a directory with `--dir /usr/local/bin`.
+Optional: pin a version with `--version v1.2.3`, choose a directory with `--dir /usr/local/bin`, or pick a feature variant with `--variant http3` (see the table below — the plain command above installs the `default` variant).
 
 **Local binary (Windows — PowerShell):**
 ```powershell
@@ -52,9 +52,22 @@ irm https://raw.githubusercontent.com/astorise/tachyon-mesh/main/scripts/get-tac
 .\core-host.exe
 ```
 
-Optional: `-Version v1.2.3` or `-Dir C:\Tools\tachyon`.
+Optional: `-Version v1.2.3`, `-Dir C:\Tools\tachyon`, or `-Variant http3`.
 
-> **Security:** Binaries are automatically verified via SHA-256 upon download. Cosign signatures (`.bundle`) and SBOMs (`.spdx.json`) are available in the [GitHub Releases](https://github.com/astorise/tachyon-mesh/releases) for each version tag.
+> **Security:** Binaries are automatically verified via SHA-256 upon download, plus a cosign signature check when `cosign` is on `PATH`. Cosign signatures (`.bundle`) and SBOMs (`.spdx.json`) are available in the [GitHub Releases](https://github.com/astorise/tachyon-mesh/releases) for each version tag.
+
+**Which variant do I want?** Every release ships six pre-built binaries per platform, each compiled with a different Cargo feature set. The plain installer command above always fetches `default` — the other five are opt-in via `--variant`/`-Variant`:
+
+| Variant | Cargo features | Adds |
+|---|---|---|
+| `default` | `admin-plane`, `ring`, `websockets`, `rate-limit`, `resiliency`, `mtls` | The `/admin/*` operator surface (dashboard, IAM, manifest/canary/chaos control), WebSocket routes, rate limiting, circuit-breaking/retry, and mutual TLS. No HTTP/3 or AI inference. |
+| `fips` | `fips` (no defaults) | FIPS-mode TLS (`aws_lc_rs` + `tls12`). No admin plane. |
+| `http3` | `admin-plane`, `ring`, `http3` | HTTP/3 / QUIC transport, on top of everything `default` has. |
+| `security` | everything `default` has, plus `secrets-vault` | The secrets vault, on top of everything `default` has. |
+| `ai` | everything `default` has, plus `ai-inference` | AI model routing/serving, on top of everything `default` has. Not built for Windows or Linux/aarch64. |
+| `no-default` | *(none)* | The smallest possible worker-data-plane binary: no `/admin/*` surface, no WebSockets, rate limiting, resiliency, or mTLS. |
+
+A route or capability that 404s or refuses to start is often just a feature the installed variant wasn't built with — `core-host`'s startup log always names the features it was compiled with, so `grep features` in its output (or `RUST_LOG=info` if you've redirected logs) tells you which variant you're running. Combine features by building from source (Path B) with your own `cargo build --features ...` instead.
 
 **Kubernetes (single node or homelab):**
 ```bash
@@ -284,7 +297,7 @@ scripts/build-guest-artifacts.sh examples/guest-example
 
 - [x] VRAM-aware routing and multi-GPU optimization.
 - [x] Tensor/pipeline/expert-parallel inference engines (intra-node tensor sharding, cross-node pipeline stages, MoE expert routing — see `openspec/changes/2026-06-19-distributed-model-parallel-inference`).
-- [x] Parallel engines wired into the live model-load path: `candle_llm_runtime::try_load` reads a deployment's `hardware_strategy`, validates the plan against discovered hardware, and selects the tensor/pipeline engine (see `openspec/changes/2026-06-22-wire-model-parallel-runtime-dispatch`). Tensor-parallelism runs the full decode loop today; pipeline-parallelism is prefill-correct with its decode loop as a follow-up; expert-parallelism awaits a full MoE checkpoint loader. The `candle-cuda` build (real GPU execution, multi-GPU VRAM telemetry, NCCL all-reduce) is validated on the CUDA CI lane, not the default CPU build.
+- [x] Magnetar Component inference is wired into the live local inference path at Magnetar `ee7ef9e9c414f3b59ea91b11a2f519bfb5085152`: Tachyon stages Component artifacts, applies trust and routing policy, then delegates model ingestion, tokenizer handling, manifest normalization, resident model instance construction, execution planning, streaming, and Provider execution to Magnetar. CUDA validation uses the `magnetar-cuda` lane and exercises multi-token generation through Magnetar's device-resident decode path.
 - [x] Distributed KV-Store (Partitioning V2).
 - [x] Tauri Interface (Phase 3: Routing Dashboards complete).
 - [ ] **Upcoming**: GPU pressure-based auto-scaling (KEDA integration).

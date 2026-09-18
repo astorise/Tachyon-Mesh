@@ -128,7 +128,7 @@ pub(crate) struct ComponentHostState {
     #[cfg(feature = "ai-inference")]
     pub(crate) ai_runtime: Option<Arc<ai_inference::AiInferenceRuntime>>,
     #[cfg(feature = "ai-inference")]
-    pub(crate) allowed_model_aliases: BTreeSet<String>,
+    pub(crate) allowed_component_aliases: BTreeSet<String>,
     /// Aliases this component may *see* in the registry, as opposed to the ones
     /// this route may execute.
     ///
@@ -140,16 +140,14 @@ pub(crate) struct ComponentHostState {
     ///
     /// Widened to the component, not to the node: the union over every route
     /// that targets a module this route targets. Execution stays sealed per
-    /// route through `allowed_model_aliases`, so a wider view buys no wider
+    /// route through `allowed_component_aliases`, so a wider view buys no wider
     /// reach.
     #[cfg(feature = "ai-inference")]
-    pub(crate) listable_model_aliases: BTreeSet<String>,
+    pub(crate) listable_component_aliases: BTreeSet<String>,
     #[cfg(feature = "ai-inference")]
-    pub(crate) adapter_id: Option<String>,
+    pub(crate) accelerator_components: HashMap<u32, LoadedAcceleratorComponent>,
     #[cfg(feature = "ai-inference")]
-    pub(crate) accelerator_models: HashMap<u32, LoadedAcceleratorModel>,
-    #[cfg(feature = "ai-inference")]
-    pub(crate) next_accelerator_model_id: u32,
+    pub(crate) next_accelerator_component_id: u32,
     /// Set by `execute_streaming_component_guest` before calling
     /// `handle-request`. `None` on the buffered path — `get-streaming-response`
     /// returns an error, and the guest falls back to the buffered return value.
@@ -171,7 +169,7 @@ pub(crate) struct LocalMeshDispatchContext {
 
 #[cfg(feature = "ai-inference")]
 #[derive(Clone, Debug)]
-pub(crate) struct LoadedAcceleratorModel {
+pub(crate) struct LoadedAcceleratorComponent {
     pub(crate) alias: String,
     pub(crate) accelerator: ai_inference::AcceleratorKind,
 }
@@ -984,8 +982,8 @@ pub(crate) enum HostWebSocketFrame {
 
 #[cfg(feature = "websockets")]
 pub(crate) struct HostWebSocketConnection {
-    pub(crate) incoming: std::sync::mpsc::Receiver<HostWebSocketFrame>,
-    pub(crate) outgoing: tokio::sync::mpsc::UnboundedSender<HostWebSocketFrame>,
+    pub(crate) incoming: tokio::sync::mpsc::Receiver<HostWebSocketFrame>,
+    pub(crate) outgoing: tokio::sync::mpsc::Sender<HostWebSocketFrame>,
 }
 
 /// Pre-populated by `execute_streaming_component_guest` before the WASM call.
@@ -1004,7 +1002,6 @@ pub(crate) struct HostStreamingBodySlot {
 /// Host state stored in the `ResourceTable` behind a
 /// `tachyon:mesh/response-body::streaming-response` resource handle. Produced
 /// by the `get-streaming-response` host function from a `HostStreamingBodySlot`.
-#[allow(dead_code)]
 pub(crate) struct HostStreamingResponseResource {
     /// `None` once `begin()` has been called (sender consumed).
     pub(crate) headers_tx: Option<tokio::sync::oneshot::Sender<(StatusCode, GuestHttpFields)>>,
@@ -1140,10 +1137,10 @@ pub(crate) struct PropagatedHeader {
 /// Stored in the `ComponentHostState::table` `ResourceTable`; dropped
 /// automatically when the Wasm guest lets the handle go out of scope.
 ///
-/// `#[allow(dead_code)]`: same justification as `WorkspaceGraphResource` —
-/// constructed inside WIT host bindings and stored type-erased in a
-/// `ResourceTable`. Not an experimental-feature placebo.
-#[allow(dead_code)]
+/// `wasmtime::component::ResourceTable<T>` is a typed table, not a
+/// type-erased one, so field reads through it (`&res.table_name` etc.) are
+/// visible to the dead-code lint like any other field access; no
+/// `#[allow(dead_code)]` is needed.
 pub(crate) struct RedbTableResource {
     pub(crate) table_name: String,
     pub(crate) core_store: Arc<store::CoreStore>,

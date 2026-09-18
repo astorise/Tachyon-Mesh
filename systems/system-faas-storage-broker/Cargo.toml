@@ -2,10 +2,11 @@
 name = "system-faas-storage-broker"
 version = "1.0.0"
 edition = "2021"
+license.workspace = true
 
 [lib]
 name = "system_faas_storage_broker"
 crate-type = ["cdylib"]
 
 [dependencies]
-wit-bindgen = "0.60"
+wit-bindgen = "0.61"

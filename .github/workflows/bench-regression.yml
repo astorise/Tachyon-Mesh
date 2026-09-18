@@ -26,6 +26,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       # k3d + two Docker image builds is disk-heavy on the standard runner
       # (mirrors integration.yml's cleanup step).
@@ -111,10 +113,14 @@ jobs:
 
       - name: Deploy tachyon-host
         run: |
-          sed \
+          # legacy-deployment/legacy-service live in deploy-legacy-e2e.yaml,
+          # not deploy.yaml itself — concatenated here so this workflow's
+          # applied manifest is unchanged; deploy.yaml stays the clean
+          # Quick Start file the README points operators at.
+          cat manifests/deploy.yaml manifests/deploy-legacy-e2e.yaml | sed \
             -e 's|ghcr.io/astorise/tachyon-mesh:latest|tachyon-mesh:bench|g' \
             -e 's|imagePullPolicy: Always|imagePullPolicy: Never|g' \
-            manifests/deploy.yaml | kubectl apply -f -
+            | kubectl apply -f -
           kubectl rollout status deployment/tachyon-host --timeout=300s
           kubectl rollout status deployment/legacy-deployment --timeout=300s
           # Enables the debug-level "mesh dispatch decision" log line (see

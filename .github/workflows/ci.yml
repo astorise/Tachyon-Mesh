@@ -24,16 +24,28 @@ concurrency:
 # RUSTFLAGS and CARGO_TERM_COLOR are repeated per-job so each job's env block
 # is self-contained and readable without cross-referencing.
 
-# ── Renovate compile-only fast lane ──────────────────────────────────────────
-# Dependency-update PRs (head branch `renovate/**`) only need to prove the tree
-# still compiles; the full lint/test/GPU suite made them impossible to merge
-# because cuda-quality queues on the resource-limited arc-gpu-runners. On these
-# PRs the four required checks (build-guests, security-audit, quality,
-# cuda-quality) still run but quality/cuda-quality drop to `cargo check`,
-# fips-tests becomes a compile check, and every other job is skipped outright
-# (a `skipped` job conclusion satisfies branch protection). Detection uses the
-# head branch prefix — not the actor — so a human re-running or pushing a fix
-# to a Renovate branch stays in the same lane.
+# ── Renovate fast lane ────────────────────────────────────────────────────────
+# Dependency-update PRs (head branch `renovate/**`) don't need the full
+# test/GPU suite; that made them impossible to merge because cuda-quality
+# queues on the resource-limited arc-gpu-runners. On these PRs the four
+# required checks (build-guests, security-audit, quality, cuda-quality) still
+# run, fips-tests becomes a compile check, and every other job is skipped
+# outright (a `skipped` job conclusion satisfies branch protection). Detection
+# uses the head branch prefix — not the actor — so a human re-running or
+# pushing a fix to a Renovate branch stays in the same lane.
+#
+# quality/cuda-quality's clippy steps stay on (not a bare `cargo check`): the
+# `push` run on `main` right after a Renovate merge always runs the strict
+# lint, so a lint this lane skipped only defers that failure to `main` for
+# everyone instead of avoiding it (see issue #416, which this fixed after #415
+# proved it out — a dependency bump grew `hyper::Response`'s size past
+# `clippy::result_large_err`'s threshold, merged green on its Renovate PR, and
+# broke `main` for five days). The lane instead allows the two lint families a
+# semver-compatible dependency bump can legitimately trigger with no change to
+# our own code — a dependency type crossing a size threshold
+# (`clippy::result_large_err`), or a newly-`#[deprecated]` dependency API
+# (`deprecated`) — so `main` and every Renovate PR are always held to the same
+# bar for everything else.
 
 jobs:
   # ── 1. Build WASM guest artifacts once ──────────────────────────────────────
@@ -45,6 +57,8 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -126,6 +140,8 @@ jobs:
             cache_scope: docker-fips
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -148,6 +164,8 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -157,21 +175,13 @@ jobs:
           tool: cargo-audit,cargo-deny
 
       - name: Run cargo audit
-        # RUSTSEC-2023-0071 (rsa Marvin attack) targets RSA private-key
-        # decryption timing; we only verify JWT signatures with public keys
-        # (no private-key ops), so it does not apply. RUSTSEC-2024-0429 is in
-        # glib's VariantStrIter; glib is present through the desktop/Tauri GTK
-        # dependency tree, not the headless runtime path. RUSTSEC-2026-0204
-        # (published 2026-07-06) is an invalid-pointer dereference in
-        # crossbeam-epoch's `fmt::Pointer` impl for `Atomic`/`Shared`, reached
-        # only by formatting those types for Debug/Display; Tachyon's
-        # dependency tree never does that. Remove this ignore once a fixed
-        # crossbeam-epoch (advisory says >=0.9.20) is picked up.
-        run: >
-          cargo audit
-          --ignore RUSTSEC-2023-0071
-          --ignore RUSTSEC-2024-0429
-          --ignore RUSTSEC-2026-0204
+        # Ignored advisories are declared in .cargo/audit.toml (auto-discovered
+        # by cargo-audit, no --ignore flags needed here) rather than as CLI
+        # flags in this step, so there is one file to read for "what's
+        # suppressed and why" instead of this step's own history. See that
+        # file, and deny.toml's [advisories].ignore, which is the canonical
+        # list for anything cargo-deny also needs to ignore (issue #428).
+        run: cargo audit
 
       - name: Run cargo deny
         run: cargo deny check advisories bans sources
@@ -186,6 +196,8 @@ jobs:
       BREAKING_MANIFEST_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'breaking-manifest') }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -242,6 +254,8 @@ jobs:
       RENOVATE_PR: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/') }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Install Linux system dependencies for Tauri
         run: |
@@ -276,7 +290,16 @@ jobs:
         if: env.RENOVATE_PR != 'true'
         run: cargo fmt --all -- --check
 
-      - name: Check core-host feature builds (compile-only)
+      - name: Check core-host feature builds
+        # Was a compile-only `cargo check` loop, so a warning specific to one
+        # of these features (e.g. only surfacing without ai-inference, or
+        # only under http3) reached main unnoticed — the only feature build
+        # actually held to -D warnings was the ai-inference lane above
+        # (issue #432). feature-matrix-tests/-artifacts below build and test
+        # --no-default-features (the worker-dataplane-profile floor) but
+        # never lint it, so it gets its own explicit clippy invocation here
+        # rather than joining this loop, which is additive `--features`
+        # flags on top of the default set.
         run: |
           for feature in \
             http3 \
@@ -287,45 +310,39 @@ jobs:
             secrets-vault \
             websockets
           do
-            cargo check -p core-host --features "$feature"
+            cargo clippy -p core-host --all-targets --features "$feature" -- -D warnings -D clippy::unwrap_used
           done
+          cargo clippy -p core-host --all-targets --no-default-features -- -D warnings -D clippy::unwrap_used
 
       - name: Lint workspace (CPU features)
         # Keep the general quality gate on ubuntu-latest CPU runners: CUDA is
         # validated separately by the arc-gpu-runners job below. `--all-features`
-        # would enable core-host/candle-cuda and require nvcc on this runner.
-        if: env.RENOVATE_PR != 'true'
-        run: cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used
-
-      # Compile-only stand-in for the lint above on Renovate PRs: a dep bump
-      # can surface new deprecation warnings in our code that `-D warnings`
-      # would turn into failures, and the fast lane only gates on "does it
-      # still compile".
-      - name: Compile workspace (Renovate compile-only lane)
-        if: env.RENOVATE_PR == 'true'
-        run: cargo check --workspace --all-targets --features core-host/ai-inference
+        # would enable core-host/magnetar-cuda and require CUDA on this runner.
+        #
+        # Runs on Renovate PRs too — see the "Renovate fast lane" note at the
+        # top of this file for why, and for what -A deprecated
+        # -A clippy::result_large_err allows on that lane specifically.
+        run: |
+          if [ "${RENOVATE_PR}" = "true" ]; then
+            cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used -A deprecated -A clippy::result_large_err
+          else
+            cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used
+          fi
 
       - name: Cross-Layer Validation
         if: env.RENOVATE_PR != 'true'
         run: bash scripts/validate_cross_layer.sh
 
+      - name: AI Component Boundary Validation
+        if: env.RENOVATE_PR != 'true'
+        run: bash scripts/validate_ai_component_boundary.sh
+
       - name: Check ai-inference host build
         run: cargo check -p core-host --features ai-inference
 
-      - name: Verify constrained decoding is implemented, not just specified
-        # openspec/specs/core-host/spec.md requires native constrained decoding
-        # behind ai-inference. The previous attempt at this (archived change
-        # 2026-05-16-ai-constrained-decoding) merged the spec text with 0 lines
-        # of matching code. Guard against that drift recurring: the FSM/logit
-        # masking engine must exist in core-host/src, and the WIT contract must
-        # expose `sample-constrained`.
-        run: |
-          grep -rq "FsmLogitProcessor" core-host/src
-          grep -q "sample-constrained" wit/ai/inference.wit
-
-      - name: Test real Candle LLM fixture
+      - name: Test real Magnetar production Qwen fixture
         if: env.RENOVATE_PR != 'true'
-        run: cargo test -p core-host --features ai-inference --bin core-host real_candle_llm_runtime
+        run: cargo test -p core-host --features ai-inference --bin core-host magnetar_qwen_binding_generates_through_real_production_cpu_path
 
       # Build the guest the streaming integration test drives, then run it. The
       # test resolves `target/wasm32-wasip2/release/guest_openai.wasm`; with
@@ -342,8 +359,8 @@ jobs:
         run: cargo test -p core-host --features ai-inference --bin core-host streaming_guest_openai -- --nocapture
 
   # ── 3b. CUDA quality gate (requires the self-hosted ARC GPU runner) ────────
-  # This job owns the CUDA-enabled Candle build so the default ubuntu-latest
-  # quality job can stay CPU-only while still validating GPU ONNX inference code.
+  # This job owns the CUDA-enabled Magnetar build so the default ubuntu-latest
+  # quality job can stay CPU-only while still validating GPU inference code.
   cuda-quality:
     runs-on: arc-gpu-runners
     env:
@@ -356,6 +373,8 @@ jobs:
       RENOVATE_PR: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/') }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -369,7 +388,7 @@ jobs:
           cache-on-failure: true
 
       # The ARC GPU runner on Talos has the NVIDIA driver (nvidia-smi works) but
-      # cudarc/candle-kernels need `nvcc` from the CUDA toolkit at build time.
+      # the Magnetar CUDA provider build expects `nvcc` from the CUDA toolkit.
       # The toolkit's bin dir is not always on PATH for the job's non-login
       # shell, so discover nvcc (PATH, then the usual roots, then a bounded
       # filesystem search) and export its bin dir + CUDA_PATH/CUDA_HOME. Print
@@ -399,7 +418,7 @@ jobs:
             nvcc_bin="$(find /usr /opt -maxdepth 5 -name nvcc -type f -executable 2>/dev/null | head -n1 || true)"
           fi
           if [ -z "$nvcc_bin" ]; then
-            echo "::error::nvcc not found on this runner. The CUDA *toolkit* (not just the driver) must be installed in the arc-gpu-runners image. nvidia-smi alone is not enough — candle-kernels/cudarc compile .cu kernels with nvcc at build time."
+            echo "::error::nvcc not found on this runner. The CUDA *toolkit* (not just the driver) must be installed in the arc-gpu-runners image. nvidia-smi alone is not enough for the Magnetar CUDA provider build."
             echo "--- diagnostics ---"
             echo "ls /usr/local:"; ls -la /usr/local 2>/dev/null || true
             echo "ls /opt:";       ls -la /opt 2>/dev/null || true
@@ -417,7 +436,7 @@ jobs:
           nvidia-smi
           nvcc --version
 
-      # candle-onnx's build script compiles the ONNX .proto and needs `protoc`.
+      # Some AI inference dependencies compile .proto files and need `protoc`.
       # The CPU jobs get it from `apt-get install protobuf-compiler`, but this
       # GPU runner image is RPM/UBI-based (no apt), so install protoc in a
       # distro-agnostic way. Skipped if the runner image already ships protoc.
@@ -426,104 +445,51 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check Candle CUDA host build
-        run: cargo check -p core-host --features candle-cuda
+      - name: Check Magnetar CUDA host build
+        run: cargo check -p core-host --features magnetar-cuda
 
-      # Renovate fast lane: also prove the FlashInfer kernel crate still
-      # compiles against the updated deps. On regular runs this compile is
-      # covered by the FlashInfer test steps below, which the fast lane skips.
-      - name: Check Candle CUDA + FlashInfer host build (Renovate compile-only lane)
-        if: env.RENOVATE_PR == 'true'
-        run: cargo check -p core-host --features candle-cuda
+      - name: Lint Magnetar CUDA host build
+        # Runs on Renovate PRs too — see the "Renovate fast lane" note at the
+        # top of this file.
+        run: |
+          if [ "${RENOVATE_PR}" = "true" ]; then
+            cargo clippy -p core-host --features magnetar-cuda --all-targets -- -D warnings -D clippy::unwrap_used -A deprecated -A clippy::result_large_err
+          else
+            cargo clippy -p core-host --features magnetar-cuda --all-targets -- -D warnings -D clippy::unwrap_used
+          fi
 
-      - name: Lint Candle CUDA host build
+      - name: Build Magnetar CUDA test binary
         if: env.RENOVATE_PR != 'true'
-        run: cargo clippy -p core-host --features candle-cuda --all-targets -- -D warnings -D clippy::unwrap_used
+        run: cargo test -p core-host --bin core-host --features magnetar-cuda --no-run
 
-      # Compile test binaries separately so execution-proof timeouts only
-      # cover the GPU operation, not a cold Candle CUDA compilation.
-      - name: Build Candle CUDA test binaries
+      - name: Verify Magnetar CUDA test selection is non-empty
         if: env.RENOVATE_PR != 'true'
-        run: cargo test -p core-host --bin core-host --features candle-cuda --no-run
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p core-host --bin core-host --features magnetar-cuda \
+            magnetar_cuda_provider_hardware_required_guard -- --list > /tmp/magnetar-cuda-tests.txt
+          cargo test -p core-host --bin core-host --features magnetar-cuda \
+            magnetar_qwen_cuda_generates_multiple_tokens_on_real_cuda_provider -- --list >> /tmp/magnetar-cuda-tests.txt
+          cat /tmp/magnetar-cuda-tests.txt
+          if ! grep -q '^.*magnetar_cuda_provider_hardware_required_guard: test$' /tmp/magnetar-cuda-tests.txt; then
+            echo "::error::Magnetar CUDA hardware guard selected zero tests"
+            exit 1
+          fi
+          if ! grep -q '^.*magnetar_qwen_cuda_generates_multiple_tokens_on_real_cuda_provider: test$' /tmp/magnetar-cuda-tests.txt; then
+            echo "::error::Magnetar CUDA multi-token proof selected zero tests"
+            exit 1
+          fi
 
-      # Proves the tensor-parallel all-reduce path issues a real NCCL
-      # AllReduce on this runner's real GPU (via ncclCommInitAll loopback
-      # ranks, see parallel.rs), not just that candle-cuda compiles/lints.
-      - name: Run CUDA NCCL all-reduce proof
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 10
-        run: cargo test -p core-host --bin core-host --features candle-cuda nccl_all_reduce_matches_cpu_staged_reference -- --nocapture
-
-      # Proves the single-device Llama path (enable-single-device-llama-cuda-execution)
-      # actually loads weights and runs a real autoregressive decode on this
-      # runner's GPU instead of falling back to `Device::Cpu`.
-      - name: Run single-device Llama CUDA execution proof
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 15
-        run: cargo test -p core-host --bin core-host --features candle-cuda single_device_llama_executes_on_a_real_cuda_device -- --nocapture
-
-      # Proves hardware_strategy.paged_attention (wire-paged-attention-decode-path)
-      # actually attaches cache.set_paged_kv and runs a real decode through
-      # flash_attn_varlen_paged_windowed on this runner's GPU, including a
-      # second request reusing the same shared block pool.
-      - name: Run paged-attention CUDA execution proof
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 15
-        run: cargo test -p core-host --bin core-host --features candle-cuda single_device_llama_paged_attention_generates_a_real_decode_on_cuda -- --nocapture
-
-      # Proves cuda_graph_decode fails closed without paged_attention and for
-      # GGUF, which has no paged GPU cache (wire-cuda-graph-decode's Section 2.1 gate).
-      - name: Run CUDA Graph decode gate proof
+      - name: Run Magnetar CUDA hardware guard
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 10
-        run: cargo test -p core-host --bin core-host --features candle-cuda cuda_graph_decode_strategy_is_rejected -- --nocapture
+        run: cargo test -p core-host --bin core-host --features magnetar-cuda magnetar_cuda_provider_hardware_required_guard -- --ignored --nocapture
 
-      # Proves hardware_strategy.cuda_graph_decode (wire-cuda-graph-decode)
-      # actually captures and replays the steady-state decode step through
-      # candle_core::CudaGraph on this runner's GPU (CudaGraphDecodeSession:
-      # warm-up, capture, first replay, then plain replays), and that its
-      # output matches the non-captured paged-attention path's greedy decode
-      # for the same checkpoint/prompt — not just that it runs without error.
-      - name: Run CUDA Graph decode capture/replay execution proof
+      - name: Run Magnetar production Qwen CUDA multi-token proof
         if: env.RENOVATE_PR != 'true'
         timeout-minutes: 20
-        run: cargo test -p core-host --bin core-host --features candle-cuda single_device_llama_cuda_graph_decode_generates_a_real_captured_decode_on_cuda -- --nocapture
-
-      # FlashInfer adds its own CUDA crate, so prepare those test binaries
-      # before applying the execution-proof timeout below.
-      - name: Build FlashInfer CUDA test binaries
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 30
-        run: cargo test -p core-host --bin core-host --features candle-cuda --no-run
-
-      # Proves hardware_strategy.flashinfer_attention (wire-flashinfer-decode-attention)
-      # actually dispatches through candle-flashinfer-kernels::flashinfer_decode_attention
-      # for the decode step on this runner's GPU, and that its output matches the
-      # dense (non-flashinfer) path's greedy decode for the same checkpoint/prompt.
-      - name: Run FlashInfer decode-attention CUDA execution proof
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 15
-        run: cargo test -p core-host --bin core-host --features candle-cuda single_device_llama_flashinfer_attention_generates_a_real_decode_on_cuda -- --nocapture
-
-      - name: Run FlashInfer/paged-attention combination rejection proof
-        if: env.RENOVATE_PR != 'true'
-        timeout-minutes: 10
-        run: cargo test -p core-host --bin core-host --features candle-cuda flashinfer_attention_and_paged_attention_combination_is_rejected -- --nocapture
-
-      # The CUTLASS headers used to be cloned here because this repository
-      # compiled its own NVFP4 kernel. `candle-nvfp4-kernels` owns that now and
-      # brings its own build, so the checkout and the include-dir hand-off are
-      # both gone.
-      # Synthetic tensors, no checkpoint: this asks only whether the native
-      # kernel agrees with the scalar fallback on the runner's own device.
-      # candle #3831 removed the compute-capability floor that used to keep it
-      # opt-in, and candle's own suite owns the hardware question now, so it
-      # runs on every PR against whatever GPU the pool hands us.
-      - name: Run native NVFP4 parity and telemetry proof
-        if: env.RENOVATE_PR != 'true'
-        env:
-          TACHYON_NVFP4_CUDA_SMOKE: "1"
-        run: cargo test -p core-host --features candle-cuda nvfp4_cuda -- --nocapture
+        run: cargo test -p core-host --bin core-host --features magnetar-cuda magnetar_qwen_cuda_generates_multiple_tokens_on_real_cuda_provider -- --ignored --nocapture
 
   # ── 4. Tests (needs quality + guests) ───────────────────────────────────────
   # Runs the full workspace nextest suite — including the core-host chaos
@@ -541,6 +507,8 @@ jobs:
       RUSTFLAGS: "-D dead_code"
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -568,14 +536,60 @@ jobs:
       - name: Unpack guest artifacts
         run: tar -xzf wasm-guests.tar.gz
 
-      # tachyon-ui is a Tauri desktop app with no unit tests (covered by
-      # Playwright E2E in e2e.yml). Excluding it avoids pulling in GTK/WebKit
-      # system libraries that are only needed in the quality job.
+      # tachyon-ui is a Tauri desktop app; its Rust side has no unit tests of
+      # its own (the crate is a thin Tauri command shim over tachyon-client,
+      # which this run does cover) and pulls in GTK/WebKit system libraries
+      # that are only needed in the quality job. Its TypeScript side has its
+      # own tests, run by the `ui` job below (plus Playwright E2E in
+      # e2e.yml) — Cargo's `--exclude` doesn't reach those either way.
       - name: Run tests
         run: cargo nextest run --workspace --exclude tachyon-ui
 
       - name: Run doc tests
         run: cargo test --doc --workspace --exclude tachyon-ui
+
+  # ── 4b. tachyon-ui TypeScript (needs nothing — pure npm, runs in parallel) ───
+  # Type-checks and unit-tests the UI's TypeScript side. Separate from `test`
+  # above (which only covers Rust) and from e2e.yml's Playwright job (which is
+  # path-filtered to tachyon-ui/** and so never runs against a core-host
+  # change that breaks a UI contract) — this job has no path filter and no
+  # `needs`, so it runs on every push and PR regardless of what changed.
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: tachyon-ui/package-lock.json
+
+      - name: Install npm dependencies
+        working-directory: tachyon-ui
+        run: npm ci
+
+      - name: Type-check
+        working-directory: tachyon-ui
+        run: npx tsc --noEmit
+
+      - name: Lint (XSS guard)
+        # eslint.config.mjs's no-restricted-properties rule is the guard
+        # against raw innerHTML/outerHTML assignment (issue #423's class of
+        # bug). It never ran in CI before this step existed — see issue #424:
+        # ESLint wasn't installed, there was no lint script, and
+        # @typescript-eslint/parser hard-refuses this project's TypeScript 7
+        # at module-load time with no config escape hatch
+        # (https://github.com/typescript-eslint/typescript-eslint/issues/10940).
+        # `npm ci`'s postinstall (scripts/link-eslint-ts6.mjs) works around
+        # that by giving the parser its own TypeScript 6 side by side with
+        # the real TS7 `tsc` above uses.
+        working-directory: tachyon-ui
+        run: npm run lint
+
+      - name: Run tests
+        working-directory: tachyon-ui
+        run: npm test
 
   # ── 5. Coverage (needs quality + guests, runs in parallel with test) ─────────
   # Separate job gives a fresh disk so the large llvm-cov instrumented tree
@@ -591,6 +605,8 @@ jobs:
       RUSTFLAGS: "-D dead_code"
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -642,6 +658,8 @@ jobs:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -724,13 +742,11 @@ jobs:
           # build (transport stack included); this one is the maximally
           # minimal floor.
           - "--no-default-features"
-          # "All CPU features": every feature except the two GPU backends —
-          # `candle-cuda`, which pulls in cudarc and needs `nvcc` (validated
+          # "All CPU features": every feature except the GPU backend —
+          # `magnetar-cuda`, which pulls in the CUDA provider (validated
           # separately by the cuda-quality job on the GPU runner), and
-          # `candle-metal`, which needs macOS. Both kernel crates are built
-          # here regardless: they ride in on `ai-inference` and compile as pure
-          # Rust. A bare `--all-features` would break on these CPU-only
-          # runners. Mirrors publish-docker-images' "-all-features" variant.
+          # A bare `--all-features` would break on these CPU-only runners.
+          # Mirrors publish-docker-images' "-all-features" variant.
           - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
@@ -747,6 +763,8 @@ jobs:
       RUSTFLAGS: "-D dead_code"
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -798,13 +816,11 @@ jobs:
         features:
           - ""
           - "--no-default-features"
-          # "All CPU features": every feature except the two GPU backends —
-          # `candle-cuda`, which pulls in cudarc and needs `nvcc` (validated
+          # "All CPU features": every feature except the GPU backend —
+          # `magnetar-cuda`, which pulls in the CUDA provider (validated
           # separately by the cuda-quality job on the GPU runner), and
-          # `candle-metal`, which needs macOS. Both kernel crates are built
-          # here regardless: they ride in on `ai-inference` and compile as pure
-          # Rust. A bare `--all-features` would break on these CPU-only
-          # runners. Mirrors publish-docker-images' "-all-features" variant.
+          # A bare `--all-features` would break on these CPU-only runners.
+          # Mirrors publish-docker-images' "-all-features" variant.
           - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
@@ -820,6 +836,8 @@ jobs:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -880,6 +898,8 @@ jobs:
       RENOVATE_PR: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/') }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -930,6 +950,8 @@ jobs:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -1018,6 +1040,8 @@ jobs:
             cache_scope: docker-default
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4

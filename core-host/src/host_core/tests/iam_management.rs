@@ -421,6 +421,7 @@ fn admin_claims() -> AuthClaims {
         subject: "admin".to_owned(),
         roles: vec!["admin".to_owned()],
         scopes: Vec::new(),
+        expires_at: None,
     }
 }
 

@@ -65,6 +65,37 @@ spec:
           operator: Exists
           effect: NoSchedule
 
+      # A ConfigMap volume mounts read-only, but core-host's manifest path
+      # also anchors every state directory it derives (auth state, core
+      # store, buffered-request spool, host identity key) — those need a
+      # writable parent, which the ConfigMap mount cannot provide even
+      # though readOnlyRootFilesystem's own writable scratch space (tmp-vol
+      # below) is right there. This copies the ConfigMap's integrity.lock
+      # into tmp-vol once at pod start, so the main container can point
+      # TACHYON_INTEGRITY_MANIFEST at a location that is both pre-populated
+      # with the real signed manifest and writable.
+      initContainers:
+        - name: copy-integrity-lock
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - cp /config/integrity.lock /tmp/integrity.lock
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: integrity-lock
+              mountPath: /config
+              readOnly: true
+            - name: tmp-vol
+              mountPath: /tmp
+
       containers:
         - name: core-host
           image: ghcr.io/astorise/tachyon-mesh:latest
@@ -88,6 +119,10 @@ spec:
               value: "0"
             - name: TACHYON_HOST_ADDRESS
               value: "0.0.0.0:8080"
+            # See the copy-integrity-lock init container above: this is the
+            # writable copy it makes of the ConfigMap-sourced manifest.
+            - name: TACHYON_INTEGRITY_MANIFEST
+              value: /tmp/integrity.lock
 
           resources:
             requests:
@@ -104,9 +139,6 @@ spec:
               mountPath: /tmp
             - name: model-cache
               mountPath: /var/lib/tachyon/models
-            - name: integrity-lock
-              mountPath: /app/integrity.lock
-              subPath: integrity.lock
 
           readinessProbe:
             tcpSocket:

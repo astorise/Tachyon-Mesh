@@ -17,6 +17,8 @@ jobs:
       MIRIFLAGS: "-Zmiri-disable-isolation"
     steps:
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - uses: Swatinem/rust-cache@v2
         with:

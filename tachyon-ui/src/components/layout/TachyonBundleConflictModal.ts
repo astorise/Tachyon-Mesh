@@ -56,10 +56,16 @@ export class TachyonBundleConflictModal extends HTMLElement {
   private render(): void {
     if (this.conflicts.length === 0) {
       this.removeFocusTrap();
+      // Static placeholder, no interpolated data.
+      // eslint-disable-next-line no-restricted-properties
       this.root.innerHTML = `<aside class="hidden"></aside>`;
       return;
     }
     const allResolved = this.conflicts.every((conflict) => this.resolutions.has(conflict.name));
+    // t() i18n lookups and fixed boolean-driven strings only — the dynamic
+    // per-conflict rows are appended below via the DOM API (el()), never
+    // interpolated into this template.
+    // eslint-disable-next-line no-restricted-properties
     this.root.innerHTML = `
       <div class="fixed inset-0 z-[110] flex items-center justify-center bg-slate-950/85 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="conflict-modal-title">
         <div class="w-[min(40rem,calc(100vw-2rem))] rounded-lg border border-amber-500/40 bg-slate-900 p-5 shadow-[0_0_28px_rgba(251,191,36,0.18)]" id="conflict-modal-panel">
@@ -122,6 +128,8 @@ export class TachyonBundleConflictModal extends HTMLElement {
       this.removeFocusTrap = trapFocus(dialog, () => {
         this.conflicts = [];
         this.resolutions.clear();
+        // Clearing, not setting content.
+        // eslint-disable-next-line no-restricted-properties
         this.root.innerHTML = "";
       });
     }

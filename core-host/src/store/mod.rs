@@ -14,9 +14,9 @@ use std::{collections::HashMap, sync::Mutex};
 pub(crate) mod secrets;
 
 const CWASM_CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cwasm_cache");
-/// LLM inference KV-cache entries. Key format: `{model_ref}/{tenant}/{cache_key}`.
-/// The `model_ref` segment isolates entries per LLM so they are never served to
-/// a node that doesn't host the corresponding model.
+/// Component invocation cache entries. Key format: `{component_ref}/{tenant}/{cache_key}`.
+/// The `component_ref` segment isolates entries per LLM so they are never served to
+/// a node that doesn't host the corresponding component.
 const KV_CACHE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("kv_cache");
 const METADATA_TABLE: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 const CWASM_ENGINE_HASH_KEY: &str = "cwasm_engine_hash";
@@ -804,6 +804,10 @@ impl CoreStore {
     }
 
     /// Look up the current state of `key` without modifying it.
+    ///
+    /// Not called anywhere yet — no `/admin/*` introspection route exposes
+    /// distributed-lock state today. A correct, self-contained read path
+    /// kept for whenever that route lands, not a stub with nothing behind it.
     #[allow(dead_code)]
     pub(crate) fn lock_inspect(&self, key: &str) -> Result<Option<DistributedLockEntry>> {
         let read_txn = self
@@ -1003,15 +1007,15 @@ impl CoreStore {
         Ok(removed)
     }
 
-    // ── KV-cache (LLM inference token cache, isolated per model) ────────────
+    // ── KV-cache (LLM inference token cache, isolated per Component) ────────────
 
     pub(crate) fn kv_cache_get(
         &self,
-        model_ref: &str,
+        component_ref: &str,
         tenant: &str,
         cache_key: &str,
     ) -> Result<Option<Vec<u8>>> {
-        let key = kv_cache_key(model_ref, tenant, cache_key)?;
+        let key = kv_cache_key(component_ref, tenant, cache_key)?;
         let read_txn = self
             .db
             .begin_read()
@@ -1029,7 +1033,7 @@ impl CoreStore {
             drop(raw);
             drop(table);
             drop(read_txn);
-            let _ = self.kv_cache_delete(model_ref, tenant, cache_key);
+            let _ = self.kv_cache_delete(component_ref, tenant, cache_key);
             return Ok(None);
         }
         Ok(Some(entry.value))
@@ -1037,13 +1041,13 @@ impl CoreStore {
 
     pub(crate) fn kv_cache_put(
         &self,
-        model_ref: &str,
+        component_ref: &str,
         tenant: &str,
         cache_key: &str,
         value: &[u8],
         ttl_seconds: Option<u64>,
     ) -> Result<()> {
-        let key = kv_cache_key(model_ref, tenant, cache_key)?;
+        let key = kv_cache_key(component_ref, tenant, cache_key)?;
         let entry = KvCacheEntry::new(value.to_vec(), ttl_seconds);
         let payload = serde_json::to_vec(&entry).context("failed to serialize kv_cache entry")?;
         let write_txn = self
@@ -1064,11 +1068,11 @@ impl CoreStore {
 
     pub(crate) fn kv_cache_delete(
         &self,
-        model_ref: &str,
+        component_ref: &str,
         tenant: &str,
         cache_key: &str,
     ) -> Result<()> {
-        let key = kv_cache_key(model_ref, tenant, cache_key)?;
+        let key = kv_cache_key(component_ref, tenant, cache_key)?;
         let write_txn = self
             .db
             .begin_write()
@@ -1085,12 +1089,12 @@ impl CoreStore {
             .context("failed to commit kv_cache delete transaction")
     }
 
-    /// Delete all cache entries whose key begins with `{model_ref}/`.
+    /// Delete all cache entries whose key begins with `{component_ref}/`.
     /// Returns the number of evicted entries.
-    pub(crate) fn kv_cache_evict_model(&self, model_ref: &str) -> Result<usize> {
-        let prefix = format!("{}/", sanitize_kv_key_part(model_ref, "model_ref")?);
+    pub(crate) fn kv_cache_evict_component(&self, component_ref: &str) -> Result<usize> {
+        let prefix = format!("{}/", sanitize_kv_key_part(component_ref, "component_ref")?);
         // Upper bound: replace the trailing '/' (0x2F) with '0' (0x30).
-        let upper = format!("{}0", sanitize_kv_key_part(model_ref, "model_ref")?);
+        let upper = format!("{}0", sanitize_kv_key_part(component_ref, "component_ref")?);
 
         let write_txn = self
             .db
@@ -1120,10 +1124,10 @@ impl CoreStore {
         Ok(evicted)
     }
 
-    /// Count of live (non-expired) entries for `model_ref` and total bytes stored.
-    pub(crate) fn kv_cache_stats(&self, model_ref: &str) -> Result<KvCacheStats> {
-        let prefix = format!("{}/", sanitize_kv_key_part(model_ref, "model_ref")?);
-        let upper = format!("{}0", sanitize_kv_key_part(model_ref, "model_ref")?);
+    /// Count of live (non-expired) entries for `component_ref` and total bytes stored.
+    pub(crate) fn kv_cache_stats(&self, component_ref: &str) -> Result<KvCacheStats> {
+        let prefix = format!("{}/", sanitize_kv_key_part(component_ref, "component_ref")?);
+        let upper = format!("{}0", sanitize_kv_key_part(component_ref, "component_ref")?);
         let read_txn = self
             .db
             .begin_read()
@@ -1429,15 +1433,14 @@ fn kv_partition_table_key(table_name: &str) -> String {
 }
 
 // ── Semantic graph store (hexastore) ─────────────────────────────────────────
-// All items in this section are reached through the `HostWorkspaceGraph` WIT
-// host binding dispatched by Wasmtime — invisible to the dead-code lint. The
-// `#[allow(dead_code)]` annotations below are tool-chain workarounds, NOT
-// experimental-feature placebos.
+// Reached through the `HostWorkspaceGraph` WIT host binding
+// (component_hosts.rs), which calls `CoreStore::graph_add_edges`/
+// `graph_delete_edges`/`graph_traverse` directly from ordinary Rust method
+// bodies — visible to the dead-code lint like any other call, so no
+// `#[allow(dead_code)]` is needed here.
 
-#[allow(dead_code)]
 const GRAPH_SEP: u8 = b'\0';
 
-#[allow(dead_code)]
 fn graph_spo_key(subject: &str, predicate: &str, object: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(subject.len() + predicate.len() + object.len() + 2);
     k.extend_from_slice(subject.as_bytes());
@@ -1448,7 +1451,6 @@ fn graph_spo_key(subject: &str, predicate: &str, object: &str) -> Vec<u8> {
     k
 }
 
-#[allow(dead_code)]
 fn graph_osp_key(object: &str, subject: &str, predicate: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(object.len() + subject.len() + predicate.len() + 2);
     k.extend_from_slice(object.as_bytes());
@@ -1459,7 +1461,6 @@ fn graph_osp_key(object: &str, subject: &str, predicate: &str) -> Vec<u8> {
     k
 }
 
-#[allow(dead_code)]
 fn graph_spo_prefix_range(subject: &str, predicate: &str) -> (Vec<u8>, Vec<u8>) {
     let mut start = Vec::with_capacity(subject.len() + predicate.len() + 2);
     start.extend_from_slice(subject.as_bytes());
@@ -1477,7 +1478,6 @@ fn graph_spo_prefix_range(subject: &str, predicate: &str) -> (Vec<u8>, Vec<u8>) 
 
 /// An edge in the semantic graph.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct GraphEdge {
     pub(crate) subject: String,
     pub(crate) predicate: String,
@@ -1485,10 +1485,8 @@ pub(crate) struct GraphEdge {
     pub(crate) properties: String,
 }
 
-#[allow(dead_code)]
 const GRAPH_TRAVERSE_LIMIT: usize = 10_000;
 
-#[allow(dead_code)]
 impl CoreStore {
     fn graph_spo_table(name: &str) -> String {
         format!("graph_{name}_spo")
@@ -1652,15 +1650,15 @@ pub(crate) struct KvCacheStats {
     pub(crate) expired_count: usize,
 }
 
-/// Compose a storage key: `{model_ref}/{tenant}/{cache_key}`.
-/// Model_ref and tenant may not contain `/` to keep prefix scans unambiguous.
-fn kv_cache_key(model_ref: &str, tenant: &str, cache_key: &str) -> Result<String> {
-    let model = sanitize_kv_key_part(model_ref, "model_ref")?;
+/// Compose a storage key: `{component_ref}/{tenant}/{cache_key}`.
+/// Component_ref and tenant may not contain `/` to keep prefix scans unambiguous.
+fn kv_cache_key(component_ref: &str, tenant: &str, cache_key: &str) -> Result<String> {
+    let component = sanitize_kv_key_part(component_ref, "component_ref")?;
     let t = sanitize_kv_key_part(tenant, "tenant")?;
     if cache_key.is_empty() {
         anyhow::bail!("kv cache_key must not be empty");
     }
-    Ok(format!("{model}/{t}/{cache_key}"))
+    Ok(format!("{component}/{t}/{cache_key}"))
 }
 
 fn sanitize_kv_key_part(value: &str, label: &str) -> Result<String> {

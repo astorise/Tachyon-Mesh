@@ -37,6 +37,9 @@ struct DistributedLockGuardInner {
 }
 
 impl DistributedLockGuard {
+    /// Not read anywhere yet — no caller currently logs or inspects which
+    /// key a held guard is for. Kept as a one-line accessor for whenever a
+    /// caller needs it, rather than removed and reintroduced later.
     #[allow(dead_code)]
     pub(crate) fn key(&self) -> &str {
         &self.inner.key

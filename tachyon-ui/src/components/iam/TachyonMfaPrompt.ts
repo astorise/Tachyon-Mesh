@@ -31,6 +31,8 @@ export class TachyonMfaPrompt extends HTMLElement {
   }
 
   private render(): void {
+    // Static structure and t() i18n lookups only — no dynamic data.
+    // eslint-disable-next-line no-restricted-properties
     this.root.innerHTML = `
       <dialog id="mfa-dialog" role="dialog" aria-modal="true" aria-labelledby="mfa-title" aria-describedby="mfa-desc" class="bg-transparent p-0 backdrop:bg-slate-950/80 backdrop:backdrop-blur-sm open:flex fixed inset-0 z-[100] h-screen w-screen items-center justify-center">
         <form id="mfa-form" class="w-full max-w-sm rounded-xl border border-slate-800 bg-slate-900 p-6 shadow-2xl">

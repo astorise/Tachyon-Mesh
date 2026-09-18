@@ -267,6 +267,7 @@ fn validate_identity_token(token: &str) -> Result<IdentityPayload, AuthnError> {
         subject: payload.subject,
         roles: normalize_roles(payload.roles),
         scopes: normalize_scopes(payload.scopes),
+        expires_at: payload.exp,
     })
 }
 
@@ -601,6 +602,7 @@ fn resolve_pat_identity(token: &str) -> Result<IdentityPayload, AuthnError> {
                 subject: pat.owner.clone(),
                 roles: Vec::new(),
                 scopes: normalize_scopes(pat.scopes.clone()),
+                expires_at: Some(pat.expires_at),
             });
         }
     }
