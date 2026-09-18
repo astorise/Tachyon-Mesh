@@ -74,10 +74,29 @@ spec:
         app: tachyon-mesh
     spec:
       serviceAccountName: tachyon-node
+
+      # ── Pod-level security context (Restricted Pod Security Standard) ──────
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
       containers:
         - name: core-host
           image: ghcr.io/astorise/tachyon-mesh:latest
           imagePullPolicy: Always
+
+          # ── Container-level security context ──────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
           ports:
             - containerPort: 8080
           env:
@@ -93,6 +112,16 @@ spec:
             # zero-touch enrollment (read by system-faas-enrollment).
             - name: TACHYON_ENROLLMENT_IDENTITY_TOKEN_PATH
               value: /var/run/secrets/tokens/tachyon-token
+            # readOnlyRootFilesystem: true means core-host's default manifest
+            # path ("integrity.lock", relative to /app — not writable here)
+            # can no longer double as the anchor for every state directory
+            # derived from it (auth state, core store, buffered-request
+            # spool, and this StatefulSet's own host identity key — the
+            # per-node identity zero-touch enrollment exists to establish).
+            # See manifests/deploy.yaml for the same fix; this StatefulSet
+            # already has a durable PVC mounted at /app/data.
+            - name: TACHYON_INTEGRITY_MANIFEST
+              value: /app/data/integrity.lock
           volumeMounts:
             - name: tachyon-store
               mountPath: /app/data

@@ -54,10 +54,28 @@ spec:
       labels:
         app: tachyon-mesh
     spec:
+      # ── Pod-level security context (Restricted Pod Security Standard) ──────
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
       containers:
         - name: core-host
           image: ghcr.io/astorise/tachyon-mesh:latest
           imagePullPolicy: Always
+
+          # ── Container-level security context ──────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+
           ports:
             - containerPort: 8080
           env:
@@ -74,6 +92,16 @@ spec:
                 secretKeyRef:
                   name: tachyon-mesh-auth
                   key: jwt-secret
+            # readOnlyRootFilesystem: true means core-host's default manifest
+            # path ("integrity.lock", relative to /app — not writable here)
+            # can no longer double as the anchor for every state directory
+            # derived from it (auth state, core store, buffered-request
+            # spool, host identity key — see manifests/deploy.yaml for the
+            # same fix). This mesh StatefulSet already has a durable PVC
+            # mounted at /app/data, so state lands there instead of an
+            # ephemeral /tmp.
+            - name: TACHYON_INTEGRITY_MANIFEST
+              value: /app/data/integrity.lock
           volumeMounts:
             - name: tachyon-store
               mountPath: /app/data
