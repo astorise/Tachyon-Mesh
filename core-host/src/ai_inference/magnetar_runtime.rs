@@ -7,9 +7,13 @@ use magnetar_runtime::GenerationStreamEvent;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-use super::{StreamControl, TokenUsage};
+use super::StreamControl;
 
 pub(crate) const MAGNETAR_PATH_PREFIX: &str = "magnetar:";
+/// Opaque wire-shape metadata tags (`wit/accelerator/*.wit`'s
+/// `invocation-result.metadata`), and one payload paired with its own tags.
+type ComponentMetadata = Vec<(String, String)>;
+type ComponentInvocationBatch = Vec<(Vec<u8>, ComponentMetadata)>;
 /// Trusts the WASM Component binary itself (the code Magnetar instantiates
 /// and executes) — never the model weights it happens to load. See
 /// [`TACHYON_ARTIFACT_TRUST_STORE_ENV`] for the separate, model-artifact trust
@@ -101,7 +105,7 @@ impl MagnetarRuntime {
         self.component.resident_debug()
     }
 
-    pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<Vec<(Vec<u8>, TokenUsage)>> {
+    pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<ComponentInvocationBatch> {
         if prompts.len() != 1 {
             bail!(
                 "Magnetar inference Component invocation for `{}` expects exactly one payload, got {}",
@@ -110,21 +114,15 @@ impl MagnetarRuntime {
             );
         }
         let outcome = self.component.invoke_payload(prompts[0])?;
-        let usage = outcome.usage;
-        Ok(vec![(
-            outcome.text.into_bytes(),
-            TokenUsage {
-                prompt_tokens: usage.prompt_tokens.min(u32::MAX as usize) as u32,
-                completion_tokens: usage.generated_tokens.min(u32::MAX as usize) as u32,
-            },
-        )])
+        let metadata = usage_metadata(outcome.usage.prompt_tokens, outcome.usage.generated_tokens);
+        Ok(vec![(outcome.text.into_bytes(), metadata)])
     }
 
     pub(crate) fn generate_streaming(
         &self,
         prompts: &[&[u8]],
         on_token: &mut dyn FnMut(&str) -> StreamControl,
-    ) -> Result<TokenUsage> {
+    ) -> Result<ComponentMetadata> {
         if prompts.len() != 1 {
             bail!(
                 "Magnetar inference Component streaming invocation for `{}` expects exactly one payload, got {}",
@@ -146,10 +144,7 @@ impl MagnetarRuntime {
                     }
                 }
                 GenerationStreamEvent::Finished { usage, .. } => {
-                    streamed_usage = Some(TokenUsage {
-                        prompt_tokens: usage.prompt_tokens.min(u32::MAX as usize) as u32,
-                        completion_tokens: usage.generated_tokens.min(u32::MAX as usize) as u32,
-                    });
+                    streamed_usage = Some((usage.prompt_tokens, usage.generated_tokens));
                     std::ops::ControlFlow::Continue(())
                 }
                 _ => std::ops::ControlFlow::Continue(()),
@@ -158,14 +153,31 @@ impl MagnetarRuntime {
         let outcome = self
             .component
             .invoke_payload_streaming(prompts[0], &mut on_event)?;
-        Ok(streamed_usage.unwrap_or_else(|| TokenUsage {
-            prompt_tokens: outcome.prompt_tokens.min(u32::MAX as usize) as u32,
-            completion_tokens: outcome.generated_tokens.min(u32::MAX as usize) as u32,
-        }))
+        let (prompt_tokens, generated_tokens) =
+            streamed_usage.unwrap_or((outcome.prompt_tokens, outcome.generated_tokens));
+        Ok(usage_metadata(prompt_tokens, generated_tokens))
     }
 }
 
-pub(crate) fn is_invalid_generation_request(error: &anyhow::Error) -> bool {
+/// Token-accounting metadata for one invocation, in the opaque wire shape the
+/// Component/artifact boundary carries (`wit/accelerator/*.wit`'s
+/// `invocation-result.metadata`). Built here, at the Magnetar adapter, rather
+/// than as a typed field threaded through `ai_inference`/`component_hosts`:
+/// the count is Magnetar's own to report, and the core only ever relays it.
+fn usage_metadata(prompt_tokens: usize, generated_tokens: usize) -> ComponentMetadata {
+    vec![
+        (
+            "tachyon.usage.prompt_tokens".to_owned(),
+            prompt_tokens.min(u32::MAX as usize).to_string(),
+        ),
+        (
+            "tachyon.usage.completion_tokens".to_owned(),
+            generated_tokens.min(u32::MAX as usize).to_string(),
+        ),
+    ]
+}
+
+pub(crate) fn is_invalid_component_invocation(error: &anyhow::Error) -> bool {
     magnetar_inference_component::is_invalid_component_invocation(error)
 }
 

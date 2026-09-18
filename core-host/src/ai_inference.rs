@@ -93,23 +93,15 @@ pub(crate) fn inference_execution_telemetry() -> Vec<InferenceExecutionTelemetry
         .clone()
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TokenUsage {
-    pub(crate) prompt_tokens: u32,
-    pub(crate) completion_tokens: u32,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ToolCall {
-    pub(crate) id: Option<String>,
-    pub(crate) name: String,
-    pub(crate) arguments: String,
-}
-
+/// One decoded event from a Component invocation stream. Opaque on both
+/// arms: `Payload` is raw output bytes (never assumed to be UTF-8 text —
+/// that interpretation belongs to whichever layer actually needs it, e.g.
+/// `guest-openai` or the Magnetar adapter), `Metadata` is whatever tagged
+/// key/value pairs the Component's own execution chose to attach mid-stream.
+/// Mirrors `wit/accelerator/*.wit`'s `stream-event` variant exactly.
 pub(crate) enum StreamEvent<'a> {
-    Content(&'a str),
-    Refusal(&'a str),
-    ToolCall(ToolCall),
+    Payload(&'a [u8]),
+    Metadata(Vec<(String, String)>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,35 +133,31 @@ where
     }
 }
 
+/// Opaque metadata a Component invocation reports once it completes —
+/// whatever tagged key/value pairs the Component's own execution (or its
+/// adapter, e.g. Magnetar) chose to attach. Tachyon core does not name or
+/// interpret these; see `wit/accelerator/*.wit`'s `invocation-result.metadata`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StreamOutcome {
-    pub(crate) usage: Option<TokenUsage>,
-    pub(crate) finish_reason: Option<String>,
+    pub(crate) metadata: Vec<(String, String)>,
 }
 
-impl StreamOutcome {
-    fn usage(usage: Option<TokenUsage>) -> Self {
-        Self {
-            usage,
-            finish_reason: None,
-        }
-    }
-}
-
+/// A Component invocation failure. Mirrors `wit/accelerator/*.wit`'s
+/// `invocation-error` record field for field; Tachyon core does not attach
+/// any dialect-specific error taxonomy beyond what that opaque contract
+/// carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GenerationError {
+pub(crate) struct ComponentInvocationError {
     pub(crate) message: String,
     pub(crate) upstream_status: Option<u16>,
-    pub(crate) class: Option<String>,
     pub(crate) invalid_request: bool,
 }
 
-impl GenerationError {
+impl ComponentInvocationError {
     pub(crate) fn local(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             upstream_status: None,
-            class: None,
             invalid_request: false,
         }
     }
@@ -178,31 +166,30 @@ impl GenerationError {
         Self {
             message: message.into(),
             upstream_status: None,
-            class: None,
             invalid_request: true,
         }
     }
 }
 
-impl std::fmt::Display for GenerationError {
+impl std::fmt::Display for ComponentInvocationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl From<String> for GenerationError {
+impl From<String> for ComponentInvocationError {
     fn from(message: String) -> Self {
         Self::local(message)
     }
 }
 
+/// The result of one buffered Component invocation: opaque output bytes plus
+/// whatever opaque metadata tags the Component's execution attached. Mirrors
+/// `wit/accelerator/*.wit`'s `invocation-result` record.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ComponentGeneration {
-    pub(crate) text: String,
-    pub(crate) refusal: Option<String>,
-    pub(crate) usage: Option<TokenUsage>,
-    pub(crate) finish_reason: Option<String>,
-    pub(crate) tool_calls: Vec<ToolCall>,
+pub(crate) struct ComponentInvocationOutcome {
+    pub(crate) payload: Vec<u8>,
+    pub(crate) metadata: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -531,22 +518,30 @@ impl AiInferenceRuntime {
         Ok(())
     }
 
+    /// Test convenience only: no production call site needs readable text
+    /// back, so this is the one place in the production API surface that
+    /// still assumes the Component's output is UTF-8. Everything it calls
+    /// (and everything `component_hosts.rs` calls directly) stays opaque.
+    #[cfg(test)]
     pub(crate) fn compute_component_prompt(
         &self,
         alias: &str,
-        prompt: &str,
-    ) -> std::result::Result<String, GenerationError> {
-        self.compute_component_prompt_generation(alias, prompt)
-            .map(|generation| generation.text)
+        payload: &[u8],
+    ) -> std::result::Result<String, ComponentInvocationError> {
+        self.compute_component_prompt_generation(alias, payload)
+            .and_then(|outcome| {
+                String::from_utf8(outcome.payload)
+                    .map_err(|error| ComponentInvocationError::local(error.to_string()))
+            })
     }
 
     pub(crate) fn compute_component_prompt_generation(
         &self,
         alias: &str,
-        prompt: &str,
-    ) -> std::result::Result<ComponentGeneration, GenerationError> {
+        payload: &[u8],
+    ) -> std::result::Result<ComponentInvocationOutcome, ComponentInvocationError> {
         self.ensure_component_loaded(alias, AcceleratorKind::Cpu)
-            .map_err(GenerationError::local)?;
+            .map_err(ComponentInvocationError::local)?;
         let model = self
             .inference_components
             .read()
@@ -554,18 +549,13 @@ impl AiInferenceRuntime {
             .get(alias)
             .cloned()
             .ok_or_else(|| {
-                GenerationError::local(format!("component alias `{alias}` is not loaded"))
+                ComponentInvocationError::local(format!("component alias `{alias}` is not loaded"))
             })?;
         let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
-        let output = execute_model(&model, prompt.as_bytes())?;
-        let text = String::from_utf8(output.bytes)
-            .map_err(|error| GenerationError::local(error.to_string()))?;
-        Ok(ComponentGeneration {
-            text,
-            refusal: output.refusal,
-            usage: output.usage,
-            finish_reason: output.finish_reason,
-            tool_calls: output.tool_calls,
+        let output = execute_model(&model, payload)?;
+        Ok(ComponentInvocationOutcome {
+            payload: output.bytes,
+            metadata: output.metadata,
         })
     }
 
@@ -573,9 +563,9 @@ impl AiInferenceRuntime {
         &self,
         alias: &str,
         _input: &str,
-    ) -> std::result::Result<Vec<f32>, GenerationError> {
+    ) -> std::result::Result<Vec<f32>, ComponentInvocationError> {
         self.ensure_component_loaded(alias, AcceleratorKind::Cpu)
-            .map_err(GenerationError::local)?;
+            .map_err(ComponentInvocationError::local)?;
         let model = self
             .inference_components
             .read()
@@ -583,10 +573,10 @@ impl AiInferenceRuntime {
             .get(alias)
             .cloned()
             .ok_or_else(|| {
-                GenerationError::local(format!("component alias `{alias}` is not loaded"))
+                ComponentInvocationError::local(format!("component alias `{alias}` is not loaded"))
             })?;
         let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
-        Err(GenerationError::invalid_request(format!(
+        Err(ComponentInvocationError::invalid_request(format!(
             "component `{alias}` does not expose dense text embeddings through the generic Tachyon invocation contract"
         )))
     }
@@ -594,11 +584,11 @@ impl AiInferenceRuntime {
     pub(crate) fn stream_component_prompt(
         &self,
         alias: &str,
-        prompt: &str,
+        payload: &[u8],
         sink: &mut dyn StreamSink,
-    ) -> std::result::Result<StreamOutcome, GenerationError> {
+    ) -> std::result::Result<StreamOutcome, ComponentInvocationError> {
         self.ensure_component_loaded(alias, AcceleratorKind::Cpu)
-            .map_err(GenerationError::local)?;
+            .map_err(ComponentInvocationError::local)?;
         let model = self
             .inference_components
             .read()
@@ -606,32 +596,31 @@ impl AiInferenceRuntime {
             .get(alias)
             .cloned()
             .ok_or_else(|| {
-                GenerationError::local(format!("component alias `{alias}` is not loaded"))
+                ComponentInvocationError::local(format!("component alias `{alias}` is not loaded"))
             })?;
         let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
         match &model.runtime {
             ComponentRuntime::Mock { .. } => {
                 if sink.is_live() {
-                    sink.emit(StreamEvent::Content(MOCK_INFERENCE_RESPONSE));
+                    sink.emit(StreamEvent::Payload(MOCK_INFERENCE_RESPONSE.as_bytes()));
                 }
                 record_execution(&model.alias, model.accelerator().as_str(), true);
-                Ok(StreamOutcome::usage(Some(mock_token_usage(
-                    prompt.as_bytes(),
-                    MOCK_INFERENCE_RESPONSE,
-                ))))
+                Ok(StreamOutcome {
+                    metadata: mock_component_metadata(payload, MOCK_INFERENCE_RESPONSE.as_bytes()),
+                })
             }
             ComponentRuntime::Magnetar(runtime) => {
                 let mut emit = |fragment: &str| {
                     if sink.is_live() {
-                        sink.emit(StreamEvent::Content(fragment))
+                        sink.emit(StreamEvent::Payload(fragment.as_bytes()))
                     } else {
                         StreamControl::Stop
                     }
                 };
                 let result = runtime
-                    .generate_streaming(&[prompt.as_bytes()], &mut emit)
-                    .map(|usage| StreamOutcome::usage(Some(usage)))
-                    .map_err(magnetar_generation_error);
+                    .generate_streaming(&[payload], &mut emit)
+                    .map(|metadata| StreamOutcome { metadata })
+                    .map_err(magnetar_invocation_error);
                 record_execution(&model.alias, runtime.executed_on(), result.is_ok());
                 result
             }
@@ -733,11 +722,11 @@ fn magnetar_provider_is_cuda(provider: &magnetar_runtime::ProviderAdvertisement)
     provider.device_class == magnetar_runtime::ProviderDeviceClass::Cuda
 }
 
-fn magnetar_generation_error(error: anyhow::Error) -> GenerationError {
-    if magnetar_runtime::is_invalid_generation_request(&error) {
-        GenerationError::invalid_request(error.to_string())
+fn magnetar_invocation_error(error: anyhow::Error) -> ComponentInvocationError {
+    if magnetar_runtime::is_invalid_component_invocation(&error) {
+        ComponentInvocationError::invalid_request(error.to_string())
     } else {
-        GenerationError::local(error.to_string())
+        ComponentInvocationError::local(error.to_string())
     }
 }
 
@@ -800,10 +789,7 @@ fn adjust_queue_depth(
 
 struct ComponentOutput {
     bytes: Vec<u8>,
-    usage: Option<TokenUsage>,
-    finish_reason: Option<String>,
-    tool_calls: Vec<ToolCall>,
-    refusal: Option<String>,
+    metadata: Vec<(String, String)>,
 }
 
 fn load_binding(binding: &IntegrityInferenceComponentBinding) -> Result<LoadedInferenceComponent> {
@@ -839,31 +825,22 @@ fn load_binding(binding: &IntegrityInferenceComponentBinding) -> Result<LoadedIn
 fn execute_model(
     model: &LoadedInferenceComponent,
     prompt: &[u8],
-) -> std::result::Result<ComponentOutput, GenerationError> {
+) -> std::result::Result<ComponentOutput, ComponentInvocationError> {
     match &model.runtime {
         ComponentRuntime::Mock { .. } => {
             record_execution(&model.alias, model.accelerator().as_str(), true);
             Ok(ComponentOutput {
                 bytes: MOCK_INFERENCE_RESPONSE.as_bytes().to_vec(),
-                usage: Some(mock_token_usage(prompt, MOCK_INFERENCE_RESPONSE)),
-                finish_reason: None,
-                tool_calls: Vec::new(),
-                refusal: None,
+                metadata: mock_component_metadata(prompt, MOCK_INFERENCE_RESPONSE.as_bytes()),
             })
         }
         ComponentRuntime::Magnetar(runtime) => {
             let result = runtime
                 .generate(&[prompt])
-                .map_err(magnetar_generation_error)
+                .map_err(magnetar_invocation_error)
                 .map(|mut outputs| {
-                    let (bytes, usage) = outputs.remove(0);
-                    ComponentOutput {
-                        bytes,
-                        usage: Some(usage),
-                        finish_reason: None,
-                        tool_calls: Vec::new(),
-                        refusal: None,
-                    }
+                    let (bytes, metadata) = outputs.remove(0);
+                    ComponentOutput { bytes, metadata }
                 });
             record_execution(&model.alias, runtime.executed_on(), result.is_ok());
             result
@@ -912,14 +889,28 @@ pub(crate) fn assert_no_credential_collisions<'a>(
     Ok(())
 }
 
-fn mock_token_usage(prompt: &[u8], completion: &str) -> TokenUsage {
-    TokenUsage {
-        prompt_tokens: String::from_utf8_lossy(prompt)
-            .split_whitespace()
-            .count()
-            .max(1) as u32,
-        completion_tokens: completion.split_whitespace().count().max(1) as u32,
-    }
+/// Best-effort token-accounting metadata for the `mock:` test/dev Component,
+/// in the same opaque wire shape a real Component's own execution (or its
+/// adapter) reports; see `magnetar_runtime::usage_metadata`.
+fn mock_component_metadata(prompt: &[u8], completion: &[u8]) -> Vec<(String, String)> {
+    let prompt_tokens = String::from_utf8_lossy(prompt)
+        .split_whitespace()
+        .count()
+        .max(1);
+    let completion_tokens = String::from_utf8_lossy(completion)
+        .split_whitespace()
+        .count()
+        .max(1);
+    vec![
+        (
+            "tachyon.usage.prompt_tokens".to_owned(),
+            prompt_tokens.to_string(),
+        ),
+        (
+            "tachyon.usage.completion_tokens".to_owned(),
+            completion_tokens.to_string(),
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -936,6 +927,13 @@ mod tests {
                 .expect("time")
                 .as_nanos()
         ))
+    }
+
+    fn metadata_u32(metadata: &[(String, String)], key: &str) -> Option<u32> {
+        metadata
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .and_then(|(_, value)| value.parse().ok())
     }
 
     const HIDDEN_SIZE: u64 = 4;
@@ -1342,7 +1340,7 @@ mod tests {
         })
         .expect("real Magnetar production Qwen bundle should load");
         let generation = runtime
-            .compute_component_prompt("qwen2_5", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .compute_component_prompt("qwen2_5", br#"{"prompt":"hi","max_new_tokens":1}"#)
             .expect("real Magnetar production Qwen should generate");
 
         assert!(!generation.is_empty());
@@ -1373,10 +1371,10 @@ mod tests {
             .magnetar_resident_debug("qwen_resident")
             .expect("resident model debug should be available");
         runtime
-            .compute_component_prompt("qwen_resident", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .compute_component_prompt("qwen_resident", br#"{"prompt":"hi","max_new_tokens":1}"#)
             .expect("first generation should succeed");
         runtime
-            .compute_component_prompt("qwen_resident", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .compute_component_prompt("qwen_resident", br#"{"prompt":"hi","max_new_tokens":1}"#)
             .expect("second generation should reuse resident model");
         let after = runtime
             .magnetar_resident_debug("qwen_resident")
@@ -1422,7 +1420,7 @@ mod tests {
                     runtime
                         .compute_component_prompt(
                             "qwen_concurrent",
-                            r#"{"prompt":"hi","max_new_tokens":1}"#,
+                            br#"{"prompt":"hi","max_new_tokens":1}"#,
                         )
                         .expect("concurrent generation should reuse resident model")
                 })
@@ -1466,7 +1464,7 @@ mod tests {
         let generation = runtime
             .compute_component_prompt(
                 "qwen2_5",
-                r#"{"messages":[{"role":"user","content":"hi"}],"temperature":0,"max_new_tokens":1}"#,
+                br#"{"messages":[{"role":"user","content":"hi"}],"temperature":0,"max_new_tokens":1}"#,
             )
             .expect("OpenAI chat messages should reach Magnetar PromptInput::ChatMessages");
 
@@ -1500,7 +1498,7 @@ mod tests {
         }
         impl StreamSink for DisconnectingSink {
             fn emit(&mut self, event: StreamEvent<'_>) -> StreamControl {
-                if let StreamEvent::Content(_) = event {
+                if let StreamEvent::Payload(_) = event {
                     self.content_events += 1;
                 }
                 StreamControl::Stop
@@ -1515,7 +1513,7 @@ mod tests {
         let outcome = runtime
             .stream_component_prompt(
                 "qwen-stream",
-                r#"{"prompt":"hi","max_new_tokens":16}"#,
+                br#"{"prompt":"hi","max_new_tokens":16}"#,
                 &mut sink,
             )
             .expect("downstream stop should cancel Magnetar streaming cleanly");
@@ -1525,9 +1523,8 @@ mod tests {
             "Tachyon must stop relaying after the downstream stream disconnects"
         );
         assert!(
-            outcome
-                .usage
-                .map(|usage| usage.completion_tokens <= 1)
+            metadata_u32(&outcome.metadata, "tachyon.usage.completion_tokens")
+                .map(|completion_tokens| completion_tokens <= 1)
                 .unwrap_or(true),
             "cancelled Magnetar stream must not continue to produce the full request"
         );
@@ -1752,7 +1749,7 @@ mod tests {
         })
         .expect("real Magnetar production Qwen CUDA bundle should load");
         let generation = runtime
-            .compute_component_prompt("qwen-cuda", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .compute_component_prompt("qwen-cuda", br#"{"prompt":"hi","max_new_tokens":1}"#)
             .expect("real Magnetar production Qwen should generate one token on CUDA");
 
         assert!(!generation.is_empty());
@@ -1795,13 +1792,13 @@ mod tests {
         let generation = runtime
             .compute_component_prompt_generation(
                 "qwen-cuda",
-                r#"{"prompt":"hi","max_new_tokens":16}"#,
+                br#"{"prompt":"hi","max_new_tokens":16}"#,
             )
             .expect("real Magnetar CUDA should generate multiple tokens device-resident");
 
-        assert!(!generation.text.is_empty());
+        assert!(!generation.payload.is_empty());
         assert_eq!(
-            generation.usage.map(|usage| usage.completion_tokens),
+            metadata_u32(&generation.metadata, "tachyon.usage.completion_tokens"),
             Some(16),
             "CUDA multi-token proof must generate exactly the requested token budget"
         );
@@ -1914,7 +1911,7 @@ mod tests {
             .load_inference_component("dynamic-cpu-qwen", AcceleratorKind::Cpu)
             .expect("dynamic CPU model should load through Reference CPU");
         let generation = runtime
-            .compute_component_prompt("dynamic-cpu-qwen", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .compute_component_prompt("dynamic-cpu-qwen", br#"{"prompt":"hi","max_new_tokens":1}"#)
             .expect("dynamic CPU model should generate through Magnetar Reference CPU");
 
         assert!(!generation.is_empty());
@@ -2101,13 +2098,13 @@ mod tests {
         );
         assert_eq!(
             runtime
-                .compute_component_prompt("component-a", "ping")
+                .compute_component_prompt("component-a", b"ping")
                 .expect("component-a should invoke"),
             MOCK_INFERENCE_RESPONSE
         );
         assert_eq!(
             runtime
-                .compute_component_prompt("component-b", "ping")
+                .compute_component_prompt("component-b", b"ping")
                 .expect("component-b should invoke"),
             MOCK_INFERENCE_RESPONSE
         );
