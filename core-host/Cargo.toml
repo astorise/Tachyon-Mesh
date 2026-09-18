@@ -5,7 +5,15 @@ edition = "2021"
 license.workspace = true
 
 [features]
-default = ["admin-plane", "ring"]
+# Widened from ["admin-plane", "ring"] so the Quick Start binary
+# (scripts/get-tachyon.sh's `default` variant, and the unsuffixed release
+# archive) actually has the production-readiness features the README
+# advertises one screen earlier — WebSocket routes, rate limiting,
+# circuit-breaking/retry, and mutual TLS. Deliberately does not add
+# `http3`/`ai-inference`/`fips`: those pull in heavier dependency trees
+# (QUIC, WASM/ML runtimes, a different TLS backend) and stay opt-in via
+# `--variant`.
+default = ["admin-plane", "ring", "websockets", "rate-limit", "resiliency", "mtls"]
 # Gates the `/admin/*` authenticated HTTP surface (operator dashboard, IAM,
 # manifest/canary/chaos control, asset uploads, OpenAPI/Swagger docs) and its
 # route mounting in the router. Disabling it (`--no-default-features`) yields

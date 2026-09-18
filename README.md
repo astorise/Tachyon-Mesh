@@ -60,12 +60,12 @@ Optional: `-Version v1.2.3`, `-Dir C:\Tools\tachyon`, or `-Variant http3`.
 
 | Variant | Cargo features | Adds |
 |---|---|---|
-| `default` | `admin-plane`, `ring` | The `/admin/*` operator surface (dashboard, IAM, manifest/canary/chaos control). No HTTP/3, AI inference, WebSockets, mTLS, or rate limiting. |
+| `default` | `admin-plane`, `ring`, `websockets`, `rate-limit`, `resiliency`, `mtls` | The `/admin/*` operator surface (dashboard, IAM, manifest/canary/chaos control), WebSocket routes, rate limiting, circuit-breaking/retry, and mutual TLS. No HTTP/3 or AI inference. |
 | `fips` | `fips` (no defaults) | FIPS-mode TLS (`aws_lc_rs` + `tls12`). No admin plane. |
-| `http3` | `admin-plane`, `ring`, `http3` | HTTP/3 / QUIC transport. |
-| `security` | `admin-plane`, `ring`, `rate-limit`, `resiliency`, `mtls`, `secrets-vault`, `websockets` | Rate limiting, circuit-breaking/retry, mutual TLS, the secrets vault, and WebSocket routes. |
-| `ai` | `admin-plane`, `ring`, `ai-inference` | AI model routing/serving. Not built for Windows or Linux/aarch64. |
-| `no-default` | *(none)* | The smallest possible worker-data-plane binary: no `/admin/*` surface at all. |
+| `http3` | `admin-plane`, `ring`, `http3` | HTTP/3 / QUIC transport, on top of everything `default` has. |
+| `security` | everything `default` has, plus `secrets-vault` | The secrets vault, on top of everything `default` has. |
+| `ai` | everything `default` has, plus `ai-inference` | AI model routing/serving, on top of everything `default` has. Not built for Windows or Linux/aarch64. |
+| `no-default` | *(none)* | The smallest possible worker-data-plane binary: no `/admin/*` surface, no WebSockets, rate limiting, resiliency, or mTLS. |
 
 A route or capability that 404s or refuses to start is often just a feature the installed variant wasn't built with — `core-host`'s startup log always names the features it was compiled with, so `grep features` in its output (or `RUST_LOG=info` if you've redirected logs) tells you which variant you're running. Combine features by building from source (Path B) with your own `cargo build --features ...` instead.
 

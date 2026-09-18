@@ -105,7 +105,10 @@ jobs:
             cargo_args: "--features http3"
           - features: security
             features_label: "-security"
-            cargo_args: "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
+            # rate-limit/resiliency/mtls/websockets now ship in core-host's
+            # own `default` feature set; secrets-vault is what this variant
+            # still adds on top of it.
+            cargo_args: "--features secrets-vault"
           - features: ai
             features_label: "-ai"
             cargo_args: "--features ai-inference"
