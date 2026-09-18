@@ -1,5 +1,3 @@
-#![allow(clippy::result_large_err)]
-
 use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{Extension, Request, State},
