@@ -977,6 +977,37 @@ mod tests {
             include_bytes!("../../vendor/Magnetar/magnetar-runtime/fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"),
         )
         .expect("Component artifact manifest should be written");
+        write_tiny_production_model_data(path);
+    }
+
+    /// The same real, independently-compiled Llama Component Magnetar's own
+    /// test suite checks in (`loaded_inference_component_load_runs_a_real_
+    /// second_architecture_end_to_end`), paired with the identical
+    /// Hugging Face-shaped bundle `write_tiny_production_qwen_bundle` writes
+    /// — same tensors, same config, same tokenizer. Proves Tachyon's own
+    /// route -> alias -> `MagnetarRuntime::try_load` pipeline can load a
+    /// second, digest-distinct compiled Component binary, not just a second
+    /// alias (Tachyon integration audit MAG-01/MAG-06, #72).
+    fn write_tiny_production_llama_bundle(path: &Path) {
+        fs::create_dir_all(path).expect("fixture dir should be created");
+        fs::write(
+            path.join("llama-real.component.wasm"),
+            include_bytes!("../../vendor/Magnetar/magnetar-runtime/fixtures/components/llama-real.component.wasm"),
+        )
+        .expect("Component artifact should be written");
+        fs::write(
+            path.join("llama-real.component.wasm.magnetar-component.yaml"),
+            include_bytes!("../../vendor/Magnetar/magnetar-runtime/fixtures/components/llama-real.component.wasm.magnetar-component.yaml"),
+        )
+        .expect("Component artifact manifest should be written");
+        write_tiny_production_model_data(path);
+    }
+
+    /// The Model Artifact half of a tiny production-shaped bundle: config,
+    /// tokenizer, and safetensors weights. Shared by every fixture Component
+    /// this module writes, since each accepts the identical Hugging
+    /// Face-shaped directory — only the `*.component.wasm` differs.
+    fn write_tiny_production_model_data(path: &Path) {
         let config_json = format!(
             r#"{{
                 "architectures": ["Qwen2ForCausalLM"],
@@ -1288,6 +1319,66 @@ mod tests {
         fs::write(
             &model_path,
             format!(r#"{{"trusted_digests":["{model_digest}"]}}"#),
+        )
+        .expect("model trust sidecar should be written");
+
+        let previous_component =
+            std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+        std::env::set_var(
+            magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
+            &component_path,
+        );
+        let previous_model = std::env::var_os(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+        std::env::set_var(
+            magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV,
+            &model_path,
+        );
+
+        TrustStoreEnvGuard {
+            _qwen_lock: qwen_lock,
+            _lock: lock,
+            previous_component,
+            previous_model,
+            component_path,
+            model_path,
+        }
+    }
+
+    /// [`trust_tachyon_component_artifact`] generalized to more than one
+    /// bundle root, trusting every root's Component (WASM) digest and Model
+    /// Artifact digest in one policy. Needed when a single route binds more
+    /// than one real Magnetar Component and each must be authorized
+    /// independently (Tachyon integration audit MAG-03).
+    fn trust_tachyon_component_artifacts(roots: &[&Path]) -> TrustStoreEnvGuard {
+        let qwen_lock = qwen_interprocess_lock();
+        let lock = trust_env_lock();
+
+        let component_digests = roots
+            .iter()
+            .map(|root| component_wasm_digest(root))
+            .collect::<Vec<_>>();
+        let model_digests = roots
+            .iter()
+            .map(|root| {
+                magnetar_inference_component::local_bundle_manifest_digest(root)
+                    .expect("fixture should ingest before writing Tachyon trust policy")
+            })
+            .collect::<Vec<_>>();
+
+        let trust_dir = unique_model_dir("component-trust-policy-multi");
+        std::fs::create_dir_all(&trust_dir).expect("trust policy dir should be created");
+
+        let component_path = trust_dir.join("tachyon-component-trust.json");
+        fs::write(
+            &component_path,
+            serde_json::json!({ "trusted_digests": component_digests }).to_string(),
+        )
+        .expect("component trust sidecar should be written");
+
+        let model_path = trust_dir.join("tachyon-artifact-trust.json");
+        fs::write(
+            &model_path,
+            serde_json::json!({ "trusted_digests": model_digests }).to_string(),
         )
         .expect("model trust sidecar should be written");
 
@@ -2065,8 +2156,15 @@ mod tests {
         assert!(!runtime.supports_accelerator(AcceleratorKind::Tpu));
     }
 
+    /// Proves alias-based dispatch on one route: two differently-aliased
+    /// `mock:` handles resolve and invoke independently. Does not prove two
+    /// *structurally* distinct Components load side by side — `mock:`
+    /// bindings never reach `MagnetarRuntime::try_load` at all, so both
+    /// aliases here answer with the same canned `MOCK_INFERENCE_RESPONSE`.
+    /// See `one_route_loads_two_structurally_distinct_magnetar_components`
+    /// for that proof through the real Magnetar path.
     #[test]
-    fn one_route_can_expose_two_distinct_inference_components() {
+    fn one_route_dispatches_two_aliases_to_independent_mock_handles() {
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.inference_components = vec![
             IntegrityInferenceComponentBinding {
@@ -2108,5 +2206,119 @@ mod tests {
                 .expect("component-b should invoke"),
             MOCK_INFERENCE_RESPONSE
         );
+    }
+
+    /// The heterogeneity proof `one_route_dispatches_two_aliases_to_
+    /// independent_mock_handles` cannot give: two *structurally* distinct,
+    /// independently-compiled Component binaries — Magnetar's own checked-in
+    /// Qwen and Llama fixtures, the same pair its own
+    /// `loaded_inference_component_load_runs_a_real_second_architecture_
+    /// end_to_end` test proves at the crate level — loaded side by side on
+    /// one route through Tachyon's real `MagnetarRuntime::try_load` path,
+    /// each invoked through its own resident instance.
+    #[test]
+    fn one_route_loads_two_structurally_distinct_magnetar_components() {
+        let qwen_dir = unique_model_dir("two-components-qwen");
+        let llama_dir = unique_model_dir("two-components-llama");
+        write_tiny_production_qwen_bundle(&qwen_dir);
+        write_tiny_production_llama_bundle(&llama_dir);
+        let _trust = trust_tachyon_component_artifacts(&[&qwen_dir, &llama_dir]);
+
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.inference_components = vec![
+            IntegrityInferenceComponentBinding {
+                alias: "qwen-real".to_owned(),
+                path: format!("magnetar:{}", qwen_dir.display()),
+                device: ComponentPlacement::Cpu,
+                qos: RouteQos::Standard,
+                dynamic: false,
+                hardware_strategy: Default::default(),
+            },
+            IntegrityInferenceComponentBinding {
+                alias: "llama-real".to_owned(),
+                path: format!("magnetar:{}", llama_dir.display()),
+                device: ComponentPlacement::Cpu,
+                qos: RouteQos::Standard,
+                dynamic: false,
+                hardware_strategy: Default::default(),
+            },
+        ];
+
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect(
+            "two structurally distinct, independently-compiled real Magnetar Components \
+             should both load on one route",
+        );
+
+        assert_eq!(
+            runtime.loaded_component_aliases(),
+            vec!["llama-real".to_owned(), "qwen-real".to_owned()]
+        );
+
+        let qwen_output = runtime
+            .compute_component_prompt(
+                "qwen-real",
+                br#"{"prompt":"hello world","max_new_tokens":1}"#,
+            )
+            .expect("the Qwen Component should generate through its own resident instance");
+        let llama_output = runtime
+            .compute_component_prompt(
+                "llama-real",
+                br#"{"prompt":"hello world","max_new_tokens":1}"#,
+            )
+            .expect("the Llama Component should generate through its own resident instance");
+        assert!(!qwen_output.is_empty());
+        assert!(!llama_output.is_empty());
+
+        // The fixture pair really is two independently-compiled binaries,
+        // not two copies of the same one — the precondition the rest of this
+        // test's proof rests on.
+        assert_ne!(
+            component_wasm_digest(&qwen_dir),
+            component_wasm_digest(&llama_dir),
+            "the fixture pair must be independently-compiled, digest-distinct Component binaries"
+        );
+        // Both loads succeeded under a policy that trusted each digest
+        // independently (`trust_tachyon_component_artifacts`): had the
+        // runtime quietly deduplicated one binding onto the other's already-
+        // loaded Component instead of running `MagnetarRuntime::try_load`
+        // for each, the alias reusing a foreign binary would carry a digest
+        // neither its own trust entry nor a coincidence could satisfy. Each
+        // alias's own resident instance also reports a fresh, single
+        // materialization — a shared or reused instance would not.
+        let (_, qwen_materializations) = runtime
+            .magnetar_resident_debug("qwen-real")
+            .expect("Qwen resident debug should be available");
+        let (_, llama_materializations) = runtime
+            .magnetar_resident_debug("llama-real")
+            .expect("Llama resident debug should be available");
+        assert_eq!(
+            qwen_materializations, 1,
+            "the Qwen Component must materialize its own weights exactly once"
+        );
+        assert_eq!(
+            llama_materializations, 1,
+            "the Llama Component must materialize its own weights exactly once"
+        );
+
+        let telemetry = inference_execution_telemetry();
+        assert!(
+            telemetry
+                .iter()
+                .any(|event| event.alias == "qwen-real" && event.succeeded),
+            "the Qwen Component's own invocation must be recorded"
+        );
+        assert!(
+            telemetry
+                .iter()
+                .any(|event| event.alias == "llama-real" && event.succeeded),
+            "the Llama Component's own invocation must be recorded"
+        );
+
+        let _ = std::fs::remove_dir_all(qwen_dir);
+        let _ = std::fs::remove_dir_all(llama_dir);
     }
 }
