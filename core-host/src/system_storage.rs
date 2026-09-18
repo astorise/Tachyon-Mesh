@@ -420,9 +420,9 @@ const TOOL_CALL_PARSER_METADATA_KEY: &str = "toolCallParser";
 /// Build a registry row's opaque metadata bag from whatever a binding's
 /// artifact sidecar declared, or an empty bag when it declared nothing.
 fn registry_component_metadata(
-    tool_call_parser: Option<String>,
+    declared_parser: Option<String>,
 ) -> std::collections::BTreeMap<String, String> {
-    tool_call_parser
+    declared_parser
         .map(|parser| {
             std::collections::BTreeMap::from([(TOOL_CALL_PARSER_METADATA_KEY.to_owned(), parser)])
         })
