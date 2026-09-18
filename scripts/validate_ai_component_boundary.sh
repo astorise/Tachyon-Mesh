@@ -37,15 +37,30 @@ check_production_prefix_absent \
   'qwen|qwen_coder|mistral|llama|gemma|gguf|safetensors|onnx|tokenizer\.json|config\.json|ProductionQwenLoadedModel|HuggingFace(Ingestor|Tokenizer)|ModelRuntime|LoadedModel|IntegrityModelBinding|ModelDevice|LoadedAcceleratorModel|UpstreamAdmission|UPSTREAM_SCHEME|upstream_openai|AI_MODELS_REGISTRY_TABLE|ai-models-registry|hot_models|hot_model_aliases|load_accelerator_model|compute_accelerator_prompt|stream_accelerator_prompt|resolve_accelerator_model' \
   'core-host AI inference production code must stay Component-centric and model-family, tokenizer, provider, and upstream-protocol agnostic'
 
+check_production_prefix_absent \
+  core-host/src/ai_inference.rs \
+  'GenerationError|ComponentGeneration|StreamEvent::Refusal|StreamEvent::ToolCall|struct ToolCall\b|\bfinish_reason\s*:|\bprompt_tokens\s*:\s*u32|\bcompletion_tokens\s*:\s*u32' \
+  'core-host AI inference production code must not reintroduce typed chat-completion generation semantics (token usage, tool calls, finish reasons, refusals) as core concepts'
+
 check_absent \
   core-host/src/host_core/component_hosts.rs \
   'model_events|ModelUploaded|publish_model_uploaded|hot_models|hot_model_aliases|AI_MODELS_REGISTRY_TABLE|ai-models-registry|load_model|compute_detailed|compute_stream' \
   'component host bindings must expose Component/artifact contracts, not legacy model host APIs'
 
 check_absent \
+  core-host/src/host_core/component_hosts.rs \
+  'GenerationError|ComponentGeneration|ai_inference::ToolCall\b|StreamPayload::Refusal|StreamPayload::ToolCall|tachyon\.refusal|tachyon\.tool_call' \
+  'component host bindings must not reintroduce typed chat-completion generation semantics or dialect-specific metadata tags'
+
+check_absent \
   core-host/src/system_storage.rs \
   'model_events|ModelUploaded|publish_model_uploaded|AI_MODELS_REGISTRY_TABLE|ai-models-registry|modelPath|model_path' \
   'system storage must publish artifact/component events and registry rows'
+
+check_production_prefix_absent \
+  core-host/src/system_storage.rs \
+  '\btool_call_parser\s*:\s*Option<String>|const OPENAI_SCHEME' \
+  'system storage must not reintroduce a named tool-call-dialect struct field or a hardcoded upstream URI scheme constant'
 
 check_absent \
   core-host/src/host_core/admin_plane.rs \
@@ -102,7 +117,7 @@ check_absent \
   'paged_attention|cuda_graph_decode|flashinfer_attention|prefill_chunk_tokens|speculative_draft|stage_layer_ranges|expert_device_map|pipeline_depth' \
   'core domain types must not carry model-execution engine knobs'
 
-check_absent \
+check_production_prefix_absent \
   vendor/Magnetar/inference-components/src/lib.rs \
   'DEFAULT_COMPONENT|register_default_component|include_bytes!' \
   'generic Magnetar inference Component adapter must not select a compiled-in default Component'

@@ -93,23 +93,15 @@ pub(crate) fn inference_execution_telemetry() -> Vec<InferenceExecutionTelemetry
         .clone()
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TokenUsage {
-    pub(crate) prompt_tokens: u32,
-    pub(crate) completion_tokens: u32,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ToolCall {
-    pub(crate) id: Option<String>,
-    pub(crate) name: String,
-    pub(crate) arguments: String,
-}
-
+/// One decoded event from a Component invocation stream. Opaque on both
+/// arms: `Payload` is raw output bytes (never assumed to be UTF-8 text —
+/// that interpretation belongs to whichever layer actually needs it, e.g.
+/// `guest-openai` or the Magnetar adapter), `Metadata` is whatever tagged
+/// key/value pairs the Component's own execution chose to attach mid-stream.
+/// Mirrors `wit/accelerator/*.wit`'s `stream-event` variant exactly.
 pub(crate) enum StreamEvent<'a> {
-    Content(&'a str),
-    Refusal(&'a str),
-    ToolCall(ToolCall),
+    Payload(&'a [u8]),
+    Metadata(Vec<(String, String)>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,35 +133,31 @@ where
     }
 }
 
+/// Opaque metadata a Component invocation reports once it completes —
+/// whatever tagged key/value pairs the Component's own execution (or its
+/// adapter, e.g. Magnetar) chose to attach. Tachyon core does not name or
+/// interpret these; see `wit/accelerator/*.wit`'s `invocation-result.metadata`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StreamOutcome {
-    pub(crate) usage: Option<TokenUsage>,
-    pub(crate) finish_reason: Option<String>,
+    pub(crate) metadata: Vec<(String, String)>,
 }
 
-impl StreamOutcome {
-    fn usage(usage: Option<TokenUsage>) -> Self {
-        Self {
-            usage,
-            finish_reason: None,
-        }
-    }
-}
-
+/// A Component invocation failure. Mirrors `wit/accelerator/*.wit`'s
+/// `invocation-error` record field for field; Tachyon core does not attach
+/// any dialect-specific error taxonomy beyond what that opaque contract
+/// carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GenerationError {
+pub(crate) struct ComponentInvocationError {
     pub(crate) message: String,
     pub(crate) upstream_status: Option<u16>,
-    pub(crate) class: Option<String>,
     pub(crate) invalid_request: bool,
 }
 
-impl GenerationError {
+impl ComponentInvocationError {
     pub(crate) fn local(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             upstream_status: None,
-            class: None,
             invalid_request: false,
         }
     }
@@ -178,31 +166,30 @@ impl GenerationError {
         Self {
             message: message.into(),
             upstream_status: None,
-            class: None,
             invalid_request: true,
         }
     }
 }
 
-impl std::fmt::Display for GenerationError {
+impl std::fmt::Display for ComponentInvocationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl From<String> for GenerationError {
+impl From<String> for ComponentInvocationError {
     fn from(message: String) -> Self {
         Self::local(message)
     }
 }
 
+/// The result of one buffered Component invocation: opaque output bytes plus
+/// whatever opaque metadata tags the Component's execution attached. Mirrors
+/// `wit/accelerator/*.wit`'s `invocation-result` record.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ComponentGeneration {
-    pub(crate) text: String,
-    pub(crate) refusal: Option<String>,
-    pub(crate) usage: Option<TokenUsage>,
-    pub(crate) finish_reason: Option<String>,
-    pub(crate) tool_calls: Vec<ToolCall>,
+pub(crate) struct ComponentInvocationOutcome {
+    pub(crate) payload: Vec<u8>,
+    pub(crate) metadata: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -531,22 +518,30 @@ impl AiInferenceRuntime {
         Ok(())
     }
 
+    /// Test convenience only: no production call site needs readable text
+    /// back, so this is the one place in the production API surface that
+    /// still assumes the Component's output is UTF-8. Everything it calls
+    /// (and everything `component_hosts.rs` calls directly) stays opaque.
+    #[cfg(test)]
     pub(crate) fn compute_component_prompt(
         &self,
         alias: &str,
-        prompt: &str,
-    ) -> std::result::Result<String, GenerationError> {
-        self.compute_component_prompt_generation(alias, prompt)
-            .map(|generation| generation.text)
+        payload: &[u8],
+    ) -> std::result::Result<String, ComponentInvocationError> {
+        self.compute_component_prompt_generation(alias, payload)
+            .and_then(|outcome| {
+                String::from_utf8(outcome.payload)
+                    .map_err(|error| ComponentInvocationError::local(error.to_string()))
+            })
     }
 
     pub(crate) fn compute_component_prompt_generation(
         &self,
         alias: &str,
-        prompt: &str,
-    ) -> std::result::Result<ComponentGeneration, GenerationError> {
+        payload: &[u8],
+    ) -> std::result::Result<ComponentInvocationOutcome, ComponentInvocationError> {
         self.ensure_component_loaded(alias, AcceleratorKind::Cpu)
-            .map_err(GenerationError::local)?;
+            .map_err(ComponentInvocationError::local)?;
         let model = self
             .inference_components
             .read()
@@ -554,18 +549,13 @@ impl AiInferenceRuntime {
             .get(alias)
             .cloned()
             .ok_or_else(|| {
-                GenerationError::local(format!("component alias `{alias}` is not loaded"))
+                ComponentInvocationError::local(format!("component alias `{alias}` is not loaded"))
             })?;
         let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
-        let output = execute_model(&model, prompt.as_bytes())?;
-        let text = String::from_utf8(output.bytes)
-            .map_err(|error| GenerationError::local(error.to_string()))?;
-        Ok(ComponentGeneration {
-            text,
-            refusal: output.refusal,
-            usage: output.usage,
-            finish_reason: output.finish_reason,
-            tool_calls: output.tool_calls,
+        let output = execute_model(&model, payload)?;
+        Ok(ComponentInvocationOutcome {
+            payload: output.bytes,
+            metadata: output.metadata,
         })
     }
 
@@ -573,9 +563,9 @@ impl AiInferenceRuntime {
         &self,
         alias: &str,
         _input: &str,
-    ) -> std::result::Result<Vec<f32>, GenerationError> {
+    ) -> std::result::Result<Vec<f32>, ComponentInvocationError> {
         self.ensure_component_loaded(alias, AcceleratorKind::Cpu)
-            .map_err(GenerationError::local)?;
+            .map_err(ComponentInvocationError::local)?;
         let model = self
             .inference_components
             .read()
@@ -583,10 +573,10 @@ impl AiInferenceRuntime {
             .get(alias)
             .cloned()
             .ok_or_else(|| {
-                GenerationError::local(format!("component alias `{alias}` is not loaded"))
+                ComponentInvocationError::local(format!("component alias `{alias}` is not loaded"))
             })?;
         let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
-        Err(GenerationError::invalid_request(format!(
+        Err(ComponentInvocationError::invalid_request(format!(
             "component `{alias}` does not expose dense text embeddings through the generic Tachyon invocation contract"
         )))
     }
@@ -594,11 +584,11 @@ impl AiInferenceRuntime {
     pub(crate) fn stream_component_prompt(
         &self,
         alias: &str,
-        prompt: &str,
+        payload: &[u8],
         sink: &mut dyn StreamSink,
-    ) -> std::result::Result<StreamOutcome, GenerationError> {
+    ) -> std::result::Result<StreamOutcome, ComponentInvocationError> {
         self.ensure_component_loaded(alias, AcceleratorKind::Cpu)
-            .map_err(GenerationError::local)?;
+            .map_err(ComponentInvocationError::local)?;
         let model = self
             .inference_components
             .read()
@@ -606,32 +596,31 @@ impl AiInferenceRuntime {
             .get(alias)
             .cloned()
             .ok_or_else(|| {
-                GenerationError::local(format!("component alias `{alias}` is not loaded"))
+                ComponentInvocationError::local(format!("component alias `{alias}` is not loaded"))
             })?;
         let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
         match &model.runtime {
             ComponentRuntime::Mock { .. } => {
                 if sink.is_live() {
-                    sink.emit(StreamEvent::Content(MOCK_INFERENCE_RESPONSE));
+                    sink.emit(StreamEvent::Payload(MOCK_INFERENCE_RESPONSE.as_bytes()));
                 }
                 record_execution(&model.alias, model.accelerator().as_str(), true);
-                Ok(StreamOutcome::usage(Some(mock_token_usage(
-                    prompt.as_bytes(),
-                    MOCK_INFERENCE_RESPONSE,
-                ))))
+                Ok(StreamOutcome {
+                    metadata: mock_component_metadata(payload, MOCK_INFERENCE_RESPONSE.as_bytes()),
+                })
             }
             ComponentRuntime::Magnetar(runtime) => {
                 let mut emit = |fragment: &str| {
                     if sink.is_live() {
-                        sink.emit(StreamEvent::Content(fragment))
+                        sink.emit(StreamEvent::Payload(fragment.as_bytes()))
                     } else {
                         StreamControl::Stop
                     }
                 };
                 let result = runtime
-                    .generate_streaming(&[prompt.as_bytes()], &mut emit)
-                    .map(|usage| StreamOutcome::usage(Some(usage)))
-                    .map_err(magnetar_generation_error);
+                    .generate_streaming(&[payload], &mut emit)
+                    .map(|metadata| StreamOutcome { metadata })
+                    .map_err(magnetar_invocation_error);
                 record_execution(&model.alias, runtime.executed_on(), result.is_ok());
                 result
             }
@@ -733,11 +722,11 @@ fn magnetar_provider_is_cuda(provider: &magnetar_runtime::ProviderAdvertisement)
     provider.device_class == magnetar_runtime::ProviderDeviceClass::Cuda
 }
 
-fn magnetar_generation_error(error: anyhow::Error) -> GenerationError {
-    if magnetar_runtime::is_invalid_generation_request(&error) {
-        GenerationError::invalid_request(error.to_string())
+fn magnetar_invocation_error(error: anyhow::Error) -> ComponentInvocationError {
+    if magnetar_runtime::is_invalid_component_invocation(&error) {
+        ComponentInvocationError::invalid_request(error.to_string())
     } else {
-        GenerationError::local(error.to_string())
+        ComponentInvocationError::local(error.to_string())
     }
 }
 
@@ -800,10 +789,7 @@ fn adjust_queue_depth(
 
 struct ComponentOutput {
     bytes: Vec<u8>,
-    usage: Option<TokenUsage>,
-    finish_reason: Option<String>,
-    tool_calls: Vec<ToolCall>,
-    refusal: Option<String>,
+    metadata: Vec<(String, String)>,
 }
 
 fn load_binding(binding: &IntegrityInferenceComponentBinding) -> Result<LoadedInferenceComponent> {
@@ -839,31 +825,22 @@ fn load_binding(binding: &IntegrityInferenceComponentBinding) -> Result<LoadedIn
 fn execute_model(
     model: &LoadedInferenceComponent,
     prompt: &[u8],
-) -> std::result::Result<ComponentOutput, GenerationError> {
+) -> std::result::Result<ComponentOutput, ComponentInvocationError> {
     match &model.runtime {
         ComponentRuntime::Mock { .. } => {
             record_execution(&model.alias, model.accelerator().as_str(), true);
             Ok(ComponentOutput {
                 bytes: MOCK_INFERENCE_RESPONSE.as_bytes().to_vec(),
-                usage: Some(mock_token_usage(prompt, MOCK_INFERENCE_RESPONSE)),
-                finish_reason: None,
-                tool_calls: Vec::new(),
-                refusal: None,
+                metadata: mock_component_metadata(prompt, MOCK_INFERENCE_RESPONSE.as_bytes()),
             })
         }
         ComponentRuntime::Magnetar(runtime) => {
             let result = runtime
                 .generate(&[prompt])
-                .map_err(magnetar_generation_error)
+                .map_err(magnetar_invocation_error)
                 .map(|mut outputs| {
-                    let (bytes, usage) = outputs.remove(0);
-                    ComponentOutput {
-                        bytes,
-                        usage: Some(usage),
-                        finish_reason: None,
-                        tool_calls: Vec::new(),
-                        refusal: None,
-                    }
+                    let (bytes, metadata) = outputs.remove(0);
+                    ComponentOutput { bytes, metadata }
                 });
             record_execution(&model.alias, runtime.executed_on(), result.is_ok());
             result
@@ -912,14 +889,28 @@ pub(crate) fn assert_no_credential_collisions<'a>(
     Ok(())
 }
 
-fn mock_token_usage(prompt: &[u8], completion: &str) -> TokenUsage {
-    TokenUsage {
-        prompt_tokens: String::from_utf8_lossy(prompt)
-            .split_whitespace()
-            .count()
-            .max(1) as u32,
-        completion_tokens: completion.split_whitespace().count().max(1) as u32,
-    }
+/// Best-effort token-accounting metadata for the `mock:` test/dev Component,
+/// in the same opaque wire shape a real Component's own execution (or its
+/// adapter) reports; see `magnetar_runtime::usage_metadata`.
+fn mock_component_metadata(prompt: &[u8], completion: &[u8]) -> Vec<(String, String)> {
+    let prompt_tokens = String::from_utf8_lossy(prompt)
+        .split_whitespace()
+        .count()
+        .max(1);
+    let completion_tokens = String::from_utf8_lossy(completion)
+        .split_whitespace()
+        .count()
+        .max(1);
+    vec![
+        (
+            "tachyon.usage.prompt_tokens".to_owned(),
+            prompt_tokens.to_string(),
+        ),
+        (
+            "tachyon.usage.completion_tokens".to_owned(),
+            completion_tokens.to_string(),
+        ),
+    ]
 }
 
 #[cfg(test)]
@@ -936,6 +927,13 @@ mod tests {
                 .expect("time")
                 .as_nanos()
         ))
+    }
+
+    fn metadata_u32(metadata: &[(String, String)], key: &str) -> Option<u32> {
+        metadata
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .and_then(|(_, value)| value.parse().ok())
     }
 
     const HIDDEN_SIZE: u64 = 4;
@@ -979,6 +977,37 @@ mod tests {
             include_bytes!("../../vendor/Magnetar/magnetar-runtime/fixtures/components/qwen-real.component.wasm.magnetar-component.yaml"),
         )
         .expect("Component artifact manifest should be written");
+        write_tiny_production_model_data(path);
+    }
+
+    /// The same real, independently-compiled Llama Component Magnetar's own
+    /// test suite checks in (`loaded_inference_component_load_runs_a_real_
+    /// second_architecture_end_to_end`), paired with the identical
+    /// Hugging Face-shaped bundle `write_tiny_production_qwen_bundle` writes
+    /// — same tensors, same config, same tokenizer. Proves Tachyon's own
+    /// route -> alias -> `MagnetarRuntime::try_load` pipeline can load a
+    /// second, digest-distinct compiled Component binary, not just a second
+    /// alias (Tachyon integration audit MAG-01/MAG-06, #72).
+    fn write_tiny_production_llama_bundle(path: &Path) {
+        fs::create_dir_all(path).expect("fixture dir should be created");
+        fs::write(
+            path.join("llama-real.component.wasm"),
+            include_bytes!("../../vendor/Magnetar/magnetar-runtime/fixtures/components/llama-real.component.wasm"),
+        )
+        .expect("Component artifact should be written");
+        fs::write(
+            path.join("llama-real.component.wasm.magnetar-component.yaml"),
+            include_bytes!("../../vendor/Magnetar/magnetar-runtime/fixtures/components/llama-real.component.wasm.magnetar-component.yaml"),
+        )
+        .expect("Component artifact manifest should be written");
+        write_tiny_production_model_data(path);
+    }
+
+    /// The Model Artifact half of a tiny production-shaped bundle: config,
+    /// tokenizer, and safetensors weights. Shared by every fixture Component
+    /// this module writes, since each accepts the identical Hugging
+    /// Face-shaped directory — only the `*.component.wasm` differs.
+    fn write_tiny_production_model_data(path: &Path) {
         let config_json = format!(
             r#"{{
                 "architectures": ["Qwen2ForCausalLM"],
@@ -1124,17 +1153,24 @@ mod tests {
         path: PathBuf,
     }
 
+    /// Restores both trust env vars independently (they're set together by
+    /// `trust_tachyon_component_artifact` but tests sometimes clear just one
+    /// to isolate a single trust decision — see
+    /// `qwen_bundle_cannot_self_authorize_with_embedded_trust_policy`).
     struct TrustStoreEnvGuard {
         _qwen_lock: QwenInterprocessGuard,
         _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Option<std::ffi::OsString>,
-        path: PathBuf,
+        previous_component: Option<std::ffi::OsString>,
+        previous_model: Option<std::ffi::OsString>,
+        component_path: PathBuf,
+        model_path: PathBuf,
     }
 
     struct TrustStoreEnvUnsetGuard {
         _qwen_lock: QwenInterprocessGuard,
         _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Option<std::ffi::OsString>,
+        previous_component: Option<std::ffi::OsString>,
+        previous_model: Option<std::ffi::OsString>,
     }
 
     impl Drop for QwenInterprocessGuard {
@@ -1145,7 +1181,7 @@ mod tests {
 
     impl Drop for TrustStoreEnvGuard {
         fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
+            if let Some(previous) = self.previous_component.take() {
                 std::env::set_var(
                     magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
                     previous,
@@ -1153,17 +1189,26 @@ mod tests {
             } else {
                 std::env::remove_var(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
             }
-            let _ = std::fs::remove_file(&self.path);
+            if let Some(previous) = self.previous_model.take() {
+                std::env::set_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV, previous);
+            } else {
+                std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+            }
+            let _ = std::fs::remove_file(&self.component_path);
+            let _ = std::fs::remove_file(&self.model_path);
         }
     }
 
     impl Drop for TrustStoreEnvUnsetGuard {
         fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
+            if let Some(previous) = self.previous_component.take() {
                 std::env::set_var(
                     magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
                     previous,
                 );
+            }
+            if let Some(previous) = self.previous_model.take() {
+                std::env::set_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV, previous);
             }
         }
     }
@@ -1212,43 +1257,150 @@ mod tests {
     fn without_tachyon_component_trust_store() -> TrustStoreEnvUnsetGuard {
         let qwen_lock = qwen_interprocess_lock();
         let lock = trust_env_lock();
-        let previous = std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+        let previous_component =
+            std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
         std::env::remove_var(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+        let previous_model = std::env::var_os(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+        std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
         TrustStoreEnvUnsetGuard {
             _qwen_lock: qwen_lock,
             _lock: lock,
-            previous,
+            previous_component,
+            previous_model,
         }
     }
 
+    /// The real content digest of the single `*.component.wasm` under
+    /// `root`, computed the same way production code's `register_inference_
+    /// component_artifact` does (`ComponentDigest::sha256` over the raw
+    /// bytes) — never a value the fixture invents.
+    fn component_wasm_digest(root: &Path) -> String {
+        let component_path = std::fs::read_dir(root)
+            .expect("fixture root should be readable")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".component.wasm"))
+            })
+            .expect("fixture root should contain a *.component.wasm artifact");
+        let component_bytes =
+            std::fs::read(&component_path).expect("component artifact should be readable");
+        // `::magnetar_runtime` (leading `::`), not `magnetar_runtime` — this
+        // module's own `mod magnetar_runtime;` submodule shadows the crate
+        // of the same name.
+        ::magnetar_runtime::ComponentDigest::sha256(&component_bytes).value
+    }
+
+    /// Trusts both the Model Artifact (weights/tokenizer/config bundle) and
+    /// the Component (WASM) binary under `path` — two independent trust
+    /// decisions since Magnetar's `ArtifactTrustPolicy` split them
+    /// (Tachyon integration audit MAG-03); conflating them here would mean
+    /// this fixture stops proving what most tests actually need, which is
+    /// that a normal, fully-trusted load succeeds.
     fn trust_tachyon_component_artifact(path: &Path) -> TrustStoreEnvGuard {
         let qwen_lock = qwen_interprocess_lock();
         let lock = trust_env_lock();
-        let digest = magnetar_inference_component::local_bundle_manifest_digest(path)
+        let model_digest = magnetar_inference_component::local_bundle_manifest_digest(path)
             .expect("fixture should ingest before writing Tachyon trust policy");
-        let trust_path =
-            unique_model_dir("component-trust-policy").join("tachyon-component-trust.json");
-        std::fs::create_dir_all(
-            trust_path
-                .parent()
-                .expect("trust policy should have a parent"),
-        )
-        .expect("trust policy parent should be created");
+        let component_digest = component_wasm_digest(path);
+
+        let trust_dir = unique_model_dir("component-trust-policy");
+        std::fs::create_dir_all(&trust_dir).expect("trust policy dir should be created");
+
+        let component_path = trust_dir.join("tachyon-component-trust.json");
         fs::write(
-            &trust_path,
-            format!(r#"{{"trusted_digests":["{digest}"]}}"#),
+            &component_path,
+            format!(r#"{{"trusted_digests":["{component_digest}"]}}"#),
         )
-        .expect("trust sidecar should be written");
-        let previous = std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+        .expect("component trust sidecar should be written");
+
+        let model_path = trust_dir.join("tachyon-artifact-trust.json");
+        fs::write(
+            &model_path,
+            format!(r#"{{"trusted_digests":["{model_digest}"]}}"#),
+        )
+        .expect("model trust sidecar should be written");
+
+        let previous_component =
+            std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
         std::env::set_var(
             magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
-            &trust_path,
+            &component_path,
         );
+        let previous_model = std::env::var_os(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+        std::env::set_var(
+            magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV,
+            &model_path,
+        );
+
         TrustStoreEnvGuard {
             _qwen_lock: qwen_lock,
             _lock: lock,
-            previous,
-            path: trust_path,
+            previous_component,
+            previous_model,
+            component_path,
+            model_path,
+        }
+    }
+
+    /// [`trust_tachyon_component_artifact`] generalized to more than one
+    /// bundle root, trusting every root's Component (WASM) digest and Model
+    /// Artifact digest in one policy. Needed when a single route binds more
+    /// than one real Magnetar Component and each must be authorized
+    /// independently (Tachyon integration audit MAG-03).
+    fn trust_tachyon_component_artifacts(roots: &[&Path]) -> TrustStoreEnvGuard {
+        let qwen_lock = qwen_interprocess_lock();
+        let lock = trust_env_lock();
+
+        let component_digests = roots
+            .iter()
+            .map(|root| component_wasm_digest(root))
+            .collect::<Vec<_>>();
+        let model_digests = roots
+            .iter()
+            .map(|root| {
+                magnetar_inference_component::local_bundle_manifest_digest(root)
+                    .expect("fixture should ingest before writing Tachyon trust policy")
+            })
+            .collect::<Vec<_>>();
+
+        let trust_dir = unique_model_dir("component-trust-policy-multi");
+        std::fs::create_dir_all(&trust_dir).expect("trust policy dir should be created");
+
+        let component_path = trust_dir.join("tachyon-component-trust.json");
+        fs::write(
+            &component_path,
+            serde_json::json!({ "trusted_digests": component_digests }).to_string(),
+        )
+        .expect("component trust sidecar should be written");
+
+        let model_path = trust_dir.join("tachyon-artifact-trust.json");
+        fs::write(
+            &model_path,
+            serde_json::json!({ "trusted_digests": model_digests }).to_string(),
+        )
+        .expect("model trust sidecar should be written");
+
+        let previous_component =
+            std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+        std::env::set_var(
+            magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
+            &component_path,
+        );
+        let previous_model = std::env::var_os(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+        std::env::set_var(
+            magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV,
+            &model_path,
+        );
+
+        TrustStoreEnvGuard {
+            _qwen_lock: qwen_lock,
+            _lock: lock,
+            previous_component,
+            previous_model,
+            component_path,
+            model_path,
         }
     }
 
@@ -1279,7 +1431,7 @@ mod tests {
         })
         .expect("real Magnetar production Qwen bundle should load");
         let generation = runtime
-            .compute_component_prompt("qwen2_5", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .compute_component_prompt("qwen2_5", br#"{"prompt":"hi","max_new_tokens":1}"#)
             .expect("real Magnetar production Qwen should generate");
 
         assert!(!generation.is_empty());
@@ -1310,10 +1462,10 @@ mod tests {
             .magnetar_resident_debug("qwen_resident")
             .expect("resident model debug should be available");
         runtime
-            .compute_component_prompt("qwen_resident", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .compute_component_prompt("qwen_resident", br#"{"prompt":"hi","max_new_tokens":1}"#)
             .expect("first generation should succeed");
         runtime
-            .compute_component_prompt("qwen_resident", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .compute_component_prompt("qwen_resident", br#"{"prompt":"hi","max_new_tokens":1}"#)
             .expect("second generation should reuse resident model");
         let after = runtime
             .magnetar_resident_debug("qwen_resident")
@@ -1359,7 +1511,7 @@ mod tests {
                     runtime
                         .compute_component_prompt(
                             "qwen_concurrent",
-                            r#"{"prompt":"hi","max_new_tokens":1}"#,
+                            br#"{"prompt":"hi","max_new_tokens":1}"#,
                         )
                         .expect("concurrent generation should reuse resident model")
                 })
@@ -1403,7 +1555,7 @@ mod tests {
         let generation = runtime
             .compute_component_prompt(
                 "qwen2_5",
-                r#"{"messages":[{"role":"user","content":"hi"}],"temperature":0,"max_new_tokens":1}"#,
+                br#"{"messages":[{"role":"user","content":"hi"}],"temperature":0,"max_new_tokens":1}"#,
             )
             .expect("OpenAI chat messages should reach Magnetar PromptInput::ChatMessages");
 
@@ -1437,7 +1589,7 @@ mod tests {
         }
         impl StreamSink for DisconnectingSink {
             fn emit(&mut self, event: StreamEvent<'_>) -> StreamControl {
-                if let StreamEvent::Content(_) = event {
+                if let StreamEvent::Payload(_) = event {
                     self.content_events += 1;
                 }
                 StreamControl::Stop
@@ -1452,7 +1604,7 @@ mod tests {
         let outcome = runtime
             .stream_component_prompt(
                 "qwen-stream",
-                r#"{"prompt":"hi","max_new_tokens":16}"#,
+                br#"{"prompt":"hi","max_new_tokens":16}"#,
                 &mut sink,
             )
             .expect("downstream stop should cancel Magnetar streaming cleanly");
@@ -1462,9 +1614,8 @@ mod tests {
             "Tachyon must stop relaying after the downstream stream disconnects"
         );
         assert!(
-            outcome
-                .usage
-                .map(|usage| usage.completion_tokens <= 1)
+            metadata_u32(&outcome.metadata, "tachyon.usage.completion_tokens")
+                .map(|completion_tokens| completion_tokens <= 1)
                 .unwrap_or(true),
             "cancelled Magnetar stream must not continue to produce the full request"
         );
@@ -1496,6 +1647,12 @@ mod tests {
 
     #[test]
     fn explicit_magnetar_binding_rejects_untrusted_qwen_bundle() {
+        // Neither trust store is configured, so this exercises the
+        // Component (WASM) trust gate — checked first, before any model
+        // ingestion (Tachyon integration audit MAG-03) — not the Model
+        // Artifact one specifically; see
+        // `qwen_bundle_cannot_self_authorize_with_embedded_trust_policy`
+        // for a test that isolates the Model Artifact half.
         let _trust = without_tachyon_component_trust_store();
         let model_dir = unique_model_dir("untrusted-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
@@ -1508,6 +1665,41 @@ mod tests {
             hardware_strategy: Default::default(),
         }) {
             Ok(_) => panic!("Magnetar Qwen bundle must require explicit Tachyon trust policy"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error_chain_contains(&error, "no trust policy matched"),
+            "unexpected trust rejection error: {error:#}"
+        );
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn explicit_magnetar_binding_rejects_a_trusted_component_with_an_untrusted_model() {
+        // The two trust decisions are independent (Tachyon integration
+        // audit MAG-03): a Component binary the operator has explicitly
+        // trusted must still not authorize loading arbitrary, untrusted
+        // model weights through it. Mirrors
+        // `qwen_bundle_cannot_self_authorize_with_embedded_trust_policy`
+        // (which isolates the Model Artifact half) by isolating the other
+        // direction — Component trusted, Model Artifact not.
+        let model_dir = unique_model_dir("component-trusted-model-untrusted");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_component_artifact(&model_dir);
+        std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+
+        let error = match load_binding(&IntegrityInferenceComponentBinding {
+            alias: "qwen-model-untrusted".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ComponentPlacement::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }) {
+            Ok(_) => panic!(
+                "a trusted Component must not authorize loading untrusted model weights through it"
+            ),
             Err(error) => error,
         };
 
@@ -1549,15 +1741,21 @@ mod tests {
 
     #[test]
     fn qwen_bundle_cannot_self_authorize_with_embedded_trust_policy() {
+        // Component trust stays externally configured throughout (valid
+        // and untouched) so the load reaches Model Artifact ingestion at
+        // all; this test is specifically about the Model Artifact half of
+        // trust (hence asserting "trust rejected", the Model Artifact
+        // rejection message — see `magnetar_inference_component`'s
+        // `ArtifactTrustPolicy`), not the Component binary half.
         let model_dir = unique_model_dir("self-trusting-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
         let _trust = trust_tachyon_component_artifact(&model_dir);
-        let trust_path = std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV)
+        let trust_path = std::env::var_os(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV)
             .map(PathBuf::from)
             .expect("test trust policy should be configured");
-        std::fs::copy(&trust_path, model_dir.join(".tachyon-component-trust.json"))
+        std::fs::copy(&trust_path, model_dir.join(".tachyon-artifact-trust.json"))
             .expect("embedded fake trust policy should be copied");
-        std::env::remove_var(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+        std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
 
         let error = match load_binding(&IntegrityInferenceComponentBinding {
             alias: "qwen-self-trusting".to_owned(),
@@ -1642,7 +1840,7 @@ mod tests {
         })
         .expect("real Magnetar production Qwen CUDA bundle should load");
         let generation = runtime
-            .compute_component_prompt("qwen-cuda", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .compute_component_prompt("qwen-cuda", br#"{"prompt":"hi","max_new_tokens":1}"#)
             .expect("real Magnetar production Qwen should generate one token on CUDA");
 
         assert!(!generation.is_empty());
@@ -1685,13 +1883,13 @@ mod tests {
         let generation = runtime
             .compute_component_prompt_generation(
                 "qwen-cuda",
-                r#"{"prompt":"hi","max_new_tokens":16}"#,
+                br#"{"prompt":"hi","max_new_tokens":16}"#,
             )
             .expect("real Magnetar CUDA should generate multiple tokens device-resident");
 
-        assert!(!generation.text.is_empty());
+        assert!(!generation.payload.is_empty());
         assert_eq!(
-            generation.usage.map(|usage| usage.completion_tokens),
+            metadata_u32(&generation.metadata, "tachyon.usage.completion_tokens"),
             Some(16),
             "CUDA multi-token proof must generate exactly the requested token budget"
         );
@@ -1804,7 +2002,7 @@ mod tests {
             .load_inference_component("dynamic-cpu-qwen", AcceleratorKind::Cpu)
             .expect("dynamic CPU model should load through Reference CPU");
         let generation = runtime
-            .compute_component_prompt("dynamic-cpu-qwen", r#"{"prompt":"hi","max_new_tokens":1}"#)
+            .compute_component_prompt("dynamic-cpu-qwen", br#"{"prompt":"hi","max_new_tokens":1}"#)
             .expect("dynamic CPU model should generate through Magnetar Reference CPU");
 
         assert!(!generation.is_empty());
@@ -1958,8 +2156,15 @@ mod tests {
         assert!(!runtime.supports_accelerator(AcceleratorKind::Tpu));
     }
 
+    /// Proves alias-based dispatch on one route: two differently-aliased
+    /// `mock:` handles resolve and invoke independently. Does not prove two
+    /// *structurally* distinct Components load side by side — `mock:`
+    /// bindings never reach `MagnetarRuntime::try_load` at all, so both
+    /// aliases here answer with the same canned `MOCK_INFERENCE_RESPONSE`.
+    /// See `one_route_loads_two_structurally_distinct_magnetar_components`
+    /// for that proof through the real Magnetar path.
     #[test]
-    fn one_route_can_expose_two_distinct_inference_components() {
+    fn one_route_dispatches_two_aliases_to_independent_mock_handles() {
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.inference_components = vec![
             IntegrityInferenceComponentBinding {
@@ -1991,15 +2196,129 @@ mod tests {
         );
         assert_eq!(
             runtime
-                .compute_component_prompt("component-a", "ping")
+                .compute_component_prompt("component-a", b"ping")
                 .expect("component-a should invoke"),
             MOCK_INFERENCE_RESPONSE
         );
         assert_eq!(
             runtime
-                .compute_component_prompt("component-b", "ping")
+                .compute_component_prompt("component-b", b"ping")
                 .expect("component-b should invoke"),
             MOCK_INFERENCE_RESPONSE
         );
+    }
+
+    /// The heterogeneity proof `one_route_dispatches_two_aliases_to_
+    /// independent_mock_handles` cannot give: two *structurally* distinct,
+    /// independently-compiled Component binaries — Magnetar's own checked-in
+    /// Qwen and Llama fixtures, the same pair its own
+    /// `loaded_inference_component_load_runs_a_real_second_architecture_
+    /// end_to_end` test proves at the crate level — loaded side by side on
+    /// one route through Tachyon's real `MagnetarRuntime::try_load` path,
+    /// each invoked through its own resident instance.
+    #[test]
+    fn one_route_loads_two_structurally_distinct_magnetar_components() {
+        let qwen_dir = unique_model_dir("two-components-qwen");
+        let llama_dir = unique_model_dir("two-components-llama");
+        write_tiny_production_qwen_bundle(&qwen_dir);
+        write_tiny_production_llama_bundle(&llama_dir);
+        let _trust = trust_tachyon_component_artifacts(&[&qwen_dir, &llama_dir]);
+
+        let mut route = IntegrityRoute::user("/api/guest-ai");
+        route.inference_components = vec![
+            IntegrityInferenceComponentBinding {
+                alias: "qwen-real".to_owned(),
+                path: format!("magnetar:{}", qwen_dir.display()),
+                device: ComponentPlacement::Cpu,
+                qos: RouteQos::Standard,
+                dynamic: false,
+                hardware_strategy: Default::default(),
+            },
+            IntegrityInferenceComponentBinding {
+                alias: "llama-real".to_owned(),
+                path: format!("magnetar:{}", llama_dir.display()),
+                device: ComponentPlacement::Cpu,
+                qos: RouteQos::Standard,
+                dynamic: false,
+                hardware_strategy: Default::default(),
+            },
+        ];
+
+        let runtime = AiInferenceRuntime::from_config(&IntegrityConfig {
+            routes: vec![route],
+            ..IntegrityConfig::default_sealed()
+        })
+        .expect(
+            "two structurally distinct, independently-compiled real Magnetar Components \
+             should both load on one route",
+        );
+
+        assert_eq!(
+            runtime.loaded_component_aliases(),
+            vec!["llama-real".to_owned(), "qwen-real".to_owned()]
+        );
+
+        let qwen_output = runtime
+            .compute_component_prompt(
+                "qwen-real",
+                br#"{"prompt":"hello world","max_new_tokens":1}"#,
+            )
+            .expect("the Qwen Component should generate through its own resident instance");
+        let llama_output = runtime
+            .compute_component_prompt(
+                "llama-real",
+                br#"{"prompt":"hello world","max_new_tokens":1}"#,
+            )
+            .expect("the Llama Component should generate through its own resident instance");
+        assert!(!qwen_output.is_empty());
+        assert!(!llama_output.is_empty());
+
+        // The fixture pair really is two independently-compiled binaries,
+        // not two copies of the same one — the precondition the rest of this
+        // test's proof rests on.
+        assert_ne!(
+            component_wasm_digest(&qwen_dir),
+            component_wasm_digest(&llama_dir),
+            "the fixture pair must be independently-compiled, digest-distinct Component binaries"
+        );
+        // Both loads succeeded under a policy that trusted each digest
+        // independently (`trust_tachyon_component_artifacts`): had the
+        // runtime quietly deduplicated one binding onto the other's already-
+        // loaded Component instead of running `MagnetarRuntime::try_load`
+        // for each, the alias reusing a foreign binary would carry a digest
+        // neither its own trust entry nor a coincidence could satisfy. Each
+        // alias's own resident instance also reports a fresh, single
+        // materialization — a shared or reused instance would not.
+        let (_, qwen_materializations) = runtime
+            .magnetar_resident_debug("qwen-real")
+            .expect("Qwen resident debug should be available");
+        let (_, llama_materializations) = runtime
+            .magnetar_resident_debug("llama-real")
+            .expect("Llama resident debug should be available");
+        assert_eq!(
+            qwen_materializations, 1,
+            "the Qwen Component must materialize its own weights exactly once"
+        );
+        assert_eq!(
+            llama_materializations, 1,
+            "the Llama Component must materialize its own weights exactly once"
+        );
+
+        let telemetry = inference_execution_telemetry();
+        assert!(
+            telemetry
+                .iter()
+                .any(|event| event.alias == "qwen-real" && event.succeeded),
+            "the Qwen Component's own invocation must be recorded"
+        );
+        assert!(
+            telemetry
+                .iter()
+                .any(|event| event.alias == "llama-real" && event.succeeded),
+            "the Llama Component's own invocation must be recorded"
+        );
+
+        let _ = std::fs::remove_dir_all(qwen_dir);
+        let _ = std::fs::remove_dir_all(llama_dir);
     }
 }

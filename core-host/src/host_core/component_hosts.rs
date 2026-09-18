@@ -329,17 +329,20 @@ impl ComponentHostState {
         &self,
         expected_accelerator: ai_inference::AcceleratorKind,
         component_id: u32,
-        prompt: String,
-    ) -> std::result::Result<ai_inference::ComponentGeneration, ai_inference::GenerationError> {
+        payload: Vec<u8>,
+    ) -> std::result::Result<
+        ai_inference::ComponentInvocationOutcome,
+        ai_inference::ComponentInvocationError,
+    > {
         let loaded = self.resolve_accelerator_component(expected_accelerator, component_id)?;
         self.ai_runtime
             .as_ref()
             .ok_or_else(|| {
-                ai_inference::GenerationError::local(
+                ai_inference::ComponentInvocationError::local(
                     "AI inference runtime is unavailable for this component",
                 )
             })?
-            .compute_component_prompt_generation(&loaded.alias, &prompt)
+            .compute_component_prompt_generation(&loaded.alias, &payload)
     }
 
     /// Resolve a guest-held Component handle to the alias it was opened for.
@@ -352,17 +355,18 @@ impl ComponentHostState {
         &self,
         expected_accelerator: ai_inference::AcceleratorKind,
         component_id: u32,
-    ) -> std::result::Result<&LoadedAcceleratorComponent, ai_inference::GenerationError> {
+    ) -> std::result::Result<&LoadedAcceleratorComponent, ai_inference::ComponentInvocationError>
+    {
         let loaded = self
             .accelerator_components
             .get(&component_id)
             .ok_or_else(|| {
-                ai_inference::GenerationError::local(format!(
+                ai_inference::ComponentInvocationError::local(format!(
                     "accelerator Component handle `{component_id}` is unknown"
                 ))
             })?;
         if loaded.accelerator != expected_accelerator {
-            return Err(ai_inference::GenerationError::local(format!(
+            return Err(ai_inference::ComponentInvocationError::local(format!(
                 "accelerator Component handle `{component_id}` was loaded for `{}` not `{}`",
                 loaded.accelerator.as_str(),
                 expected_accelerator.as_str()
@@ -377,12 +381,12 @@ impl ComponentHostState {
         expected_accelerator: ai_inference::AcceleratorKind,
         component_id: u32,
         input: String,
-    ) -> std::result::Result<Vec<f32>, ai_inference::GenerationError> {
+    ) -> std::result::Result<Vec<f32>, ai_inference::ComponentInvocationError> {
         let loaded = self.resolve_accelerator_component(expected_accelerator, component_id)?;
         self.ai_runtime
             .as_ref()
             .ok_or_else(|| {
-                ai_inference::GenerationError::local(
+                ai_inference::ComponentInvocationError::local(
                     "AI inference runtime is unavailable for this component",
                 )
             })?
@@ -399,12 +403,12 @@ impl ComponentHostState {
         &self,
         expected_accelerator: ai_inference::AcceleratorKind,
         component_id: u32,
-        prompt: String,
-    ) -> std::result::Result<StreamedGeneration, ai_inference::GenerationError> {
+        payload: Vec<u8>,
+    ) -> std::result::Result<StreamedGeneration, ai_inference::ComponentInvocationError> {
         let loaded = self.resolve_accelerator_component(expected_accelerator, component_id)?;
         let alias = loaded.alias.clone();
         let ai_runtime = Arc::clone(self.ai_runtime.as_ref().ok_or_else(|| {
-            ai_inference::GenerationError::local(
+            ai_inference::ComponentInvocationError::local(
                 "AI inference runtime is unavailable for this component",
             )
         })?);
@@ -419,7 +423,7 @@ impl ComponentHostState {
         // cancellation: `send` blocks while the consumer is merely slow, and
         // fails only once it is gone.
         let (sender, receiver) = std::sync::mpsc::sync_channel::<
-            std::result::Result<StreamPayload, ai_inference::GenerationError>,
+            std::result::Result<StreamPayload, ai_inference::ComponentInvocationError>,
         >(STREAM_CHANNEL_CAPACITY);
         // Token counts are only known once generation ends, which is after the
         // last fragment has already gone down the channel. They therefore come
@@ -464,7 +468,7 @@ impl ComponentHostState {
                     stalled: &generation_stalled,
                     reported_stall: false,
                 };
-                match ai_runtime.stream_component_prompt(&alias, &prompt, &mut sink) {
+                match ai_runtime.stream_component_prompt(&alias, &payload, &mut sink) {
                     // An absent count means the backend could not measure, and
                     // stays absent in the slot: `usage()` then reports nothing
                     // rather than zeros, which a client would read as a
@@ -482,7 +486,7 @@ impl ComponentHostState {
                 // end of the stream.
             })
             .map_err(|error| {
-                ai_inference::GenerationError::local(format!(
+                ai_inference::ComponentInvocationError::local(format!(
                     "failed to spawn streaming generation thread: {error}"
                 ))
             })?;
@@ -2202,34 +2206,12 @@ type WitInvocationError =
     accelerator_component_bindings::tachyon::accelerator::cpu::InvocationError;
 
 #[cfg(feature = "ai-inference")]
-fn wit_invocation_error(error: ai_inference::GenerationError) -> WitInvocationError {
+fn wit_invocation_error(error: ai_inference::ComponentInvocationError) -> WitInvocationError {
     WitInvocationError {
         message: error.message,
         upstream_status: error.upstream_status,
         invalid_request: error.invalid_request,
     }
-}
-
-#[cfg(feature = "ai-inference")]
-fn invocation_metadata(generation: &ai_inference::ComponentGeneration) -> Vec<(String, String)> {
-    let mut metadata = Vec::new();
-    if let Some(usage) = generation.usage {
-        metadata.push((
-            "tachyon.usage.prompt_tokens".to_owned(),
-            usage.prompt_tokens.to_string(),
-        ));
-        metadata.push((
-            "tachyon.usage.completion_tokens".to_owned(),
-            usage.completion_tokens.to_string(),
-        ));
-    }
-    if let Some(finish_reason) = generation.finish_reason.as_ref() {
-        metadata.push(("tachyon.finish_reason".to_owned(), finish_reason.clone()));
-    }
-    if let Some(refusal) = generation.refusal.as_ref() {
-        metadata.push(("tachyon.refusal".to_owned(), refusal.clone()));
-    }
-    metadata
 }
 
 /// How many decoded events may sit between the generation thread and the guest.
@@ -2472,7 +2454,7 @@ impl StreamQueueBudget {
 #[cfg(feature = "ai-inference")]
 struct GuestStreamSink<'a> {
     sender: &'a std::sync::mpsc::SyncSender<
-        std::result::Result<StreamPayload, ai_inference::GenerationError>,
+        std::result::Result<StreamPayload, ai_inference::ComponentInvocationError>,
     >,
     consumer_alive: &'a Arc<std::sync::atomic::AtomicBool>,
     budget: &'a Arc<StreamQueueBudget>,
@@ -2487,9 +2469,8 @@ struct GuestStreamSink<'a> {
 impl ai_inference::StreamSink for GuestStreamSink<'_> {
     fn emit(&mut self, event: ai_inference::StreamEvent<'_>) -> ai_inference::StreamControl {
         let payload = match event {
-            ai_inference::StreamEvent::Content(text) => StreamPayload::Content(text.to_owned()),
-            ai_inference::StreamEvent::Refusal(text) => StreamPayload::Refusal(text.to_owned()),
-            ai_inference::StreamEvent::ToolCall(call) => StreamPayload::ToolCall(call),
+            ai_inference::StreamEvent::Payload(bytes) => StreamPayload::Payload(bytes.to_owned()),
+            ai_inference::StreamEvent::Metadata(tags) => StreamPayload::Metadata(tags),
         };
         // Charged before the send and refunded when the guest takes the event,
         // so the producer waits on the *bytes* outstanding rather than only on
@@ -2565,7 +2546,7 @@ impl GuestStreamSink<'_> {
             .store(true, std::sync::atomic::Ordering::Release);
         let _ = Self::send_before(
             self.sender,
-            Err(ai_inference::GenerationError::local(
+            Err(ai_inference::ComponentInvocationError::local(
                 "the client stopped reading this stream for longer than the backpressure limit \
                  allows, so generation was cancelled",
             )),
@@ -2581,9 +2562,9 @@ impl GuestStreamSink<'_> {
     /// is already full — a consumer keeping up never sleeps here.
     fn send_before(
         sender: &std::sync::mpsc::SyncSender<
-            std::result::Result<StreamPayload, ai_inference::GenerationError>,
+            std::result::Result<StreamPayload, ai_inference::ComponentInvocationError>,
         >,
-        mut payload: std::result::Result<StreamPayload, ai_inference::GenerationError>,
+        mut payload: std::result::Result<StreamPayload, ai_inference::ComponentInvocationError>,
         deadline: Instant,
     ) -> SlotSend {
         loop {
@@ -2618,22 +2599,22 @@ enum SlotSend {
 /// backend can emit a fragment without allocating when nobody needs to keep it.
 #[cfg(feature = "ai-inference")]
 enum StreamPayload {
-    Content(String),
-    Refusal(String),
-    ToolCall(ai_inference::ToolCall),
+    Payload(Vec<u8>),
+    Metadata(Vec<(String, String)>),
 }
 
 #[cfg(feature = "ai-inference")]
 impl StreamPayload {
     /// What this event costs while it waits in the channel. Approximate on
-    /// purpose — it counts the heap-allocated text, which is the part that
-    /// scales with the model's output and the only part worth bounding.
+    /// purpose — it counts the heap-allocated bytes, which is the part that
+    /// scales with the Component's output and the only part worth bounding.
     fn queued_bytes(&self) -> usize {
         match self {
-            Self::Content(text) | Self::Refusal(text) => text.len(),
-            Self::ToolCall(call) => {
-                call.name.len() + call.arguments.len() + call.id.as_ref().map_or(0, String::len)
-            }
+            Self::Payload(bytes) => bytes.len(),
+            Self::Metadata(tags) => tags
+                .iter()
+                .map(|(key, value)| key.len() + value.len())
+                .sum(),
         }
     }
 }
@@ -2641,7 +2622,7 @@ impl StreamPayload {
 #[cfg(feature = "ai-inference")]
 pub(crate) struct StreamedGeneration {
     receiver: std::sync::mpsc::Receiver<
-        std::result::Result<StreamPayload, ai_inference::GenerationError>,
+        std::result::Result<StreamPayload, ai_inference::ComponentInvocationError>,
     >,
     outcome: Arc<Mutex<ai_inference::StreamOutcome>>,
     consumer_alive: Arc<std::sync::atomic::AtomicBool>,
@@ -2652,7 +2633,7 @@ pub(crate) struct StreamedGeneration {
 #[cfg(feature = "ai-inference")]
 pub(crate) struct HostTokenStream {
     receiver: std::sync::mpsc::Receiver<
-        std::result::Result<StreamPayload, ai_inference::GenerationError>,
+        std::result::Result<StreamPayload, ai_inference::ComponentInvocationError>,
     >,
     outcome: Arc<Mutex<ai_inference::StreamOutcome>>,
     /// Refunded as each event is taken, and closed on drop so a producer
@@ -2714,19 +2695,13 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
         accelerator_component_bindings::tachyon::accelerator::cpu::InvocationResult,
         WitInvocationError,
     > {
-        let prompt = String::from_utf8(payload).map_err(|error| {
-            wit_invocation_error(ai_inference::GenerationError::invalid_request(format!(
-                "component invocation payload must be UTF-8 for the current Magnetar adapter: {error}"
-            )))
-        })?;
-        let generation = self
-            .invoke_accelerator_component(ai_inference::AcceleratorKind::Cpu, component_id, prompt)
+        let outcome = self
+            .invoke_accelerator_component(ai_inference::AcceleratorKind::Cpu, component_id, payload)
             .map_err(wit_invocation_error)?;
-        let metadata = invocation_metadata(&generation);
         Ok(
             accelerator_component_bindings::tachyon::accelerator::cpu::InvocationResult {
-                payload: generation.text.clone().into_bytes(),
-                metadata,
+                payload: outcome.payload,
+                metadata: outcome.metadata,
             },
         )
     }
@@ -2741,11 +2716,6 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
         >,
         WitInvocationError,
     > {
-        let prompt = String::from_utf8(payload).map_err(|error| {
-            wit_invocation_error(ai_inference::GenerationError::invalid_request(format!(
-                "component invocation payload must be UTF-8 for the current Magnetar adapter: {error}"
-            )))
-        })?;
         let StreamedGeneration {
             receiver,
             outcome,
@@ -2753,7 +2723,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
             budget,
             stalled,
         } = self
-            .stream_accelerator_component(ai_inference::AcceleratorKind::Cpu, component_id, prompt)
+            .stream_accelerator_component(ai_inference::AcceleratorKind::Cpu, component_id, payload)
             .map_err(wit_invocation_error)?;
         let handle = self
             .table
@@ -2766,7 +2736,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
                 saw_eof: false,
             })
             .map_err(|error| {
-                wit_invocation_error(ai_inference::GenerationError::local(format!(
+                wit_invocation_error(ai_inference::ComponentInvocationError::local(format!(
                     "failed to register token stream resource: {error}"
                 )))
             })?;
@@ -2789,7 +2759,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostByteStream
     > {
         let handle = wasmtime::component::Resource::<HostTokenStream>::new_borrow(self_.rep());
         let stream = self.table.get_mut(&handle).map_err(|error| {
-            wit_invocation_error(ai_inference::GenerationError::local(format!(
+            wit_invocation_error(ai_inference::ComponentInvocationError::local(format!(
                 "failed to access token stream resource: {error}"
             )))
         })?;
@@ -2803,22 +2773,14 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostByteStream
             stream.budget.release(payload.queued_bytes());
         }
         match received {
-            Ok(Ok(StreamPayload::Content(text))) => Ok(Some(
+            Ok(Ok(StreamPayload::Payload(bytes))) => Ok(Some(
                 accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Payload(
-                    text.into_bytes(),
+                    bytes,
                 ),
             )),
-            Ok(Ok(StreamPayload::Refusal(text))) => Ok(Some(
+            Ok(Ok(StreamPayload::Metadata(tags))) => Ok(Some(
                 accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Metadata(
-                    vec![("tachyon.refusal".to_owned(), text)],
-                ),
-            )),
-            Ok(Ok(StreamPayload::ToolCall(call))) => Ok(Some(
-                accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Metadata(
-                    vec![
-                        ("tachyon.tool_call.name".to_owned(), call.name),
-                        ("tachyon.tool_call.arguments".to_owned(), call.arguments),
-                    ],
+                    tags,
                 ),
             )),
             Ok(Err(error)) => Err(wit_invocation_error(error)),
@@ -2831,7 +2793,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostByteStream
                     .stalled
                     .swap(false, std::sync::atomic::Ordering::AcqRel)
                 {
-                    return Err(wit_invocation_error(ai_inference::GenerationError::local(
+                    return Err(wit_invocation_error(ai_inference::ComponentInvocationError::local(
                         "the client stopped reading this stream for longer than the backpressure \
                          limit allows, so generation was cancelled",
                     )));
@@ -2858,12 +2820,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostByteStream
         let Ok(outcome) = stream.outcome.lock() else {
             return Vec::new();
         };
-        let generation = ai_inference::ComponentGeneration {
-            usage: outcome.usage,
-            finish_reason: outcome.finish_reason.clone(),
-            ..Default::default()
-        };
-        invocation_metadata(&generation)
+        outcome.metadata.clone()
     }
 
     fn drop(
@@ -2903,17 +2860,8 @@ impl accelerator_component_bindings::tachyon::accelerator::gpu::Host for Compone
         accelerator_component_bindings::tachyon::accelerator::gpu::InvocationResult,
         accelerator_component_bindings::tachyon::accelerator::gpu::InvocationError,
     > {
-        let prompt = String::from_utf8(payload).map_err(|error| {
-            accelerator_component_bindings::tachyon::accelerator::gpu::InvocationError {
-                message: format!(
-                    "component invocation payload must be UTF-8 for the current Magnetar adapter: {error}"
-                ),
-                upstream_status: None,
-                invalid_request: true,
-            }
-        })?;
-        let generation = self
-            .invoke_accelerator_component(ai_inference::AcceleratorKind::Gpu, component_id, prompt)
+        let outcome = self
+            .invoke_accelerator_component(ai_inference::AcceleratorKind::Gpu, component_id, payload)
             .map_err(|error| {
                 accelerator_component_bindings::tachyon::accelerator::gpu::InvocationError {
                     message: error.message,
@@ -2923,8 +2871,8 @@ impl accelerator_component_bindings::tachyon::accelerator::gpu::Host for Compone
             })?;
         Ok(
             accelerator_component_bindings::tachyon::accelerator::gpu::InvocationResult {
-                payload: generation.text.clone().into_bytes(),
-                metadata: invocation_metadata(&generation),
+                payload: outcome.payload,
+                metadata: outcome.metadata,
             },
         )
     }
@@ -2944,17 +2892,8 @@ impl accelerator_component_bindings::tachyon::accelerator::npu::Host for Compone
         accelerator_component_bindings::tachyon::accelerator::npu::InvocationResult,
         accelerator_component_bindings::tachyon::accelerator::npu::InvocationError,
     > {
-        let prompt = String::from_utf8(payload).map_err(|error| {
-            accelerator_component_bindings::tachyon::accelerator::npu::InvocationError {
-                message: format!(
-                    "component invocation payload must be UTF-8 for the current Magnetar adapter: {error}"
-                ),
-                upstream_status: None,
-                invalid_request: true,
-            }
-        })?;
-        let generation = self
-            .invoke_accelerator_component(ai_inference::AcceleratorKind::Npu, component_id, prompt)
+        let outcome = self
+            .invoke_accelerator_component(ai_inference::AcceleratorKind::Npu, component_id, payload)
             .map_err(|error| {
                 accelerator_component_bindings::tachyon::accelerator::npu::InvocationError {
                     message: error.message,
@@ -2964,8 +2903,8 @@ impl accelerator_component_bindings::tachyon::accelerator::npu::Host for Compone
             })?;
         Ok(
             accelerator_component_bindings::tachyon::accelerator::npu::InvocationResult {
-                payload: generation.text.clone().into_bytes(),
-                metadata: invocation_metadata(&generation),
+                payload: outcome.payload,
+                metadata: outcome.metadata,
             },
         )
     }
@@ -2985,17 +2924,8 @@ impl accelerator_component_bindings::tachyon::accelerator::tpu::Host for Compone
         accelerator_component_bindings::tachyon::accelerator::tpu::InvocationResult,
         accelerator_component_bindings::tachyon::accelerator::tpu::InvocationError,
     > {
-        let prompt = String::from_utf8(payload).map_err(|error| {
-            accelerator_component_bindings::tachyon::accelerator::tpu::InvocationError {
-                message: format!(
-                    "component invocation payload must be UTF-8 for the current Magnetar adapter: {error}"
-                ),
-                upstream_status: None,
-                invalid_request: true,
-            }
-        })?;
-        let generation = self
-            .invoke_accelerator_component(ai_inference::AcceleratorKind::Tpu, component_id, prompt)
+        let outcome = self
+            .invoke_accelerator_component(ai_inference::AcceleratorKind::Tpu, component_id, payload)
             .map_err(|error| {
                 accelerator_component_bindings::tachyon::accelerator::tpu::InvocationError {
                     message: error.message,
@@ -3005,8 +2935,8 @@ impl accelerator_component_bindings::tachyon::accelerator::tpu::Host for Compone
             })?;
         Ok(
             accelerator_component_bindings::tachyon::accelerator::tpu::InvocationResult {
-                payload: generation.text.clone().into_bytes(),
-                metadata: invocation_metadata(&generation),
+                payload: outcome.payload,
+                metadata: outcome.metadata,
             },
         )
     }
@@ -4429,16 +4359,11 @@ mod stream_budget_tests {
     }
 
     #[test]
-    fn queued_bytes_counts_the_text_that_scales_with_the_answer() {
-        assert_eq!(StreamPayload::Content("hello".to_owned()).queued_bytes(), 5);
+    fn queued_bytes_counts_the_bytes_that_scale_with_the_answer() {
+        assert_eq!(StreamPayload::Payload(b"hello".to_vec()).queued_bytes(), 5);
         assert_eq!(
-            StreamPayload::ToolCall(ai_inference::ToolCall {
-                id: Some("id".to_owned()),
-                name: "read".to_owned(),
-                arguments: "{\"p\":1}".to_owned(),
-            })
-            .queued_bytes(),
-            2 + 4 + 7
+            StreamPayload::Metadata(vec![("key".to_owned(), "value".to_owned())]).queued_bytes(),
+            3 + 5
         );
     }
 }

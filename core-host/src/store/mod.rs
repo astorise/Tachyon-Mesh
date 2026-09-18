@@ -804,6 +804,10 @@ impl CoreStore {
     }
 
     /// Look up the current state of `key` without modifying it.
+    ///
+    /// Not called anywhere yet — no `/admin/*` introspection route exposes
+    /// distributed-lock state today. A correct, self-contained read path
+    /// kept for whenever that route lands, not a stub with nothing behind it.
     #[allow(dead_code)]
     pub(crate) fn lock_inspect(&self, key: &str) -> Result<Option<DistributedLockEntry>> {
         let read_txn = self
@@ -1429,15 +1433,14 @@ fn kv_partition_table_key(table_name: &str) -> String {
 }
 
 // ── Semantic graph store (hexastore) ─────────────────────────────────────────
-// All items in this section are reached through the `HostWorkspaceGraph` WIT
-// host binding dispatched by Wasmtime — invisible to the dead-code lint. The
-// `#[allow(dead_code)]` annotations below are tool-chain workarounds, NOT
-// experimental-feature placebos.
+// Reached through the `HostWorkspaceGraph` WIT host binding
+// (component_hosts.rs), which calls `CoreStore::graph_add_edges`/
+// `graph_delete_edges`/`graph_traverse` directly from ordinary Rust method
+// bodies — visible to the dead-code lint like any other call, so no
+// `#[allow(dead_code)]` is needed here.
 
-#[allow(dead_code)]
 const GRAPH_SEP: u8 = b'\0';
 
-#[allow(dead_code)]
 fn graph_spo_key(subject: &str, predicate: &str, object: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(subject.len() + predicate.len() + object.len() + 2);
     k.extend_from_slice(subject.as_bytes());
@@ -1448,7 +1451,6 @@ fn graph_spo_key(subject: &str, predicate: &str, object: &str) -> Vec<u8> {
     k
 }
 
-#[allow(dead_code)]
 fn graph_osp_key(object: &str, subject: &str, predicate: &str) -> Vec<u8> {
     let mut k = Vec::with_capacity(object.len() + subject.len() + predicate.len() + 2);
     k.extend_from_slice(object.as_bytes());
@@ -1459,7 +1461,6 @@ fn graph_osp_key(object: &str, subject: &str, predicate: &str) -> Vec<u8> {
     k
 }
 
-#[allow(dead_code)]
 fn graph_spo_prefix_range(subject: &str, predicate: &str) -> (Vec<u8>, Vec<u8>) {
     let mut start = Vec::with_capacity(subject.len() + predicate.len() + 2);
     start.extend_from_slice(subject.as_bytes());
@@ -1477,7 +1478,6 @@ fn graph_spo_prefix_range(subject: &str, predicate: &str) -> (Vec<u8>, Vec<u8>) 
 
 /// An edge in the semantic graph.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct GraphEdge {
     pub(crate) subject: String,
     pub(crate) predicate: String,
@@ -1485,10 +1485,8 @@ pub(crate) struct GraphEdge {
     pub(crate) properties: String,
 }
 
-#[allow(dead_code)]
 const GRAPH_TRAVERSE_LIMIT: usize = 10_000;
 
-#[allow(dead_code)]
 impl CoreStore {
     fn graph_spo_table(name: &str) -> String {
         format!("graph_{name}_spo")

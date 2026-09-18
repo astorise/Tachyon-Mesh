@@ -124,9 +124,6 @@ pub(crate) enum ScopeCategory {
     Http,
     Outbox,
     Storage,
-    // Reached via Wasmtime WIT host dispatch — invisible to the dead-code lint
-    // when the experimental feature is not active.
-    #[allow(dead_code)]
     Graph,
 }
 
@@ -350,8 +347,6 @@ impl DeploymentScopes {
         }
     }
 
-    // Reached via Wasmtime WIT host dispatch — invisible to dead-code lint without experimental.
-    #[allow(dead_code)]
     pub(crate) fn check_graph(&self, name: &str) -> bool {
         if self.allow_all {
             return true;
@@ -673,6 +668,11 @@ impl ScopeDenialCounters {
         record_scope_denial_prometheus(deployment, category);
     }
 
+    /// Not read anywhere yet — no `/admin/*` metrics route or test exercises
+    /// this counter today. Kept rather than removed: `secrets` is already
+    /// tracked (`self.secrets`, incremented by `increment`), so this is a
+    /// one-line accessor away from being wired into observability whenever
+    /// that lands, not aspirational code with nothing behind it.
     #[allow(dead_code)]
     pub(crate) fn total_secrets(&self) -> u64 {
         self.secrets.load(std::sync::atomic::Ordering::Relaxed)

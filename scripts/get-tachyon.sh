@@ -9,12 +9,14 @@
 #
 # --variant selects which of the release's feature builds to fetch (see
 # publish-server-binaries in .github/workflows/release.yml):
-#   default    admin-plane + ring (the plain Quick Start build; this is the
-#              default when --variant is omitted)
+#   default    admin-plane + ring + websockets + rate-limit + resiliency + mtls
+#              (the plain Quick Start build; this is the default when
+#              --variant is omitted)
 #   fips       --no-default-features --features fips
-#   http3      --features http3
-#   security   --features rate-limit,resiliency,mtls,secrets-vault,websockets
-#   ai         --features ai-inference (not built for windows or linux/aarch64)
+#   http3      --features http3 (adds HTTP/3 on top of default)
+#   security   --features secrets-vault (adds the secrets vault on top of default)
+#   ai         --features ai-inference (adds AI inference on top of default;
+#              not built for windows or linux/aarch64)
 #   no-default --no-default-features
 set -euo pipefail
 

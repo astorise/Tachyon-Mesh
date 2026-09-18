@@ -5025,6 +5025,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc04a4c58212d57930a24bf47d3fa87485264a3a054e9c10e042eb373573ad3c"
 
 [[package]]
+name = "magnetar-format-gguf"
+version = "0.1.0"
+dependencies = [
+ "magnetar-runtime",
+]
+
+[[package]]
 name = "magnetar-format-safetensors"
 version = "0.1.0"
 dependencies = [
@@ -5037,11 +5044,21 @@ name = "magnetar-inference-component"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "magnetar-loader-gguf",
  "magnetar-loader-huggingface",
  "magnetar-provider-cpu",
  "magnetar-provider-cuda",
  "magnetar-runtime",
  "serde_json",
+]
+
+[[package]]
+name = "magnetar-loader-gguf"
+version = "0.1.0"
+dependencies = [
+ "magnetar-format-gguf",
+ "magnetar-runtime",
+ "tokenizers",
 ]
 
 [[package]]

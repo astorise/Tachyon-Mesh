@@ -7,11 +7,10 @@ pub(crate) use store::GraphEdge;
 /// when the Wasm guest releases the handle, which prevents redb
 /// reader exhaustion on long-running FaaS invocations.
 ///
-/// `#[allow(dead_code)]`: the struct is constructed inside the WIT
-/// `HostWorkspaceGraph::new()` host binding and stored in a
-/// `wasmtime::component::ResourceTable`, which is opaque to the
-/// dead-code lint. This is NOT an experimental-feature placebo.
-#[allow(dead_code)]
+/// `wasmtime::component::ResourceTable<T>` is a typed table — `get`/`get_mut`
+/// return an ordinary `&T`/`&mut T`, not a type-erased handle — so every
+/// field this struct's own methods read back is visible to the dead-code
+/// lint like any other field access; no dead-code allow is needed.
 pub(crate) struct WorkspaceGraphResource {
     pub(crate) graph_name: String,
     pub(crate) core_store: Arc<store::CoreStore>,

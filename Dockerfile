@@ -253,6 +253,14 @@ ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 EXPOSE 8081
 
+# Numeric UID/GID: `scratch` has no /etc/passwd for a named user to resolve
+# against. 65532 is the conventional "nonroot" distroless UID; a Kubernetes
+# manifest's own `securityContext.runAsUser` overrides this, but Docker/
+# Compose/Podman users who never see that manifest still get a non-root
+# default. legacy-mock is a stateless test/e2e HTTP fixture — no writable
+# path is needed.
+USER 65532:65532
+
 ENTRYPOINT ["/app/legacy-mock"]
 
 FROM scratch AS runtime
@@ -289,5 +297,18 @@ COPY --from=host-builder /workspace/staging-modules/ /app/guest-modules/
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 EXPOSE 8080
+
+# Numeric UID/GID: `scratch` has no /etc/passwd for a named user to resolve
+# against. 65532 is the conventional "nonroot" distroless UID, matching
+# manifests/deploy.yaml's `securityContext.runAsUser`. A Kubernetes
+# manifest's own `securityContext.runAsUser` overrides this at deploy time,
+# but Docker/Compose/Podman users who never see that manifest still get a
+# non-root default. Every deployment manifest under manifests/ that lets
+# core-host resolve its manifest path (and therefore its auth-state/
+# core-store/buffered-request-spool/host-identity paths, which all derive
+# from that path's parent directory) to a location this UID cannot write —
+# `/app` by default — must redirect TACHYON_INTEGRITY_MANIFEST to a writable
+# mount, same as manifests/deploy.yaml already does.
+USER 65532:65532
 
 ENTRYPOINT ["/app/core-host"]
