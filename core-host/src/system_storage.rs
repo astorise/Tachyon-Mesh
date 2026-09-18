@@ -2473,7 +2473,6 @@ mod registry_casing_tests {
     /// miss), making uploaded artifacts invisible in `GET /ai/v1/components`.
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
-    #[allow(dead_code)]
     struct GuestOpenAiComponentInfoReader {
         alias: String,
         engine: String,

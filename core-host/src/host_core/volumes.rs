@@ -710,7 +710,6 @@ pub(crate) fn snapshot_path_for_volume(active_path: &Path) -> PathBuf {
 // ── S3 volume lifecycle ────────────────────────────────────────────────────────
 
 /// Carries the prepared temporary directory for one S3 volume invocation.
-#[allow(dead_code)]
 pub(crate) struct S3VolumePrep {
     /// Guest-side mount path (e.g. `/app/data`).
     pub(crate) guest_path: String,

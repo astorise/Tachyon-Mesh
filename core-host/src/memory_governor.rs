@@ -69,8 +69,10 @@ impl MemoryGovernor {
     }
 
     /// Updates the tracked VRAM utilization. Activates PCIe host-RAM offloading
-    /// when `pct >= VRAM_CRITICAL_THRESHOLD_PCT`. Called by the AI inference
-    /// runtime each time it updates its accelerator load metrics.
+    /// when `pct >= VRAM_CRITICAL_THRESHOLD_PCT`. Not currently called by
+    /// production code — no accelerator load path reports utilization back to
+    /// this governor yet — so `#[allow(dead_code)]` covers the non-test build
+    /// this crate ships; exercised directly by this module's own tests below.
     #[allow(dead_code)]
     pub(crate) fn set_vram_utilization(&self, pct: u8) {
         let pct = pct.min(100);

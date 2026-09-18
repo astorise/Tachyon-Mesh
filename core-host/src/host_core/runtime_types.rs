@@ -1002,7 +1002,6 @@ pub(crate) struct HostStreamingBodySlot {
 /// Host state stored in the `ResourceTable` behind a
 /// `tachyon:mesh/response-body::streaming-response` resource handle. Produced
 /// by the `get-streaming-response` host function from a `HostStreamingBodySlot`.
-#[allow(dead_code)]
 pub(crate) struct HostStreamingResponseResource {
     /// `None` once `begin()` has been called (sender consumed).
     pub(crate) headers_tx: Option<tokio::sync::oneshot::Sender<(StatusCode, GuestHttpFields)>>,
@@ -1138,10 +1137,10 @@ pub(crate) struct PropagatedHeader {
 /// Stored in the `ComponentHostState::table` `ResourceTable`; dropped
 /// automatically when the Wasm guest lets the handle go out of scope.
 ///
-/// `#[allow(dead_code)]`: same justification as `WorkspaceGraphResource` —
-/// constructed inside WIT host bindings and stored type-erased in a
-/// `ResourceTable`. Not an experimental-feature placebo.
-#[allow(dead_code)]
+/// `wasmtime::component::ResourceTable<T>` is a typed table, not a
+/// type-erased one, so field reads through it (`&res.table_name` etc.) are
+/// visible to the dead-code lint like any other field access; no
+/// `#[allow(dead_code)]` is needed.
 pub(crate) struct RedbTableResource {
     pub(crate) table_name: String,
     pub(crate) core_store: Arc<store::CoreStore>,
