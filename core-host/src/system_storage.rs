@@ -391,11 +391,15 @@ struct RegistryComponentInfo<'a> {
     /// unknown fields, so adding it does not disturb the reader.
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<&'a str>,
-    /// Opaque tool-call parser metadata declared by the artifact sidecar.
-    /// Tachyon does not interpret dialect names; `guest-openai`, Magnetar, or
-    /// the Component boundary owns that protocol decision.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_parser: Option<String>,
+    /// Opaque, uninterpreted key/value metadata a binding's artifact sidecar
+    /// declares — e.g. a tool-call dialect name a `guest-openai`-side consumer
+    /// looks for under the `toolCallParser` key. Tachyon does not name or
+    /// interpret any entry here; it stores and republishes whatever the
+    /// Component/artifact boundary attached, verbatim. Flattened so each entry
+    /// still lands as its own top-level JSON field, matching the wire shape a
+    /// dedicated `tool_call_parser` field would have produced.
+    #[serde(flatten)]
+    component_metadata: std::collections::BTreeMap<String, String>,
     /// Set on a *reservation* row: the alias is still the manifest's, but no
     /// runtime is serving it right now. Written for the length of a hot-reload
     /// swap, and overwritten by the real row when publication follows.
@@ -405,6 +409,24 @@ struct RegistryComponentInfo<'a> {
     /// still answers `true`, so an upload cannot claim the alias in the gap.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     withdrawn: bool,
+}
+
+/// The wire key a declared tool-call dialect rides under in a registry row's
+/// opaque `component_metadata` bag — `guest-openai`'s `ModelInfo` reads this
+/// exact camelCase key. Tachyon core does not interpret the value; this is
+/// only the one key name core-host itself still writes into the bag.
+const TOOL_CALL_PARSER_METADATA_KEY: &str = "toolCallParser";
+
+/// Build a registry row's opaque metadata bag from whatever a binding's
+/// artifact sidecar declared, or an empty bag when it declared nothing.
+fn registry_component_metadata(
+    tool_call_parser: Option<String>,
+) -> std::collections::BTreeMap<String, String> {
+    tool_call_parser
+        .map(|parser| {
+            std::collections::BTreeMap::from([(TOOL_CALL_PARSER_METADATA_KEY.to_owned(), parser)])
+        })
+        .unwrap_or_default()
 }
 
 /// The tool-call dialect to advertise for a configured binding.
@@ -444,19 +466,21 @@ const REGISTRY_SOURCE_CONFIG: &str = "config";
 /// resolves a request against either form, so this string is part of the public
 /// component id — not just metadata.
 #[cfg(feature = "ai-inference")]
-fn binding_engine_label(path: &str) -> &'static str {
-    // The `openai:` scheme is classified here, not in `ai_inference`: that
-    // module stays Component-centric and upstream-protocol agnostic, but the
-    // registry still has to tell clients which alias points at a remote
-    // OpenAI-compatible endpoint versus a local artifact.
-    const OPENAI_SCHEME: &str = "openai:";
+fn binding_engine_label(path: &str) -> &str {
     let path = path.trim();
-    if path.starts_with(OPENAI_SCHEME) {
-        "openai"
-    } else if path == "mock" || path.starts_with("mock:") {
+    if path == "mock" || path.starts_with("mock:") {
         "mock"
     } else if path.starts_with(crate::ai_inference::MAGNETAR_PATH_PREFIX) {
         "magnetar"
+    } else if let Some((scheme, _rest)) = path.split_once(':') {
+        // A `scheme:...` binding names a remote provider this registry does
+        // not interpret. The scheme itself — `openai`, or whatever a future
+        // upstream protocol calls itself — is the only classification
+        // core-host needs to make, and it is read back verbatim rather than
+        // matched against a list of protocols core-host knows about: adding
+        // a new upstream scheme is then purely additive at the Component/
+        // guest boundary, with no core-host change required.
+        scheme
     } else {
         "local"
     }
@@ -500,7 +524,9 @@ pub(crate) fn publish_configured_component_bindings(
                 status: "available",
                 artifact_path: &binding.path,
                 source: Some(REGISTRY_SOURCE_CONFIG),
-                tool_call_parser: binding_tool_call_parser(&binding.path),
+                component_metadata: registry_component_metadata(binding_tool_call_parser(
+                    &binding.path,
+                )),
                 withdrawn: false,
             };
             let Ok(value) = serde_json::to_vec(&info) else {
@@ -1066,7 +1092,7 @@ pub(crate) fn withdraw_changed_component_bindings(
             status: "reloading",
             artifact_path: "",
             source: Some(REGISTRY_SOURCE_CONFIG),
-            tool_call_parser: None,
+            component_metadata: std::collections::BTreeMap::new(),
             withdrawn: true,
         }));
         let reservation = match reservation {
@@ -1176,7 +1202,9 @@ impl bindings::tachyon::mesh::artifact_events::Host for StorageComponentState {
             status: "available",
             artifact_path: &event.artifact_path,
             source: None,
-            tool_call_parser: binding_tool_call_parser(&event.artifact_path),
+            component_metadata: registry_component_metadata(binding_tool_call_parser(
+                &event.artifact_path,
+            )),
             withdrawn: false,
         };
         let value = serde_json::to_vec(&info)
@@ -2464,7 +2492,7 @@ mod registry_casing_tests {
             status: "available",
             artifact_path: "/data/tachyon_data/components/tinyllama",
             source: None,
-            tool_call_parser: Some("qwen".to_owned()),
+            component_metadata: registry_component_metadata(Some("qwen".to_owned())),
             withdrawn: false,
         };
         let bytes = serde_json::to_vec(&info).expect("serialize registry entry");
@@ -2513,7 +2541,7 @@ mod registry_casing_tests {
             status: "available",
             artifact_path: "/data/tachyon_data/components/tinyllama",
             source: None,
-            tool_call_parser: None,
+            component_metadata: registry_component_metadata(None),
             withdrawn: false,
         };
         let value: serde_json::Value =
