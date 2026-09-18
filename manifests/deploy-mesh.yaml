@@ -105,6 +105,13 @@ spec:
           volumeMounts:
             - name: tachyon-store
               mountPath: /app/data
+            # readOnlyRootFilesystem: true also removes the writable /tmp
+            # core-host's UDS peer-discovery registry defaults to
+            # (/tmp/tachyon/peers) — sockets, so kept off the tachyon-store
+            # PVC deliberately: some storage classes (e.g. NFS) don't
+            # support UNIX sockets, while local emptyDir always does.
+            - name: tmp-vol
+              mountPath: /tmp
           readinessProbe:
             tcpSocket:
               port: 8080
@@ -115,6 +122,9 @@ spec:
               port: 8080
             initialDelaySeconds: 30
             periodSeconds: 20
+      volumes:
+        - name: tmp-vol
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: tachyon-store

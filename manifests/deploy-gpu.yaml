@@ -130,6 +130,13 @@ spec:
               mountPath: /var/lib/tachyon/models
             - name: state-vol
               mountPath: /state
+            # readOnlyRootFilesystem: true also removes the writable /tmp
+            # core-host's UDS peer-discovery registry defaults to
+            # (/tmp/tachyon/peers) — sockets, so kept off state-vol
+            # deliberately in case that volume type ever changes; local
+            # emptyDir always supports UNIX sockets.
+            - name: tmp-vol
+              mountPath: /tmp
           readinessProbe:
             tcpSocket:
               port: 8080
@@ -153,6 +160,8 @@ spec:
         # directories. Ephemeral (no PVC): this Deployment has none today,
         # matching its behavior before this change.
         - name: state-vol
+          emptyDir: {}
+        - name: tmp-vol
           emptyDir: {}
 
 ---
