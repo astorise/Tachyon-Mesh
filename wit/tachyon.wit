@@ -101,7 +101,7 @@ interface telemetry-reader {
         network-rt-load: u32,
         network-standard-load: u32,
         network-batch-load: u32,
-        hot-models: list<string>,
+        hot-inference-components: list<string>,
         dropped-events: u64,
         last-status: u16,
         total-duration-us: u64,
@@ -156,7 +156,7 @@ interface training {
     }
 
     record training-job {
-        base-model: string,
+        base-component-ref: string,
         dataset: dataset-handle,
         rank: rank,
         max-steps: step-budget,
@@ -189,21 +189,21 @@ interface storage-broker {
     restore-volume: func(volume-id: string, snapshot-path: string, destination-path: string) -> result<_, string>;
 }
 
-interface model-events {
-    record model-file {
+interface artifact-events {
+    record artifact-file {
         path: string,
         size-bytes: u64,
         sha256: string,
     }
 
-    record model-uploaded {
+    record artifact-uploaded {
         alias: string,
         engine: string,
-        model-path: string,
-        files: list<model-file>,
+        artifact-path: string,
+        files: list<artifact-file>,
     }
 
-    publish-model-uploaded: func(event: model-uploaded) -> result<_, string>;
+    publish-artifact-uploaded: func(event: artifact-uploaded) -> result<_, string>;
 }
 
 interface outbound-http {
@@ -356,7 +356,7 @@ world system-faas-guest {
     import custom-metrics;
     import scaling-metrics;
     import storage-broker;
-    import model-events;
+    import artifact-events;
     import outbound-http;
     export handler;
 }

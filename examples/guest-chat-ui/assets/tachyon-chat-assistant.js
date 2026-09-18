@@ -1,6 +1,6 @@
 const DEFAULT_ENDPOINT = "/ai/v1/chat/completions";
 const DEFAULT_MODELS_ENDPOINT = "/ai/v1/models";
-const DEFAULT_MODEL = "safetensors/nvidia--Qwen3.6-35B-A3B-NVFP4";
+const DEFAULT_MODEL = "magnetar/qwen2.5-0.5b-instruct";
 
 class TachyonChatAssistant extends HTMLElement {
   constructor() {

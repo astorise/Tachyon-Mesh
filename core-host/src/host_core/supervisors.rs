@@ -714,7 +714,7 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
     // A missing row is a client's retry; a wrong one is a prompt sent somewhere
     // it did not choose.
     #[cfg(feature = "ai-inference")]
-    crate::system_storage::withdraw_changed_model_bindings(
+    crate::system_storage::withdraw_changed_component_bindings(
         &state.core_store,
         &previous_runtime_config,
         &runtime.config,
@@ -745,7 +745,7 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
     // Best-effort, like the boot-time publication: the reload itself must not
     // fail on a registry write.
     #[cfg(feature = "ai-inference")]
-    publish_configured_model_bindings_with_retry(&state.core_store, &runtime.config).await;
+    publish_configured_component_bindings_with_retry(&state.core_store, &runtime.config).await;
     state
         .host_identity
         .clear_route_token_cache()
@@ -778,7 +778,7 @@ pub(crate) async fn reload_runtime_from_disk(state: &AppState) -> Result<()> {
 /// on the registry. The last failure is reported at `error` so the gap is
 /// visible rather than inferred from a 404.
 #[cfg(feature = "ai-inference")]
-async fn publish_configured_model_bindings_with_retry(
+async fn publish_configured_component_bindings_with_retry(
     core_store: &store::CoreStore,
     config: &crate::IntegrityConfig,
 ) {
@@ -788,7 +788,8 @@ async fn publish_configured_model_bindings_with_retry(
     const BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 
     for attempt in 1..=ATTEMPTS {
-        let failures = crate::system_storage::publish_configured_model_bindings(core_store, config);
+        let failures =
+            crate::system_storage::publish_configured_component_bindings(core_store, config);
         if failures == 0 {
             return;
         }
@@ -796,13 +797,13 @@ async fn publish_configured_model_bindings_with_retry(
             tracing::warn!(
                 failures,
                 attempt,
-                "model registry publication left rows unwritten after a reload; retrying"
+                "component registry publication left rows unwritten after a reload; retrying"
             );
             tokio::time::sleep(BACKOFF).await;
         } else {
             tracing::error!(
                 failures,
-                "model registry publication still failing after {ATTEMPTS} attempts; aliases \
+                "component registry publication still failing after {ATTEMPTS} attempts; aliases \
                  withdrawn for this reload stay hidden and refused to uploads until the next one"
             );
         }

@@ -24,6 +24,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       # The two image builds plus the k3d/containerd image imports below are
       # disk-heavy and have intermittently exhausted the ~14 GB free on
@@ -191,6 +193,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -215,6 +219,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+        with:
+          submodules: recursive
 
       - name: Run QUIC Interop
         run: docker compose -f tests/conformance/quic/docker-compose.yml config

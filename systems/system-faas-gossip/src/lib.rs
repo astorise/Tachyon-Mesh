@@ -115,7 +115,7 @@ fn evaluate_cluster_pressure() -> Result<(), String> {
                     candidate.base_url,
                     route_path_for_override_key(&steer_route)
                 ),
-                hot_models: candidate.snapshot.hot_models.clone(),
+                hot_inference_components: candidate.snapshot.hot_inference_components.clone(),
                 effective_pressure: candidate.snapshot.effective_pressure(),
                 capability_mask: candidate.snapshot.capability_mask,
                 capabilities: candidate.snapshot.capabilities.clone(),
@@ -186,7 +186,7 @@ fn local_snapshot() -> TelemetrySnapshot {
         network_rt_load: snapshot.network_rt_load,
         network_standard_load: snapshot.network_standard_load,
         network_batch_load: snapshot.network_batch_load,
-        hot_models: snapshot.hot_models,
+        hot_inference_components: snapshot.hot_inference_components,
         dropped_events: snapshot.dropped_events,
         last_status: snapshot.last_status,
         total_duration_us: snapshot.total_duration_us,
@@ -326,7 +326,10 @@ fn evaluate_qos_routing(
                             candidate.base_url,
                             route_path_for_override_key(steer_route)
                         ),
-                        hot_models: candidate.snapshot.hot_models.clone(),
+                        hot_inference_components: candidate
+                            .snapshot
+                            .hot_inference_components
+                            .clone(),
                         effective_pressure: candidate.snapshot.effective_pressure(),
                         capability_mask: candidate.snapshot.capability_mask,
                         capabilities: candidate.snapshot.capabilities.clone(),
@@ -362,7 +365,10 @@ fn evaluate_qos_routing(
                             candidate.base_url,
                             route_path_for_override_key(steer_route)
                         ),
-                        hot_models: candidate.snapshot.hot_models.clone(),
+                        hot_inference_components: candidate
+                            .snapshot
+                            .hot_inference_components
+                            .clone(),
                         effective_pressure: candidate.snapshot.effective_pressure(),
                         capability_mask: candidate.snapshot.capability_mask,
                         capabilities: candidate.snapshot.capabilities.clone(),
@@ -585,7 +591,7 @@ struct RouteOverrideDescriptor {
 #[derive(Clone, Debug, Serialize)]
 struct RouteOverrideCandidate {
     destination: String,
-    hot_models: Vec<String>,
+    hot_inference_components: Vec<String>,
     effective_pressure: u8,
     capability_mask: u64,
     capabilities: Vec<String>,
@@ -644,7 +650,7 @@ struct TelemetrySnapshot {
     #[serde(default)]
     network_batch_load: u32,
     #[serde(default)]
-    hot_models: Vec<String>,
+    hot_inference_components: Vec<String>,
     dropped_events: u64,
     last_status: u16,
     total_duration_us: u64,
@@ -693,7 +699,7 @@ mod tests {
             network_rt_load: 0,
             network_standard_load: 0,
             network_batch_load: 0,
-            hot_models: Vec::new(),
+            hot_inference_components: Vec::new(),
             dropped_events: 0,
             last_status: 0,
             total_duration_us: 0,
@@ -790,7 +796,7 @@ mod tests {
             network_rt_load: 0,
             network_standard_load: 0,
             network_batch_load: 0,
-            hot_models: vec!["llama3".to_owned()],
+            hot_inference_components: vec!["llama3".to_owned()],
             dropped_events: 0,
             last_status: 200,
             total_duration_us: 0,
@@ -800,7 +806,7 @@ mod tests {
         let descriptor = RouteOverrideDescriptor {
             candidates: vec![RouteOverrideCandidate {
                 destination: "http://node-a/api/guest-ai".to_owned(),
-                hot_models: snapshot.hot_models.clone(),
+                hot_inference_components: snapshot.hot_inference_components.clone(),
                 effective_pressure: snapshot.effective_pressure(),
                 capability_mask: snapshot.capability_mask,
                 capabilities: snapshot.capabilities.clone(),

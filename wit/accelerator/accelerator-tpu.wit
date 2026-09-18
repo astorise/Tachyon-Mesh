@@ -1,6 +1,17 @@
-package tachyon:accelerator@3.0.0;
+package tachyon:accelerator@4.0.0;
 
 interface tpu {
-    load-model: func(name: string) -> result<u32, string>;
-    compute: func(model-id: u32, prompt: string) -> result<string, string>;
+    record invocation-error {
+        message: string,
+        upstream-status: option<u16>,
+        invalid-request: bool,
+    }
+
+    record invocation-result {
+        payload: list<u8>,
+        metadata: list<tuple<string, string>>,
+    }
+
+    load-component: func(alias: string) -> result<u32, string>;
+    invoke: func(component-id: u32, payload: list<u8>) -> result<invocation-result, invocation-error>;
 }

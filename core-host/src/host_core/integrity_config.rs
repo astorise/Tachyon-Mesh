@@ -38,10 +38,10 @@ pub(crate) fn inject_feature_routes(mut config: IntegrityConfig) -> IntegrityCon
 
     #[cfg(feature = "ai-inference")]
     {
-        // The OpenAI surface and model registry are now the `guest-openai` user
+        // The OpenAI surface and component registry are now the `guest-openai` user
         // FaaS example (see change `faas-openai-user-example`); only the broker
         // remains a system route auto-injected under `ai-inference`.
-        to_inject.push(("/system/model-broker", "model-broker"));
+        to_inject.push(("/system/component-broker", "model-broker"));
     }
 
     #[cfg(feature = "s3-persistence")]
@@ -1006,15 +1006,15 @@ pub(crate) fn validate_kv_caches(config: &IntegrityConfig) -> Result<()> {
         if cache.name.trim().is_empty() {
             anyhow::bail!("Integrity Validation Failed: kv_caches entry has an empty `name`");
         }
-        if cache.model_ref.trim().is_empty() {
+        if cache.component_ref.trim().is_empty() {
             anyhow::bail!(
-                "Integrity Validation Failed: kv_caches entry `{}` has an empty `model_ref`",
+                "Integrity Validation Failed: kv_caches entry `{}` has an empty `component_ref`",
                 cache.name
             );
         }
-        if cache.model_ref.contains('/') || cache.model_ref.contains('\\') {
+        if cache.component_ref.contains('/') || cache.component_ref.contains('\\') {
             anyhow::bail!(
-                "Integrity Validation Failed: kv_caches entry `{}` has an invalid `model_ref` \
+                "Integrity Validation Failed: kv_caches entry `{}` has an invalid `component_ref` \
                  (slashes are not allowed)",
                 cache.name
             );
@@ -1034,9 +1034,9 @@ pub(crate) fn validate_kv_caches(config: &IntegrityConfig) -> Result<()> {
 pub(crate) fn validate_scheduler_config(config: &IntegrityConfig) -> Result<()> {
     let mut known_tenants = BTreeSet::from(["default".to_owned()]);
     for route in &config.routes {
-        if let Some(adapter_id) = route.adapter_id.as_deref().map(str::trim) {
-            if !adapter_id.is_empty() {
-                known_tenants.insert(adapter_id.to_owned());
+        if let Some(artifact_id) = route.artifact_id.as_deref().map(str::trim) {
+            if !artifact_id.is_empty() {
+                known_tenants.insert(artifact_id.to_owned());
             }
         }
     }
@@ -1060,7 +1060,7 @@ pub(crate) fn validate_scheduler_config(config: &IntegrityConfig) -> Result<()> 
         }
         if !known_tenants.contains(tenant) {
             anyhow::bail!(
-                "Integrity Validation Failed: scheduler.tenant_weights references unknown tenant `{tenant}`; declare the tenant as a route `adapter_id` or use `default`"
+                "Integrity Validation Failed: scheduler.tenant_weights references unknown tenant `{tenant}`; declare the tenant as a route `artifact_id` or use `default`"
             );
         }
     }
@@ -1159,7 +1159,7 @@ pub(crate) fn normalize_config_routes(
             ));
         }
     }
-    ensure_unique_model_aliases(&normalized)?;
+    ensure_unique_component_aliases(&normalized)?;
     ensure_unique_route_domains(&normalized)?;
     Ok(normalized)
 }
@@ -1525,7 +1525,7 @@ pub(crate) fn validate_integrity_route(route: IntegrityRoute) -> Result<Integrit
         allowed_secrets: normalize_allowed_secrets(route.allowed_secrets)?,
         targets: normalize_route_targets(route.targets)?,
         resiliency: normalize_route_resiliency(route.resiliency, &normalized)?,
-        models: normalize_route_models(route.models, &normalized)?,
+        inference_components: normalize_route_components(route.inference_components, &normalized)?,
         domains: normalize_route_domains(route.domains, &normalized)?,
         min_instances: route.min_instances,
         max_concurrency: route.max_concurrency,
@@ -1537,7 +1537,7 @@ pub(crate) fn validate_integrity_route(route: IntegrityRoute) -> Result<Integrit
         allow_overflow: route.allow_overflow,
         distributed_rate_limit: route.distributed_rate_limit,
         shadow_target: route.shadow_target,
-        adapter_id: route.adapter_id,
+        artifact_id: route.artifact_id,
         canary: route.canary,
         concurrency: normalized_concurrency,
         scopes: validate_route_scopes(route.scopes, &normalized)?,
@@ -1731,35 +1731,35 @@ pub(crate) fn normalize_retry_policy(policy: RetryPolicy, route_path: &str) -> R
     })
 }
 
-pub(crate) fn normalize_route_models(
-    models: Vec<IntegrityModelBinding>,
+pub(crate) fn normalize_route_components(
+    inference_components: Vec<IntegrityInferenceComponentBinding>,
     route_path: &str,
-) -> Result<Vec<IntegrityModelBinding>> {
+) -> Result<Vec<IntegrityInferenceComponentBinding>> {
     let mut deduped = BTreeMap::new();
 
-    for model in models {
-        let alias = normalize_service_name(&model.alias).map_err(|error| {
+    for component in inference_components {
+        let alias = normalize_service_name(&component.alias).map_err(|error| {
             anyhow!(
-                "Integrity Validation Failed: route `{route_path}` has an invalid model alias `{}`: {error}",
-                model.alias
+                "Integrity Validation Failed: route `{route_path}` has an invalid Component alias `{}`: {error}",
+                component.alias
             )
         })?;
-        let path = model.path.trim();
-        if path.is_empty() && !model.dynamic {
+        let path = component.path.trim();
+        if path.is_empty() && !component.dynamic {
             return Err(anyhow!(
-                "Integrity Validation Failed: route `{route_path}` model `{alias}` must include a non-empty `path`"
+                "Integrity Validation Failed: route `{route_path}` Component `{alias}` must include a non-empty `path`"
             ));
         }
 
         deduped
             .entry(alias.clone())
-            .or_insert(IntegrityModelBinding {
+            .or_insert(IntegrityInferenceComponentBinding {
                 alias,
                 path: path.to_owned(),
-                device: model.device,
-                qos: model.qos,
-                dynamic: model.dynamic,
-                hardware_strategy: model.hardware_strategy,
+                device: component.device,
+                qos: component.qos,
+                dynamic: component.dynamic,
+                hardware_strategy: component.hardware_strategy,
             });
     }
 
@@ -1800,15 +1800,16 @@ pub(crate) fn ensure_unique_route_domains(routes: &[IntegrityRoute]) -> Result<(
     Ok(())
 }
 
-pub(crate) fn ensure_unique_model_aliases(routes: &[IntegrityRoute]) -> Result<()> {
+pub(crate) fn ensure_unique_component_aliases(routes: &[IntegrityRoute]) -> Result<()> {
     let mut owners = HashMap::new();
 
     for route in routes {
-        for model in &route.models {
-            if let Some(previous_route) = owners.insert(model.alias.clone(), route.path.clone()) {
+        for component in &route.inference_components {
+            if let Some(previous_route) = owners.insert(component.alias.clone(), route.path.clone())
+            {
                 return Err(anyhow!(
-                    "Integrity Validation Failed: model alias `{}` is declared by both route `{previous_route}` and route `{}`",
-                    model.alias, route.path
+                    "Integrity Validation Failed: component alias `{}` is declared by both route `{previous_route}` and route `{}`",
+                    component.alias, route.path
                 ));
             }
         }

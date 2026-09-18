@@ -19,7 +19,7 @@ use wasmtime_wasi::{
 
 const ASSET_URI_PREFIX: &str = "tachyon://sha256:";
 const REGISTRY_MODULE_NAME: &str = "system-faas-registry";
-const MODEL_BROKER_MODULE_NAME: &str = "system-faas-model-broker";
+const ARTIFACT_BROKER_MODULE_NAME: &str = "system-faas-model-broker";
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -40,7 +40,7 @@ struct StorageComponentState {
     core_store_path: PathBuf,
 }
 
-pub(crate) const AI_MODELS_REGISTRY_TABLE: &str = "ai-models-registry";
+pub(crate) const AI_COMPONENTS_REGISTRY_TABLE: &str = "ai-components-registry";
 
 struct ComponentRequest {
     method: String,
@@ -63,20 +63,20 @@ pub(crate) fn asset_registry_dir(manifest_path: &Path) -> PathBuf {
         .join("asset-registry")
 }
 
-fn model_broker_dir(manifest_path: &Path) -> PathBuf {
+fn artifact_broker_dir(manifest_path: &Path) -> PathBuf {
     manifest_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("tachyon_data")
 }
 
-/// Host-side directory where `system-faas-model-broker` unpacks uploaded models
-/// (`{tachyon_data}/models/{alias}/`). The broker's preopened `.` maps to
-/// `model_broker_dir`, so this is exactly where it writes; the AI runtime reads
-/// the same path to lazily load uploaded checkpoints.
+/// Host-side directory where the artifact broker component unpacks uploaded artifacts
+/// (`{tachyon_data}/components/{alias}/`). The broker's preopened `.` maps to
+/// `artifact_broker_dir`, so this is exactly where it writes; the AI runtime reads
+/// the same path to lazily load uploaded Component bundles.
 #[cfg(feature = "ai-inference")]
-pub(crate) fn model_broker_models_dir(manifest_path: &Path) -> PathBuf {
-    model_broker_dir(manifest_path).join("models")
+pub(crate) fn artifact_broker_components_dir(manifest_path: &Path) -> PathBuf {
+    artifact_broker_dir(manifest_path).join("components")
 }
 
 pub(crate) fn is_asset_uri(value: &str) -> bool {
@@ -95,7 +95,7 @@ pub(crate) fn resolve_asset_uri(manifest_path: &Path, uri: &str) -> Result<PathB
 }
 
 // Reachable only via `admin_plane::authenticated_routes` (`/admin/assets`,
-// `/admin/models/*`), gated behind `admin-plane`. `allow(dead_code)` avoids
+// `/admin/artifacts/*`), gated behind `admin-plane`. `allow(dead_code)` avoids
 // chasing this through the shared `proxy_request_to_component` plumbing below.
 #[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn upload_asset_handler(
@@ -110,7 +110,13 @@ pub(crate) async fn init_upload_handler(
     State(state): State<crate::AppState>,
     request: Request,
 ) -> Response {
-    proxy_request_to_component(state, request, MODEL_BROKER_MODULE_NAME, model_broker_dir).await
+    proxy_request_to_component(
+        state,
+        request,
+        ARTIFACT_BROKER_MODULE_NAME,
+        artifact_broker_dir,
+    )
+    .await
 }
 
 #[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
@@ -118,7 +124,13 @@ pub(crate) async fn upload_chunk_handler(
     State(state): State<crate::AppState>,
     request: Request,
 ) -> Response {
-    proxy_request_to_component(state, request, MODEL_BROKER_MODULE_NAME, model_broker_dir).await
+    proxy_request_to_component(
+        state,
+        request,
+        ARTIFACT_BROKER_MODULE_NAME,
+        artifact_broker_dir,
+    )
+    .await
 }
 
 #[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
@@ -126,7 +138,13 @@ pub(crate) async fn commit_upload_handler(
     State(state): State<crate::AppState>,
     request: Request,
 ) -> Response {
-    proxy_request_to_component(state, request, MODEL_BROKER_MODULE_NAME, model_broker_dir).await
+    proxy_request_to_component(
+        state,
+        request,
+        ARTIFACT_BROKER_MODULE_NAME,
+        artifact_broker_dir,
+    )
+    .await
 }
 
 async fn proxy_request_to_component(
@@ -255,12 +273,12 @@ fn invoke_storage_component(
     })?;
     let module_path = crate::resolve_guest_module_path(module_name)
         .map_err(|error| anyhow!(error.to_string()))?;
-    // Large model uploads are split into many chunked requests (one per
+    // Large artifact uploads are split into many chunked requests (one per
     // `MODEL_CHUNK_BYTES`), each of which proxies through this function. Loading
     // through the cwasm cache means only the first request per engine pays the
     // Cranelift compile; every later chunk just deserializes the cached
     // precompiled artifact, so per-chunk host overhead stays flat instead of
-    // growing with the number of chunks (and thus the model size).
+    // growing with the number of chunks (and thus the component size).
     let component = crate::load_component_with_pool(
         engine,
         &module_path,
@@ -279,11 +297,13 @@ fn invoke_storage_component(
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|error| {
         anyhow!("failed to add WASI preview2 functions to storage component linker: {error}")
     })?;
-    bindings::tachyon::mesh::model_events::add_to_linker::<_, StorageComponentState>(
+    bindings::tachyon::mesh::artifact_events::add_to_linker::<_, StorageComponentState>(
         &mut linker,
         |state| state,
     )
-    .map_err(|error| anyhow!("failed to add model-events functions to storage linker: {error}"))?;
+    .map_err(|error| {
+        anyhow!("failed to add artifact-events functions to storage linker: {error}")
+    })?;
 
     let mut builder = WasiCtxBuilder::new();
     builder
@@ -349,20 +369,20 @@ fn invoke_storage_component(
     })
 }
 
-// The `ai-models-registry` kv-partition table is owned by `guest-openai`, which
-// reads/writes its `ModelInfo` with `#[serde(rename_all = "camelCase")]`. The
+// The `ai-components-registry` kv-partition table is owned by `guest-openai`, which
+// reads/writes its `ComponentInfo` with `#[serde(rename_all = "camelCase")]`. The
 // broker writes the same table directly on upload, so it MUST use the identical
-// casing — otherwise `guest-openai`'s `list_models` fails to deserialize the
+// casing — otherwise `guest-openai`'s `list_components` fails to deserialize the
 // row (missing required `vramRequiredMb`) and silently drops it, so uploaded
-// models never surface in `GET /ai/v1/models`.
+// components never surface in `GET /ai/v1/components`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RegistryModelInfo<'a> {
+struct RegistryComponentInfo<'a> {
     alias: &'a str,
     engine: &'a str,
     vram_required_mb: u64,
     status: &'a str,
-    model_path: &'a str,
+    artifact_path: &'a str,
     /// Who wrote this row. Absent on upload-published rows (they predate the
     /// field), `"config"` on manifest-derived ones. Reconciliation needs the
     /// distinction: a configured row must be refreshed or dropped when the
@@ -371,14 +391,11 @@ struct RegistryModelInfo<'a> {
     /// unknown fields, so adding it does not disturb the reader.
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<&'a str>,
-    /// Tool-call dialect this checkpoint emits, resolved from its sidecar or
-    /// its chat template. `guest-openai` reads it to pick a parser instead of
-    /// pattern-matching the alias, which is what made tool calling depend on
-    /// how a model happened to be named. Absent when the model does not
-    /// declare one, or is an upstream binding (which applies its own template
-    /// and returns already-structured calls).
+    /// Opaque tool-call parser metadata declared by the artifact sidecar.
+    /// Tachyon does not interpret dialect names; `guest-openai`, Magnetar, or
+    /// the Component boundary owns that protocol decision.
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_parser: Option<&'a str>,
+    tool_call_parser: Option<String>,
     /// Set on a *reservation* row: the alias is still the manifest's, but no
     /// runtime is serving it right now. Written for the length of a hot-reload
     /// swap, and overwritten by the real row when publication follows.
@@ -392,29 +409,25 @@ struct RegistryModelInfo<'a> {
 
 /// The tool-call dialect to advertise for a configured binding.
 ///
-/// Only local checkpoints are probed: an `openai:` upstream returns structured
-/// `tool_calls` of its own and never needs its text parsed, and `mock` has no
-/// checkpoint to read.
+/// Only local Component artifact roots are probed. Remote-provider protocol
+/// metadata belongs in the guest or selected Component, not in core storage.
 ///
 /// Present in every build, not just `ai-inference` ones: the upload path that
 /// calls it is not feature-gated. Without the detector there is nothing to
 /// classify a checkpoint with, so the field stays absent and `guest-openai`
-/// falls back to its own resolution — the same behaviour as a model that
+/// falls back to its own resolution — the same behaviour as a component that
 /// declares nothing.
-pub(crate) fn binding_tool_call_parser(path: &str) -> Option<&'static str> {
+pub(crate) fn binding_tool_call_parser(path: &str) -> Option<String> {
     let path = path.trim();
     if path == "mock" || path.starts_with("mock:") {
         return None;
     }
     #[cfg(feature = "ai-inference")]
     {
-        if path.starts_with(crate::ai_inference::UPSTREAM_SCHEME) {
-            return None;
-        }
         let metadata_path = path
             .strip_prefix(crate::ai_inference::MAGNETAR_PATH_PREFIX)
             .unwrap_or(path);
-        crate::ai_inference::detect_tool_call_parser(std::path::Path::new(metadata_path))
+        crate::ai_inference::declared_tool_call_metadata(std::path::Path::new(metadata_path))
     }
     #[cfg(not(feature = "ai-inference"))]
     {
@@ -427,112 +440,35 @@ const REGISTRY_SOURCE_CONFIG: &str = "config";
 
 /// Engine label recorded for a configured binding.
 ///
-/// `guest-openai` builds each `GET /ai/v1/models` id as `{engine}/{alias}` and
+/// `guest-openai` builds each `GET /ai/v1/components` id as `{engine}/{alias}` and
 /// resolves a request against either form, so this string is part of the public
-/// model id — not just metadata.
+/// component id — not just metadata.
 #[cfg(feature = "ai-inference")]
 fn binding_engine_label(path: &str) -> &'static str {
-    // Classify the same trimmed value `UpstreamEndpoint::parse` accepts, or a
-    // path with leading whitespace loads as a working upstream while the
-    // registry advertises it as `safetensors/<alias>`.
+    // The `openai:` scheme is classified here, not in `ai_inference`: that
+    // module stays Component-centric and upstream-protocol agnostic, but the
+    // registry still has to tell clients which alias points at a remote
+    // OpenAI-compatible endpoint versus a local artifact.
+    const OPENAI_SCHEME: &str = "openai:";
     let path = path.trim();
-    if path.starts_with(crate::ai_inference::UPSTREAM_SCHEME) {
+    if path.starts_with(OPENAI_SCHEME) {
         "openai"
     } else if path == "mock" || path.starts_with("mock:") {
         "mock"
+    } else if path.starts_with(crate::ai_inference::MAGNETAR_PATH_PREFIX) {
+        "magnetar"
     } else {
-        // Probe the directory once and classify by what is actually in it. The
-        // label is part of the public model id (`{engine}/{alias}`), so an
-        // ONNX embedding directory advertised as `safetensors` gives clients
-        // wrong format metadata.
-        // The sidecar wins, because `resolve_model_format` treats it as
-        // authoritative when loading. Probing extensions first made the public
-        // `{engine}/{alias}` id disagree with the backend actually selected —
-        // a directory declaring `safetensors` while still holding a stale
-        // `.gguf` advertised itself as `gguf/<alias>` and then loaded
-        // safetensors.
-        let mut has_gguf = false;
-        let mut has_onnx = false;
-        if let Ok(entries) = std::path::Path::new(path).read_dir() {
-            for entry in entries.flatten() {
-                match entry.path().extension().and_then(|ext| ext.to_str()) {
-                    Some(ext) if ext.eq_ignore_ascii_case("gguf") => has_gguf = true,
-                    Some(ext) if ext.eq_ignore_ascii_case("onnx") => has_onnx = true,
-                    _ => {}
-                }
-            }
-        }
-        // ONNX outranks the sidecar, because the loader never asks the sidecar
-        // about it. `CandleEmbeddingRuntime::try_load` runs first and resolves
-        // its file by `model_file`, then `model.onnx`, then any `.onnx` in the
-        // directory — the declared format is consulted nowhere in that path. A
-        // directory declaring `safetensors` beside a usable ONNX therefore
-        // loaded the embedding backend while advertising `safetensors/<alias>`,
-        // and the label is half the public `{engine}/{alias}` id, not just
-        // metadata.
-        //
-        // "Usable" is that runtime's own bar: without `tokenizer.json` it
-        // declines and the next probe takes over, so the declaration is honest
-        // again and wins below.
-        if has_onnx && std::path::Path::new(path).join("tokenizer.json").is_file() {
-            return "onnx";
-        }
-        if let Some(declared) = declared_model_format(path) {
-            return declared;
-        }
-        // ONNX first, because that is the order `CandleBackendModel::load`
-        // probes in: `CandleEmbeddingRuntime::try_load` runs before the GGUF
-        // runtime and accepts a bare `.onnx` file with no sidecar. Preferring
-        // GGUF here labelled a directory `gguf/<alias>` while requests for it
-        // executed the ONNX embedding backend — and the label is half the
-        // public `{engine}/{alias}` id, not just metadata.
-        match (has_onnx, has_gguf) {
-            (true, _) => "onnx",
-            (false, true) => "gguf",
-            (false, false) => "safetensors",
-        }
+        "local"
     }
 }
 
-/// The format a model directory declares in its `.tachyon-model.json` sidecar,
-/// when it declares one this publisher can name.
+/// Publish the route-configured component bindings into the registry table.
 ///
-/// Gated with its only caller: `binding_engine_label` classifies manifest
-/// bindings, which only exist on an `ai-inference` build, and CI compiles the
-/// default build with `-D dead_code`.
-#[cfg(feature = "ai-inference")]
-fn declared_model_format(path: &str) -> Option<&'static str> {
-    #[derive(serde::Deserialize)]
-    struct Sidecar {
-        #[serde(default)]
-        format: String,
-    }
-
-    let raw = fs::read(std::path::Path::new(path).join(".tachyon-model.json")).ok()?;
-    let sidecar: Sidecar = serde_json::from_slice(&raw).ok()?;
-    match sidecar.format.trim().to_ascii_lowercase().as_str() {
-        "gguf" => Some("gguf"),
-        "safetensors" => Some("safetensors"),
-        // Omitting this let a directory declaring ONNX but still holding a
-        // stale `.gguf` fall through to extension probing, which gives GGUF
-        // precedence — while the loader tries the embedding runtime first and
-        // honours the sidecar. The row then advertised `gguf/<alias>` for a
-        // backend that is ONNX.
-        "onnx" => Some("onnx"),
-        // Anything else — absent, empty, or a value the loader would itself
-        // reject — falls through to probing, which is what happened before the
-        // sidecar existed.
-        _ => None,
-    }
-}
-
-/// Publish the route-configured model bindings into the registry table.
-///
-/// Until now the table was written only by the upload flow, so a model declared
+/// Until now the table was written only by the upload flow, so a component declared
 /// in the manifest — every `openai:` upstream, and every operator-provisioned
-/// local checkpoint — was invisible in `GET /ai/v1/models`. Requests still
+/// local checkpoint — was invisible in `GET /ai/v1/components`. Requests still
 /// worked (`guest-openai` falls back to passing an unslashed alias straight to
-/// `load_model`), but the model never appeared in a client's model picker.
+/// `load_component`), but the component never appeared in a client's component picker.
 ///
 /// Existing rows are left untouched: an upload-published entry carries a real
 /// on-disk path and VRAM figure, and must win over anything derived from
@@ -542,27 +478,27 @@ fn declared_model_format(path: &str) -> Option<&'static str> {
 /// Returns how many registry transactions failed, so a caller that placed
 /// withdrawal reservations before the swap can tell whether they were lifted.
 /// Zero means the registry now describes the runtime that is answering.
-pub(crate) fn publish_configured_model_bindings(
+pub(crate) fn publish_configured_component_bindings(
     core_store: &crate::store::CoreStore,
     config: &crate::IntegrityConfig,
 ) -> usize {
     let mut failures = 0usize;
     let mut configured = std::collections::HashSet::new();
     for route in &config.routes {
-        for binding in &route.models {
+        for binding in &route.inference_components {
             if binding.dynamic || binding.path.trim().is_empty() {
                 continue;
             }
             configured.insert(binding.alias.as_str());
-            let info = RegistryModelInfo {
+            let info = RegistryComponentInfo {
                 alias: &binding.alias,
                 engine: binding_engine_label(&binding.path),
                 // Unknown for a configured binding: the upload path is what
                 // measures a checkpoint. `0` is the registry's documented
-                // "unknown" value, not a claim that the model is free.
+                // "unknown" value, not a claim that the component is free.
                 vram_required_mb: 0,
                 status: "available",
-                model_path: &binding.path,
+                artifact_path: &binding.path,
                 source: Some(REGISTRY_SOURCE_CONFIG),
                 tool_call_parser: binding_tool_call_parser(&binding.path),
                 withdrawn: false,
@@ -575,7 +511,7 @@ pub(crate) fn publish_configured_model_bindings(
             // cannot express "the existing row wins": an upload committing
             // between the two would be overwritten by this zero-VRAM row.
             match core_store.kv_partition_insert_if_absent(
-                AI_MODELS_REGISTRY_TABLE,
+                AI_COMPONENTS_REGISTRY_TABLE,
                 &binding.alias,
                 &value,
             ) {
@@ -583,7 +519,7 @@ pub(crate) fn publish_configured_model_bindings(
                     tracing::info!(
                         alias = %binding.alias,
                         engine = %info.engine,
-                        "published configured model binding to `{AI_MODELS_REGISTRY_TABLE}`"
+                        "published configured component binding to `{AI_COMPONENTS_REGISTRY_TABLE}`"
                     );
                     continue;
                 }
@@ -599,7 +535,7 @@ pub(crate) fn publish_configured_model_bindings(
                     failures += 1;
                     tracing::warn!(
                         alias = %binding.alias,
-                        "failed to publish configured model binding to the registry: {error:#}"
+                        "failed to publish configured component binding to the registry: {error:#}"
                     );
                     continue;
                 }
@@ -607,7 +543,7 @@ pub(crate) fn publish_configured_model_bindings(
 
             // A row already exists, and this binding is non-dynamic — which
             // means the runtime has *already* eagerly loaded it under this
-            // alias, and `ensure_model_loaded` will short-circuit for that key
+            // alias, and `ensure_component_loaded` will short-circuit for that key
             // forever after. Whatever the row says, a request for this alias
             // executes the configured backend.
             //
@@ -616,7 +552,7 @@ pub(crate) fn publish_configured_model_bindings(
             // uploaded checkpoint's path while the alias actually runs the
             // configured binding — and `guest-openai` strips the engine prefix
             // back to the bare alias, so a client selecting the advertised
-            // upload would have its prompt answered by a different model, in
+            // upload would have its prompt answered by a different component, in
             // the `openai:` case by a third-party server. A listing that lies
             // about where a prompt goes is worse than one that loses an
             // upload's VRAM figure.
@@ -633,14 +569,14 @@ pub(crate) fn publish_configured_model_bindings(
             // row therefore rides along inside the config row, and the sweep
             // puts it back instead of deleting.
             if let Err(error) = core_store.kv_partition_update(
-                AI_MODELS_REGISTRY_TABLE,
+                AI_COMPONENTS_REGISTRY_TABLE,
                 &binding.alias,
                 |current| {
                     let shadowed = current.filter(|_| !row_is_config_owned(current));
                     if let Some(shadowed) = shadowed {
                         tracing::warn!(
                             alias = %binding.alias,
-                            "an uploaded model shares an alias with a configured binding; the configured binding is what executes, so the registry row now describes it and the upload's row is held aside"
+                            "an uploaded artifact shares an alias with a configured binding; the configured binding is what executes, so the registry row now describes it and the upload's row is held aside"
                         );
                         if let Some(carried) = carry_shadowed_upload(&value, shadowed) {
                             return crate::store::KvPartitionUpdate::Set(carried);
@@ -666,22 +602,22 @@ pub(crate) fn publish_configured_model_bindings(
                 failures += 1;
                 tracing::warn!(
                     alias = %binding.alias,
-                    "failed to refresh configured model binding in the registry: {error:#}"
+                    "failed to refresh configured component binding in the registry: {error:#}"
                 );
             }
         }
     }
 
     // Drop configured rows whose binding is gone, or a removed alias would stay
-    // listed in `GET /ai/v1/models` forever. Upload-owned rows are never swept:
-    // their model is still on disk and reachable.
+    // listed in `GET /ai/v1/components` forever. Upload-owned rows are never swept:
+    // their component is still on disk and reachable.
     let owned = match config_owned_aliases(core_store) {
         Ok(owned) => owned,
         Err(error) => {
             // Counted, so the reload retries instead of accepting a sweep that
             // never ran. Nothing has been deleted on this path yet, so stopping
             // here leaves the registry exactly as the publication above left it.
-            tracing::warn!("failed to scan the model registry for stale bindings: {error}");
+            tracing::warn!("failed to scan the component registry for stale bindings: {error}");
             return failures + 1;
         }
     };
@@ -692,7 +628,7 @@ pub(crate) fn publish_configured_model_bindings(
         // Same race: an upload may have replaced this row since the scan, so
         // ownership is re-checked inside the deleting transaction.
         if let Err(error) =
-            core_store.kv_partition_update(AI_MODELS_REGISTRY_TABLE, &alias, |current| {
+            core_store.kv_partition_update(AI_COMPONENTS_REGISTRY_TABLE, &alias, |current| {
                 if !row_is_config_owned(current) {
                     return crate::store::KvPartitionUpdate::Keep;
                 }
@@ -708,36 +644,36 @@ pub(crate) fn publish_configured_model_bindings(
             failures += 1;
             tracing::warn!(
                 %alias,
-                "failed to drop a stale configured model binding from the registry: {error:#}"
+                "failed to drop a stale configured component binding from the registry: {error:#}"
             );
         } else {
-            tracing::info!(%alias, "dropped a configured model binding that left the manifest");
+            tracing::info!(%alias, "dropped a configured component binding that left the manifest");
         }
     }
     failures
 }
 
-/// Write an uploaded model's registry row, unless a configured binding owns
+/// Write an uploaded artifact's registry row, unless a configured binding owns
 /// the alias.
 ///
 /// The single place this rule is enforced, because it has to hold for *every*
 /// writer: the storage-proxy host, the general component host, and any future
 /// one. A non-dynamic configured binding is loaded eagerly at boot, so
-/// `ensure_model_loaded` short-circuits for its alias and a request runs that
+/// `ensure_component_loaded` short-circuits for its alias and a request runs that
 /// backend no matter what the registry says — an `openai:` upstream included.
 /// A row claiming otherwise sends a client's prompt somewhere it did not
 /// choose.
 ///
 /// Ownership is read inside the write transaction: checking first and writing
 /// after would let a concurrent reconciliation land in between.
-pub(crate) fn write_uploaded_model_row(
+pub(crate) fn write_uploaded_component_row(
     core_store: &crate::store::CoreStore,
     alias: &str,
     value: Vec<u8>,
 ) -> std::result::Result<(), String> {
     let mut alias_taken = false;
     core_store
-        .kv_partition_update(AI_MODELS_REGISTRY_TABLE, alias, |current| {
+        .kv_partition_update(AI_COMPONENTS_REGISTRY_TABLE, alias, |current| {
             if row_is_config_owned(current) {
                 alias_taken = true;
                 crate::store::KvPartitionUpdate::Keep
@@ -745,24 +681,24 @@ pub(crate) fn write_uploaded_model_row(
                 crate::store::KvPartitionUpdate::Set(value)
             }
         })
-        .map_err(|error| format!("failed to publish model upload event: {error:#}"))?;
+        .map_err(|error| format!("failed to publish artifact upload event: {error:#}"))?;
     if alias_taken {
         // Failing beats silently keeping the configured row: the upload cannot
         // be served under this alias whatever we write, and an error is the
         // only thing that tells the operator so.
         return Err(format!(
-            "model alias `{alias}` is claimed by a configured binding in the sealed manifest; \
-             uploaded models must use a free alias, or the binding must be declared `dynamic`"
+            "component alias `{alias}` is claimed by a configured binding in the sealed manifest; \
+             uploaded artifacts must use a free alias, or the binding must be declared `dynamic`"
         ));
     }
     Ok(())
 }
 
-/// Apply a guest's write to the model registry, refusing rows a configured
+/// Apply a guest's write to the component registry, refusing rows a configured
 /// binding owns.
 ///
 /// The rule itself is not new — `guest-openai` checks ownership before it
-/// registers, and `write_uploaded_model_row` checks it before an upload lands.
+/// registers, and `write_uploaded_component_row` checks it before an upload lands.
 /// What is new is *where*: a guest's `get` and `set` are two separate host
 /// transactions, so a reload publishing a configured row between them left the
 /// unconditional `set` to overwrite it, and the registry then advertised a
@@ -780,7 +716,7 @@ pub(crate) fn apply_guest_registry_write(
     key: &str,
     value: Option<Vec<u8>>,
 ) -> std::result::Result<(), String> {
-    if table != AI_MODELS_REGISTRY_TABLE {
+    if table != AI_COMPONENTS_REGISTRY_TABLE {
         return match value {
             Some(value) => core_store
                 .kv_partition_set(table, key, &value)
@@ -793,7 +729,7 @@ pub(crate) fn apply_guest_registry_write(
     reject_forged_config_marker(key, value.as_ref())?;
     let mut alias_taken = false;
     core_store
-        .kv_partition_update(AI_MODELS_REGISTRY_TABLE, key, |current| {
+        .kv_partition_update(AI_COMPONENTS_REGISTRY_TABLE, key, |current| {
             if row_is_config_owned(current) {
                 alias_taken = true;
                 crate::store::KvPartitionUpdate::Keep
@@ -807,7 +743,7 @@ pub(crate) fn apply_guest_registry_write(
         .map_err(|error| format!("{error:#}"))?;
     if alias_taken {
         return Err(format!(
-            "{GUEST_REGISTRY_ALIAS_TAKEN}: model alias `{key}` is claimed by a configured \
+            "{GUEST_REGISTRY_ALIAS_TAKEN}: component alias `{key}` is claimed by a configured \
              binding in the sealed manifest"
         ));
     }
@@ -821,7 +757,7 @@ pub(crate) fn apply_guest_registry_compare_and_set(
     expected: Option<Vec<u8>>,
     value: Vec<u8>,
 ) -> std::result::Result<bool, String> {
-    if table != AI_MODELS_REGISTRY_TABLE {
+    if table != AI_COMPONENTS_REGISTRY_TABLE {
         let mut applied = false;
         core_store
             .kv_partition_update(table, key, |current| {
@@ -840,7 +776,7 @@ pub(crate) fn apply_guest_registry_compare_and_set(
     let mut alias_taken = false;
     let mut applied = false;
     core_store
-        .kv_partition_update(AI_MODELS_REGISTRY_TABLE, key, |current| {
+        .kv_partition_update(AI_COMPONENTS_REGISTRY_TABLE, key, |current| {
             if row_is_config_owned(current) {
                 alias_taken = true;
                 crate::store::KvPartitionUpdate::Keep
@@ -854,7 +790,7 @@ pub(crate) fn apply_guest_registry_compare_and_set(
         .map_err(|error| format!("{error:#}"))?;
     if alias_taken {
         return Err(format!(
-            "{GUEST_REGISTRY_ALIAS_TAKEN}: model alias `{key}` is claimed by a configured \
+            "{GUEST_REGISTRY_ALIAS_TAKEN}: component alias `{key}` is claimed by a configured \
              binding in the sealed manifest"
         ));
     }
@@ -867,7 +803,7 @@ pub(crate) fn apply_guest_registry_compare_and_delete(
     key: &str,
     expected: Vec<u8>,
 ) -> std::result::Result<bool, String> {
-    if table != AI_MODELS_REGISTRY_TABLE {
+    if table != AI_COMPONENTS_REGISTRY_TABLE {
         let mut applied = false;
         core_store
             .kv_partition_update(table, key, |current| {
@@ -885,7 +821,7 @@ pub(crate) fn apply_guest_registry_compare_and_delete(
     let mut alias_taken = false;
     let mut applied = false;
     core_store
-        .kv_partition_update(AI_MODELS_REGISTRY_TABLE, key, |current| {
+        .kv_partition_update(AI_COMPONENTS_REGISTRY_TABLE, key, |current| {
             if row_is_config_owned(current) {
                 alias_taken = true;
                 crate::store::KvPartitionUpdate::Keep
@@ -899,14 +835,14 @@ pub(crate) fn apply_guest_registry_compare_and_delete(
         .map_err(|error| format!("{error:#}"))?;
     if alias_taken {
         return Err(format!(
-            "{GUEST_REGISTRY_ALIAS_TAKEN}: model alias `{key}` is claimed by a configured \
+            "{GUEST_REGISTRY_ALIAS_TAKEN}: component alias `{key}` is claimed by a configured \
              binding in the sealed manifest"
         ));
     }
     Ok(applied)
 }
 
-/// Apply a guest's `batch-set` to the model registry, all-or-nothing.
+/// Apply a guest's `batch-set` to the component registry, all-or-nothing.
 ///
 /// The ownership rule and the atomicity `batch-set` promises have to hold at
 /// once. Validating per key in a loop of single-key writes satisfies the first
@@ -918,7 +854,7 @@ pub(crate) fn apply_guest_registry_batch(
     table: &str,
     entries: &[(String, Vec<u8>)],
 ) -> std::result::Result<(), String> {
-    if table != AI_MODELS_REGISTRY_TABLE {
+    if table != AI_COMPONENTS_REGISTRY_TABLE {
         return core_store
             .kv_partition_batch_set(table, entries)
             .map_err(|error| format!("{error:#}"));
@@ -927,10 +863,10 @@ pub(crate) fn apply_guest_registry_batch(
         reject_forged_config_marker(key, Some(value))?;
     }
     core_store
-        .kv_partition_batch_update(AI_MODELS_REGISTRY_TABLE, entries, |key, current| {
+        .kv_partition_batch_update(AI_COMPONENTS_REGISTRY_TABLE, entries, |key, current| {
             if row_is_config_owned(current) {
                 return Err(format!(
-                    "{GUEST_REGISTRY_ALIAS_TAKEN}: model alias `{key}` is claimed by a \
+                    "{GUEST_REGISTRY_ALIAS_TAKEN}: component alias `{key}` is claimed by a \
                      configured binding in the sealed manifest"
                 ));
             }
@@ -957,7 +893,7 @@ pub(crate) fn apply_guest_registry_batch(
 fn reject_forged_config_marker(key: &str, value: Option<&Vec<u8>>) -> Result<(), String> {
     if row_is_config_owned(value.map(Vec::as_slice)) {
         return Err(format!(
-            "model alias `{key}`: a registry row may not declare \
+            "component alias `{key}`: a registry row may not declare \
              `source: \"{REGISTRY_SOURCE_CONFIG}\"`; that marker belongs to the manifest \
              publisher"
         ));
@@ -968,8 +904,8 @@ fn reject_forged_config_marker(key: &str, value: Option<&Vec<u8>>) -> Result<(),
 /// The key a displaced upload row is parked under inside a config row.
 ///
 /// Namespaced and camel-cased like the rest of the row so it travels with it
-/// through every reader; `RegistryModelInfo` does not declare it, and the
-/// guest's `ModelInfo` ignores unknown fields, so nothing downstream has to
+/// through every reader; `RegistryComponentInfo` does not declare it, and the
+/// guest's `ComponentInfo` ignores unknown fields, so nothing downstream has to
 /// learn about it.
 #[cfg(feature = "ai-inference")]
 const SHADOWED_UPLOAD_KEY: &str = "shadowedUpload";
@@ -1002,7 +938,7 @@ fn shadowed_upload_row(row: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Marker the guest matches on to turn an ownership refusal into a 409.
-pub(crate) const GUEST_REGISTRY_ALIAS_TAKEN: &str = "model-alias-claimed-by-config";
+pub(crate) const GUEST_REGISTRY_ALIAS_TAKEN: &str = "component-alias-claimed-by-config";
 
 /// Whether a registry row's raw bytes say the manifest publisher wrote it.
 /// Takes the value rather than the key so the caller can decide inside a
@@ -1032,7 +968,7 @@ fn row_is_config_owned(row: Option<&[u8]>) -> bool {
 /// the alias for the publication that follows the swap.
 #[cfg(feature = "ai-inference")]
 fn stored_row_still_current(core_store: &crate::store::CoreStore, alias: &str, path: &str) -> bool {
-    let Ok(Some(raw)) = core_store.kv_partition_get(AI_MODELS_REGISTRY_TABLE, alias) else {
+    let Ok(Some(raw)) = core_store.kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, alias) else {
         return false;
     };
     let Ok(row) = serde_json::from_slice::<serde_json::Value>(&raw) else {
@@ -1043,12 +979,13 @@ fn stored_row_still_current(core_store: &crate::store::CoreStore, alias: &str, p
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
     };
-    // `RegistryModelInfo` is `rename_all = "camelCase"`, so the stored key is
+    // `RegistryComponentInfo` is `rename_all = "camelCase"`, so the stored key is
     // `toolCallParser`. Reading the Rust field name here would have found
     // nothing every time and withdrawn every parser-declaring binding on every
     // reload — a silent availability cost, in the code meant to avoid one.
+    let declared_parser = binding_tool_call_parser(path);
     stored("engine").as_deref() == Some(binding_engine_label(path))
-        && stored("toolCallParser").as_deref() == binding_tool_call_parser(path)
+        && stored("toolCallParser").as_deref() == declared_parser.as_deref()
 }
 
 /// Withdraw configured rows the incoming config will not serve identically.
@@ -1064,7 +1001,7 @@ fn stored_row_still_current(core_store: &crate::store::CoreStore, alias: &str, p
 /// identical on both sides keeps its row throughout, so an unrelated reload
 /// costs no availability.
 #[cfg(feature = "ai-inference")]
-pub(crate) fn withdraw_changed_model_bindings(
+pub(crate) fn withdraw_changed_component_bindings(
     core_store: &crate::store::CoreStore,
     previous: &crate::IntegrityConfig,
     incoming: &crate::IntegrityConfig,
@@ -1073,7 +1010,7 @@ pub(crate) fn withdraw_changed_model_bindings(
         config
             .routes
             .iter()
-            .flat_map(|route| route.models.iter())
+            .flat_map(|route| route.inference_components.iter())
             .filter(|binding| !binding.dynamic && !binding.path.trim().is_empty())
             .map(|binding| (binding.alias.clone(), binding.path.clone()))
             .collect::<std::collections::HashMap<_, _>>()
@@ -1122,12 +1059,12 @@ pub(crate) fn withdraw_changed_model_bindings(
         // the reservation across the swap is not a leak, because the
         // publication that follows sweeps every config-owned row the incoming
         // manifest does not claim — which is exactly this one.
-        let reservation = Some(serde_json::to_vec(&RegistryModelInfo {
+        let reservation = Some(serde_json::to_vec(&RegistryComponentInfo {
             alias: &alias,
             engine: "",
             vram_required_mb: 0,
             status: "reloading",
-            model_path: "",
+            artifact_path: "",
             source: Some(REGISTRY_SOURCE_CONFIG),
             tool_call_parser: None,
             withdrawn: true,
@@ -1150,7 +1087,7 @@ pub(crate) fn withdraw_changed_model_bindings(
         // reservation exists to close: an upload commits into it, is reported
         // installed, and is then displaced by the publication that follows.
         if let Err(error) =
-            core_store.kv_partition_update(AI_MODELS_REGISTRY_TABLE, &alias, |current| {
+            core_store.kv_partition_update(AI_COMPONENTS_REGISTRY_TABLE, &alias, |current| {
                 if current.is_some() && !row_is_config_owned(current) {
                     return crate::store::KvPartitionUpdate::Keep;
                 }
@@ -1176,7 +1113,7 @@ pub(crate) fn withdraw_changed_model_bindings(
         {
             tracing::warn!(
                 %alias,
-                "failed to withdraw a changed model binding before the reload swap: {error:#}"
+                "failed to withdraw a changed component binding before the reload swap: {error:#}"
             );
         }
     }
@@ -1188,7 +1125,7 @@ pub(crate) fn withdraw_changed_model_bindings(
 /// page, which is indistinguishable from the end of the table: the sweep then
 /// finished early, reported nothing wrong, and the reload's retry loop returned
 /// satisfied — leaving aliases the manifest had dropped still advertised in
-/// `GET /ai/v1/models` with no runtime behind them. Under-sweeping is not itself
+/// `GET /ai/v1/components` with no runtime behind them. Under-sweeping is not itself
 /// destructive, so the answer is to say the scan was incomplete and be retried,
 /// rather than to act on a partial view.
 #[cfg(feature = "ai-inference")]
@@ -1204,9 +1141,9 @@ fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Result<Vec<Stri
         // past it — uploaded rows count too — any configured alias beyond that
         // page stayed advertised forever after leaving the manifest.
         let page = core_store
-            .kv_partition_get_range(AI_MODELS_REGISTRY_TABLE, "", "\u{10ffff}", PAGE, offset)
+            .kv_partition_get_range(AI_COMPONENTS_REGISTRY_TABLE, "", "\u{10ffff}", PAGE, offset)
             .map_err(|error| {
-                format!("failed to read the model registry at offset {offset}: {error:#}")
+                format!("failed to read the component registry at offset {offset}: {error:#}")
             })?;
         let read = page.len() as u32;
         owned.extend(page.into_iter().filter_map(|(alias, raw)| {
@@ -1221,98 +1158,98 @@ fn config_owned_aliases(core_store: &crate::store::CoreStore) -> Result<Vec<Stri
     }
 }
 
-impl bindings::tachyon::mesh::model_events::Host for StorageComponentState {
-    fn publish_model_uploaded(
+impl bindings::tachyon::mesh::artifact_events::Host for StorageComponentState {
+    fn publish_artifact_uploaded(
         &mut self,
-        event: bindings::tachyon::mesh::model_events::ModelUploaded,
+        event: bindings::tachyon::mesh::artifact_events::ArtifactUploaded,
     ) -> std::result::Result<(), String> {
         if event.alias.trim().is_empty() {
-            return Err("model upload event alias must not be empty".to_owned());
+            return Err("artifact upload event alias must not be empty".to_owned());
         }
         if event.engine.trim().is_empty() {
-            return Err("model upload event engine must not be empty".to_owned());
+            return Err("artifact upload event engine must not be empty".to_owned());
         }
-        let info = RegistryModelInfo {
+        let info = RegistryComponentInfo {
             alias: &event.alias,
             engine: &event.engine,
             vram_required_mb: 0,
             status: "available",
-            model_path: &event.model_path,
+            artifact_path: &event.artifact_path,
             source: None,
-            tool_call_parser: binding_tool_call_parser(&event.model_path),
+            tool_call_parser: binding_tool_call_parser(&event.artifact_path),
             withdrawn: false,
         };
         let value = serde_json::to_vec(&info)
-            .map_err(|error| format!("failed to encode model registry entry: {error}"))?;
+            .map_err(|error| format!("failed to encode component registry entry: {error}"))?;
         tracing::info!(
             alias = %event.alias,
             engine = %event.engine,
-            model_path = %event.model_path,
-            "publishing uploaded model to registry `{AI_MODELS_REGISTRY_TABLE}`"
+            artifact_path = %event.artifact_path,
+            "publishing uploaded artifact to registry `{AI_COMPONENTS_REGISTRY_TABLE}`"
         );
         // Refuse to take an alias a configured binding already owns.
         //
-        // `publish_configured_model_bindings` resolves that collision at boot
+        // `publish_configured_component_bindings` resolves that collision at boot
         // and on reload, but an upload committing *afterwards* would overwrite
         // the row while the runtime kept executing the eagerly loaded
         // configured backend — so the listing would advertise this uploaded
         // checkpoint and requests for the alias would still reach the
-        // configured model, an `openai:` upstream included.
+        // configured component, an `openai:` upstream included.
         //
         // Failing is better than silently keeping the configured row: the
         // upload cannot be served under this alias whatever we write, and an
         // error is the only thing that tells the operator so. Ownership is read
         // inside the write transaction, so a concurrent reconciliation cannot
         // slip between a check and a set.
-        write_uploaded_model_row(&self.core_store, &event.alias, value)?;
-        tracing::info!(alias = %event.alias, "model registry entry written; scheduling S3 flush");
-        self.flush_uploaded_model_to_s3(&event.alias);
+        write_uploaded_component_row(&self.core_store, &event.alias, value)?;
+        tracing::info!(alias = %event.alias, "artifact registry entry written; scheduling S3 flush");
+        self.flush_uploaded_component_to_s3(&event.alias);
         Ok(())
     }
 }
 
 impl StorageComponentState {
-    fn flush_uploaded_model_to_s3(&self, _alias: &str) {
+    fn flush_uploaded_component_to_s3(&self, _alias: &str) {
         #[cfg(feature = "s3-persistence")]
         {
             let Some(backend) = self.s3_backend.clone() else {
                 tracing::warn!(
                     alias = %_alias,
-                    "S3 model flush skipped: no S3 backend configured (TACHYON_S3_* unset or backend init failed)"
+                    "S3 component flush skipped: no S3 backend configured (TACHYON_S3_* unset or backend init failed)"
                 );
                 return;
             };
-            let Some(model_dir) = uploaded_model_dir(&self.root_dir, _alias) else {
-                tracing::warn!(alias = %_alias, "skipping S3 model flush for invalid upload alias");
+            let Some(component_dir) = uploaded_component_dir(&self.root_dir, _alias) else {
+                tracing::warn!(alias = %_alias, "skipping S3 component flush for invalid upload alias");
                 return;
             };
             tracing::info!(
                 alias = %_alias,
-                model_dir = %model_dir.display(),
-                "starting S3 flush of uploaded model"
+                component_dir = %component_dir.display(),
+                "starting S3 flush of uploaded artifact"
             );
             let alias = _alias.to_owned();
             let core_store_path = self.core_store_path.clone();
             tokio::spawn(async move {
-                if let Err(error) = backend.flush_path(&model_dir).await {
+                if let Err(error) = backend.flush_path(&component_dir).await {
                     tracing::warn!(
                         alias = %alias,
-                        path = %model_dir.display(),
+                        path = %component_dir.display(),
                         error = %error,
-                        "failed to flush uploaded model to S3"
+                        "failed to flush uploaded artifact to S3"
                     );
                 } else {
                     tracing::info!(
                         alias = %alias,
-                        path = %model_dir.display(),
-                        "flushed uploaded model files to S3"
+                        path = %component_dir.display(),
+                        "flushed uploaded artifact files to S3"
                     );
                 }
                 if let Err(error) = backend.flush_path(&core_store_path).await {
                     tracing::warn!(
                         path = %core_store_path.display(),
                         error = %error,
-                        "failed to flush model registry to S3"
+                        "failed to flush component registry to S3"
                     );
                 }
             });
@@ -1321,7 +1258,7 @@ impl StorageComponentState {
 }
 
 #[cfg(feature = "s3-persistence")]
-fn uploaded_model_dir(root_dir: &Path, alias: &str) -> Option<PathBuf> {
+fn uploaded_component_dir(root_dir: &Path, alias: &str) -> Option<PathBuf> {
     let alias = alias.trim();
     if alias.is_empty()
         || alias.contains(['/', '\\'])
@@ -1331,7 +1268,7 @@ fn uploaded_model_dir(root_dir: &Path, alias: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    Some(root_dir.join("models").join(alias))
+    Some(root_dir.join("components").join(alias))
 }
 
 fn component_response_to_http(response: ComponentResponse) -> Response {
@@ -1433,7 +1370,7 @@ impl wasmtime::component::HasData for StorageComponentState {
 #[cfg(all(test, feature = "ai-inference"))]
 mod configured_binding_registry_tests {
     use super::*;
-    use crate::{IntegrityModelBinding, IntegrityRoute};
+    use crate::{IntegrityInferenceComponentBinding, IntegrityRoute};
 
     fn temp_store() -> (crate::store::CoreStore, std::path::PathBuf) {
         let nanos = std::time::SystemTime::now()
@@ -1448,21 +1385,21 @@ mod configured_binding_registry_tests {
         (store, dir)
     }
 
-    fn config_with(bindings: Vec<IntegrityModelBinding>) -> crate::IntegrityConfig {
+    fn config_with(bindings: Vec<IntegrityInferenceComponentBinding>) -> crate::IntegrityConfig {
         crate::IntegrityConfig {
             routes: vec![IntegrityRoute {
-                models: bindings,
+                inference_components: bindings,
                 ..IntegrityRoute::default()
             }],
             ..crate::IntegrityConfig::default()
         }
     }
 
-    fn binding(alias: &str, path: &str, dynamic: bool) -> IntegrityModelBinding {
-        IntegrityModelBinding {
+    fn binding(alias: &str, path: &str, dynamic: bool) -> IntegrityInferenceComponentBinding {
+        IntegrityInferenceComponentBinding {
             alias: alias.to_owned(),
             path: path.to_owned(),
-            device: crate::ModelDevice::Cpu,
+            device: crate::ComponentPlacement::Cpu,
             qos: crate::RouteQos::Standard,
             dynamic,
             hardware_strategy: Default::default(),
@@ -1477,16 +1414,15 @@ mod configured_binding_registry_tests {
         );
         assert_eq!(binding_engine_label("mock:demo"), "mock");
         assert_eq!(binding_engine_label("mock"), "mock");
-        // A directory that does not exist cannot be probed for a `.gguf`, so it
-        // falls back to the safetensors label rather than guessing.
+        assert_eq!(binding_engine_label("/components/does-not-exist"), "local");
         assert_eq!(
-            binding_engine_label("/models/does-not-exist"),
-            "safetensors"
+            binding_engine_label("magnetar:/components/component"),
+            "magnetar"
         );
     }
 
     #[test]
-    fn configured_bindings_become_visible_in_the_model_registry() {
+    fn configured_bindings_become_visible_in_the_component_registry() {
         let (store, dir) = temp_store();
         let config = config_with(vec![
             binding("remote-coder", "openai:http://127.0.0.1:8080/v1", false),
@@ -1495,10 +1431,10 @@ mod configured_binding_registry_tests {
             binding("uploaded-later", "", true),
         ]);
 
-        publish_configured_model_bindings(&store, &config);
+        publish_configured_component_bindings(&store, &config);
 
         let raw = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "remote-coder")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "remote-coder")
             .expect("registry read should succeed")
             .expect("the upstream binding should be registered");
         let entry: serde_json::Value =
@@ -1510,7 +1446,7 @@ mod configured_binding_registry_tests {
         assert_eq!(entry["vramRequiredMb"], 0);
 
         assert!(store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "uploaded-later")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "uploaded-later")
             .expect("registry read should succeed")
             .is_none());
         let _ = fs::remove_dir_all(dir);
@@ -1521,7 +1457,7 @@ mod configured_binding_registry_tests {
         let (store, dir) = temp_store();
         // The collision that matters: an upload and a *non-dynamic* manifest
         // binding claim the same alias. The runtime loaded the configured
-        // binding eagerly at boot, so `ensure_model_loaded("shared")`
+        // binding eagerly at boot, so `ensure_component_loaded("shared")`
         // short-circuits and every request for `shared` reaches the upstream —
         // whatever the registry says.
         //
@@ -1533,17 +1469,17 @@ mod configured_binding_registry_tests {
         let uploaded = serde_json::json!({
             "alias": "shared", "engine": "gguf",
             "vramRequiredMb": 4096, "status": "available",
-            "modelPath": "/data/tachyon_data/models/shared",
+            "artifactPath": "/data/tachyon_data/components/shared",
         });
         store
             .kv_partition_set(
-                AI_MODELS_REGISTRY_TABLE,
+                AI_COMPONENTS_REGISTRY_TABLE,
                 "shared",
                 &serde_json::to_vec(&uploaded).expect("serialize"),
             )
             .expect("seed write should succeed");
 
-        publish_configured_model_bindings(
+        publish_configured_component_bindings(
             &store,
             &config_with(vec![binding(
                 "shared",
@@ -1553,7 +1489,7 @@ mod configured_binding_registry_tests {
         );
 
         let raw = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "shared")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "shared")
             .expect("registry read should succeed")
             .expect("row should still exist");
         let entry: serde_json::Value = serde_json::from_slice(&raw).expect("row should be JSON");
@@ -1561,14 +1497,14 @@ mod configured_binding_registry_tests {
             entry["engine"], "openai",
             "the listing must describe what a request for this alias actually runs"
         );
-        assert_eq!(entry["modelPath"], "openai:http://127.0.0.1:8080/v1");
+        assert_eq!(entry["artifactPath"], "openai:http://127.0.0.1:8080/v1");
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_configured_row_is_refreshed_when_its_binding_kind_changes() {
         let (store, dir) = temp_store();
-        publish_configured_model_bindings(
+        publish_configured_component_bindings(
             &store,
             &config_with(vec![binding(
                 "coder",
@@ -1578,31 +1514,31 @@ mod configured_binding_registry_tests {
         );
         // Hot reload swaps the same alias to a local checkpoint: leaving the
         // old row would keep advertising `openai/coder`.
-        publish_configured_model_bindings(
+        publish_configured_component_bindings(
             &store,
-            &config_with(vec![binding("coder", "/models/coder", false)]),
+            &config_with(vec![binding("coder", "/components/coder", false)]),
         );
 
         let raw = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "coder")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "coder")
             .expect("read")
             .expect("row");
         let entry: serde_json::Value = serde_json::from_slice(&raw).expect("json");
-        assert_eq!(entry["engine"], "safetensors");
+        assert_eq!(entry["engine"], "local");
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn a_configured_row_is_dropped_when_its_binding_leaves_the_manifest() {
         let (store, dir) = temp_store();
-        publish_configured_model_bindings(
+        publish_configured_component_bindings(
             &store,
             &config_with(vec![
                 binding("keep", "openai:http://127.0.0.1:8080/v1", false),
                 binding("drop", "openai:http://127.0.0.1:8081/v1", false),
             ]),
         );
-        publish_configured_model_bindings(
+        publish_configured_component_bindings(
             &store,
             &config_with(vec![binding(
                 "keep",
@@ -1612,12 +1548,12 @@ mod configured_binding_registry_tests {
         );
 
         assert!(store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "keep")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "keep")
             .expect("read")
             .is_some());
         assert!(
             store
-                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "drop")
+                .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "drop")
                 .expect("read")
                 .is_none(),
             "a removed binding must stop being advertised"
@@ -1630,21 +1566,21 @@ mod configured_binding_registry_tests {
         let (store, dir) = temp_store();
         let uploaded = serde_json::json!({
             "alias": "uploaded-only", "engine": "gguf", "vramRequiredMb": 4096,
-            "status": "available", "modelPath": "/data/models/uploaded-only",
+            "status": "available", "artifactPath": "/data/components/uploaded-only",
         });
         store
             .kv_partition_set(
-                AI_MODELS_REGISTRY_TABLE,
+                AI_COMPONENTS_REGISTRY_TABLE,
                 "uploaded-only",
                 &serde_json::to_vec(&uploaded).expect("serialize"),
             )
             .expect("seed");
 
         // Neither the refresh pass nor the sweep may touch a row this publisher
-        // does not own: the model is on disk, reachable, and nothing in the
+        // does not own: the component is on disk, reachable, and nothing in the
         // manifest contradicts it. The sweep in particular only walks
         // config-owned aliases, so an upload must never be collateral.
-        publish_configured_model_bindings(
+        publish_configured_component_bindings(
             &store,
             &config_with(vec![binding(
                 "unrelated",
@@ -1652,10 +1588,10 @@ mod configured_binding_registry_tests {
                 false,
             )]),
         );
-        publish_configured_model_bindings(&store, &config_with(Vec::new()));
+        publish_configured_component_bindings(&store, &config_with(Vec::new()));
 
         let raw = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "uploaded-only")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "uploaded-only")
             .expect("read")
             .expect("an uploaded row must survive");
         let entry: serde_json::Value = serde_json::from_slice(&raw).expect("json");
@@ -1665,44 +1601,34 @@ mod configured_binding_registry_tests {
     }
 
     #[test]
-    fn an_onnx_sidecar_is_authoritative_over_a_stale_gguf_file() {
+    fn local_component_sidecar_does_not_change_engine_label() {
         let (_store, dir) = temp_store();
-        let model_dir = dir.join("onnx-embed");
-        fs::create_dir_all(&model_dir).expect("model dir");
+        let component_dir = dir.join("component-artifact");
+        fs::create_dir_all(&component_dir).expect("artifact dir");
         fs::write(
-            model_dir.join(".tachyon-model.json"),
-            serde_json::json!({ "format": "onnx" }).to_string(),
+            component_dir.join(".tachyon-component.json"),
+            serde_json::json!({ "tool_call_parser": "opaque-parser" }).to_string(),
         )
         .expect("sidecar");
-        // A leftover checkpoint from a previous upload. Extension probing gives
-        // GGUF precedence, but the loader tries the embedding runtime first and
-        // honours the sidecar — so the row would have advertised `gguf/<alias>`
-        // for a backend that is ONNX.
-        fs::write(model_dir.join("stale.gguf"), b"not read").expect("stale gguf");
-        fs::write(model_dir.join("model.onnx"), b"not read").expect("onnx");
 
         assert_eq!(
-            binding_engine_label(model_dir.to_str().expect("utf-8 path")),
-            "onnx"
+            binding_engine_label(component_dir.to_str().expect("utf-8 path")),
+            "local"
         );
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn sidecar_less_probing_follows_the_loaders_onnx_first_order() {
+    fn local_file_extensions_do_not_change_engine_label() {
         let (_store, dir) = temp_store();
-        let model_dir = dir.join("onnx-no-sidecar");
-        fs::create_dir_all(&model_dir).expect("model dir");
-        // No sidecar at all, and a leftover checkpoint beside the ONNX one.
-        // `CandleBackendModel::load` probes the embedding runtime first and it
-        // accepts a bare `.onnx`, so labelling this `gguf/<alias>` advertised a
-        // backend that would never run.
-        fs::write(model_dir.join("stale.gguf"), b"not read").expect("stale gguf");
-        fs::write(model_dir.join("model.onnx"), b"not read").expect("onnx");
+        let component_dir = dir.join("extension-noise");
+        fs::create_dir_all(&component_dir).expect("artifact dir");
+        fs::write(component_dir.join("legacy-a.gguf"), b"not read").expect("opaque file");
+        fs::write(component_dir.join("legacy-b.onnx"), b"not read").expect("opaque file");
 
         assert_eq!(
-            binding_engine_label(model_dir.to_str().expect("utf-8 path")),
-            "onnx"
+            binding_engine_label(component_dir.to_str().expect("utf-8 path")),
+            "local"
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -1713,7 +1639,7 @@ mod configured_binding_registry_tests {
         // The rule has to hold for callers other than the storage proxy — the
         // general component host reaches the registry through the same shared
         // writer, so this exercises it directly.
-        publish_configured_model_bindings(
+        publish_configured_component_bindings(
             &store,
             &config_with(vec![binding(
                 "claimed",
@@ -1722,7 +1648,7 @@ mod configured_binding_registry_tests {
             )]),
         );
 
-        let error = write_uploaded_model_row(&store, "claimed", b"{}".to_vec())
+        let error = write_uploaded_component_row(&store, "claimed", b"{}".to_vec())
             .expect_err("a configured alias must not be taken by an upload");
         assert!(
             error.contains("claimed") && error.contains("dynamic"),
@@ -1731,12 +1657,13 @@ mod configured_binding_registry_tests {
 
         // The configured row is intact, and a free alias still writes.
         let raw = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "claimed")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "claimed")
             .expect("read")
             .expect("row");
         let entry: serde_json::Value = serde_json::from_slice(&raw).expect("json");
         assert_eq!(entry["engine"], "openai");
-        write_uploaded_model_row(&store, "free", b"{}".to_vec()).expect("a free alias is writable");
+        write_uploaded_component_row(&store, "free", b"{}".to_vec())
+            .expect("a free alias is writable");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1757,22 +1684,22 @@ mod configured_binding_registry_tests {
     #[test]
     fn a_reload_withdraws_a_binding_whose_checkpoint_changed_under_its_path() {
         let (store, dir) = temp_store();
-        let model_dir = dir.join("qwen-coder");
-        std::fs::create_dir_all(&model_dir).expect("model dir");
-        let sidecar = model_dir.join(".tachyon-model.json");
+        let component_dir = dir.join("qwen-coder");
+        std::fs::create_dir_all(&component_dir).expect("component dir");
+        let sidecar = component_dir.join(".tachyon-component.json");
         std::fs::write(&sidecar, br#"{"tool_call_parser":"qwen"}"#).expect("write sidecar");
 
-        let path = model_dir.to_string_lossy().into_owned();
+        let path = component_dir.to_string_lossy().into_owned();
         assert_eq!(
             binding_tool_call_parser(&path),
-            Some("qwen"),
+            Some("qwen".to_owned()),
             "the sidecar is what the publisher reads the dialect from"
         );
         let config = config_with(vec![binding("qwen-coder", &path, false)]);
-        publish_configured_model_bindings(&store, &config);
+        publish_configured_component_bindings(&store, &config);
 
         let published = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "qwen-coder")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "qwen-coder")
             .expect("read")
             .expect("the binding publishes a row");
         let published: serde_json::Value = serde_json::from_slice(&published).expect("row json");
@@ -1783,10 +1710,10 @@ mod configured_binding_registry_tests {
 
         // Same alias, same path, different checkpoint.
         std::fs::write(&sidecar, br#"{"tool_call_parser":"mistral"}"#).expect("rewrite sidecar");
-        withdraw_changed_model_bindings(&store, &config, &config);
+        withdraw_changed_component_bindings(&store, &config, &config);
 
         let raw = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "qwen-coder")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "qwen-coder")
             .expect("read")
             .expect("a changed binding keeps a reservation row rather than vanishing");
         let row: serde_json::Value = serde_json::from_slice(&raw).expect("row json");
@@ -1799,26 +1726,29 @@ mod configured_binding_registry_tests {
     #[test]
     fn configured_magnetar_binding_strips_scheme_before_parser_probe() {
         let (store, dir) = temp_store();
-        let model_dir = dir.join("local-coder");
-        std::fs::create_dir_all(&model_dir).expect("model dir");
-        std::fs::write(model_dir.join("config.json"), br#"{"model_type":"qwen3"}"#)
-            .expect("config");
+        let component_dir = dir.join("local-coder");
+        std::fs::create_dir_all(&component_dir).expect("component dir");
+        std::fs::write(
+            component_dir.join(".tachyon-component.json"),
+            br#"{"tool_call_parser":"qwen"}"#,
+        )
+        .expect("metadata");
 
         let config = config_with(vec![binding(
             "local-coder",
-            &format!("magnetar:{}", model_dir.display()),
+            &format!("magnetar:{}", component_dir.display()),
             false,
         )]);
-        publish_configured_model_bindings(&store, &config);
+        publish_configured_component_bindings(&store, &config);
 
         let published = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "local-coder")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "local-coder")
             .expect("read")
             .expect("the binding publishes a row");
         let published: serde_json::Value = serde_json::from_slice(&published).expect("row json");
         assert_eq!(
             published["toolCallParser"], "qwen",
-            "the publisher must probe the real filesystem path, not `magnetar:<path>`"
+            "the publisher must strip `magnetar:` before reading explicit metadata"
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -1827,21 +1757,21 @@ mod configured_binding_registry_tests {
     #[test]
     fn a_reload_keeps_a_binding_whose_checkpoint_is_unchanged() {
         let (store, dir) = temp_store();
-        let model_dir = dir.join("qwen-coder");
-        std::fs::create_dir_all(&model_dir).expect("model dir");
+        let component_dir = dir.join("qwen-coder");
+        std::fs::create_dir_all(&component_dir).expect("component dir");
         std::fs::write(
-            model_dir.join(".tachyon-model.json"),
+            component_dir.join(".tachyon-component.json"),
             br#"{"tool_call_parser":"qwen"}"#,
         )
         .expect("write sidecar");
 
-        let path = model_dir.to_string_lossy().into_owned();
+        let path = component_dir.to_string_lossy().into_owned();
         let config = config_with(vec![binding("qwen-coder", &path, false)]);
-        publish_configured_model_bindings(&store, &config);
-        withdraw_changed_model_bindings(&store, &config, &config);
+        publish_configured_component_bindings(&store, &config);
+        withdraw_changed_component_bindings(&store, &config, &config);
 
         let raw = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "qwen-coder")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "qwen-coder")
             .expect("read")
             .expect("the row survives");
         let row: serde_json::Value = serde_json::from_slice(&raw).expect("row json");
@@ -1859,25 +1789,25 @@ mod configured_binding_registry_tests {
             binding("re-pointed", "openai:http://127.0.0.1:8080/v1", false),
             binding("removed", "openai:http://127.0.0.1:9090/v1", false),
         ]);
-        publish_configured_model_bindings(&store, &previous);
+        publish_configured_component_bindings(&store, &previous);
 
         let incoming = config_with(vec![
             binding("unchanged", "openai:http://127.0.0.1:8080/v1", false),
             // Same alias, different backend: advertising the old engine while
             // the new one answers is the failure this withdrawal prevents.
-            binding("re-pointed", "/models/re-pointed", false),
+            binding("re-pointed", "/components/re-pointed", false),
         ]);
-        withdraw_changed_model_bindings(&store, &previous, &incoming);
+        withdraw_changed_component_bindings(&store, &previous, &incoming);
 
         let present = |alias: &str| {
             store
-                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, alias)
+                .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, alias)
                 .expect("read")
                 .is_some()
         };
         let row = |alias: &str| {
             store
-                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, alias)
+                .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, alias)
                 .expect("read")
                 .map(|raw| serde_json::from_slice::<serde_json::Value>(&raw).expect("row json"))
         };
@@ -1901,7 +1831,7 @@ mod configured_binding_registry_tests {
 
         // Which is the point: the same refusal an unchanged configured row
         // gets, for the whole length of the reload.
-        let denied = write_uploaded_model_row(&store, "re-pointed", b"{}".to_vec())
+        let denied = write_uploaded_component_row(&store, "re-pointed", b"{}".to_vec())
             .expect_err("an upload must not claim an alias the incoming config still owns");
         assert!(
             denied.contains("sealed manifest"),
@@ -1927,7 +1857,7 @@ mod configured_binding_registry_tests {
             Some(serde_json::json!(true)),
             "a removed binding is held withdrawn until the swap completes"
         );
-        let denied = write_uploaded_model_row(&store, "removed", b"{}".to_vec())
+        let denied = write_uploaded_component_row(&store, "removed", b"{}".to_vec())
             .expect_err("the reservation must hold while the previous runtime still answers");
         assert!(
             denied.contains("sealed manifest"),
@@ -1951,7 +1881,7 @@ mod configured_binding_registry_tests {
             "openai:http://127.0.0.1:8080/v1",
             false,
         )]);
-        assert_eq!(publish_configured_model_bindings(&store, &config), 0);
+        assert_eq!(publish_configured_component_bindings(&store, &config), 0);
 
         // A healthy table scans, and says so as `Ok` — the shape that lets the
         // publisher above tell "no stale rows" apart from "could not look".
@@ -1982,23 +1912,23 @@ mod configured_binding_registry_tests {
             "openai:http://127.0.0.1:8080/v1",
             false,
         )]);
-        // Deliberately no `publish_configured_model_bindings` call: the table
+        // Deliberately no `publish_configured_component_bindings` call: the table
         // has no row for this alias.
         assert!(store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "never-published")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "never-published")
             .expect("read")
             .is_none());
 
-        withdraw_changed_model_bindings(&store, &previous, &config_with(Vec::new()));
+        withdraw_changed_component_bindings(&store, &previous, &config_with(Vec::new()));
 
         let raw = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "never-published")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "never-published")
             .expect("read")
             .expect("an unpublished binding is sealed on the way out");
         let row: serde_json::Value = serde_json::from_slice(&raw).expect("row json");
         assert_eq!(row["withdrawn"], true);
         assert_eq!(row["source"], "config");
-        let denied = write_uploaded_model_row(&store, "never-published", b"{}".to_vec())
+        let denied = write_uploaded_component_row(&store, "never-published", b"{}".to_vec())
             .expect_err("the seal is what stops an upload claiming the alias mid-swap");
         assert!(
             denied.contains("sealed manifest"),
@@ -2007,10 +1937,10 @@ mod configured_binding_registry_tests {
 
         // And the publication after the swap sweeps it, so the seal is not a
         // permanent lock on an alias no config claims.
-        publish_configured_model_bindings(&store, &config_with(Vec::new()));
+        publish_configured_component_bindings(&store, &config_with(Vec::new()));
         assert!(
             store
-                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "never-published")
+                .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "never-published")
                 .expect("read")
                 .is_none(),
             "a reservation no manifest claims is swept, not held forever"
@@ -2031,9 +1961,9 @@ mod configured_binding_registry_tests {
 
         let upload = serde_json::json!({
             "alias": "shared", "engine": "gguf", "vramRequiredMb": 4096,
-            "status": "available", "modelPath": "/models/shared",
+            "status": "available", "artifactPath": "/components/shared",
         });
-        write_uploaded_model_row(
+        write_uploaded_component_row(
             &store,
             "shared",
             serde_json::to_vec(&upload).expect("serialize"),
@@ -2047,22 +1977,22 @@ mod configured_binding_registry_tests {
             "openai:http://127.0.0.1:8080/v1",
             false,
         )]);
-        publish_configured_model_bindings(&store, &config);
+        publish_configured_component_bindings(&store, &config);
         let row = |alias: &str| {
             store
-                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, alias)
+                .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, alias)
                 .expect("read")
                 .map(|raw| serde_json::from_slice::<serde_json::Value>(&raw).expect("row json"))
         };
         let shadowing = row("shared").expect("the configured row is published");
         assert_eq!(shadowing["source"], "config");
-        assert_eq!(shadowing["modelPath"], "openai:http://127.0.0.1:8080/v1");
+        assert_eq!(shadowing["artifactPath"], "openai:http://127.0.0.1:8080/v1");
 
         // The binding leaves. The upload never moved, so its row comes back
         // rather than going down with the binding that hid it.
-        publish_configured_model_bindings(&store, &config_with(Vec::new()));
+        publish_configured_component_bindings(&store, &config_with(Vec::new()));
         let restored = row("shared").expect("the displaced upload is restored, not swept");
-        assert_eq!(restored["modelPath"], "/models/shared");
+        assert_eq!(restored["artifactPath"], "/components/shared");
         assert_eq!(restored["vramRequiredMb"], 4096);
         assert!(
             restored.get("source").is_none(),
@@ -2074,25 +2004,25 @@ mod configured_binding_registry_tests {
         // publisher's, and writing a fresh one over it dropped the only saved
         // copy of the displaced upload: the alias then swept clean when the
         // binding left, and the files on disk became unreachable.
-        write_uploaded_model_row(
+        write_uploaded_component_row(
             &store,
             "shared",
             serde_json::to_vec(&upload).expect("serialize"),
         )
         .expect("the restored alias is the upload's again, so it accepts a write");
-        publish_configured_model_bindings(&store, &config);
-        publish_configured_model_bindings(&store, &config);
-        publish_configured_model_bindings(&store, &config_with(Vec::new()));
+        publish_configured_component_bindings(&store, &config);
+        publish_configured_component_bindings(&store, &config);
+        publish_configured_component_bindings(&store, &config_with(Vec::new()));
         let restored = row("shared").expect("a reload must not consume the displaced upload");
-        assert_eq!(restored["modelPath"], "/models/shared");
+        assert_eq!(restored["artifactPath"], "/components/shared");
         assert!(restored.get("source").is_none());
 
         // And a config row with nothing held aside is still swept, so a binding
         // that never displaced anything leaves no trace.
-        let plain = config_with(vec![binding("solo", "/models/solo", false)]);
-        publish_configured_model_bindings(&store, &plain);
+        let plain = config_with(vec![binding("solo", "/components/solo", false)]);
+        publish_configured_component_bindings(&store, &plain);
         assert!(row("solo").is_some());
-        publish_configured_model_bindings(&store, &config_with(Vec::new()));
+        publish_configured_component_bindings(&store, &config_with(Vec::new()));
         assert!(
             row("solo").is_none(),
             "a binding that displaced nothing is swept"
@@ -2101,15 +2031,12 @@ mod configured_binding_registry_tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The engine label has to name the backend that will answer.
+    /// The engine label names only Tachyon-owned routing classes.
     ///
-    /// It is half the public `{engine}/{alias}` id, so a directory advertised
-    /// as `safetensors/<alias>` while the ONNX embedding backend executes is a
-    /// listing that lies about where a prompt goes. The sidecar is
-    /// authoritative for the loaders that read it — and
-    /// `CandleEmbeddingRuntime::try_load`, which runs first, never does.
+    /// Local artifact contents and sidecar hints are opaque to the registry
+    /// publisher; Magnetar or the selected Component owns format decisions.
     #[test]
-    fn a_usable_onnx_outranks_a_sidecar_the_loader_will_not_consult() {
+    fn local_artifact_label_ignores_component_format_markers() {
         let dir = std::env::temp_dir().join(format!(
             "tachyon-engine-label-{}-{}",
             std::process::id(),
@@ -2122,32 +2049,29 @@ mod configured_binding_registry_tests {
         let path = dir.to_string_lossy().to_string();
 
         fs::write(
-            dir.join(".tachyon-model.json"),
+            dir.join(".tachyon-component.json"),
             br#"{"format":"safetensors"}"#,
         )
         .expect("sidecar");
         assert_eq!(
             binding_engine_label(&path),
-            "safetensors",
-            "with nothing else to go on the declaration stands"
+            "local",
+            "component sidecar metadata must not classify the local engine"
         );
 
-        // An ONNX file alone is not enough: the embedding runtime needs a
-        // tokenizer, and without one it declines and the declaration is honest.
-        fs::write(dir.join("model.onnx"), b"not really onnx").expect("onnx");
+        // Legacy format-looking files are opaque payloads at this boundary.
+        fs::write(dir.join("component.onnx"), b"not really onnx").expect("opaque file");
         assert_eq!(
             binding_engine_label(&path),
-            "safetensors",
-            "an ONNX the embedding runtime would decline does not change what answers"
+            "local",
+            "local artifact contents must not classify the local engine"
         );
 
-        // With the tokenizer the embedding runtime claims the directory, and
-        // the label has to say so.
-        fs::write(dir.join("tokenizer.json"), b"{}").expect("tokenizer");
+        fs::write(dir.join("tokenizer.json"), b"{}").expect("opaque side file");
         assert_eq!(
             binding_engine_label(&path),
-            "onnx",
-            "the label must name the backend the loader's probe order selects"
+            "local",
+            "tokenizer-looking files remain opaque to Tachyon core"
         );
 
         let _ = fs::remove_dir_all(dir);
@@ -2165,11 +2089,11 @@ mod configured_binding_registry_tests {
         let (store, dir) = temp_store();
         let config = config_with(vec![
             binding("coder", "openai:http://127.0.0.1:8080/v1", false),
-            binding("embed", "/models/embed", false),
+            binding("embed", "/components/embed", false),
         ]);
 
         assert_eq!(
-            publish_configured_model_bindings(&store, &config),
+            publish_configured_component_bindings(&store, &config),
             0,
             "a healthy store writes every row, so nothing stays withdrawn"
         );
@@ -2177,12 +2101,12 @@ mod configured_binding_registry_tests {
         // And the sweep of a dropped alias counts the same way, so a reload
         // that removes a binding can also tell whether the removal landed.
         assert_eq!(
-            publish_configured_model_bindings(&store, &config_with(Vec::new())),
+            publish_configured_component_bindings(&store, &config_with(Vec::new())),
             0
         );
         assert!(
             store
-                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "coder")
+                .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "coder")
                 .expect("read")
                 .is_none(),
             "a binding that left the manifest is swept, which is what frees its reservation"
@@ -2204,13 +2128,13 @@ mod configured_binding_registry_tests {
         let (store, dir) = temp_store();
         let forged = serde_json::json!({
             "alias": "mine", "engine": "gguf", "vramRequiredMb": 0,
-            "status": "available", "modelPath": "/models/mine",
+            "status": "available", "artifactPath": "/components/mine",
             "source": "config",
         });
 
         let denied = apply_guest_registry_write(
             &store,
-            AI_MODELS_REGISTRY_TABLE,
+            AI_COMPONENTS_REGISTRY_TABLE,
             "mine",
             Some(serde_json::to_vec(&forged).expect("serialize")),
         )
@@ -2223,7 +2147,7 @@ mod configured_binding_registry_tests {
         // Nothing landed, so the alias is still free for its rightful writer.
         assert!(
             store
-                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "mine")
+                .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "mine")
                 .expect("read")
                 .is_none(),
             "a refused write must not leave a partial row behind"
@@ -2233,11 +2157,11 @@ mod configured_binding_registry_tests {
         // batch: one forged entry must not commit its neighbours.
         let honest = serde_json::json!({
             "alias": "other", "engine": "gguf", "vramRequiredMb": 0,
-            "status": "available", "modelPath": "/models/other",
+            "status": "available", "artifactPath": "/components/other",
         });
         let denied = apply_guest_registry_batch(
             &store,
-            AI_MODELS_REGISTRY_TABLE,
+            AI_COMPONENTS_REGISTRY_TABLE,
             &[
                 (
                     "other".to_owned(),
@@ -2256,7 +2180,7 @@ mod configured_binding_registry_tests {
         );
         assert!(
             store
-                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "other")
+                .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "other")
                 .expect("read")
                 .is_none(),
             "the honest entry beside a forged one must not commit on its own"
@@ -2273,7 +2197,7 @@ mod configured_binding_registry_tests {
             "openai:http://127.0.0.1:8080/v1",
             false,
         )]);
-        publish_configured_model_bindings(&store, &configured);
+        publish_configured_component_bindings(&store, &configured);
 
         // The guest checks ownership before it writes, but the check and the
         // write are two separate host transactions — a reload publishing the
@@ -2281,11 +2205,11 @@ mod configured_binding_registry_tests {
         // one, inside the write.
         let registration = serde_json::json!({
             "alias": "coder", "engine": "safetensors", "vramRequiredMb": 0,
-            "status": "available", "modelPath": "/models/mine",
+            "status": "available", "artifactPath": "/components/mine",
         });
         let denied = apply_guest_registry_write(
             &store,
-            AI_MODELS_REGISTRY_TABLE,
+            AI_COMPONENTS_REGISTRY_TABLE,
             "coder",
             Some(serde_json::to_vec(&registration).expect("serialize")),
         )
@@ -2298,23 +2222,24 @@ mod configured_binding_registry_tests {
         // The configured row is intact — the registration did not partially
         // land — so the listing still describes the backend that answers.
         let raw = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "coder")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "coder")
             .expect("read")
             .expect("the configured row survives");
         let row: serde_json::Value = serde_json::from_slice(&raw).expect("row json");
         assert_eq!(row["source"], "config");
-        assert_eq!(row["modelPath"], "openai:http://127.0.0.1:8080/v1");
+        assert_eq!(row["artifactPath"], "openai:http://127.0.0.1:8080/v1");
 
         // A deregistration is refused the same way, from the same place.
-        let denied = apply_guest_registry_write(&store, AI_MODELS_REGISTRY_TABLE, "coder", None)
-            .expect_err("a configured alias must not be deregistered either");
+        let denied =
+            apply_guest_registry_write(&store, AI_COMPONENTS_REGISTRY_TABLE, "coder", None)
+                .expect_err("a configured alias must not be deregistered either");
         assert!(denied.contains(GUEST_REGISTRY_ALIAS_TAKEN));
 
         // And a free alias is unaffected: the rule guards configured rows, it
         // does not make the table read-only.
         apply_guest_registry_write(
             &store,
-            AI_MODELS_REGISTRY_TABLE,
+            AI_COMPONENTS_REGISTRY_TABLE,
             "mine",
             Some(b"{\"alias\":\"mine\"}".to_vec()),
         )
@@ -2330,7 +2255,7 @@ mod configured_binding_registry_tests {
             "openai:http://127.0.0.1:8080/v1",
             false,
         )]);
-        publish_configured_model_bindings(&store, &configured);
+        publish_configured_component_bindings(&store, &configured);
 
         // A free alias first, then one the manifest owns. Validating per key in
         // a loop of single-key writes commits `mine` and then fails on `coder`,
@@ -2340,19 +2265,19 @@ mod configured_binding_registry_tests {
             ("mine".to_owned(), br#"{"alias":"mine"}"#.to_vec()),
             ("coder".to_owned(), br#"{"alias":"coder"}"#.to_vec()),
         ];
-        let denied = apply_guest_registry_batch(&store, AI_MODELS_REGISTRY_TABLE, &entries)
+        let denied = apply_guest_registry_batch(&store, AI_COMPONENTS_REGISTRY_TABLE, &entries)
             .expect_err("a batch touching a configured alias must be refused");
         assert!(denied.contains(GUEST_REGISTRY_ALIAS_TAKEN), "got: {denied}");
 
         assert!(
             store
-                .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "mine")
+                .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "mine")
                 .expect("read")
                 .is_none(),
             "the entry before the refused one must have rolled back with it"
         );
         let raw = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "coder")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "coder")
             .expect("read")
             .expect("the configured row survives");
         let row: serde_json::Value = serde_json::from_slice(&raw).expect("row json");
@@ -2361,7 +2286,7 @@ mod configured_binding_registry_tests {
         // And a batch of free aliases still lands whole.
         apply_guest_registry_batch(
             &store,
-            AI_MODELS_REGISTRY_TABLE,
+            AI_COMPONENTS_REGISTRY_TABLE,
             &[
                 ("mine".to_owned(), br#"{"alias":"mine"}"#.to_vec()),
                 ("yours".to_owned(), br#"{"alias":"yours"}"#.to_vec()),
@@ -2371,7 +2296,7 @@ mod configured_binding_registry_tests {
         for alias in ["mine", "yours"] {
             assert!(
                 store
-                    .kv_partition_get(AI_MODELS_REGISTRY_TABLE, alias)
+                    .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, alias)
                     .expect("read")
                     .is_some(),
                 "`{alias}` should have been written"
@@ -2385,11 +2310,11 @@ mod configured_binding_registry_tests {
         let (store, dir) = temp_store();
         let uploaded = serde_json::json!({
             "alias": "shared", "engine": "gguf", "vramRequiredMb": 4096,
-            "status": "available", "modelPath": "/data/models/shared",
+            "status": "available", "artifactPath": "/data/components/shared",
         });
         store
             .kv_partition_set(
-                AI_MODELS_REGISTRY_TABLE,
+                AI_COMPONENTS_REGISTRY_TABLE,
                 "shared",
                 &serde_json::to_vec(&uploaded).expect("serialize"),
             )
@@ -2397,7 +2322,7 @@ mod configured_binding_registry_tests {
 
         // The alias leaves the manifest, but the row belongs to an upload —
         // ownership is re-read inside the delete transaction.
-        withdraw_changed_model_bindings(
+        withdraw_changed_component_bindings(
             &store,
             &config_with(vec![binding(
                 "shared",
@@ -2408,7 +2333,7 @@ mod configured_binding_registry_tests {
         );
 
         let raw = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "shared")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "shared")
             .expect("read")
             .expect("an uploaded row must survive a reload");
         let entry: serde_json::Value = serde_json::from_slice(&raw).expect("json");
@@ -2424,20 +2349,23 @@ mod configured_binding_registry_tests {
         // advertised. Nothing is published for it at all.
         let uploaded = serde_json::json!({
             "alias": "shared", "engine": "gguf", "vramRequiredMb": 4096,
-            "status": "available", "modelPath": "/data/models/shared",
+            "status": "available", "artifactPath": "/data/components/shared",
         });
         store
             .kv_partition_set(
-                AI_MODELS_REGISTRY_TABLE,
+                AI_COMPONENTS_REGISTRY_TABLE,
                 "shared",
                 &serde_json::to_vec(&uploaded).expect("serialize"),
             )
             .expect("seed");
 
-        publish_configured_model_bindings(&store, &config_with(vec![binding("shared", "", true)]));
+        publish_configured_component_bindings(
+            &store,
+            &config_with(vec![binding("shared", "", true)]),
+        );
 
         let raw = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "shared")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "shared")
             .expect("read")
             .expect("row");
         let entry: serde_json::Value = serde_json::from_slice(&raw).expect("json");
@@ -2465,14 +2393,14 @@ mod configured_binding_registry_tests {
             false,
         )]);
 
-        publish_configured_model_bindings(&store, &config);
+        publish_configured_component_bindings(&store, &config);
         let first = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "remote-coder")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "remote-coder")
             .expect("read")
             .expect("row");
-        publish_configured_model_bindings(&store, &config);
+        publish_configured_component_bindings(&store, &config);
         let second = store
-            .kv_partition_get(AI_MODELS_REGISTRY_TABLE, "remote-coder")
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "remote-coder")
             .expect("read")
             .expect("row");
 
@@ -2486,21 +2414,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uploaded_model_dir_accepts_single_component_alias() {
+    fn uploaded_component_dir_accepts_single_component_alias() {
         let root = Path::new("/tachyon/tachyon_data");
         assert_eq!(
-            uploaded_model_dir(root, "llama-3"),
-            Some(PathBuf::from("/tachyon/tachyon_data/models/llama-3"))
+            uploaded_component_dir(root, "llama-3"),
+            Some(PathBuf::from("/tachyon/tachyon_data/components/llama-3"))
         );
     }
 
     #[test]
-    fn uploaded_model_dir_rejects_path_like_aliases() {
+    fn uploaded_component_dir_rejects_path_like_aliases() {
         let root = Path::new("/tachyon/tachyon_data");
-        assert!(uploaded_model_dir(root, "").is_none());
-        assert!(uploaded_model_dir(root, "../llama").is_none());
-        assert!(uploaded_model_dir(root, "models/llama").is_none());
-        assert!(uploaded_model_dir(root, r"models\llama").is_none());
+        assert!(uploaded_component_dir(root, "").is_none());
+        assert!(uploaded_component_dir(root, "../llama").is_none());
+        assert!(uploaded_component_dir(root, "components/llama").is_none());
+        assert!(uploaded_component_dir(root, r"components\llama").is_none());
     }
 }
 
@@ -2509,16 +2437,16 @@ mod registry_casing_tests {
     use super::*;
     use serde::Deserialize;
 
-    /// Mirror of `guest-openai`'s `ModelInfo` reader, which owns the
-    /// `ai-models-registry` table and reads rows with `#[serde(rename_all =
+    /// Mirror of `guest-openai`'s `ComponentInfo` reader, which owns the
+    /// `ai-components-registry` table and reads rows with `#[serde(rename_all =
     /// "camelCase")]` and a *required* `vram_required_mb`. If the host writer
     /// drifts back to snake_case, deserialization fails here exactly as it does
-    /// in `guest-openai::list_models` (which silently `filter_map(...ok())`s the
-    /// miss), making uploaded models invisible in `GET /ai/v1/models`.
+    /// in `guest-openai::list_components` (which silently `filter_map(...ok())`s the
+    /// miss), making uploaded artifacts invisible in `GET /ai/v1/components`.
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     #[allow(dead_code)]
-    struct GuestOpenAiModelInfoReader {
+    struct GuestOpenAiComponentInfoReader {
         alias: String,
         engine: String,
         vram_required_mb: u64,
@@ -2529,21 +2457,21 @@ mod registry_casing_tests {
 
     #[test]
     fn registry_entry_is_readable_by_guest_openai_camelcase_reader() {
-        let info = RegistryModelInfo {
+        let info = RegistryComponentInfo {
             alias: "tinyllama",
             engine: "gguf",
             vram_required_mb: 0,
             status: "available",
-            model_path: "/data/tachyon_data/models/tinyllama",
+            artifact_path: "/data/tachyon_data/components/tinyllama",
             source: None,
-            tool_call_parser: Some("qwen"),
+            tool_call_parser: Some("qwen".to_owned()),
             withdrawn: false,
         };
         let bytes = serde_json::to_vec(&info).expect("serialize registry entry");
 
-        // Reproduces `guest-openai::list_models`, which does
-        // `serde_json::from_slice::<ModelInfo>(&v)` and drops any miss.
-        let parsed: GuestOpenAiModelInfoReader = serde_json::from_slice(&bytes)
+        // Reproduces `guest-openai::list_components`, which does
+        // `serde_json::from_slice::<ComponentInfo>(&v)` and drops any miss.
+        let parsed: GuestOpenAiComponentInfoReader = serde_json::from_slice(&bytes)
             .expect("guest-openai must be able to read host-written registry rows");
         assert_eq!(parsed.alias, "tinyllama");
         assert_eq!(parsed.engine, "gguf");
@@ -2559,8 +2487,8 @@ mod registry_casing_tests {
             "registry entry must serialize camelCase `vramRequiredMb`"
         );
         assert!(
-            value.get("modelPath").is_some(),
-            "registry entry must serialize camelCase `modelPath`"
+            value.get("artifactPath").is_some(),
+            "registry entry must serialize camelCase `artifactPath`"
         );
         assert!(
             value.get("toolCallParser").is_some(),
@@ -2572,18 +2500,18 @@ mod registry_casing_tests {
         );
     }
 
-    /// The field is optional on the wire: a model that declares no dialect
+    /// The field is optional on the wire: a component that declares no dialect
     /// must produce a row with the key absent, not `null`. `guest-openai`
     /// reads it as `Option<String>` either way, but an absent key is what lets
     /// a reader predating the field ignore it entirely.
     #[test]
-    fn a_model_without_a_declared_parser_omits_the_key() {
-        let info = RegistryModelInfo {
+    fn a_component_without_a_declared_parser_omits_the_key() {
+        let info = RegistryComponentInfo {
             alias: "tinyllama",
             engine: "gguf",
             vram_required_mb: 0,
             status: "available",
-            model_path: "/data/tachyon_data/models/tinyllama",
+            artifact_path: "/data/tachyon_data/components/tinyllama",
             source: None,
             tool_call_parser: None,
             withdrawn: false,

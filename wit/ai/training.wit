@@ -1,8 +1,8 @@
 package tachyon:mesh@2.0.0;
 
-/// Submission interface for asynchronous on-Edge LoRA fine-tuning. The host enqueues
-/// jobs into the low-priority lane of `system-faas-buffer` so the inference critical
-/// path's latency budget is unaffected.
+/// Submission interface for asynchronous on-Edge training. The host enqueues
+/// jobs into the low-priority lane of `system-faas-buffer` so latency-critical
+/// Component invocations are unaffected.
 interface training {
     /// Adapter rank — keep small (4-32) on Edge nodes.
     type rank = u32;
@@ -20,11 +20,11 @@ interface training {
     }
 
     record training-job {
-        /// Foundation model alias as declared in the route's `models`.
-        base-model: string,
+        /// Component or artifact reference selected by the guest.
+        base-component-ref: string,
         /// Where to read training samples from.
         dataset: dataset-handle,
-        /// LoRA rank.
+        /// Adapter rank.
         rank: rank,
         /// Hard upper bound on optimisation steps.
         max-steps: step-budget,
@@ -42,7 +42,7 @@ interface training {
         queued,
         /// Running; reports current step and total.
         running(tuple<u32, u32>),
-        /// Completed; carries the broker path of the resulting `.safetensors`.
+        /// Completed; carries the broker path of the resulting artifact.
         completed(string),
         /// Failed; carries a human-readable message.
         failed(string),

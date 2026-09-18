@@ -1,0 +1,3 @@
+[submodule "vendor/Magnetar"]
+	path = vendor/Magnetar
+	url = https://github.com/astorise/Magnetar.git

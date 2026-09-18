@@ -4,7 +4,7 @@
 TBD - created by archiving change p2p-mesh-overlay-discovery. Update Purpose after archive.
 ## Requirements
 ### Requirement: system-faas-mesh-overlay broadcasts hardware heartbeats
-The Mesh SHALL provide `system-faas-mesh-overlay`, an optional System FaaS that periodically broadcasts a hardware heartbeat describing the local node's capabilities (for example `gpu_available`, `active_faas_count`, `supported_models`).
+The Mesh SHALL provide `system-faas-mesh-overlay`, an optional System FaaS that periodically broadcasts a hardware heartbeat describing the local node's capabilities (for example `gpu_available`, `active_faas_count`, `supported_components`).
 
 #### Scenario: Node advertises its capabilities to peers
 - **WHEN** `system-faas-mesh-overlay` is enabled on a node
@@ -24,7 +24,7 @@ When the local `core-host` cannot satisfy a request locally (for example because
 
 #### Scenario: Saturated GPU forwards inference to an idle peer
 - **WHEN** an inference request arrives on a node whose GPU is saturated
-- **AND** `system-faas-mesh-overlay` reports an idle peer with `gpu_available: true` and a matching `supported_model`
+- **AND** `system-faas-mesh-overlay` reports an idle peer with `gpu_available: true` and a matching `supported_component`
 - **THEN** the host forwards the request payload over the secure peer tunnel
 - **AND** streams the peer's response back to the original client
 - **AND** the client observes the response as if it had been served locally

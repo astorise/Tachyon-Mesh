@@ -3,36 +3,36 @@
 ## Purpose
 TBD - created by archiving change large-model-broker. Update Purpose after archive.
 ## Requirements
-### Requirement: Large model uploads are streamed directly to disk
-The host SHALL stream large model uploads into staging files on disk instead of buffering the complete payload in memory.
+### Requirement: Large artifact uploads are streamed directly to disk
+The host SHALL stream large artifact uploads into staging files on disk instead of buffering the complete payload in memory.
 
 #### Scenario: A multipart upload is in progress
-- **WHEN** the client uploads chunk `N` for an initialized model upload
+- **WHEN** the client uploads chunk `N` for an initialized artifact upload
 - **THEN** the host appends the raw bytes directly to the upload staging file
 - **AND** it tracks the received byte count and expected part order
 
 ### Requirement: Completed uploads are verified before finalization
 The host SHALL hash the staged file during commit and only finalize it when the hash and size match the initialized metadata.
 
-#### Scenario: A model upload commits successfully
+#### Scenario: A artifact upload commits successfully
 - **WHEN** the staged file hash matches the expected `sha256:<digest>` and the received size matches
 - **THEN** the host moves the file into `tachyon_data/models`
 - **AND** it returns the finalized model path
 
-#### Scenario: A model upload fails verification
+#### Scenario: A artifact upload fails verification
 - **WHEN** the staged file hash or size differs from the initialized metadata
 - **THEN** the host rejects the commit
 - **AND** it removes the staging file
 
 ### Requirement: The desktop UI reports multipart progress
-The desktop UI SHALL show upload progress for large-model uploads.
+The desktop UI SHALL show upload progress for large-artifact uploads.
 
 #### Scenario: A model is being streamed
 - **WHEN** the Tauri command emits `upload_progress`
 - **THEN** the UI updates the progress bar width to reflect the current percentage
 
 ### Requirement: Model broker writes large downloads to a .part file and renames atomically
-`system-faas-model-broker` SHALL stream large model downloads (e.g. GGUF) into a temporary file with a `.part` suffix, and SHALL rename the file to its final name only after the entire stream completes successfully.
+`system-faas-model-broker` SHALL stream large model artifact downloads into a temporary file with a `.part` suffix, and SHALL rename the file to its final name only after the entire stream completes successfully.
 
 #### Scenario: Successful download is renamed atomically
 - **WHEN** a model download stream completes successfully
@@ -54,3 +54,16 @@ If a download stream is interrupted (client abort, network error, host shutdown)
 - **AND** the file's age exceeds the configured GC TTL
 - **THEN** `system-faas-gc` removes the orphaned `.part` file during a sweep
 
+### Requirement: Model broker treats uploaded model artifacts as format-neutral
+`system-faas-model-broker` SHALL verify upload manifests, install artifact directories, write host-controlled provenance metadata, and publish a Magnetar-owned artifact upload event without deciding whether the bytes are GGUF, Safetensors, or another model format.
+
+#### Scenario: Upload commit does not infer model format
+- **WHEN** a model archive is committed successfully
+- **THEN** the broker unpacks and verifies the declared files
+- **AND** the broker writes alias and upload provenance metadata
+- **AND** it does not write a model `format` declaration into the provenance sidecar
+
+#### Scenario: Magnetar owns model format support
+- **WHEN** the broker publishes the artifact upload event
+- **THEN** the event identifies the installed path as a Magnetar artifact
+- **AND** format validation remains the responsibility of Magnetar production ingestion

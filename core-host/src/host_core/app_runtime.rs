@@ -24,7 +24,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/auth/login/stage", post(auth::stage_login_handler))
         .route("/auth/login/finalize", post(auth::finalize_login_handler))
         .route(
-            "/api/kv-cache/{model}/{key}",
+            "/api/component-cache/{component}/{key}",
             get(kv_cache::kv_cache_get_handler)
                 .put(kv_cache::kv_cache_put_handler)
                 .delete(kv_cache::kv_cache_delete_handler),
@@ -227,16 +227,16 @@ pub(crate) fn distributed_rate_limit_bypass_total() -> u64 {
     DISTRIBUTED_RATE_LIMIT_BYPASS_TOTAL.load(Ordering::Relaxed)
 }
 
-pub(crate) fn lora_training_queue() -> Arc<LoraTrainingQueue> {
-    Arc::clone(LORA_TRAINING_QUEUE.get_or_init(|| {
+pub(crate) fn component_training_queue() -> Arc<ComponentTrainingQueue> {
+    Arc::clone(COMPONENT_TRAINING_QUEUE.get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::channel();
         let statuses = Arc::new(Mutex::new(HashMap::new()));
         let worker_statuses = Arc::clone(&statuses);
         std::thread::Builder::new()
-            .name("tachyon-lora-low-priority".to_owned())
-            .spawn(move || run_lora_training_worker(receiver, worker_statuses))
-            .expect("LoRA training worker should spawn");
-        Arc::new(LoraTrainingQueue { sender, statuses })
+            .name("tachyon-train-low-priority".to_owned())
+            .spawn(move || run_component_training_worker(receiver, worker_statuses))
+            .expect("Component training worker should spawn");
+        Arc::new(ComponentTrainingQueue { sender, statuses })
     }))
 }
 
@@ -319,30 +319,32 @@ pub(crate) fn update_ai_inference_status(
         .insert(id.to_owned(), status);
 }
 
-pub(crate) fn run_lora_training_worker(
-    receiver: std::sync::mpsc::Receiver<LoraTrainingJob>,
-    statuses: Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
+pub(crate) fn run_component_training_worker(
+    receiver: std::sync::mpsc::Receiver<ComponentTrainingJob>,
+    statuses: Arc<Mutex<HashMap<String, ComponentTrainingJobStatus>>>,
 ) {
     while let Ok(job) = receiver.recv() {
-        update_lora_training_status(
+        update_component_training_status(
             &statuses,
             &job.id,
-            LoraTrainingJobStatus::Running {
+            ComponentTrainingJobStatus::Running {
                 step: 0,
                 total: job.max_steps,
             },
         );
-        let result = execute_lora_training_job(&job, &statuses);
+        let result = execute_component_training_job(&job, &statuses);
         match result {
-            Ok(path) => update_lora_training_status(
+            Ok(path) => update_component_training_status(
                 &statuses,
                 &job.id,
-                LoraTrainingJobStatus::Completed { adapter_path: path },
+                ComponentTrainingJobStatus::Completed {
+                    artifact_path: path,
+                },
             ),
-            Err(error) => update_lora_training_status(
+            Err(error) => update_component_training_status(
                 &statuses,
                 &job.id,
-                LoraTrainingJobStatus::Failed {
+                ComponentTrainingJobStatus::Failed {
                     message: format!("{error:#}"),
                 },
             ),
@@ -350,36 +352,36 @@ pub(crate) fn run_lora_training_worker(
     }
 }
 
-pub(crate) fn execute_lora_training_job(
-    job: &LoraTrainingJob,
-    statuses: &Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
+pub(crate) fn execute_component_training_job(
+    job: &ComponentTrainingJob,
+    statuses: &Arc<Mutex<HashMap<String, ComponentTrainingJobStatus>>>,
 ) -> Result<String> {
     let total = job.max_steps.max(1);
     for step in 1..=total.min(4) {
-        update_lora_training_status(
+        update_component_training_status(
             statuses,
             &job.id,
-            LoraTrainingJobStatus::Running { step, total },
+            ComponentTrainingJobStatus::Running { step, total },
         );
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    let broker_root = std::env::var(MODEL_BROKER_DIR_ENV)
+    let broker_root = std::env::var(ARTIFACT_BROKER_DIR_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("tachyon_data"));
-    let adapter_dir = broker_root.join("adapters");
-    fs::create_dir_all(&adapter_dir).with_context(|| {
+    let artifact_dir = broker_root.join("training-artifacts");
+    fs::create_dir_all(&artifact_dir).with_context(|| {
         format!(
-            "failed to create adapter broker dir `{}`",
-            adapter_dir.display()
+            "failed to create artifact broker dir `{}`",
+            artifact_dir.display()
         )
     })?;
-    let sanitized = sanitize_lora_job_part(&job.id)?;
-    let adapter_path = adapter_dir.join(format!("{sanitized}.safetensors"));
+    let sanitized = sanitize_training_job_part(&job.id)?;
+    let artifact_path = artifact_dir.join(format!("{sanitized}.training.json"));
     let payload = serde_json::to_vec(&serde_json::json!({
-        "format": "tachyon.mock-lora.safetensors",
+        "format": "tachyon.component-training-artifact",
         "tenant_id": job.tenant_id,
-        "base_model": job.base_model,
+        "base_component_ref": job.base_component_ref,
         "dataset": {
             "volume": job.dataset_volume,
             "path": job.dataset_path,
@@ -395,31 +397,31 @@ pub(crate) fn execute_lora_training_job(
             "estimated_ram_mb": u64::from(job.rank.max(1)) * 64,
         }
     }))
-    .context("failed to serialize LoRA adapter artifact")?;
-    fs::write(&adapter_path, payload)
-        .with_context(|| format!("failed to write adapter `{}`", adapter_path.display()))?;
-    Ok(adapter_path.display().to_string())
+    .context("failed to serialize Component training artifact")?;
+    fs::write(&artifact_path, payload)
+        .with_context(|| format!("failed to write artifact `{}`", artifact_path.display()))?;
+    Ok(artifact_path.display().to_string())
 }
 
-pub(crate) fn update_lora_training_status(
-    statuses: &Arc<Mutex<HashMap<String, LoraTrainingJobStatus>>>,
+pub(crate) fn update_component_training_status(
+    statuses: &Arc<Mutex<HashMap<String, ComponentTrainingJobStatus>>>,
     id: &str,
-    status: LoraTrainingJobStatus,
+    status: ComponentTrainingJobStatus,
 ) {
     statuses
         .lock()
-        .expect("LoRA training status map should not be poisoned")
+        .expect("Component training status map should not be poisoned")
         .insert(id.to_owned(), status);
 }
 
-pub(crate) fn sanitize_lora_job_part(value: &str) -> Result<String> {
+pub(crate) fn sanitize_training_job_part(value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty()
         || !trimmed
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
     {
-        return Err(anyhow!("invalid LoRA job id `{value}`"));
+        return Err(anyhow!("invalid training job id `{value}`"));
     }
     Ok(trimmed.to_owned())
 }
@@ -1140,30 +1142,34 @@ pub(crate) async fn forward_request_to_override_as_streaming_response_with_hands
     }
 }
 
-pub(crate) fn requested_model_alias(
+pub(crate) fn requested_component_alias(
     route: &IntegrityRoute,
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Option<String> {
-    let header_alias = ["x-tachyon-model", "x-model-alias", "model-alias"]
-        .into_iter()
-        .find_map(|name| headers.get(name))
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
+    let header_alias = [
+        "x-tachyon-component",
+        "x-component-alias",
+        "component-alias",
+    ]
+    .into_iter()
+    .find_map(|name| headers.get(name))
+    .and_then(|value| value.to_str().ok())
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(ToOwned::to_owned);
 
     if let Some(alias) = header_alias {
-        return resolve_requested_model_alias(route, Some(alias));
+        return resolve_requested_component_alias(route, Some(alias));
     }
 
-    let body_alias = if route.models.is_empty() {
+    let body_alias = if route.inference_components.is_empty() {
         None
     } else {
         serde_json::from_slice::<Value>(body)
             .ok()
             .and_then(|payload| {
-                ["model", "model_alias", "alias"]
+                ["component", "component_alias", "alias"]
                     .into_iter()
                     .find_map(|key| payload.get(key).and_then(Value::as_str))
                     .map(str::trim)
@@ -1172,16 +1178,16 @@ pub(crate) fn requested_model_alias(
             })
     };
 
-    resolve_requested_model_alias(route, body_alias)
+    resolve_requested_component_alias(route, body_alias)
 }
 
-/// The bare manifest alias a requested model id names, if any.
+/// The bare manifest alias a requested component id names, if any.
 ///
-/// `GET /ai/v1/models` advertises `{engine}/{alias}` — `openai/qwen3-coder` —
-/// and `guest-openai` accepts either form, so a client that picked a model out
+/// `GET /ai/v1/components` advertises `{engine}/{alias}` — `openai/qwen3-coder` —
+/// and `guest-openai` accepts either form, so a client that picked a component out
 /// of that listing sends the qualified id. Matching it against bare aliases
 /// alone therefore failed for exactly the clients doing the right thing, and on
-/// a multi-model route the caller fell back to the route's *first* binding:
+/// a multi-component route the caller fell back to the route's *first* binding:
 /// mesh QoS then watched an idle local queue while the upstream the request
 /// actually targeted was saturated.
 ///
@@ -1189,12 +1195,12 @@ pub(crate) fn requested_model_alias(
 /// where the id puts it. Taking the part after the last one instead truncated
 /// any alias that contains a slash — `gguf/Qwen/Qwen3-Coder` yielded
 /// `Qwen3-Coder`, which matches nothing, while the full string does not match
-/// either. A model named the way Hugging Face names them was therefore
+/// either. A component named the way Hugging Face names them was therefore
 /// unreachable through the qualified id this route advertises for it.
 ///
 /// The unqualified form is still tried first, so an alias that genuinely
 /// contains a slash wins before anything is stripped.
-fn model_alias_candidates(requested: &str) -> [&str; 2] {
+fn component_alias_candidates(requested: &str) -> [&str; 2] {
     let tail = requested
         .split_once('/')
         .map(|(_engine, alias)| alias)
@@ -1202,25 +1208,31 @@ fn model_alias_candidates(requested: &str) -> [&str; 2] {
     [requested, tail]
 }
 
-fn resolve_requested_model_alias(route: &IntegrityRoute, alias: Option<String>) -> Option<String> {
+fn resolve_requested_component_alias(
+    route: &IntegrityRoute,
+    alias: Option<String>,
+) -> Option<String> {
     alias
         .and_then(|alias| {
-            if route.models.is_empty() {
+            if route.inference_components.is_empty() {
                 return Some(alias);
             }
-            model_alias_candidates(&alias)
+            component_alias_candidates(&alias)
                 .into_iter()
                 .find_map(|candidate| {
                     route
-                        .models
+                        .inference_components
                         .iter()
                         .find(|binding| binding.alias.eq_ignore_ascii_case(candidate))
                         .map(|binding| binding.alias.clone())
                 })
         })
         .or_else(|| {
-            if route.models.len() == 1 {
-                route.models.first().map(|binding| binding.alias.clone())
+            if route.inference_components.len() == 1 {
+                route
+                    .inference_components
+                    .first()
+                    .map(|binding| binding.alias.clone())
             } else {
                 None
             }
@@ -1228,10 +1240,10 @@ fn resolve_requested_model_alias(route: &IntegrityRoute, alias: Option<String>) 
 }
 
 #[cfg(test)]
-mod requested_model_alias_tests {
+mod requested_component_alias_tests {
     use super::*;
 
-    /// A model named the way Hugging Face names them stays reachable.
+    /// A component named the way Hugging Face names them stays reachable.
     ///
     /// The engine prefix is the part before the *first* slash, because that is
     /// where `{engine}/{alias}` puts it. Stripping from the last slash instead
@@ -1241,17 +1253,17 @@ mod requested_model_alias_tests {
     #[test]
     fn a_qualified_id_keeps_the_slashes_inside_the_alias() {
         assert_eq!(
-            model_alias_candidates("gguf/Qwen/Qwen3-Coder"),
+            component_alias_candidates("gguf/Qwen/Qwen3-Coder"),
             ["gguf/Qwen/Qwen3-Coder", "Qwen/Qwen3-Coder"]
         );
         // The ordinary case is unchanged.
         assert_eq!(
-            model_alias_candidates("gguf/coder"),
+            component_alias_candidates("gguf/coder"),
             ["gguf/coder", "coder"]
         );
         // And an unqualified alias offers itself twice rather than inventing a
         // second candidate.
-        assert_eq!(model_alias_candidates("coder"), ["coder", "coder"]);
+        assert_eq!(component_alias_candidates("coder"), ["coder", "coder"]);
     }
 
     /// The unqualified form is tried first, so an alias that really does
@@ -1260,10 +1272,10 @@ mod requested_model_alias_tests {
     fn an_alias_containing_a_slash_matches_before_any_prefix_is_removed() {
         let route = IntegrityRoute {
             path: "/ai".to_owned(),
-            models: vec![IntegrityModelBinding {
+            inference_components: vec![IntegrityInferenceComponentBinding {
                 alias: "Qwen/Qwen3-Coder".to_owned(),
-                path: "/models/qwen".to_owned(),
-                device: ModelDevice::Cpu,
+                path: "/components/qwen".to_owned(),
+                device: ComponentPlacement::Cpu,
                 qos: RouteQos::Standard,
                 dynamic: false,
                 hardware_strategy: HardwareStrategy::default(),
@@ -1271,21 +1283,21 @@ mod requested_model_alias_tests {
             ..Default::default()
         };
         assert_eq!(
-            resolve_requested_model_alias(&route, Some("Qwen/Qwen3-Coder".to_owned())),
+            resolve_requested_component_alias(&route, Some("Qwen/Qwen3-Coder".to_owned())),
             Some("Qwen/Qwen3-Coder".to_owned())
         );
         assert_eq!(
-            resolve_requested_model_alias(&route, Some("gguf/Qwen/Qwen3-Coder".to_owned())),
+            resolve_requested_component_alias(&route, Some("gguf/Qwen/Qwen3-Coder".to_owned())),
             Some("Qwen/Qwen3-Coder".to_owned()),
             "the qualified id this route advertises has to resolve back to it"
         );
     }
 
-    fn model_binding(alias: &str) -> IntegrityModelBinding {
-        IntegrityModelBinding {
+    fn component_binding(alias: &str) -> IntegrityInferenceComponentBinding {
+        IntegrityInferenceComponentBinding {
             alias: alias.to_owned(),
             path: String::new(),
-            device: ModelDevice::Cpu,
+            device: ComponentPlacement::Cpu,
             qos: RouteQos::Standard,
             dynamic: true,
             hardware_strategy: HardwareStrategy::default(),
@@ -1293,27 +1305,31 @@ mod requested_model_alias_tests {
     }
 
     #[test]
-    fn an_engine_qualified_model_id_resolves_to_its_manifest_alias() {
-        // `GET /ai/v1/models` advertises `{engine}/{alias}`, so a client that
-        // picked a model out of the listing sends the qualified form. Failing
-        // to match it made a multi-model route fall back to its *first*
+    fn an_engine_qualified_component_id_resolves_to_its_manifest_alias() {
+        // `GET /ai/v1/components` advertises `{engine}/{alias}`, so a client that
+        // picked a component out of the listing sends the qualified form. Failing
+        // to match it made a multi-component route fall back to its *first*
         // binding, and mesh QoS then watched the wrong lane entirely.
         let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
-        route.models = vec![model_binding("local-llama"), model_binding("qwen3-coder")];
+        route.inference_components = vec![
+            component_binding("local-llama"),
+            component_binding("qwen3-coder"),
+        ];
 
         assert_eq!(
-            resolve_requested_model_alias(&route, Some("openai/qwen3-coder".to_owned())).as_deref(),
+            resolve_requested_component_alias(&route, Some("openai/qwen3-coder".to_owned()))
+                .as_deref(),
             Some("qwen3-coder")
         );
         // The bare form still works, and casing is still ignored.
         assert_eq!(
-            resolve_requested_model_alias(&route, Some("QWEN3-Coder".to_owned())).as_deref(),
+            resolve_requested_component_alias(&route, Some("QWEN3-Coder".to_owned())).as_deref(),
             Some("qwen3-coder")
         );
         // A qualified id naming no binding stays unresolved rather than
         // silently selecting the first one.
         assert_eq!(
-            resolve_requested_model_alias(&route, Some("openai/not-here".to_owned())),
+            resolve_requested_component_alias(&route, Some("openai/not-here".to_owned())),
             None
         );
     }
@@ -1323,62 +1339,57 @@ mod requested_model_alias_tests {
     // half of the pair is gated.
     #[cfg(feature = "ai-inference")]
     #[test]
-    fn the_qos_lane_follows_the_engine_qualified_model_a_client_asked_for() {
+    fn the_qos_lane_follows_the_engine_qualified_component_a_client_asked_for() {
         let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
-        let mut local = model_binding("local-llama");
-        local.device = ModelDevice::Cuda;
-        let mut upstream = model_binding("qwen3-coder");
-        upstream.path = "openai:http://127.0.0.1:8080/v1".to_owned();
-        // Non-dynamic, because that is what makes the path a destination: the
-        // broker overwrites a `dynamic` binding's path with the directory its
-        // upload landed in, so one written `openai:…` still runs locally. The
-        // shared fixture above is dynamic for the alias-resolution test, which
-        // needs no paths at all.
-        upstream.dynamic = false;
-        route.models = vec![local, upstream];
+        let mut first = component_binding("local-llama");
+        first.device = ComponentPlacement::Cpu;
+        let mut requested_binding = component_binding("qwen3-coder");
+        requested_binding.device = ComponentPlacement::Cuda;
+        route.inference_components = vec![first, requested_binding];
 
         let requested =
-            resolve_requested_model_alias(&route, Some("openai/qwen3-coder".to_owned()));
+            resolve_requested_component_alias(&route, Some("openai/qwen3-coder".to_owned()));
         let profile = route_mesh_qos_profile(&route, requested.as_deref())
             .expect("a route with bindings has a profile");
         assert_eq!(
             profile.accelerator,
-            ai_inference::AcceleratorKind::Network,
+            ai_inference::AcceleratorKind::Gpu,
             "admission must watch the lane the request actually runs on, not the route's first binding"
         );
     }
 
     #[test]
-    fn skips_body_alias_for_routes_without_model_bindings() {
+    fn skips_body_alias_for_routes_without_component_bindings() {
         let route = IntegrityRoute::user("/plain");
         let headers = HeaderMap::new();
-        let body = Bytes::from_static(br#"{"model":"llama3"}"#);
+        let body = Bytes::from_static(br#"{"component":"llama3"}"#);
 
-        assert_eq!(requested_model_alias(&route, &headers, &body), None);
+        assert_eq!(requested_component_alias(&route, &headers, &body), None);
     }
 
     #[test]
-    fn keeps_header_alias_available_for_routes_without_model_bindings() {
+    fn keeps_header_alias_available_for_routes_without_component_bindings() {
         let route = IntegrityRoute::user("/plain");
         let mut headers = HeaderMap::new();
-        headers.insert("x-tachyon-model", HeaderValue::from_static("llama3"));
-        let body = Bytes::from_static(br#"{"model":"ignored"}"#);
+        headers.insert("x-tachyon-component", HeaderValue::from_static("llama3"));
+        let body = Bytes::from_static(br#"{"component":"ignored"}"#);
 
         assert_eq!(
-            requested_model_alias(&route, &headers, &body).as_deref(),
+            requested_component_alias(&route, &headers, &body).as_deref(),
             Some("llama3")
         );
     }
 
     #[test]
-    fn reads_body_alias_by_reference_for_model_routes() {
+    fn reads_body_alias_by_reference_for_component_routes() {
         let mut route = IntegrityRoute::user("/ai");
-        route.models = vec![model_binding("llama3"), model_binding("mistral")];
+        route.inference_components =
+            vec![component_binding("llama3"), component_binding("mistral")];
         let headers = HeaderMap::new();
-        let body = Bytes::from_static(br#"{"model":"mistral","messages":[{"role":"user"}]}"#);
+        let body = Bytes::from_static(br#"{"component":"mistral","messages":[{"role":"user"}]}"#);
 
         assert_eq!(
-            requested_model_alias(&route, &headers, &body).as_deref(),
+            requested_component_alias(&route, &headers, &body).as_deref(),
             Some("mistral")
         );
     }
@@ -1394,31 +1405,21 @@ pub(crate) struct RouteMeshQosProfile {
 #[cfg(feature = "ai-inference")]
 pub(crate) fn route_mesh_qos_profile(
     route: &IntegrityRoute,
-    requested_model: Option<&str>,
+    requested_component: Option<&str>,
 ) -> Option<RouteMeshQosProfile> {
-    let binding = requested_model
+    let binding = requested_component
         .and_then(|alias| {
             route
-                .models
+                .inference_components
                 .iter()
                 .find(|binding| binding.alias.eq_ignore_ascii_case(alias))
         })
-        .or_else(|| route.models.first())?;
-    // The lane the work actually queues on, not the device the binding
-    // declares. An `openai:` upstream runs on no local accelerator and is
-    // scheduled on `Network`; reading its declared `cpu`/`cuda` here made mesh
-    // admission watch an idle local queue while the network queue filled, so a
-    // saturated upstream never redirected a request to a healthier peer.
-    //
-    // `binding_runs_upstream` rather than the prefix: a `dynamic` binding's
-    // path is a placeholder the broker overwrites, so one written
-    // `openai:…` still runs its uploaded checkpoint locally, and calling that
-    // `Network` hid a real GPU queue from admission.
-    let accelerator = if ai_inference::binding_runs_upstream(binding) {
-        ai_inference::AcceleratorKind::Network
-    } else {
-        ai_inference::AcceleratorKind::from_model_device(&binding.device)
-    };
+        .or_else(|| route.inference_components.first())?;
+    // The lane the work actually queues on: the device the *requested*
+    // binding declares, not the route's first binding. Falling back to the
+    // first binding here made mesh admission watch the wrong queue whenever
+    // a client asked for a component other than the route's default.
+    let accelerator = ai_inference::AcceleratorKind::from_component_placement(&binding.device);
     Some(RouteMeshQosProfile {
         accelerator,
         qos: binding.qos,
@@ -1613,14 +1614,14 @@ pub(crate) async fn faas_handler(
                 None,
             ),
             Ok(selected_target) => {
-                let requested_model = requested_model_alias(&route, &headers, &body);
+                let requested_component = requested_component_alias(&route, &headers, &body);
                 let required_capabilities =
                     Capabilities::from_mask(selected_target.required_capability_mask);
                 let local_supports_target = state.host_capabilities.supports(required_capabilities);
                 #[cfg(feature = "ai-inference")]
                 let mesh_qos_destination = route_mesh_qos_profile(
                     &route,
-                    requested_model.as_deref(),
+                    requested_component.as_deref(),
                 )
                 .and_then(|profile| {
                     let tier_snapshot = runtime.ai_runtime.queue_tier_snapshot(profile.accelerator);
@@ -1639,7 +1640,7 @@ pub(crate) async fn faas_handler(
                             ),
                             &headers,
                             selected_target.required_capability_mask,
-                            requested_model.as_deref(),
+                            requested_component.as_deref(),
                         )
                     })?
                 });
@@ -1654,7 +1655,7 @@ pub(crate) async fn faas_handler(
                         &route.path,
                         &headers,
                         selected_target.required_capability_mask,
-                        requested_model.as_deref(),
+                        requested_component.as_deref(),
                     )
                 }) {
                     execute_route_override(
@@ -2284,7 +2285,7 @@ pub(crate) async fn execute_route_request(
     }
 
     // VRAM-aware admission: AI inference routes are gated on accelerator headroom.
-    if !route.models.is_empty() {
+    if !route.inference_components.is_empty() {
         if let Some(rejection) = enforce_vram_admission(state, route) {
             return Ok(rejection);
         }
@@ -2337,7 +2338,7 @@ pub(crate) async fn execute_route_request(
         )),
         Err(RoutePermitError::TimedOut) => {
             if route.allow_overflow {
-                let requested_model = requested_model_alias(route, headers, body);
+                let requested_component = requested_component_alias(route, headers, body);
                 if let Some(destination) = control_plane_override_destination(
                     state.route_overrides.as_ref(),
                     &state.peer_capabilities,
@@ -2346,7 +2347,7 @@ pub(crate) async fn execute_route_request(
                     select_route_target(route, headers)
                         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?
                         .required_capability_mask,
-                    requested_model.as_deref(),
+                    requested_component.as_deref(),
                 ) {
                     let response = if allow_streaming_overflow {
                         let idle_timeout = route_stream_idle_timeout(route);
@@ -2463,7 +2464,7 @@ pub(crate) async fn enforce_resource_admission(
     }
 
     if policy.admission_strategy == AdmissionStrategy::MeshRetry {
-        let requested_model = requested_model_alias(route, headers, body);
+        let requested_component = requested_component_alias(route, headers, body);
         let target = select_route_target(route, headers)
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))?;
         if let Some(destination) = control_plane_override_destination(
@@ -2472,7 +2473,7 @@ pub(crate) async fn enforce_resource_admission(
             &route.path,
             headers,
             target.required_capability_mask,
-            requested_model.as_deref(),
+            requested_component.as_deref(),
         ) {
             let response = if allow_streaming_overflow {
                 let idle_timeout = route_stream_idle_timeout(route);
@@ -2525,105 +2526,6 @@ pub(crate) async fn enforce_resource_admission(
     }))
 }
 
-/// Whether every model this route can run lives behind an `openai:` upstream.
-///
-/// Deliberately "every", not "the first": a route mixing an upstream with a
-/// local checkpoint still has something on the local device, and exempting it
-/// would let that model bypass the admission its neighbours obey. A route with
-/// no models at all is not upstream-only — it has nothing to be upstream about,
-/// and the ordinary path already ignores it.
-#[cfg(all(test, feature = "ai-inference"))]
-mod vram_admission_scope_tests {
-    use super::*;
-
-    fn route_with(paths: &[&str]) -> IntegrityRoute {
-        IntegrityRoute {
-            path: "/ai".to_owned(),
-            models: paths
-                .iter()
-                .map(|path| IntegrityModelBinding {
-                    alias: "coder".to_owned(),
-                    path: (*path).to_owned(),
-                    device: ModelDevice::Cpu,
-                    qos: RouteQos::Standard,
-                    dynamic: false,
-                    hardware_strategy: HardwareStrategy::default(),
-                })
-                .collect(),
-            ..Default::default()
-        }
-    }
-
-    /// Local VRAM pressure says nothing about a route served from upstreams.
-    ///
-    /// Rejecting one with `vram-saturated` invents a failure: the provider is
-    /// healthy, the request would have succeeded, and the client is handed a
-    /// 503 naming a resource its request never touches.
-    #[test]
-    fn only_a_route_served_entirely_from_upstreams_skips_vram_admission() {
-        assert!(route_is_entirely_upstream(&route_with(&[
-            "openai:http://a.invalid/v1"
-        ])));
-        assert!(route_is_entirely_upstream(&route_with(&[
-            "openai:http://a.invalid/v1",
-            "openai:http://b.invalid/v1",
-        ])));
-
-        // One local checkpoint is enough to keep the check: exempting a mixed
-        // route would let that model bypass the admission its neighbours obey.
-        assert!(!route_is_entirely_upstream(&route_with(&[
-            "openai:http://a.invalid/v1",
-            "/models/local",
-        ])));
-        assert!(!route_is_entirely_upstream(&route_with(&["/models/local"])));
-
-        // A route with no models is not upstream-only — it has nothing to be
-        // upstream about, and the ordinary path already ignores it.
-        assert!(!route_is_entirely_upstream(&route_with(&[])));
-    }
-
-    /// A `dynamic` binding's path is a placeholder, not a destination.
-    ///
-    /// The broker overwrites it: `ensure_model_loaded` swaps it for the
-    /// directory the upload landed in, so the checkpoint runs locally on the
-    /// device the binding seals. Reading the `openai:` prefix alone therefore
-    /// exempted a route holding real VRAM from the refusal that protects it,
-    /// and pointed mesh QoS at an idle network lane while a GPU queue filled.
-    #[test]
-    fn a_dynamic_binding_is_local_however_its_path_reads() {
-        let mut route = route_with(&["openai:http://a.invalid/v1"]);
-        route.models[0].dynamic = true;
-        route.models[0].device = ModelDevice::Cuda;
-
-        assert!(
-            !route_is_entirely_upstream(&route),
-            "a dynamic binding runs its uploaded checkpoint locally, so the VRAM refusal applies"
-        );
-        assert_eq!(
-            route_mesh_qos_profile(&route, None).map(|profile| profile.accelerator),
-            Some(ai_inference::AcceleratorKind::Gpu),
-            "and it queues on the device it sealed, not on the network lane"
-        );
-
-        // The non-dynamic case is unchanged: that path *is* where requests go.
-        route.models[0].dynamic = false;
-        assert!(route_is_entirely_upstream(&route));
-        assert_eq!(
-            route_mesh_qos_profile(&route, None).map(|profile| profile.accelerator),
-            Some(ai_inference::AcceleratorKind::Network)
-        );
-    }
-}
-
-#[cfg(feature = "ai-inference")]
-fn route_is_entirely_upstream(route: &IntegrityRoute) -> bool {
-    // Not the `openai:` prefix: a `dynamic` binding carrying one still runs an
-    // uploaded checkpoint on a local device, so a route made entirely of those
-    // would have skipped the critical-VRAM refusal while holding the very VRAM
-    // the refusal exists to protect.
-    !route.models.is_empty() && route.models.iter().all(ai_inference::binding_runs_upstream)
-}
-
 /// Returns a rejection `RouteExecutionResult` when VRAM pressure is critical
 /// for routes that drive AI inference, or `None` to allow the request through.
 ///
@@ -2638,16 +2540,6 @@ pub(crate) fn enforce_vram_admission(
     state: &AppState,
     route: &IntegrityRoute,
 ) -> Option<RouteExecutionResult> {
-    // A route served entirely from upstreams holds no local VRAM, so local
-    // pressure says nothing about whether it can run. Rejecting it with
-    // `vram-saturated` invented a failure: the remote provider was healthy, the
-    // request would have succeeded, and the client got a 503 naming a resource
-    // its request never touches. Local models on the same route keep the check,
-    // which is why this asks about every binding rather than the first.
-    #[cfg(feature = "ai-inference")]
-    if route_is_entirely_upstream(route) {
-        return None;
-    }
     match state.memory_governor.vram_pressure() {
         memory_governor::MemoryPressure::Critical => {
             tracing::warn!(
@@ -3392,14 +3284,14 @@ async fn try_peer_overflow_dispatch(
     reason: MeshDispatchReason,
     started_at: Instant,
 ) -> std::result::Result<Option<GuestHttpResponse>, String> {
-    let requested_model = requested_model_alias(route, headers, body);
+    let requested_component = requested_component_alias(route, headers, body);
     let Some(destination) = control_plane_override_destination(
         state.route_overrides.as_ref(),
         &state.peer_capabilities,
         &route.path,
         headers,
         required_capability_mask,
-        requested_model.as_deref(),
+        requested_component.as_deref(),
     ) else {
         return Ok(None);
     };

@@ -4,7 +4,7 @@
 TBD - created by archiving change architectural-realignment. Update Purpose after archive.
 ## Requirements
 ### Requirement: Admin storage flows are delegated to dedicated system FaaS components
-The host SHALL stop implementing the asset registry and large-model broker directly in `core-host` and SHALL delegate those workflows to dedicated system FaaS components.
+The host SHALL stop implementing the asset registry and large-artifact broker directly in `core-host` and SHALL delegate those workflows to dedicated system FaaS components.
 
 #### Scenario: Asset registry uploads are proxied through a system guest
 - **WHEN** an operator uploads a `.wasm` asset through `/admin/assets`
@@ -12,7 +12,7 @@ The host SHALL stop implementing the asset registry and large-model broker direc
 - **AND** the system guest persists the asset under a stable content-addressed hash
 - **AND** the response returns a `tachyon://sha256:...` URI
 
-#### Scenario: Large model uploads follow a chunked disk-backed protocol
+#### Scenario: Large artifact uploads follow a chunked disk-backed protocol
 - **WHEN** an operator uploads a model through the init/upload/commit API
 - **THEN** the host forwards the multipart flow to `system-faas-model-broker`
 - **AND** each chunk is appended directly to a staging file on disk

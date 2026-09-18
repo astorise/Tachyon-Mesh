@@ -950,7 +950,7 @@ pub(crate) async fn handle_streaming_http_request(
                 let (mut retries_left, retry_on) =
                     route_stream_retry_budget(&route).unwrap_or_default();
                 loop {
-                    let requested_model = requested_model_alias(&route, headers, &request.body);
+                    let requested_model = requested_component_alias(&route, headers, &request.body);
                     let Some(destination) = control_plane_override_destination(
                         state.route_overrides.as_ref(),
                         &state.peer_capabilities,

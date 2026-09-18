@@ -115,7 +115,10 @@ pub(crate) async fn serve_host(accel: AccelerationMode) -> Result<()> {
     // registry write failure must not stop the node from booting, and requests
     // to these aliases work either way.
     #[cfg(feature = "ai-inference")]
-    crate::system_storage::publish_configured_model_bindings(core_store.as_ref(), &runtime.config);
+    crate::system_storage::publish_configured_component_bindings(
+        core_store.as_ref(),
+        &runtime.config,
+    );
     let host_key_path = manifest_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))

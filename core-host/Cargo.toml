@@ -18,15 +18,13 @@ default = ["admin-plane", "ring"]
 # PIN approval step) stays gated: approval is expected to happen against an
 # admin-plane node via Tachyon Studio.
 admin-plane = []
-# Magnetar-only inference cutover. Local model execution accepts Qwen
-# safetensors through the Magnetar facade; legacy Candle modules are retained
-# outside the compiled path for reference during the migration.
+# Magnetar-only inference. Local execution delegates opaque inference Component
+# invocations to Magnetar.
 ai-inference = [
+    "dep:magnetar-inference-component",
+    "dep:magnetar-runtime",
     "dep:wasmtime-wasi-nn",
 ]
-# Compatibility aliases kept for old build commands during the Magnetar cutover.
-# They no longer enable backend code.
-candle-flashinfer = ["ai-inference"]
 ebpf-loader = ["dep:aya"]
 # `experimental` gates unwired v1.1 stubs (QUIC safetensors replication, predictive
 # VRAM helpers, BaaS scratch tables) so they are excluded from the default build but
@@ -35,9 +33,7 @@ experimental = []
 fips = ["tokio-rustls/aws_lc_rs", "tokio-rustls/fips"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tower", "dep:tokio-stream"]
 mtls = []
-candle-cuda = ["ai-inference"]
-candle-metal = ["ai-inference"]
-nvfp4-cuda = ["ai-inference"]
+magnetar-cuda = ["ai-inference", "magnetar-inference-component/cuda"]
 rate-limit = ["dep:governor", "dep:forwarded-header-value"]
 resiliency = ["dep:tower"]
 ring = ["tokio-rustls/ring", "tokio-rustls/tls12"]
@@ -64,6 +60,8 @@ forwarded-header-value = { version = "0.1", optional = true }
 globset = "0.4"
 governor = { version = "0.10", optional = true }
 memmap2 = "0.9"
+magnetar-inference-component = { path = "../vendor/Magnetar/inference-components", optional = true }
+magnetar-runtime = { path = "../vendor/Magnetar/magnetar-runtime", features = ["wasmtime-component-engine"], optional = true }
 moka = { version = "0.12", features = ["sync"] }
 notify = { version = "8.0", default-features = false, features = ["macos_kqueue"] }
 h3 = { version = "0.0.8", optional = true }

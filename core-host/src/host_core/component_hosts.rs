@@ -119,7 +119,7 @@ impl ComponentHostState {
         };
         // Computed before the struct literal, which moves `runtime_config`.
         #[cfg(feature = "ai-inference")]
-        let listable = listable_model_aliases(route, &runtime_config);
+        let listable = listable_component_aliases(route, &runtime_config);
         Ok(Self {
             ctx: build_component_wasi_ctx(route, host_identity.as_ref(), s3_preps)?,
             table: ResourceTable::new(),
@@ -146,19 +146,17 @@ impl ComponentHostState {
             #[cfg(feature = "ai-inference")]
             ai_runtime: None,
             #[cfg(feature = "ai-inference")]
-            allowed_model_aliases: route
-                .models
+            allowed_component_aliases: route
+                .inference_components
                 .iter()
                 .map(|binding| binding.alias.clone())
                 .collect(),
             #[cfg(feature = "ai-inference")]
-            listable_model_aliases: listable,
+            listable_component_aliases: listable,
             #[cfg(feature = "ai-inference")]
-            adapter_id: route.adapter_id.clone(),
+            accelerator_components: HashMap::new(),
             #[cfg(feature = "ai-inference")]
-            accelerator_models: HashMap::new(),
-            #[cfg(feature = "ai-inference")]
-            next_accelerator_model_id: 1,
+            next_accelerator_component_id: 1,
             #[cfg(feature = "ai-inference")]
             streaming_consumer_alive: None,
             streaming_body: None,
@@ -183,12 +181,12 @@ impl ComponentHostState {
             .to_owned()
     }
 
-    pub(crate) fn hot_model_aliases(&self) -> Vec<String> {
+    pub(crate) fn hot_component_aliases(&self) -> Vec<String> {
         #[cfg(feature = "ai-inference")]
         {
             self.ai_runtime
                 .as_ref()
-                .map(|runtime| runtime.loaded_model_aliases())
+                .map(|runtime| runtime.loaded_component_aliases())
                 .unwrap_or_default()
         }
 
@@ -303,35 +301,37 @@ impl ComponentHostState {
     }
 
     #[cfg(feature = "ai-inference")]
-    pub(crate) fn load_accelerator_model(
+    pub(crate) fn load_accelerator_component(
         &mut self,
         accelerator: ai_inference::AcceleratorKind,
         alias: String,
     ) -> std::result::Result<u32, String> {
-        if !self.allowed_model_aliases.contains(&alias) {
+        if !self.allowed_component_aliases.contains(&alias) {
             return Err(format!(
-                "model alias `{alias}` is not sealed for this route"
+                "Component alias `{alias}` is not sealed for this route"
             ));
         }
         self.ai_runtime
             .as_ref()
             .ok_or_else(|| "AI inference runtime is unavailable for this component".to_owned())?
-            .load_component_model(&alias, accelerator)?;
-        let model_id = self.next_accelerator_model_id;
-        self.next_accelerator_model_id = self.next_accelerator_model_id.saturating_add(1);
-        self.accelerator_models
-            .insert(model_id, LoadedAcceleratorModel { alias, accelerator });
-        Ok(model_id)
+            .load_inference_component(&alias, accelerator)?;
+        let component_id = self.next_accelerator_component_id;
+        self.next_accelerator_component_id = self.next_accelerator_component_id.saturating_add(1);
+        self.accelerator_components.insert(
+            component_id,
+            LoadedAcceleratorComponent { alias, accelerator },
+        );
+        Ok(component_id)
     }
 
     #[cfg(feature = "ai-inference")]
-    pub(crate) fn compute_accelerator_prompt(
+    pub(crate) fn invoke_accelerator_component(
         &self,
         expected_accelerator: ai_inference::AcceleratorKind,
-        model_id: u32,
+        component_id: u32,
         prompt: String,
     ) -> std::result::Result<ai_inference::ComponentGeneration, ai_inference::GenerationError> {
-        let loaded = self.resolve_accelerator_model(expected_accelerator, model_id)?;
+        let loaded = self.resolve_accelerator_component(expected_accelerator, component_id)?;
         self.ai_runtime
             .as_ref()
             .ok_or_else(|| {
@@ -339,32 +339,31 @@ impl ComponentHostState {
                     "AI inference runtime is unavailable for this component",
                 )
             })?
-            .compute_component_prompt_with_adapter(
-                &loaded.alias,
-                &prompt,
-                self.adapter_id.as_deref(),
-            )
+            .compute_component_prompt_generation(&loaded.alias, &prompt)
     }
 
-    /// Resolve a guest-held model handle to the alias it was opened for.
+    /// Resolve a guest-held Component handle to the alias it was opened for.
     ///
     /// Shared by every accelerator entry point so the handle check — the gate
     /// that stops a component reaching a model it never loaded, or reaching a
     /// CPU-bound alias through the GPU interface — cannot drift between them.
     #[cfg(feature = "ai-inference")]
-    fn resolve_accelerator_model(
+    fn resolve_accelerator_component(
         &self,
         expected_accelerator: ai_inference::AcceleratorKind,
-        model_id: u32,
-    ) -> std::result::Result<&LoadedAcceleratorModel, ai_inference::GenerationError> {
-        let loaded = self.accelerator_models.get(&model_id).ok_or_else(|| {
-            ai_inference::GenerationError::local(format!(
-                "accelerator model handle `{model_id}` is unknown"
-            ))
-        })?;
+        component_id: u32,
+    ) -> std::result::Result<&LoadedAcceleratorComponent, ai_inference::GenerationError> {
+        let loaded = self
+            .accelerator_components
+            .get(&component_id)
+            .ok_or_else(|| {
+                ai_inference::GenerationError::local(format!(
+                    "accelerator Component handle `{component_id}` is unknown"
+                ))
+            })?;
         if loaded.accelerator != expected_accelerator {
             return Err(ai_inference::GenerationError::local(format!(
-                "accelerator model handle `{model_id}` was loaded for `{}` not `{}`",
+                "accelerator Component handle `{component_id}` was loaded for `{}` not `{}`",
                 loaded.accelerator.as_str(),
                 expected_accelerator.as_str()
             )));
@@ -373,13 +372,13 @@ impl ComponentHostState {
     }
 
     #[cfg(feature = "ai-inference")]
-    pub(crate) fn embed_accelerator_input(
+    pub(crate) fn embed_accelerator_component_input(
         &self,
         expected_accelerator: ai_inference::AcceleratorKind,
-        model_id: u32,
+        component_id: u32,
         input: String,
     ) -> std::result::Result<Vec<f32>, ai_inference::GenerationError> {
-        let loaded = self.resolve_accelerator_model(expected_accelerator, model_id)?;
+        let loaded = self.resolve_accelerator_component(expected_accelerator, component_id)?;
         self.ai_runtime
             .as_ref()
             .ok_or_else(|| {
@@ -390,21 +389,20 @@ impl ComponentHostState {
             .embed_component_input(&loaded.alias, &input)
     }
 
-    /// Begin a streaming generation: resolve the model handle (the same scope
-    /// and accelerator checks as `compute_accelerator_prompt`), then run the
+    /// Begin a streaming generation: resolve the Component handle (the same scope
+    /// and accelerator checks as `invoke_accelerator_component`), then run the
     /// decode on a dedicated thread that pushes each decoded text fragment into
     /// a channel. The returned receiver is drained by the `token-stream`
     /// resource's `next` calls, giving the guest real time-to-first-token.
     #[cfg(feature = "ai-inference")]
-    pub(crate) fn stream_accelerator_prompt(
+    pub(crate) fn stream_accelerator_component(
         &self,
         expected_accelerator: ai_inference::AcceleratorKind,
-        model_id: u32,
+        component_id: u32,
         prompt: String,
     ) -> std::result::Result<StreamedGeneration, ai_inference::GenerationError> {
-        let loaded = self.resolve_accelerator_model(expected_accelerator, model_id)?;
+        let loaded = self.resolve_accelerator_component(expected_accelerator, component_id)?;
         let alias = loaded.alias.clone();
-        let adapter_id = self.adapter_id.clone();
         let ai_runtime = Arc::clone(self.ai_runtime.as_ref().ok_or_else(|| {
             ai_inference::GenerationError::local(
                 "AI inference runtime is unavailable for this component",
@@ -466,12 +464,7 @@ impl ComponentHostState {
                     stalled: &generation_stalled,
                     reported_stall: false,
                 };
-                match ai_runtime.stream_component_prompt(
-                    &alias,
-                    &prompt,
-                    adapter_id.as_deref(),
-                    &mut sink,
-                ) {
+                match ai_runtime.stream_component_prompt(&alias, &prompt, &mut sink) {
                     // An absent count means the backend could not measure, and
                     // stays absent in the slot: `usage()` then reports nothing
                     // rather than zeros, which a client would read as a
@@ -558,7 +551,7 @@ pub(crate) struct RouteOverrideDescriptor {
 pub(crate) struct RouteOverrideCandidate {
     pub(crate) destination: String,
     #[serde(default)]
-    pub(crate) hot_models: Vec<String>,
+    pub(crate) hot_inference_components: Vec<String>,
     #[serde(default)]
     pub(crate) effective_pressure: u8,
     #[serde(default)]
@@ -657,7 +650,7 @@ pub(crate) fn control_plane_override_destination(
             );
             let supports_model = requested_model.is_none_or(|alias| {
                 candidate
-                    .hot_models
+                    .hot_inference_components
                     .iter()
                     .any(|model| model.eq_ignore_ascii_case(alias))
             });
@@ -1581,21 +1574,21 @@ impl component_bindings::tachyon::mesh::training::Host for ComponentHostState {
                 job.dataset.volume_alias
             ));
         }
-        if job.base_model.trim().is_empty() {
-            return Err("training job base model must not be empty".to_owned());
+        if job.base_component_ref.trim().is_empty() {
+            return Err("training job base component reference must not be empty".to_owned());
         }
         if job.dataset.path.trim().is_empty() {
             return Err("training job dataset path must not be empty".to_owned());
         }
-        let queue = lora_training_queue();
-        let id = format!("lora-{}", Uuid::new_v4().simple());
-        update_lora_training_status(&queue.statuses, &id, LoraTrainingJobStatus::Queued);
+        let queue = component_training_queue();
+        let id = format!("train-{}", Uuid::new_v4().simple());
+        update_component_training_status(&queue.statuses, &id, ComponentTrainingJobStatus::Queued);
         queue
             .sender
-            .send(LoraTrainingJob {
+            .send(ComponentTrainingJob {
                 id: id.clone(),
                 tenant_id: self.vector_tenant_id(),
-                base_model: job.base_model,
+                base_component_ref: job.base_component_ref,
                 dataset_volume: job.dataset.volume_alias,
                 dataset_path: job.dataset.path,
                 dataset_split: job.dataset.split,
@@ -1603,7 +1596,7 @@ impl component_bindings::tachyon::mesh::training::Host for ComponentHostState {
                 max_steps: job.max_steps,
                 seed: job.seed,
             })
-            .map_err(|error| format!("failed to queue LoRA training job: {error}"))?;
+            .map_err(|error| format!("failed to queue Component training job: {error}"))?;
         Ok(component_bindings::tachyon::mesh::training::JobId { value: id })
     }
 
@@ -1611,25 +1604,25 @@ impl component_bindings::tachyon::mesh::training::Host for ComponentHostState {
         &mut self,
         id: component_bindings::tachyon::mesh::training::JobId,
     ) -> std::result::Result<component_bindings::tachyon::mesh::training::JobStatus, String> {
-        let queue = lora_training_queue();
+        let queue = component_training_queue();
         let status = queue
             .statuses
             .lock()
-            .expect("LoRA training status map should not be poisoned")
+            .expect("Component training status map should not be poisoned")
             .get(&id.value)
             .cloned()
-            .ok_or_else(|| format!("unknown LoRA training job `{}`", id.value))?;
+            .ok_or_else(|| format!("unknown Component training job `{}`", id.value))?;
         Ok(match status {
-            LoraTrainingJobStatus::Queued => {
+            ComponentTrainingJobStatus::Queued => {
                 component_bindings::tachyon::mesh::training::JobStatus::Queued
             }
-            LoraTrainingJobStatus::Running { step, total } => {
+            ComponentTrainingJobStatus::Running { step, total } => {
                 component_bindings::tachyon::mesh::training::JobStatus::Running((step, total))
             }
-            LoraTrainingJobStatus::Completed { adapter_path } => {
-                component_bindings::tachyon::mesh::training::JobStatus::Completed(adapter_path)
+            ComponentTrainingJobStatus::Completed { artifact_path } => {
+                component_bindings::tachyon::mesh::training::JobStatus::Completed(artifact_path)
             }
-            LoraTrainingJobStatus::Failed { message } => {
+            ComponentTrainingJobStatus::Failed { message } => {
                 component_bindings::tachyon::mesh::training::JobStatus::Failed(message)
             }
         })
@@ -1931,9 +1924,9 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         if let Some(ref denial) = res.scope_denial {
             return Err(denial.clone());
         }
-        // The model registry is one table for the whole node, but a component
+        // The component registry is one table for the whole node, but a component
         // may only see the aliases its own routes seal — and
-        // `load_accelerator_model` enforces exactly that for execution.
+        // `load_accelerator_component` enforces exactly that for execution.
         // Handing the full table back made `GET /ai/v1/models` advertise
         // models belonging to other components, which a client can see,
         // select, and then be refused for, with nothing in the listing to say
@@ -1947,7 +1940,7 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
         // The store's own reconciliation pages beyond 10 000 rows, so that size
         // is reachable rather than theoretical.
         #[cfg(feature = "ai-inference")]
-        if res.table_name == crate::system_storage::AI_MODELS_REGISTRY_TABLE {
+        if res.table_name == crate::system_storage::AI_COMPONENTS_REGISTRY_TABLE {
             /// Raw rows per store read while collecting a scoped page.
             const SCAN_PAGE: u32 = 10_000;
 
@@ -1967,7 +1960,7 @@ impl component_bindings::tachyon::mesh::kv_partition::HostTable for ComponentHos
                     .map_err(|e| format!("{e:#}"))?;
                 let read = page.len() as u32;
                 for row in page {
-                    if !self.listable_model_aliases.contains(&row.0) {
+                    if !self.listable_component_aliases.contains(&row.0) {
                         continue;
                     }
                     if skipped < offset {
@@ -2198,22 +2191,19 @@ impl control_plane_component_bindings::tachyon::mesh::kv_partition::HostTable
     }
 }
 
-/// Host state behind a `tachyon:accelerator/cpu` `token-stream` resource: the
+/// Host state behind a `tachyon:accelerator/cpu` `byte-stream` resource: the
 /// receiving end of the channel the generation thread writes decoded fragments
 /// into. `next` drains it; a closed channel marks the end of the stream.
 /// A streaming generation in flight: the channel its decoded fragments arrive
 /// on, and the slot its token counts land in when it finishes.
-/// The WIT error every `tachyon:accelerator/cpu` generation function returns.
+/// The WIT error every generic Component invocation function returns.
 #[cfg(feature = "ai-inference")]
-type WitGenerationError =
-    accelerator_component_bindings::tachyon::accelerator::cpu::GenerationError;
+type WitInvocationError =
+    accelerator_component_bindings::tachyon::accelerator::cpu::InvocationError;
 
-/// Cross the host/guest boundary, keeping the upstream status intact. The
-/// status is the whole point of the typed error: flattening to a message here
-/// would put the guest back to guessing whether a failure is retryable.
 #[cfg(feature = "ai-inference")]
-fn wit_generation_error(error: ai_inference::GenerationError) -> WitGenerationError {
-    WitGenerationError {
+fn wit_invocation_error(error: ai_inference::GenerationError) -> WitInvocationError {
+    WitInvocationError {
         message: error.message,
         upstream_status: error.upstream_status,
         invalid_request: error.invalid_request,
@@ -2221,14 +2211,25 @@ fn wit_generation_error(error: ai_inference::GenerationError) -> WitGenerationEr
 }
 
 #[cfg(feature = "ai-inference")]
-fn wit_tool_call(
-    call: ai_inference::ToolCall,
-) -> accelerator_component_bindings::tachyon::accelerator::cpu::ToolCall {
-    accelerator_component_bindings::tachyon::accelerator::cpu::ToolCall {
-        id: call.id,
-        name: call.name,
-        arguments: call.arguments,
+fn invocation_metadata(generation: &ai_inference::ComponentGeneration) -> Vec<(String, String)> {
+    let mut metadata = Vec::new();
+    if let Some(usage) = generation.usage {
+        metadata.push((
+            "tachyon.usage.prompt_tokens".to_owned(),
+            usage.prompt_tokens.to_string(),
+        ));
+        metadata.push((
+            "tachyon.usage.completion_tokens".to_owned(),
+            usage.completion_tokens.to_string(),
+        ));
     }
+    if let Some(finish_reason) = generation.finish_reason.as_ref() {
+        metadata.push(("tachyon.finish_reason".to_owned(), finish_reason.clone()));
+    }
+    if let Some(refusal) = generation.refusal.as_ref() {
+        metadata.push(("tachyon.refusal".to_owned(), refusal.clone()));
+    }
+    metadata
 }
 
 /// How many decoded events may sit between the generation thread and the guest.
@@ -2240,9 +2241,9 @@ fn wit_tool_call(
 #[cfg(feature = "ai-inference")]
 /// Narrow a table read to the aliases the reading route may execute.
 ///
-/// The model registry is one table for the whole node, but a route may only
+/// The component registry is one table for the whole node, but a route may only
 /// execute the aliases its own manifest entry seals — which is what
-/// `load_accelerator_model` enforces. Handing back the full table made
+/// `load_accelerator_component` enforces. Handing back the full table made
 /// `GET /ai/v1/models` advertise models belonging to other routes: a client
 /// could see one, select it, and be refused, with nothing in the listing to
 /// say why. Reading through the same set the execution check uses keeps the
@@ -2267,13 +2268,13 @@ fn wit_tool_call(
 /// The union is taken over routes sharing a *module* with this one, so the
 /// boundary is the component rather than the node: a second, unrelated guest on
 /// the same host still cannot read this one's aliases. Execution is unaffected —
-/// `load_accelerator_model` keeps checking the per-route set — so this widens
+/// `load_accelerator_component` keeps checking the per-route set — so this widens
 /// what a component can see, never what it can run.
 ///
 /// A route with no targets is named by `route.name`, matching how
 /// `select_stream_route_module` resolves a module for one.
 #[cfg(feature = "ai-inference")]
-fn listable_model_aliases(
+fn listable_component_aliases(
     route: &IntegrityRoute,
     config: &IntegrityConfig,
 ) -> std::collections::BTreeSet<String> {
@@ -2292,7 +2293,7 @@ fn listable_model_aliases(
         .routes
         .iter()
         .filter(|candidate| !modules(candidate).is_disjoint(&own))
-        .flat_map(|candidate| candidate.models.iter())
+        .flat_map(|candidate| candidate.inference_components.iter())
         .map(|binding| binding.alias.clone())
         .collect()
 }
@@ -2303,7 +2304,7 @@ fn scope_registry_rows_to_route(
     rows: Vec<(String, Vec<u8>)>,
     allowed: &std::collections::BTreeSet<String>,
 ) -> Vec<(String, Vec<u8>)> {
-    if table_name != crate::system_storage::AI_MODELS_REGISTRY_TABLE {
+    if table_name != crate::system_storage::AI_COMPONENTS_REGISTRY_TABLE {
         return rows;
     }
     rows.into_iter()
@@ -2701,70 +2702,50 @@ impl Drop for HostTokenStream {
 
 #[cfg(feature = "ai-inference")]
 impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for ComponentHostState {
-    fn load_model(&mut self, name: String) -> std::result::Result<u32, String> {
-        self.load_accelerator_model(ai_inference::AcceleratorKind::Cpu, name)
+    fn load_component(&mut self, name: String) -> std::result::Result<u32, String> {
+        self.load_accelerator_component(ai_inference::AcceleratorKind::Cpu, name)
     }
 
-    fn compute(
+    fn invoke(
         &mut self,
-        model_id: u32,
-        prompt: String,
-    ) -> std::result::Result<String, WitGenerationError> {
-        self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
-            .map(|generation| generation.text)
-            .map_err(wit_generation_error)
-    }
-
-    fn compute_detailed(
-        &mut self,
-        model_id: u32,
-        prompt: String,
+        component_id: u32,
+        payload: Vec<u8>,
     ) -> std::result::Result<
-        accelerator_component_bindings::tachyon::accelerator::cpu::Generation,
-        WitGenerationError,
+        accelerator_component_bindings::tachyon::accelerator::cpu::InvocationResult,
+        WitInvocationError,
     > {
+        let prompt = String::from_utf8(payload).map_err(|error| {
+            wit_invocation_error(ai_inference::GenerationError::invalid_request(format!(
+                "component invocation payload must be UTF-8 for the current Magnetar adapter: {error}"
+            )))
+        })?;
         let generation = self
-            .compute_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
-            .map_err(wit_generation_error)?;
+            .invoke_accelerator_component(ai_inference::AcceleratorKind::Cpu, component_id, prompt)
+            .map_err(wit_invocation_error)?;
+        let metadata = invocation_metadata(&generation);
         Ok(
-            accelerator_component_bindings::tachyon::accelerator::cpu::Generation {
-                text: generation.text,
-                finish_reason: generation.finish_reason,
-                usage: generation.usage.map(|usage| {
-                    accelerator_component_bindings::tachyon::accelerator::cpu::TokenUsage {
-                        prompt_tokens: usage.prompt_tokens,
-                        completion_tokens: usage.completion_tokens,
-                    }
-                }),
-                refusal: generation.refusal,
-                tool_calls: generation
-                    .tool_calls
-                    .into_iter()
-                    .map(wit_tool_call)
-                    .collect(),
+            accelerator_component_bindings::tachyon::accelerator::cpu::InvocationResult {
+                payload: generation.text.clone().into_bytes(),
+                metadata,
             },
         )
     }
 
-    fn embed(
+    fn invoke_stream(
         &mut self,
-        model_id: u32,
-        input: String,
-    ) -> std::result::Result<Vec<f32>, WitGenerationError> {
-        self.embed_accelerator_input(ai_inference::AcceleratorKind::Cpu, model_id, input)
-            .map_err(wit_generation_error)
-    }
-
-    fn compute_stream(
-        &mut self,
-        model_id: u32,
-        prompt: String,
+        component_id: u32,
+        payload: Vec<u8>,
     ) -> std::result::Result<
         wasmtime::component::Resource<
-            accelerator_component_bindings::tachyon::accelerator::cpu::TokenStream,
+            accelerator_component_bindings::tachyon::accelerator::cpu::ByteStream,
         >,
-        WitGenerationError,
+        WitInvocationError,
     > {
+        let prompt = String::from_utf8(payload).map_err(|error| {
+            wit_invocation_error(ai_inference::GenerationError::invalid_request(format!(
+                "component invocation payload must be UTF-8 for the current Magnetar adapter: {error}"
+            )))
+        })?;
         let StreamedGeneration {
             receiver,
             outcome,
@@ -2772,8 +2753,8 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
             budget,
             stalled,
         } = self
-            .stream_accelerator_prompt(ai_inference::AcceleratorKind::Cpu, model_id, prompt)
-            .map_err(wit_generation_error)?;
+            .stream_accelerator_component(ai_inference::AcceleratorKind::Cpu, component_id, prompt)
+            .map_err(wit_invocation_error)?;
         let handle = self
             .table
             .push(HostTokenStream {
@@ -2785,7 +2766,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
                 saw_eof: false,
             })
             .map_err(|error| {
-                wit_generation_error(ai_inference::GenerationError::local(format!(
+                wit_invocation_error(ai_inference::GenerationError::local(format!(
                     "failed to register token stream resource: {error}"
                 )))
             })?;
@@ -2794,21 +2775,21 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
 }
 
 #[cfg(feature = "ai-inference")]
-impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
+impl accelerator_component_bindings::tachyon::accelerator::cpu::HostByteStream
     for ComponentHostState
 {
     fn next(
         &mut self,
         self_: wasmtime::component::Resource<
-            accelerator_component_bindings::tachyon::accelerator::cpu::TokenStream,
+            accelerator_component_bindings::tachyon::accelerator::cpu::ByteStream,
         >,
     ) -> std::result::Result<
         Option<accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent>,
-        WitGenerationError,
+        WitInvocationError,
     > {
         let handle = wasmtime::component::Resource::<HostTokenStream>::new_borrow(self_.rep());
         let stream = self.table.get_mut(&handle).map_err(|error| {
-            wit_generation_error(ai_inference::GenerationError::local(format!(
+            wit_invocation_error(ai_inference::GenerationError::local(format!(
                 "failed to access token stream resource: {error}"
             )))
         })?;
@@ -2823,21 +2804,24 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
         }
         match received {
             Ok(Ok(StreamPayload::Content(text))) => Ok(Some(
-                accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Content(
-                    text,
+                accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Payload(
+                    text.into_bytes(),
                 ),
             )),
             Ok(Ok(StreamPayload::Refusal(text))) => Ok(Some(
-                accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Refusal(
-                    text,
+                accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Metadata(
+                    vec![("tachyon.refusal".to_owned(), text)],
                 ),
             )),
             Ok(Ok(StreamPayload::ToolCall(call))) => Ok(Some(
-                accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::ToolCall(
-                    wit_tool_call(call),
+                accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent::Metadata(
+                    vec![
+                        ("tachyon.tool_call.name".to_owned(), call.name),
+                        ("tachyon.tool_call.arguments".to_owned(), call.arguments),
+                    ],
                 ),
             )),
-            Ok(Err(error)) => Err(wit_generation_error(error)),
+            Ok(Err(error)) => Err(wit_invocation_error(error)),
             Err(_) => {
                 // A stall whose error could not be enqueued surfaces here, at
                 // the one moment there is room for it. Without this the client
@@ -2847,7 +2831,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
                     .stalled
                     .swap(false, std::sync::atomic::Ordering::AcqRel)
                 {
-                    return Err(wit_generation_error(ai_inference::GenerationError::local(
+                    return Err(wit_invocation_error(ai_inference::GenerationError::local(
                         "the client stopped reading this stream for longer than the backpressure \
                          limit allows, so generation was cancelled",
                     )));
@@ -2858,48 +2842,34 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
         }
     }
 
-    fn usage(
+    fn metadata(
         &mut self,
         self_: wasmtime::component::Resource<
-            accelerator_component_bindings::tachyon::accelerator::cpu::TokenStream,
+            accelerator_component_bindings::tachyon::accelerator::cpu::ByteStream,
         >,
-    ) -> Option<accelerator_component_bindings::tachyon::accelerator::cpu::TokenUsage> {
+    ) -> Vec<(String, String)> {
         let handle = wasmtime::component::Resource::<HostTokenStream>::new_borrow(self_.rep());
-        let stream = self.table.get(&handle).ok()?;
+        let Some(stream) = self.table.get(&handle).ok() else {
+            return Vec::new();
+        };
         if !stream.saw_eof {
-            return None;
+            return Vec::new();
         }
-        let reported = stream.outcome.lock().ok()?.usage?;
-        Some(
-            accelerator_component_bindings::tachyon::accelerator::cpu::TokenUsage {
-                prompt_tokens: reported.prompt_tokens,
-                completion_tokens: reported.completion_tokens,
-            },
-        )
-    }
-
-    fn finish_reason(
-        &mut self,
-        self_: wasmtime::component::Resource<
-            accelerator_component_bindings::tachyon::accelerator::cpu::TokenStream,
-        >,
-    ) -> Option<String> {
-        let handle = wasmtime::component::Resource::<HostTokenStream>::new_borrow(self_.rep());
-        let stream = self.table.get(&handle).ok()?;
-        // Withheld until the caller has observed EOF, for the same reason as
-        // `usage`: the generation thread can finish while fragments are still
-        // queued, and a caller polling this as its completion signal would stop
-        // reading and truncate the response.
-        if !stream.saw_eof {
-            return None;
-        }
-        stream.outcome.lock().ok()?.finish_reason.clone()
+        let Ok(outcome) = stream.outcome.lock() else {
+            return Vec::new();
+        };
+        let generation = ai_inference::ComponentGeneration {
+            usage: outcome.usage,
+            finish_reason: outcome.finish_reason.clone(),
+            ..Default::default()
+        };
+        invocation_metadata(&generation)
     }
 
     fn drop(
         &mut self,
         rep: wasmtime::component::Resource<
-            accelerator_component_bindings::tachyon::accelerator::cpu::TokenStream,
+            accelerator_component_bindings::tachyon::accelerator::cpu::ByteStream,
         >,
     ) -> wasmtime::Result<()> {
         let stream =
@@ -2921,40 +2891,124 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostTokenStream
 
 #[cfg(feature = "ai-inference")]
 impl accelerator_component_bindings::tachyon::accelerator::gpu::Host for ComponentHostState {
-    fn load_model(&mut self, name: String) -> std::result::Result<u32, String> {
-        self.load_accelerator_model(ai_inference::AcceleratorKind::Gpu, name)
+    fn load_component(&mut self, name: String) -> std::result::Result<u32, String> {
+        self.load_accelerator_component(ai_inference::AcceleratorKind::Gpu, name)
     }
 
-    fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
-        self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Gpu, model_id, prompt)
-            .map(|generation| generation.text)
-            .map_err(|error| error.message)
+    fn invoke(
+        &mut self,
+        component_id: u32,
+        payload: Vec<u8>,
+    ) -> std::result::Result<
+        accelerator_component_bindings::tachyon::accelerator::gpu::InvocationResult,
+        accelerator_component_bindings::tachyon::accelerator::gpu::InvocationError,
+    > {
+        let prompt = String::from_utf8(payload).map_err(|error| {
+            accelerator_component_bindings::tachyon::accelerator::gpu::InvocationError {
+                message: format!(
+                    "component invocation payload must be UTF-8 for the current Magnetar adapter: {error}"
+                ),
+                upstream_status: None,
+                invalid_request: true,
+            }
+        })?;
+        let generation = self
+            .invoke_accelerator_component(ai_inference::AcceleratorKind::Gpu, component_id, prompt)
+            .map_err(|error| {
+                accelerator_component_bindings::tachyon::accelerator::gpu::InvocationError {
+                    message: error.message,
+                    upstream_status: error.upstream_status,
+                    invalid_request: error.invalid_request,
+                }
+            })?;
+        Ok(
+            accelerator_component_bindings::tachyon::accelerator::gpu::InvocationResult {
+                payload: generation.text.clone().into_bytes(),
+                metadata: invocation_metadata(&generation),
+            },
+        )
     }
 }
 
 #[cfg(feature = "ai-inference")]
 impl accelerator_component_bindings::tachyon::accelerator::npu::Host for ComponentHostState {
-    fn load_model(&mut self, name: String) -> std::result::Result<u32, String> {
-        self.load_accelerator_model(ai_inference::AcceleratorKind::Npu, name)
+    fn load_component(&mut self, name: String) -> std::result::Result<u32, String> {
+        self.load_accelerator_component(ai_inference::AcceleratorKind::Npu, name)
     }
 
-    fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
-        self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Npu, model_id, prompt)
-            .map(|generation| generation.text)
-            .map_err(|error| error.message)
+    fn invoke(
+        &mut self,
+        component_id: u32,
+        payload: Vec<u8>,
+    ) -> std::result::Result<
+        accelerator_component_bindings::tachyon::accelerator::npu::InvocationResult,
+        accelerator_component_bindings::tachyon::accelerator::npu::InvocationError,
+    > {
+        let prompt = String::from_utf8(payload).map_err(|error| {
+            accelerator_component_bindings::tachyon::accelerator::npu::InvocationError {
+                message: format!(
+                    "component invocation payload must be UTF-8 for the current Magnetar adapter: {error}"
+                ),
+                upstream_status: None,
+                invalid_request: true,
+            }
+        })?;
+        let generation = self
+            .invoke_accelerator_component(ai_inference::AcceleratorKind::Npu, component_id, prompt)
+            .map_err(|error| {
+                accelerator_component_bindings::tachyon::accelerator::npu::InvocationError {
+                    message: error.message,
+                    upstream_status: error.upstream_status,
+                    invalid_request: error.invalid_request,
+                }
+            })?;
+        Ok(
+            accelerator_component_bindings::tachyon::accelerator::npu::InvocationResult {
+                payload: generation.text.clone().into_bytes(),
+                metadata: invocation_metadata(&generation),
+            },
+        )
     }
 }
 
 #[cfg(feature = "ai-inference")]
 impl accelerator_component_bindings::tachyon::accelerator::tpu::Host for ComponentHostState {
-    fn load_model(&mut self, name: String) -> std::result::Result<u32, String> {
-        self.load_accelerator_model(ai_inference::AcceleratorKind::Tpu, name)
+    fn load_component(&mut self, name: String) -> std::result::Result<u32, String> {
+        self.load_accelerator_component(ai_inference::AcceleratorKind::Tpu, name)
     }
 
-    fn compute(&mut self, model_id: u32, prompt: String) -> std::result::Result<String, String> {
-        self.compute_accelerator_prompt(ai_inference::AcceleratorKind::Tpu, model_id, prompt)
-            .map(|generation| generation.text)
-            .map_err(|error| error.message)
+    fn invoke(
+        &mut self,
+        component_id: u32,
+        payload: Vec<u8>,
+    ) -> std::result::Result<
+        accelerator_component_bindings::tachyon::accelerator::tpu::InvocationResult,
+        accelerator_component_bindings::tachyon::accelerator::tpu::InvocationError,
+    > {
+        let prompt = String::from_utf8(payload).map_err(|error| {
+            accelerator_component_bindings::tachyon::accelerator::tpu::InvocationError {
+                message: format!(
+                    "component invocation payload must be UTF-8 for the current Magnetar adapter: {error}"
+                ),
+                upstream_status: None,
+                invalid_request: true,
+            }
+        })?;
+        let generation = self
+            .invoke_accelerator_component(ai_inference::AcceleratorKind::Tpu, component_id, prompt)
+            .map_err(|error| {
+                accelerator_component_bindings::tachyon::accelerator::tpu::InvocationError {
+                    message: error.message,
+                    upstream_status: error.upstream_status,
+                    invalid_request: error.invalid_request,
+                }
+            })?;
+        Ok(
+            accelerator_component_bindings::tachyon::accelerator::tpu::InvocationResult {
+                payload: generation.text.clone().into_bytes(),
+                metadata: invocation_metadata(&generation),
+            },
+        )
     }
 }
 
@@ -3044,7 +3098,7 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
             self.accelerator_queue_loads(),
         );
         let l4 = self.bridge_manager.telemetry_snapshot();
-        let hot_models = self.hot_model_aliases();
+        let hot_inference_components = self.hot_component_aliases();
 
         system_component_bindings::tachyon::mesh::telemetry_reader::MetricsSnapshot {
             total_requests,
@@ -3076,7 +3130,7 @@ impl system_component_bindings::tachyon::mesh::telemetry_reader::Host for Compon
             network_rt_load: control_plane.network_rt_load,
             network_standard_load: control_plane.network_standard_load,
             network_batch_load: control_plane.network_batch_load,
-            hot_models,
+            hot_inference_components,
             dropped_events,
             last_status,
             total_duration_us,
@@ -3126,7 +3180,7 @@ impl control_plane_component_bindings::tachyon::mesh::telemetry_reader::Host
             network_rt_load: snapshot.network_rt_load,
             network_standard_load: snapshot.network_standard_load,
             network_batch_load: snapshot.network_batch_load,
-            hot_models: snapshot.hot_models,
+            hot_inference_components: snapshot.hot_inference_components,
             dropped_events: snapshot.dropped_events,
             last_status: snapshot.last_status,
             total_duration_us: snapshot.total_duration_us,
@@ -3174,7 +3228,7 @@ impl background_component_bindings::tachyon::mesh::telemetry_reader::Host for Co
             network_rt_load: snapshot.network_rt_load,
             network_standard_load: snapshot.network_standard_load,
             network_batch_load: snapshot.network_batch_load,
-            hot_models: snapshot.hot_models,
+            hot_inference_components: snapshot.hot_inference_components,
             dropped_events: snapshot.dropped_events,
             last_status: snapshot.last_status,
             total_duration_us: snapshot.total_duration_us,
@@ -3440,60 +3494,60 @@ impl background_component_bindings::tachyon::mesh::routing_control::Host for Com
     }
 }
 
-// Must match the casing `guest-openai` uses to read the `ai-models-registry`
+// Must match the casing `guest-openai` uses to read the `ai-components-registry`
 // table (`#[serde(rename_all = "camelCase")]`); otherwise its `list_models`
 // drops the row on a deserialize miss and the model never appears in
-// `GET /ai/v1/models`. See the matching note on `RegistryModelInfo` in
+// `GET /ai/v1/models`. See the matching note on `RegistryComponentInfo` in
 // `system_storage.rs`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ModelRegistryRecord<'a> {
+struct ComponentRegistryRecord<'a> {
     alias: &'a str,
     engine: &'a str,
     vram_required_mb: u64,
     status: &'a str,
-    model_path: &'a str,
-    /// See the matching field on `RegistryModelInfo` in `system_storage.rs`:
-    /// `guest-openai` reads this to pick a tool-call parser instead of
-    /// pattern-matching the alias.
+    artifact_path: &'a str,
+    /// See the matching field on `RegistryComponentInfo` in `system_storage.rs`:
+    /// Tachyon publishes artifact-declared parser metadata opaquely and does
+    /// not interpret component-protocol dialects in core.
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_parser: Option<&'a str>,
+    tool_call_parser: Option<String>,
 }
 
-impl system_component_bindings::tachyon::mesh::model_events::Host for ComponentHostState {
-    fn publish_model_uploaded(
+impl system_component_bindings::tachyon::mesh::artifact_events::Host for ComponentHostState {
+    fn publish_artifact_uploaded(
         &mut self,
-        event: system_component_bindings::tachyon::mesh::model_events::ModelUploaded,
+        event: system_component_bindings::tachyon::mesh::artifact_events::ArtifactUploaded,
     ) -> std::result::Result<(), String> {
         if event.alias.trim().is_empty() {
-            return Err("model upload event alias must not be empty".to_owned());
+            return Err("artifact upload event alias must not be empty".to_owned());
         }
         if event.engine.trim().is_empty() {
-            return Err("model upload event engine must not be empty".to_owned());
+            return Err("artifact upload event engine must not be empty".to_owned());
         }
-        let record = ModelRegistryRecord {
+        let record = ComponentRegistryRecord {
             alias: &event.alias,
             engine: &event.engine,
             vram_required_mb: 0,
             status: "available",
-            model_path: &event.model_path,
-            tool_call_parser: crate::system_storage::binding_tool_call_parser(&event.model_path),
+            artifact_path: &event.artifact_path,
+            tool_call_parser: crate::system_storage::binding_tool_call_parser(&event.artifact_path),
         };
         let value = serde_json::to_vec(&record)
-            .map_err(|error| format!("failed to encode model registry entry: {error}"))?;
+            .map_err(|error| format!("failed to encode component registry entry: {error}"))?;
         // NOTE: unlike the storage-proxy path (`StorageComponentState`), this
         // general component-host path does NOT flush the model to S3. If this log
         // fires during an upload, that is why the bucket stays empty.
         tracing::info!(
             alias = %event.alias,
             engine = %event.engine,
-            model_path = %event.model_path,
-            "publishing uploaded model to registry via ComponentHostState (no S3 flush on this path)"
+            artifact_path = %event.artifact_path,
+            "publishing uploaded artifact to registry via ComponentHostState (no S3 flush on this path)"
         );
         // Through the shared writer, not a bare `set`: the alias-ownership rule
         // has to hold on every path into the registry, and this one is reached
         // by the ordinary component host rather than the storage proxy.
-        crate::system_storage::write_uploaded_model_row(
+        crate::system_storage::write_uploaded_component_row(
             &self.storage_broker.core_store,
             &event.alias,
             value,
@@ -4164,7 +4218,7 @@ mod registry_scope_tests {
     /// The listing and the execution check must agree.
     ///
     /// A route may only run the aliases its manifest entry seals, and
-    /// `load_accelerator_model` refuses the rest. A listing built from the
+    /// `load_accelerator_component` refuses the rest. A listing built from the
     /// whole node's registry therefore offered clients models they would be
     /// refused for, with nothing in the row to say so.
     #[test]
@@ -4178,7 +4232,7 @@ mod registry_scope_tests {
         let allowed: std::collections::BTreeSet<String> = ["mine".to_owned()].into_iter().collect();
 
         let scoped = scope_registry_rows_to_route(
-            crate::system_storage::AI_MODELS_REGISTRY_TABLE,
+            crate::system_storage::AI_COMPONENTS_REGISTRY_TABLE,
             rows(),
             &allowed,
         );
@@ -4195,7 +4249,7 @@ mod registry_scope_tests {
         // than this arithmetic does — see the test below: feeding it the
         // *executing* set emptied the public listing outright.
         let scoped = scope_registry_rows_to_route(
-            crate::system_storage::AI_MODELS_REGISTRY_TABLE,
+            crate::system_storage::AI_COMPONENTS_REGISTRY_TABLE,
             rows(),
             &std::collections::BTreeSet::new(),
         );
@@ -4215,31 +4269,32 @@ mod registry_scope_tests {
     /// loaded and answering.
     #[test]
     fn a_listing_route_sees_the_models_its_component_can_execute() {
-        let route = |name: &str, path: &str, module: &str, models: &[&str]| IntegrityRoute {
-            path: path.to_owned(),
-            name: name.to_owned(),
-            targets: vec![RouteTarget {
-                module: module.to_owned(),
-                weight: 100,
-                websocket: false,
-                match_header: None,
-                requires: Vec::new(),
-            }],
-            models: models
-                .iter()
-                .map(
-                    |alias| crate::host_core::domain_types::IntegrityModelBinding {
-                        alias: (*alias).to_owned(),
-                        path: String::new(),
-                        device: Default::default(),
-                        qos: Default::default(),
-                        dynamic: true,
-                        hardware_strategy: Default::default(),
-                    },
-                )
-                .collect(),
-            ..IntegrityRoute::default()
-        };
+        let route =
+            |name: &str, path: &str, module: &str, inference_components: &[&str]| IntegrityRoute {
+                path: path.to_owned(),
+                name: name.to_owned(),
+                targets: vec![RouteTarget {
+                    module: module.to_owned(),
+                    weight: 100,
+                    websocket: false,
+                    match_header: None,
+                    requires: Vec::new(),
+                }],
+                inference_components: inference_components
+                    .iter()
+                    .map(|alias| {
+                        crate::host_core::domain_types::IntegrityInferenceComponentBinding {
+                            alias: (*alias).to_owned(),
+                            path: String::new(),
+                            device: Default::default(),
+                            qos: Default::default(),
+                            dynamic: true,
+                            hardware_strategy: Default::default(),
+                        }
+                    })
+                    .collect(),
+                ..IntegrityRoute::default()
+            };
         let listing = route("openai-models", "/ai/v1/models", "guest-openai", &[]);
         let config = IntegrityConfig {
             routes: vec![
@@ -4258,13 +4313,13 @@ mod registry_scope_tests {
         };
 
         assert_eq!(
-            listable_model_aliases(&listing, &config),
+            listable_component_aliases(&listing, &config),
             ["coder".to_owned()].into_iter().collect(),
             "the listing route must see what its own component executes, and nothing further"
         );
         // Execution is untouched: the listing route still seals nothing, so
-        // `load_accelerator_model` refuses it every alias.
-        assert!(listing.models.is_empty());
+        // `load_accelerator_component` refuses it every alias.
+        assert!(listing.inference_components.is_empty());
     }
 }
 

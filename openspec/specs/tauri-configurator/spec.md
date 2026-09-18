@@ -70,13 +70,13 @@ The `tachyon-ui` Rust crate SHALL depend only on the shared `tachyon-client` lib
 The `tachyon-ui` frontend SHALL bind sidebar navigation links to pre-rendered management-plane views and switch between them inside the existing `<main>` container without a full page reload.
 
 #### Scenario: The operator selects a different management plane
-- **WHEN** the operator clicks a sidebar link for Dashboard, Mesh Topology, Asset Registry, Identity, My Account, or Model Broker
+- **WHEN** the operator clicks a sidebar link for Dashboard, Mesh Topology, Asset Registry, Identity, My Account, or Artifact Broker
 - **THEN** the currently visible panel fades and slides out through GSAP
 - **AND** the selected panel fades and slides in within the same page shell
 - **AND** the selected sidebar link becomes the active link
 
 ### Requirement: The desktop UI exposes dedicated panels for topology, registry, identity, account, and broker workflows
-The `tachyon-ui` frontend SHALL expose dedicated panels for mesh topology, asset registry uploads, shared identity posture, personal account security, and AI model brokerage using the shared Tauri commands and widgets already owned by the desktop client.
+The `tachyon-ui` frontend SHALL expose dedicated panels for mesh topology, asset registry uploads, shared identity posture, personal account security, and AI artifact brokerage using the shared Tauri commands and widgets already owned by the desktop client.
 
 #### Scenario: The operator opens Mesh Topology
 - **WHEN** the Mesh Topology panel becomes active
@@ -96,9 +96,9 @@ The `tachyon-ui` frontend SHALL expose dedicated panels for mesh topology, asset
 - **WHEN** the My Account panel becomes active
 - **THEN** the frontend renders personal security actions for the connected operator
 
-#### Scenario: The operator opens Model Broker
-- **WHEN** the Model Broker panel becomes active
-- **THEN** the frontend renders the chunked model upload controls and progress bar in that panel
+#### Scenario: The operator opens Artifact Broker
+- **WHEN** the Artifact Broker panel becomes active
+- **THEN** the frontend renders the chunked artifact upload controls and progress bar in that panel
 
 ### Requirement: The UI Backend MUST strictly validate intents against WIT definitions
 The Rust Tauri backend SHALL NOT act as a simple passthrough proxy for JSON payloads. Before dispatching any configuration to the `system-faas-gossip` network, the backend MUST deserialize and validate the JSON payload against the strict Rust structures generated from the `.wit` contracts (e.g., `config-routing.wit`).
@@ -173,7 +173,7 @@ Configuration panels that affect `core-host` runtime behavior SHALL read the act
 #### Scenario: Operator configures advanced route policy
 - **WHEN** the operator edits route policy fields from the expanded Routing view
 - **THEN** Tachyon Studio can write `routes[].concurrency`, `routes[].distributed_rate_limit`, `routes[].resource_policy`, `routes[].adapter_id`, `routes[].shadow_target`, `routes[].min_instances`, `routes[].max_concurrency`, `routes[].env`, and `routes[].domains`
-- **AND** model policy edits write only model binding fields such as `routes[].models[].qos` to the matching `routes[].models[]` entry
+- **AND** model policy edits write only Component binding fields such as `routes[].inference_components[].qos` to the matching `routes[].inference_components[]` entry
 - **AND** validation failures from manifest apply are returned to the panel feedback area
 
 #### Scenario: Legacy domain payload command is not exposed
