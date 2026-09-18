@@ -1,5 +1,3 @@
-#![allow(clippy::result_large_err)]
-
 use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{Extension, Request, State},
@@ -61,18 +59,36 @@ pub(crate) struct AuthClaims {
     pub(crate) subject: String,
     pub(crate) roles: Vec<String>,
     pub(crate) scopes: Vec<String>,
+    /// Unix timestamp the underlying credential stops being valid at, from
+    /// `identity-payload`'s `expires-at`. `None` for credential types that
+    /// carry no expiry. Used by `AuthDecisionCache` to re-check real expiry
+    /// on a cache hit instead of only bounding staleness by TTL.
+    pub(crate) expires_at: Option<u64>,
 }
 
 /// In-process cache of full authn+authz decisions, keyed by SHA-256(token) plus the
 /// (method, path) the caller wanted to access. Hashing the token keeps the raw
 /// secret out of the cache key space — a memory dump exposes only the digest.
 ///
-/// Bounded to 16 384 entries so a token-spoofing flood cannot OOM the host. Time-
-/// to-idle of 5 minutes is well below the typical PAT lifetime; mutations issued
-/// via `system-faas-authz` invalidate matching entries through the
-/// `authz_purge_outbox` table, so the steady-state worst case is "5 minutes of
-/// stale access" only when the host is also network-partitioned from its own
-/// outbox storage, which is impossible by construction (redb is in-process).
+/// Bounded to 16 384 entries so a token-spoofing flood cannot OOM the host.
+/// Mutations issued via `system-faas-authz` invalidate matching entries
+/// through the `authz_purge_outbox` table, so revocation / role change / ban
+/// take effect on the next request regardless of these durations.
+///
+/// Two independent time bounds, for two independent risks:
+/// - `time_to_idle` (5 minutes): evicts an entry nobody has used recently, so
+///   a spoofing flood that stops hitting a given (token, method, path) can't
+///   hold that slot forever.
+/// - `time_to_live` (60 seconds): evicts an entry no matter how often it's
+///   used, as a backstop for credential types with no expiry at all
+///   (`identity-payload`'s `expires-at` is `None`).
+///
+/// For a credential that does carry an expiry, `get()` checks it against the
+/// wall clock on every lookup and treats an expired entry as a miss — a
+/// token polled every few minutes no longer stays accepted past its own
+/// `exp` just because it keeps resetting the idle timer. This closed the gap
+/// issue #422 tracked (`expires-at` on `identity-payload`, threaded through
+/// the authn component into `AuthClaims`).
 #[derive(Clone)]
 pub(crate) struct AuthDecisionCache {
     inner: moka::sync::Cache<AuthDecisionKey, AuthDecision>,
@@ -97,6 +113,7 @@ impl AuthDecisionCache {
             inner: moka::sync::Cache::builder()
                 .max_capacity(16_384)
                 .time_to_idle(Duration::from_secs(300))
+                .time_to_live(Duration::from_secs(60))
                 .support_invalidation_closures()
                 .build(),
         }
@@ -115,9 +132,23 @@ impl AuthDecisionCache {
     }
 
     fn get(&self, token: &str, method: &str, path: &str) -> Option<AuthClaims> {
-        self.inner
-            .get(&Self::key(token, method, path))
-            .map(|d| d.claims)
+        let key = Self::key(token, method, path);
+        let decision = self.inner.get(&key)?;
+        if let Some(expires_at) = decision.claims.expires_at {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(u64::MAX);
+            if now >= expires_at {
+                // Real expiry has passed even though the cache entry itself
+                // hasn't hit its TTL — evict it now rather than waiting, so a
+                // concurrent lookup for the same key doesn't also get a stale
+                // hit before the TTL sweep runs.
+                self.inner.invalidate(&key);
+                return None;
+            }
+        }
+        Some(decision.claims)
     }
 
     fn put(&self, token: &str, method: &str, path: &str, claims: AuthClaims) {
@@ -704,6 +735,7 @@ impl AuthManager {
                 subject: claims.subject,
                 roles: claims.roles,
                 scopes: claims.scopes,
+                expires_at: claims.expires_at,
             })
             .map_err(map_authn_error)
     }
@@ -996,11 +1028,50 @@ pub(crate) async fn admin_status_handler(State(state): State<crate::AppState>) -
     )
 }
 
+/// Error type for the IAM admin handlers below. `axum::response::Response`
+/// (`hyper::Response<axum::body::Body>`) is at least 128 bytes, so returning
+/// it directly as a `Result::Err` makes every one of these `async fn`s carry
+/// that weight on its stack frame regardless of whether the call succeeds
+/// (`clippy::result_large_err`). Boxing it keeps the `Err` variant at one
+/// pointer while still satisfying axum's `Handler` blanket impl for
+/// `Result<T, E>` via the `IntoResponse`/`From<Response>` impls below.
+/// `Deref`/`DerefMut` to the inner `Response` mean callers (tests included)
+/// can still use the full `Response` API — `.status()`, `.headers()`, etc. —
+/// without reaching into a `.0` field.
+#[derive(Debug)]
+pub(crate) struct BoxedErrorResponse(Box<Response>);
+
+impl std::ops::Deref for BoxedErrorResponse {
+    type Target = Response;
+
+    fn deref(&self) -> &Response {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for BoxedErrorResponse {
+    fn deref_mut(&mut self) -> &mut Response {
+        &mut self.0
+    }
+}
+
+impl IntoResponse for BoxedErrorResponse {
+    fn into_response(self) -> Response {
+        *self.0
+    }
+}
+
+impl From<Response> for BoxedErrorResponse {
+    fn from(response: Response) -> Self {
+        Self(Box::new(response))
+    }
+}
+
 #[cfg_attr(not(feature = "admin-plane"), allow(dead_code))]
 pub(crate) async fn generate_recovery_codes_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<RecoveryCodeRequest>,
-) -> Result<Json<RecoveryCodeResponse>, Response> {
+) -> Result<Json<RecoveryCodeResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let username = payload.username;
@@ -1025,7 +1096,7 @@ pub(crate) async fn generate_recovery_codes_handler(
 pub(crate) async fn validate_registration_token_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<ValidateRegistrationTokenRequest>,
-) -> Result<Json<RegistrationTokenClaimsResponse>, Response> {
+) -> Result<Json<RegistrationTokenClaimsResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let token = payload.token;
@@ -1049,7 +1120,7 @@ pub(crate) async fn validate_registration_token_handler(
 pub(crate) async fn stage_signup_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<StageSignupRequest>,
-) -> Result<Json<StagedUserSessionResponse>, Response> {
+) -> Result<Json<StagedUserSessionResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
 
@@ -1071,7 +1142,7 @@ pub(crate) async fn stage_signup_handler(
 pub(crate) async fn finalize_enrollment_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<FinalizeEnrollmentRequest>,
-) -> Result<Json<FinalizeEnrollmentResponse>, Response> {
+) -> Result<Json<FinalizeEnrollmentResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let session_id = payload.session_id;
@@ -1097,7 +1168,7 @@ pub(crate) async fn finalize_enrollment_handler(
 pub(crate) async fn stage_login_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<StageLoginRequest>,
-) -> Result<Json<StagedLoginSessionResponse>, Response> {
+) -> Result<Json<StagedLoginSessionResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let username = payload.username;
@@ -1149,7 +1220,7 @@ pub(crate) async fn stage_login_handler(
 pub(crate) async fn finalize_login_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<FinalizeLoginRequest>,
-) -> Result<Json<FinalizeEnrollmentResponse>, Response> {
+) -> Result<Json<FinalizeEnrollmentResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let session_id = payload.session_id;
@@ -1203,14 +1274,15 @@ pub(crate) async fn finalize_login_handler(
 pub(crate) async fn issue_step_up_session_handler(
     Extension(claims): Extension<AuthClaims>,
     Json(payload): Json<StepUpSessionRequest>,
-) -> Result<Json<StepUpSessionResponse>, Response> {
+) -> Result<Json<StepUpSessionResponse>, BoxedErrorResponse> {
     let totp_code = payload.totp_code.trim();
     if totp_code.len() != 6 || !totp_code.chars().all(|digit| digit.is_ascii_digit()) {
         return Err((
             StatusCode::BAD_REQUEST,
             "MFA code must contain exactly 6 digits",
         )
-            .into_response());
+            .into_response()
+            .into());
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1233,7 +1305,7 @@ pub(crate) async fn issue_step_up_session_handler(
 pub(crate) async fn regenerate_account_security_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
-) -> Result<Json<RecoveryCodeResponse>, Response> {
+) -> Result<Json<RecoveryCodeResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let username = claims.subject;
@@ -1260,7 +1332,7 @@ pub(crate) async fn issue_pat_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
     Json(payload): Json<IssuePatRequest>,
-) -> Result<Json<IssuePatResponse>, Response> {
+) -> Result<Json<IssuePatResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let subject = claims.subject;
@@ -1290,7 +1362,7 @@ pub(crate) async fn issue_pat_handler(
 pub(crate) async fn consume_recovery_code_handler(
     State(state): State<crate::AppState>,
     Json(payload): Json<ConsumeRecoveryCodeRequest>,
-) -> Result<Json<ConsumeRecoveryCodeResponse>, Response> {
+) -> Result<Json<ConsumeRecoveryCodeResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let username = payload.username;
@@ -1317,7 +1389,7 @@ pub(crate) async fn consume_recovery_code_handler(
 pub(crate) async fn list_users_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
-) -> Result<Json<Vec<IamUserSummaryResponse>>, Response> {
+) -> Result<Json<Vec<IamUserSummaryResponse>>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let actor = claims.subject.clone();
@@ -1360,7 +1432,7 @@ pub(crate) async fn update_user_handler(
     Extension(claims): Extension<AuthClaims>,
     axum::extract::Path(username): axum::extract::Path<String>,
     Json(payload): Json<UpdateUserRequest>,
-) -> Result<Json<IamUserSummaryResponse>, Response> {
+) -> Result<Json<IamUserSummaryResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let actor = claims.subject.clone();
@@ -1412,7 +1484,7 @@ pub(crate) async fn delete_user_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
     axum::extract::Path(username): axum::extract::Path<String>,
-) -> Result<StatusCode, Response> {
+) -> Result<StatusCode, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let actor = claims.subject.clone();
@@ -1459,7 +1531,7 @@ pub(crate) async fn delete_user_handler(
 pub(crate) async fn list_groups_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
-) -> Result<Json<Vec<IamGroupSummaryResponse>>, Response> {
+) -> Result<Json<Vec<IamGroupSummaryResponse>>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let actor = claims.subject.clone();
@@ -1501,7 +1573,7 @@ pub(crate) async fn upsert_group_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
     Json(payload): Json<UpsertGroupRequest>,
-) -> Result<Json<IamGroupSummaryResponse>, Response> {
+) -> Result<Json<IamGroupSummaryResponse>, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let actor = claims.subject.clone();
@@ -1546,7 +1618,7 @@ pub(crate) async fn delete_group_handler(
     State(state): State<crate::AppState>,
     Extension(claims): Extension<AuthClaims>,
     axum::extract::Path(name): axum::extract::Path<String>,
-) -> Result<StatusCode, Response> {
+) -> Result<StatusCode, BoxedErrorResponse> {
     let auth_manager = Arc::clone(&state.auth_manager);
     let engine = state.runtime.load().engine.clone();
     let actor = claims.subject.clone();
@@ -1784,6 +1856,7 @@ mod tests {
             subject: subject.to_owned(),
             roles: roles.iter().map(|r| (*r).to_owned()).collect(),
             scopes: Vec::new(),
+            expires_at: None,
         }
     }
 
@@ -1828,6 +1901,40 @@ mod tests {
         // Different method/path is a cache miss.
         assert!(cache.get("tok-1", "POST", "/api/x").is_none());
         assert!(cache.get("tok-1", "GET", "/api/y").is_none());
+    }
+
+    #[test]
+    fn cache_hit_with_a_past_expiry_is_treated_as_a_miss() {
+        let cache = AuthDecisionCache::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_secs();
+        let mut claims = fresh_claims("alice", &["admin"]);
+        claims.expires_at = Some(now.saturating_sub(1));
+        cache.put("tok-1", "GET", "/api/x", claims);
+
+        // A real expiry in the past is caught even though the cache entry's
+        // own TTL/idle window hasn't elapsed — this is the gap issue #422
+        // tracked: nothing used to re-check expiry on a cache hit.
+        assert!(cache.get("tok-1", "GET", "/api/x").is_none());
+    }
+
+    #[test]
+    fn cache_hit_with_a_future_expiry_is_still_served() {
+        let cache = AuthDecisionCache::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_secs();
+        let mut claims = fresh_claims("alice", &["admin"]);
+        claims.expires_at = Some(now + 3600);
+        cache.put("tok-1", "GET", "/api/x", claims);
+
+        let got = cache
+            .get("tok-1", "GET", "/api/x")
+            .expect("not yet expired");
+        assert_eq!(got.subject, "alice");
     }
 
     #[test]

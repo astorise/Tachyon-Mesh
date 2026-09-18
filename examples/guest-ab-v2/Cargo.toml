@@ -2,6 +2,7 @@
 name = "guest-ab-v2"
 version = "2.0.0"
 edition = "2021"
+license.workspace = true
 description = "Greeting service v2 — canary variant with enhanced metadata"
 
 [lib]

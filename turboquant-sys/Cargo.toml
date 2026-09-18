@@ -3,6 +3,7 @@ name = "turboquant-sys"
 version = "1.0.0"
 edition = "2021"
 
+license.workspace = true
 # This crate's name is preserved from when it was a thin Rust wrapper around a
 # C++ implementation linked via `turboquant_native`. The implementation is now
 # pure Rust (see openspec change `turboquant-native-rust-migration`); the crate

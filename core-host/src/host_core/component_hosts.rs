@@ -3030,9 +3030,13 @@ impl websocket_component_bindings::tachyon::mesh::websocket::HostConnection for 
             .table
             .get(&handle)
             .map_err(|error| format!("failed to access WebSocket connection resource: {error}"))?;
+        // This host function runs on the guest's dedicated blocking OS
+        // thread (see execute_websocket_guest), not inside the tokio
+        // runtime, so `blocking_send` — not `.send().await` — is the
+        // correct way to push onto the now-bounded `outgoing` channel here.
         connection
             .outgoing
-            .send(websocket_binding_frame_to_host_frame(frame))
+            .blocking_send(websocket_binding_frame_to_host_frame(frame))
             .map_err(|_| "WebSocket connection is closed".to_owned())
     }
 
@@ -3048,10 +3052,13 @@ impl websocket_component_bindings::tachyon::mesh::websocket::HostConnection for 
             Ok(connection) => connection,
             Err(_) => return None,
         };
+        // Same blocking-OS-thread context as `send` above; `blocking_recv`
+        // is `tokio::sync::mpsc::Receiver`'s documented way to be read from
+        // outside the runtime, and — unlike `std::sync::mpsc::Receiver::recv`
+        // — returns `Option<T>` directly rather than a `Result`.
         connection
             .incoming
-            .recv()
-            .ok()
+            .blocking_recv()
             .map(host_frame_to_websocket_binding_frame)
     }
 

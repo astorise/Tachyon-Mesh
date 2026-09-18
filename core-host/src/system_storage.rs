@@ -180,12 +180,14 @@ async fn proxy_request_to_component(
             &engine,
             module_name,
             &root_dir,
-            core_store,
-            #[cfg(feature = "s3-persistence")]
-            s3_backend,
-            #[cfg(feature = "s3-persistence")]
-            core_store_path,
-            component_cache,
+            StorageComponentContext {
+                core_store,
+                #[cfg(feature = "s3-persistence")]
+                s3_backend,
+                #[cfg(feature = "s3-persistence")]
+                core_store_path,
+                component_cache,
+            },
             component_request,
         )
     })
@@ -228,18 +230,34 @@ async fn collect_component_request(request: Request) -> Result<ComponentRequest>
     })
 }
 
+/// Bundles the fixed, per-node context `invoke_storage_component` needs,
+/// separately from the per-call `module_name`/`request` — otherwise the
+/// s3-persistence-gated fields push it over clippy's too-many-arguments
+/// threshold (8, feature-gated fields included).
+struct StorageComponentContext {
+    core_store: Arc<crate::store::CoreStore>,
+    #[cfg(feature = "s3-persistence")]
+    s3_backend: Option<Arc<crate::persistence::S3PersistenceBackend>>,
+    #[cfg(feature = "s3-persistence")]
+    core_store_path: PathBuf,
+    component_cache: Arc<moka::sync::Cache<PathBuf, crate::CachedComponent>>,
+}
+
 fn invoke_storage_component(
     engine: &Engine,
     module_name: &str,
     root_dir: &Path,
-    core_store: Arc<crate::store::CoreStore>,
-    #[cfg(feature = "s3-persistence")] s3_backend: Option<
-        Arc<crate::persistence::S3PersistenceBackend>,
-    >,
-    #[cfg(feature = "s3-persistence")] core_store_path: PathBuf,
-    component_cache: Arc<moka::sync::Cache<PathBuf, crate::CachedComponent>>,
+    context: StorageComponentContext,
     request: ComponentRequest,
 ) -> Result<ComponentResponse> {
+    let StorageComponentContext {
+        core_store,
+        #[cfg(feature = "s3-persistence")]
+        s3_backend,
+        #[cfg(feature = "s3-persistence")]
+        core_store_path,
+        component_cache,
+    } = context;
     tracing::info!(
         module = module_name,
         method = %request.method,

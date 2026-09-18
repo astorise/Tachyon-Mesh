@@ -55,6 +55,7 @@ export class TachyonAppShellNav extends HTMLElement {
     const active = this.activeRoute;
 
     // Static structural HTML — no user data.
+    // eslint-disable-next-line no-restricted-properties
     this.root.innerHTML = `
       <aside class="w-64 bg-slate-900 border-r border-slate-800 flex flex-col h-screen" aria-label="${t("shell.sidebar-label")}">
         <div class="h-16 flex items-center px-6 border-b border-slate-800">

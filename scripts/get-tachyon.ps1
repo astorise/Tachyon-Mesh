@@ -1,10 +1,23 @@
 # get-tachyon.ps1 — Zero-build installer for Tachyon-Mesh on Windows
 # Usage:
 #   irm https://raw.githubusercontent.com/astorise/tachyon-mesh/main/scripts/get-tachyon.ps1 | iex
-#   .\scripts\get-tachyon.ps1 [-Version v1.2.3] [-Dir C:\Tools\tachyon]
+#   .\scripts\get-tachyon.ps1 [-Version v1.2.3] [-Dir C:\Tools\tachyon] [-Variant http3]
+#
+# -Variant selects which of the release's feature builds to fetch (see
+# publish-server-binaries in .github/workflows/release.yml):
+#   default    admin-plane + ring (the plain Quick Start build; this is the
+#              default when -Variant is omitted)
+#   fips       --no-default-features --features fips
+#   http3      --features http3
+#   security   --features rate-limit,resiliency,mtls,secrets-vault,websockets
+#   no-default --no-default-features
+# ("ai" is not offered here: publish-server-binaries excludes windows-x86_64
+# from the -features ai matrix cell, so no Windows -ai archive is published.)
 param(
     [string]$Version = "",
-    [string]$Dir     = "."
+    [string]$Dir     = ".",
+    [ValidateSet("default", "fips", "http3", "security", "no-default")]
+    [string]$Variant = "default"
 )
 $ErrorActionPreference = "Stop"
 
@@ -13,6 +26,13 @@ function Write-Ok    { param($msg) Write-Host "OK  $msg" -ForegroundColor Green 
 function Write-Fail  { param($msg) Write-Host "FAIL $msg" -ForegroundColor Red; exit 1 }
 
 $Repo = "astorise/tachyon-mesh"
+$VariantSuffix = switch ($Variant) {
+    "default"    { "" }
+    "fips"       { "-fips" }
+    "http3"      { "-http3" }
+    "security"   { "-security" }
+    "no-default" { "-no-default" }
+}
 
 # ── 1. Resolve version ────────────────────────────────────────────────────────
 if ($Version -eq "") {
@@ -28,11 +48,12 @@ Write-Ok "Version: $Version"
 
 # ── 2. Build download URL ─────────────────────────────────────────────────────
 # Matches the artifact produced by publish-server-binaries in release.yml:
-#   tachyon-mesh-{VERSION}-windows-x86_64.zip
+#   tachyon-mesh-{VERSION}-windows-x86_64[-variant].zip
 $VersionNoV = $Version -replace '^v', ''
-$ZipName    = "tachyon-mesh-${VersionNoV}-windows-x86_64.zip"
+$ZipName    = "tachyon-mesh-${VersionNoV}-windows-x86_64${VariantSuffix}.zip"
 $DownloadUrl    = "https://github.com/$Repo/releases/download/$Version/$ZipName"
 $ChecksumUrl    = "$DownloadUrl.sha256"
+Write-Ok "Variant: $Variant"
 
 Write-Info "Downloading $ZipName..."
 
@@ -64,6 +85,35 @@ if ($ActualHash -ne $ExpectedHash) {
     Write-Fail "SHA-256 checksum mismatch — the archive is corrupt or tampered with.`n  Expected: $ExpectedHash`n  Got:      $ActualHash"
 }
 Write-Ok "Checksum verified"
+
+# ── 3c. Verify cosign signature (optional — proves the archive came from
+# this repo's release workflow, not just that it matches a checksum served
+# from the same place) ─────────────────────────────────────────────────────
+$Cosign = Get-Command cosign -ErrorAction SilentlyContinue
+if ($Cosign) {
+    Write-Info "Verifying cosign signature..."
+    $BundleUrl = "$DownloadUrl.bundle"
+    $TmpBundle = Join-Path $env:TEMP "tachyon-mesh-$([System.IO.Path]::GetRandomFileName()).bundle"
+    try {
+        Invoke-WebRequest -Uri $BundleUrl -OutFile $TmpBundle -UseBasicParsing
+    } catch {
+        Remove-Item $TmpZip -Force -ErrorAction SilentlyContinue
+        Write-Fail "cosign is installed but the signature bundle could not be fetched.`n  URL: $BundleUrl`n  Re-run without cosign on PATH to skip this check, or verify manually once the bundle is available."
+    }
+    & cosign verify-blob `
+        --bundle $TmpBundle `
+        --certificate-identity-regexp "^https://github\.com/$Repo/\.github/workflows/release\.yml@" `
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" `
+        $TmpZip
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item $TmpZip, $TmpBundle -Force -ErrorAction SilentlyContinue
+        Write-Fail "cosign signature verification failed — the archive does not match a signature from this repo's release workflow."
+    }
+    Remove-Item $TmpBundle -Force -ErrorAction SilentlyContinue
+    Write-Ok "Signature verified"
+} else {
+    Write-Info "cosign not found on PATH — skipping signature verification (SHA-256 checksum above still applies). Install cosign (https://docs.sigstore.dev/cosign/installation/) to also verify the archive was signed by this repo's release workflow."
+}
 
 # ── 4. Extract ────────────────────────────────────────────────────────────────
 Write-Info "Extracting to $Dir..."

@@ -22,6 +22,15 @@ const STRONGHOLD_PROFILE_KEY_BYTES: usize = 32;
 const MFA_SESSION_TTL_SECONDS: u64 = 20 * 60;
 const UPLOAD_STATUS_EMIT_INTERVAL: Duration = Duration::from_millis(200);
 
+// `cert` on this and the other pre-auth payloads below is, despite the
+// name, the custom CA certificate to trust for this connection — resolved
+// frontend-side (TachyonAuthStepCredentials.currentCert()) from either a
+// freshly-selected file or the persisted "custom CA" (save_custom_ca/
+// load_custom_ca below). It flows straight through to
+// tachyon_client::authn_login's `custom_ca` parameter, which adds it as a
+// trusted root rather than presenting it as this client's own TLS identity
+// (issue #421 — that used to be the bug: the same bytes were passed as an
+// mTLS client certificate, which a CA-only PEM can't actually serve as).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AuthnLoginPayload {
@@ -345,6 +354,8 @@ async fn get_shadow_diffs() -> Result<Vec<tachyon_client::ShadowDiff>, String> {
 async fn connect_to_node(
     url: String,
     token: String,
+    // Custom CA to trust, not an mTLS client identity — see the comment on
+    // AuthnLoginPayload above.
     cert: Option<Vec<u8>>,
 ) -> Result<String, String> {
     tachyon_client::set_connection(url, token, cert).await?;

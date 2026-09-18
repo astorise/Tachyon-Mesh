@@ -1,0 +1,58 @@
+# Test fixture for the hybrid-mesh CI workflows — NOT part of the Quick
+# Start. `legacy-mock` is built by e2e-k8s.yml/integration.yml/
+# bench-regression.yml themselves (docker build -t legacy-mock:test) and
+# does not exist in any registry, so `imagePullPolicy: Never` here only
+# works when a CI job has just built and imported that exact image into the
+# cluster. Applying this file on its own, outside those workflows, leaves a
+# permanently ErrImageNeverPull Deployment.
+#
+# integration.yml and bench-regression.yml apply this file together with
+# deploy.yaml (concatenated, not `kubectl apply -f` on each separately) —
+# splitting it out keeps deploy.yaml itself, the one the README's Quick
+# Start points operators at, free of this CI-only fixture. The leading `---`
+# below matters: without it, concatenating this file directly after
+# deploy.yaml (which has no trailing `---`) merges this Deployment's keys
+# into deploy.yaml's last document instead of starting a new one.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: legacy-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: legacy-mock
+  template:
+    metadata:
+      labels:
+        app: legacy-mock
+    spec:
+      containers:
+        - name: legacy-mock
+          image: legacy-mock:test
+          imagePullPolicy: Never
+          env:
+            - name: FAAS_URL
+              value: http://tachyon-service:8080/metrics
+          ports:
+            - containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 8081
+            periodSeconds: 2
+            failureThreshold: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: legacy-service
+spec:
+  selector:
+    app: legacy-mock
+  ports:
+    - name: http
+      port: 8081
+      protocol: TCP
+      targetPort: 8081

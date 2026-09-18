@@ -88,6 +88,8 @@ export class TachyonIAM extends HTMLElement {
       this.renderAdminPanel();
       return;
     }
+    // Static structure and t() i18n lookups only — no dynamic data.
+    // eslint-disable-next-line no-restricted-properties
     this.root.innerHTML = `
       <section class="fixed inset-0 z-[100] bg-slate-950/95 backdrop-blur-xl flex items-center justify-center text-slate-300">
         <div id="iam-panel" role="dialog" aria-modal="true" aria-labelledby="iam-dialog-title" class="bg-slate-900 border border-slate-800 p-8 rounded-2xl w-full max-w-2xl shadow-2xl relative overflow-hidden">
@@ -209,6 +211,8 @@ export class TachyonIAM extends HTMLElement {
   }
 
   private renderAdminPanel(): void {
+    // Static structure and t() i18n lookups only — no dynamic data.
+    // eslint-disable-next-line no-restricted-properties
     this.root.innerHTML = `
       <section class="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-6 backdrop-blur-sm">
         <h3 class="mb-2 text-lg font-medium text-emerald-400">${t("iam.admin.title")}</h3>
@@ -246,7 +250,6 @@ export class TachyonIAM extends HTMLElement {
         session.textContent = invite.sessionId;
       }
       if (qr) {
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
         const dataUrl = await (QRCode as unknown as { toDataURL: (text: string, opts: object) => Promise<string> }).toDataURL(invite.qrPayload, {
           margin: 1,
           width: 180,
@@ -503,7 +506,6 @@ export class TachyonIAM extends HTMLElement {
     }
 
     try {
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access
       const dataUrl = await (QRCode as unknown as { toDataURL: (text: string, opts: object) => Promise<string> }).toDataURL(session.provisioningUri, {
         margin: 1,
         width: 256,

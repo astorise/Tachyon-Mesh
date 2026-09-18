@@ -1,5 +1,9 @@
 pub(super) use crate::*;
 
+// Body is only read by sibling test modules gated behind features absent
+// from --no-default-features (admin-plane, rate-limit, ...); unused, not
+// dead, under that build.
+#[allow(unused_imports)]
 pub(super) use axum::{body::Body, http::Request};
 use ed25519_dalek::{Signer, SigningKey};
 pub(super) use http_body_util::Full;

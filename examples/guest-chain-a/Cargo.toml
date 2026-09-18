@@ -2,6 +2,7 @@
 name = "guest-chain-a"
 version = "1.0.0"
 edition = "2021"
+license.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
