@@ -8418,6 +8418,7 @@ dependencies = [
  "sysinfo",
  "tar",
  "tokio",
+ "url",
 ]
 
 [[package]]
