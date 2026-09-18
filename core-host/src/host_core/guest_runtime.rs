@@ -1897,7 +1897,7 @@ pub(crate) fn execute_legacy_guest(
     )?;
 
     if let Some(module_dir) = module_path.parent() {
-        wasi.preopened_dir(module_dir, ".", DirPerms::READ, FilePerms::READ)
+        wasi.preopened_dir(module_dir, ".", FsPerms::ReadOnly)
             .map_err(|error| {
                 guest_execution_error(
                     error,
@@ -1980,7 +1980,7 @@ pub(crate) fn execute_legacy_guest_with_stdio(
         .stdout(stdout);
 
     if let Some(module_dir) = module_path.parent() {
-        wasi.preopened_dir(module_dir, ".", DirPerms::READ, FilePerms::READ)
+        wasi.preopened_dir(module_dir, ".", FsPerms::ReadOnly)
             .map_err(|error| {
                 guest_execution_error(
                     error,
