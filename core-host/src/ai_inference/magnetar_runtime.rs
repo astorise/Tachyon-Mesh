@@ -10,7 +10,16 @@ use std::path::{Path, PathBuf};
 use super::{StreamControl, TokenUsage};
 
 pub(crate) const MAGNETAR_PATH_PREFIX: &str = "magnetar:";
+/// Trusts the WASM Component binary itself (the code Magnetar instantiates
+/// and executes) — never the model weights it happens to load. See
+/// [`TACHYON_ARTIFACT_TRUST_STORE_ENV`] for the separate, model-artifact trust
+/// decision. Feeds `ArtifactTrustPolicy::trust_component_digest`.
 pub(crate) const TACHYON_COMPONENT_TRUST_STORE_ENV: &str = "TACHYON_COMPONENT_TRUST_STORE";
+/// Trusts a Model Artifact digest (weights/tokenizer/config bundle) — never
+/// the Component binary. See [`TACHYON_COMPONENT_TRUST_STORE_ENV`] for the
+/// separate, Component-specific trust decision. Feeds
+/// `ArtifactTrustPolicy::trust_digest`.
+pub(crate) const TACHYON_ARTIFACT_TRUST_STORE_ENV: &str = "TACHYON_ARTIFACT_TRUST_STORE";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProviderAdvertisement {
@@ -221,9 +230,36 @@ fn component_artifact_from_root(root: &Path) -> Result<InferenceComponentArtifac
 }
 
 fn tachyon_component_trust_policy(root: &Path) -> Result<ArtifactTrustPolicy> {
-    let Some(trust_path) = std::env::var_os(TACHYON_COMPONENT_TRUST_STORE_ENV).map(PathBuf::from)
-    else {
-        return Ok(ArtifactTrustPolicy::default());
+    let mut trust_policy = ArtifactTrustPolicy::default();
+    trust_policy = apply_trust_digests(
+        trust_policy,
+        root,
+        TACHYON_COMPONENT_TRUST_STORE_ENV,
+        ArtifactTrustPolicy::trust_component_digest,
+    )?;
+    trust_policy = apply_trust_digests(
+        trust_policy,
+        root,
+        TACHYON_ARTIFACT_TRUST_STORE_ENV,
+        ArtifactTrustPolicy::trust_digest,
+    )?;
+    Ok(trust_policy)
+}
+
+/// Reads `trusted_digests` out of the JSON file named by `env_var`, if set,
+/// and applies each one to `trust_policy` via `apply`. `TACHYON_COMPONENT_
+/// TRUST_STORE` and `TACHYON_ARTIFACT_TRUST_STORE` both use this same file
+/// shape and both call this — they differ only in which of `Artifact
+/// TrustPolicy`'s two independent trust decisions (Component binary vs.
+/// Model Artifact) their digests feed.
+fn apply_trust_digests(
+    mut trust_policy: ArtifactTrustPolicy,
+    root: &Path,
+    env_var: &str,
+    apply: impl Fn(ArtifactTrustPolicy, &str) -> ArtifactTrustPolicy,
+) -> Result<ArtifactTrustPolicy> {
+    let Some(trust_path) = std::env::var_os(env_var).map(PathBuf::from) else {
+        return Ok(trust_policy);
     };
     reject_trust_policy_inside_artifact(root, &trust_path)?;
     let value = serde_json::from_slice::<Value>(
@@ -240,7 +276,6 @@ fn tachyon_component_trust_policy(root: &Path) -> Result<ArtifactTrustPolicy> {
                 trust_path.display()
             )
         })?;
-    let mut trust_policy = ArtifactTrustPolicy::default();
     for digest in trusted_digests {
         let digest = digest.as_str().ok_or_else(|| {
             anyhow!(
@@ -248,7 +283,7 @@ fn tachyon_component_trust_policy(root: &Path) -> Result<ArtifactTrustPolicy> {
                 trust_path.display()
             )
         })?;
-        trust_policy = trust_policy.trust_digest(digest);
+        trust_policy = apply(trust_policy, digest);
     }
     Ok(trust_policy)
 }

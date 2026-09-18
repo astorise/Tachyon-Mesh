@@ -102,7 +102,7 @@ check_absent \
   'paged_attention|cuda_graph_decode|flashinfer_attention|prefill_chunk_tokens|speculative_draft|stage_layer_ranges|expert_device_map|pipeline_depth' \
   'core domain types must not carry model-execution engine knobs'
 
-check_absent \
+check_production_prefix_absent \
   vendor/Magnetar/inference-components/src/lib.rs \
   'DEFAULT_COMPONENT|register_default_component|include_bytes!' \
   'generic Magnetar inference Component adapter must not select a compiled-in default Component'

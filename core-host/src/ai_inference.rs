@@ -1124,17 +1124,24 @@ mod tests {
         path: PathBuf,
     }
 
+    /// Restores both trust env vars independently (they're set together by
+    /// `trust_tachyon_component_artifact` but tests sometimes clear just one
+    /// to isolate a single trust decision — see
+    /// `qwen_bundle_cannot_self_authorize_with_embedded_trust_policy`).
     struct TrustStoreEnvGuard {
         _qwen_lock: QwenInterprocessGuard,
         _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Option<std::ffi::OsString>,
-        path: PathBuf,
+        previous_component: Option<std::ffi::OsString>,
+        previous_model: Option<std::ffi::OsString>,
+        component_path: PathBuf,
+        model_path: PathBuf,
     }
 
     struct TrustStoreEnvUnsetGuard {
         _qwen_lock: QwenInterprocessGuard,
         _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Option<std::ffi::OsString>,
+        previous_component: Option<std::ffi::OsString>,
+        previous_model: Option<std::ffi::OsString>,
     }
 
     impl Drop for QwenInterprocessGuard {
@@ -1145,7 +1152,7 @@ mod tests {
 
     impl Drop for TrustStoreEnvGuard {
         fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
+            if let Some(previous) = self.previous_component.take() {
                 std::env::set_var(
                     magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
                     previous,
@@ -1153,17 +1160,26 @@ mod tests {
             } else {
                 std::env::remove_var(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
             }
-            let _ = std::fs::remove_file(&self.path);
+            if let Some(previous) = self.previous_model.take() {
+                std::env::set_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV, previous);
+            } else {
+                std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+            }
+            let _ = std::fs::remove_file(&self.component_path);
+            let _ = std::fs::remove_file(&self.model_path);
         }
     }
 
     impl Drop for TrustStoreEnvUnsetGuard {
         fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
+            if let Some(previous) = self.previous_component.take() {
                 std::env::set_var(
                     magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
                     previous,
                 );
+            }
+            if let Some(previous) = self.previous_model.take() {
+                std::env::set_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV, previous);
             }
         }
     }
@@ -1212,43 +1228,90 @@ mod tests {
     fn without_tachyon_component_trust_store() -> TrustStoreEnvUnsetGuard {
         let qwen_lock = qwen_interprocess_lock();
         let lock = trust_env_lock();
-        let previous = std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+        let previous_component =
+            std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
         std::env::remove_var(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+        let previous_model = std::env::var_os(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+        std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
         TrustStoreEnvUnsetGuard {
             _qwen_lock: qwen_lock,
             _lock: lock,
-            previous,
+            previous_component,
+            previous_model,
         }
     }
 
+    /// The real content digest of the single `*.component.wasm` under
+    /// `root`, computed the same way production code's `register_inference_
+    /// component_artifact` does (`ComponentDigest::sha256` over the raw
+    /// bytes) — never a value the fixture invents.
+    fn component_wasm_digest(root: &Path) -> String {
+        let component_path = std::fs::read_dir(root)
+            .expect("fixture root should be readable")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".component.wasm"))
+            })
+            .expect("fixture root should contain a *.component.wasm artifact");
+        let component_bytes =
+            std::fs::read(&component_path).expect("component artifact should be readable");
+        // `::magnetar_runtime` (leading `::`), not `magnetar_runtime` — this
+        // module's own `mod magnetar_runtime;` submodule shadows the crate
+        // of the same name.
+        ::magnetar_runtime::ComponentDigest::sha256(&component_bytes).value
+    }
+
+    /// Trusts both the Model Artifact (weights/tokenizer/config bundle) and
+    /// the Component (WASM) binary under `path` — two independent trust
+    /// decisions since Magnetar's `ArtifactTrustPolicy` split them
+    /// (Tachyon integration audit MAG-03); conflating them here would mean
+    /// this fixture stops proving what most tests actually need, which is
+    /// that a normal, fully-trusted load succeeds.
     fn trust_tachyon_component_artifact(path: &Path) -> TrustStoreEnvGuard {
         let qwen_lock = qwen_interprocess_lock();
         let lock = trust_env_lock();
-        let digest = magnetar_inference_component::local_bundle_manifest_digest(path)
+        let model_digest = magnetar_inference_component::local_bundle_manifest_digest(path)
             .expect("fixture should ingest before writing Tachyon trust policy");
-        let trust_path =
-            unique_model_dir("component-trust-policy").join("tachyon-component-trust.json");
-        std::fs::create_dir_all(
-            trust_path
-                .parent()
-                .expect("trust policy should have a parent"),
-        )
-        .expect("trust policy parent should be created");
+        let component_digest = component_wasm_digest(path);
+
+        let trust_dir = unique_model_dir("component-trust-policy");
+        std::fs::create_dir_all(&trust_dir).expect("trust policy dir should be created");
+
+        let component_path = trust_dir.join("tachyon-component-trust.json");
         fs::write(
-            &trust_path,
-            format!(r#"{{"trusted_digests":["{digest}"]}}"#),
+            &component_path,
+            format!(r#"{{"trusted_digests":["{component_digest}"]}}"#),
         )
-        .expect("trust sidecar should be written");
-        let previous = std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+        .expect("component trust sidecar should be written");
+
+        let model_path = trust_dir.join("tachyon-artifact-trust.json");
+        fs::write(
+            &model_path,
+            format!(r#"{{"trusted_digests":["{model_digest}"]}}"#),
+        )
+        .expect("model trust sidecar should be written");
+
+        let previous_component =
+            std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
         std::env::set_var(
             magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
-            &trust_path,
+            &component_path,
         );
+        let previous_model = std::env::var_os(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+        std::env::set_var(
+            magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV,
+            &model_path,
+        );
+
         TrustStoreEnvGuard {
             _qwen_lock: qwen_lock,
             _lock: lock,
-            previous,
-            path: trust_path,
+            previous_component,
+            previous_model,
+            component_path,
+            model_path,
         }
     }
 
@@ -1496,6 +1559,12 @@ mod tests {
 
     #[test]
     fn explicit_magnetar_binding_rejects_untrusted_qwen_bundle() {
+        // Neither trust store is configured, so this exercises the
+        // Component (WASM) trust gate — checked first, before any model
+        // ingestion (Tachyon integration audit MAG-03) — not the Model
+        // Artifact one specifically; see
+        // `qwen_bundle_cannot_self_authorize_with_embedded_trust_policy`
+        // for a test that isolates the Model Artifact half.
         let _trust = without_tachyon_component_trust_store();
         let model_dir = unique_model_dir("untrusted-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
@@ -1508,6 +1577,41 @@ mod tests {
             hardware_strategy: Default::default(),
         }) {
             Ok(_) => panic!("Magnetar Qwen bundle must require explicit Tachyon trust policy"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error_chain_contains(&error, "no trust policy matched"),
+            "unexpected trust rejection error: {error:#}"
+        );
+        let _ = std::fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn explicit_magnetar_binding_rejects_a_trusted_component_with_an_untrusted_model() {
+        // The two trust decisions are independent (Tachyon integration
+        // audit MAG-03): a Component binary the operator has explicitly
+        // trusted must still not authorize loading arbitrary, untrusted
+        // model weights through it. Mirrors
+        // `qwen_bundle_cannot_self_authorize_with_embedded_trust_policy`
+        // (which isolates the Model Artifact half) by isolating the other
+        // direction — Component trusted, Model Artifact not.
+        let model_dir = unique_model_dir("component-trusted-model-untrusted");
+        write_tiny_production_qwen_bundle(&model_dir);
+        let _trust = trust_tachyon_component_artifact(&model_dir);
+        std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+
+        let error = match load_binding(&IntegrityInferenceComponentBinding {
+            alias: "qwen-model-untrusted".to_owned(),
+            path: format!("magnetar:{}", model_dir.display()),
+            device: ComponentPlacement::Cpu,
+            qos: RouteQos::Standard,
+            dynamic: false,
+            hardware_strategy: Default::default(),
+        }) {
+            Ok(_) => panic!(
+                "a trusted Component must not authorize loading untrusted model weights through it"
+            ),
             Err(error) => error,
         };
 
@@ -1549,15 +1653,21 @@ mod tests {
 
     #[test]
     fn qwen_bundle_cannot_self_authorize_with_embedded_trust_policy() {
+        // Component trust stays externally configured throughout (valid
+        // and untouched) so the load reaches Model Artifact ingestion at
+        // all; this test is specifically about the Model Artifact half of
+        // trust (hence asserting "trust rejected", the Model Artifact
+        // rejection message — see `magnetar_inference_component`'s
+        // `ArtifactTrustPolicy`), not the Component binary half.
         let model_dir = unique_model_dir("self-trusting-qwen");
         write_tiny_production_qwen_bundle(&model_dir);
         let _trust = trust_tachyon_component_artifact(&model_dir);
-        let trust_path = std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV)
+        let trust_path = std::env::var_os(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV)
             .map(PathBuf::from)
             .expect("test trust policy should be configured");
-        std::fs::copy(&trust_path, model_dir.join(".tachyon-component-trust.json"))
+        std::fs::copy(&trust_path, model_dir.join(".tachyon-artifact-trust.json"))
             .expect("embedded fake trust policy should be copied");
-        std::env::remove_var(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+        std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
 
         let error = match load_binding(&IntegrityInferenceComponentBinding {
             alias: "qwen-self-trusting".to_owned(),
