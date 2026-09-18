@@ -719,6 +719,18 @@ pub(crate) async fn handle_udp_layer4_datagram(
 #[cfg(feature = "websockets")]
 const WEBSOCKET_CHANNEL_CAPACITY: usize = 64;
 
+/// Per-message and per-frame size ceilings applied to every WebSocket
+/// upgrade. axum's own defaults (64 MiB message / 16 MiB frame) are already
+/// bounded rather than unlimited, but combined with
+/// `WEBSOCKET_CHANNEL_CAPACITY` frames sitting in the bounded queue above,
+/// that still allows up to `64 * 64 MiB` = 4 GiB of buffered frames per
+/// connection in the worst case. Tightened so the same worst case stays in
+/// the low hundreds of megabytes instead.
+#[cfg(feature = "websockets")]
+pub(crate) const WEBSOCKET_MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(feature = "websockets")]
+pub(crate) const WEBSOCKET_MAX_FRAME_BYTES: usize = 1024 * 1024;
+
 #[cfg(feature = "websockets")]
 pub(crate) async fn handle_websocket_connection(
     state: AppState,

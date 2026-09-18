@@ -5,12 +5,14 @@ pub(crate) use crate::ai_inference;
 #[cfg(test)]
 pub(crate) use crate::identity::CallerIdentityClaims;
 pub(crate) use crate::identity::HostIdentity;
-#[cfg(feature = "websockets")]
-pub(crate) use crate::network::handle_websocket_connection;
 #[cfg(test)]
 pub(crate) use crate::network::{
     handle_tcp_layer4_connection, layer4_bind_address,
     start_udp_layer4_listeners_with_queue_capacity,
+};
+#[cfg(feature = "websockets")]
+pub(crate) use crate::network::{
+    handle_websocket_connection, WEBSOCKET_MAX_FRAME_BYTES, WEBSOCKET_MAX_MESSAGE_BYTES,
 };
 pub(crate) use crate::network::{
     serve_http_listener, start_http3_listener, start_https_listener, start_mtls_gateway_listener,

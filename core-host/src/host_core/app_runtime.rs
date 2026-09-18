@@ -1700,7 +1700,9 @@ pub(crate) async fn faas_handler(
                             };
                             match ws {
                                 Ok(upgrade) => {
-                                    let upgrade: WebSocketUpgrade = upgrade;
+                                    let upgrade: WebSocketUpgrade = upgrade
+                                        .max_message_size(WEBSOCKET_MAX_MESSAGE_BYTES)
+                                        .max_frame_size(WEBSOCKET_MAX_FRAME_BYTES);
                                     let websocket_state = state.clone();
                                     let websocket_route = route.as_ref().clone();
                                     let websocket_module = selected_target.module.clone();
