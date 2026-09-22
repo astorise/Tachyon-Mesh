@@ -955,12 +955,22 @@ mod tests {
 
     /// The same real, independently-compiled Llama Component Magnetar's own
     /// test suite checks in (`loaded_inference_component_load_runs_a_real_
-    /// second_architecture_end_to_end`), paired with the identical
-    /// Hugging Face-shaped bundle `write_tiny_production_qwen_bundle` writes
-    /// — same tensors, same config, same tokenizer. Proves Tachyon's own
-    /// route -> alias -> `MagnetarRuntime::try_load` pipeline can load a
-    /// second, digest-distinct compiled Component binary, not just a second
-    /// alias (Tachyon integration audit MAG-01/MAG-06, #72).
+    /// second_architecture_end_to_end`), paired with a Model Artifact whose
+    /// `config.json` declares `model_type: "llama"` — Magnetar's own
+    /// `magnetar-loader-huggingface` normalizes that directly into
+    /// `architecture.family` (astorise/Magnetar#83), and `llama-real`'s own
+    /// manifest declares `compatibility.architecture_families: [llama]`
+    /// (Tachyon integration audit round 2, TACH-05 fixture bug: this used
+    /// to share `write_tiny_production_qwen_bundle`'s `qwen2`-declaring
+    /// Model Artifact, which loaded only because Magnetar had no
+    /// Component-vs-family compatibility gate yet; it now rejects that
+    /// mismatch on purpose). Same tensor shapes and tokenizer as the Qwen
+    /// bundle — HIDDEN_SIZE/LAYER_COUNT/etc. describe a generic HF-style
+    /// transformer either family accepts; only the declared family differs.
+    /// Proves Tachyon's own route -> alias -> `MagnetarRuntime::try_load`
+    /// pipeline can load a second, digest-distinct compiled Component
+    /// binary, not just a second alias (Tachyon integration audit
+    /// MAG-01/MAG-06, #72).
     fn write_tiny_production_llama_bundle(path: &Path) {
         fs::create_dir_all(path).expect("fixture dir should be created");
         fs::write(
@@ -973,18 +983,28 @@ mod tests {
             include_bytes!("../../vendor/Magnetar/magnetar-runtime/fixtures/components/llama-real.component.wasm.magnetar-component.yaml"),
         )
         .expect("Component artifact manifest should be written");
-        write_tiny_production_model_data(path);
+        write_tiny_production_model_data_for_family(path, "LlamaForCausalLM", "llama");
     }
 
     /// The Model Artifact half of a tiny production-shaped bundle: config,
     /// tokenizer, and safetensors weights. Shared by every fixture Component
     /// this module writes, since each accepts the identical Hugging
-    /// Face-shaped directory — only the `*.component.wasm` differs.
+    /// Face-shaped directory — only the `*.component.wasm` (and, since
+    /// Magnetar's Component-vs-family compatibility gate landed, the
+    /// declared `architectures`/`model_type`) differ.
     fn write_tiny_production_model_data(path: &Path) {
+        write_tiny_production_model_data_for_family(path, "Qwen2ForCausalLM", "qwen2");
+    }
+
+    fn write_tiny_production_model_data_for_family(
+        path: &Path,
+        architectures: &str,
+        model_type: &str,
+    ) {
         let config_json = format!(
             r#"{{
-                "architectures": ["Qwen2ForCausalLM"],
-                "model_type": "qwen2",
+                "architectures": ["{architectures}"],
+                "model_type": "{model_type}",
                 "hidden_size": {HIDDEN_SIZE},
                 "intermediate_size": {INTERMEDIATE_SIZE},
                 "num_hidden_layers": {LAYER_COUNT},
