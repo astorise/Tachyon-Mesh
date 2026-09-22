@@ -42,6 +42,11 @@ check_production_prefix_absent \
   'GenerationError|ComponentGeneration|StreamEvent::Refusal|StreamEvent::ToolCall|struct ToolCall\b|\bfinish_reason\s*:|\bprompt_tokens\s*:\s*u32|\bcompletion_tokens\s*:\s*u32' \
   'core-host AI inference production code must not reintroduce typed chat-completion generation semantics (token usage, tool calls, finish reasons, refusals) as core concepts'
 
+check_production_prefix_absent \
+  core-host/src/ai_inference.rs \
+  'struct ModelMeta\b|declared_tool_call_metadata|read_declared_tool_call_parser' \
+  'core-host must read a Component artifact sidecar as an opaque key/value bag, not extract one named tool-call-dialect field (TACH-01)'
+
 check_absent \
   core-host/src/host_core/component_hosts.rs \
   'model_events|ModelUploaded|publish_model_uploaded|hot_models|hot_model_aliases|AI_MODELS_REGISTRY_TABLE|ai-models-registry|load_model|compute_detailed|compute_stream' \
@@ -49,8 +54,8 @@ check_absent \
 
 check_absent \
   core-host/src/host_core/component_hosts.rs \
-  'GenerationError|ComponentGeneration|ai_inference::ToolCall\b|StreamPayload::Refusal|StreamPayload::ToolCall|tachyon\.refusal|tachyon\.tool_call' \
-  'component host bindings must not reintroduce typed chat-completion generation semantics or dialect-specific metadata tags'
+  'GenerationError|ComponentGeneration|ai_inference::ToolCall\b|StreamPayload::Refusal|StreamPayload::ToolCall|tachyon\.refusal|tachyon\.tool_call|\btool_call_parser\s*:\s*Option<String>' \
+  'component host bindings must not reintroduce typed chat-completion generation semantics or a named tool-call-dialect field in the registry record (TACH-01)'
 
 check_absent \
   core-host/src/system_storage.rs \
@@ -59,8 +64,8 @@ check_absent \
 
 check_production_prefix_absent \
   core-host/src/system_storage.rs \
-  '\btool_call_parser\s*:\s*Option<String>|const OPENAI_SCHEME' \
-  'system storage must not reintroduce a named tool-call-dialect struct field or a hardcoded upstream URI scheme constant'
+  '\btool_call_parser\s*:\s*Option<String>|const OPENAI_SCHEME|TOOL_CALL_PARSER_METADATA_KEY|binding_tool_call_parser|registry_component_metadata' \
+  'system storage must not reintroduce a named tool-call-dialect struct field, a hardcoded upstream URI scheme constant, or a dedicated tool-call-dialect metadata key/reader (TACH-01)'
 
 check_absent \
   core-host/src/host_core/admin_plane.rs \
@@ -81,6 +86,11 @@ check_absent \
   wit/tachyon.wit \
   'model-events|model-uploaded|model-file|model-path|publish-model|base-model|hot-models' \
   'central Tachyon WIT must not expose Component-native upload or training contracts'
+
+check_absent \
+  sdk/wit/tachyon.wit \
+  'model-events|model-uploaded|model-file|model-path|publish-model|base-model|hot-models' \
+  'sdk WIT must stay aligned with the Component-centric field names in wit/tachyon.wit (TACH-03; see also scripts/check_wit_sdk_sync.sh)'
 
 check_absent \
   wit/accelerator/accelerator-cpu.wit \
