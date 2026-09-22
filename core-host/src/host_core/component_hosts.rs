@@ -375,24 +375,6 @@ impl ComponentHostState {
         Ok(loaded)
     }
 
-    #[cfg(feature = "ai-inference")]
-    pub(crate) fn embed_accelerator_component_input(
-        &self,
-        expected_accelerator: ai_inference::AcceleratorKind,
-        component_id: u32,
-        input: String,
-    ) -> std::result::Result<Vec<f32>, ai_inference::ComponentInvocationError> {
-        let loaded = self.resolve_accelerator_component(expected_accelerator, component_id)?;
-        self.ai_runtime
-            .as_ref()
-            .ok_or_else(|| {
-                ai_inference::ComponentInvocationError::local(
-                    "AI inference runtime is unavailable for this component",
-                )
-            })?
-            .embed_component_input(&loaded.alias, &input)
-    }
-
     /// Begin a streaming generation: resolve the Component handle (the same scope
     /// and accelerator checks as `invoke_accelerator_component`), then run the
     /// decode on a dedicated thread that pushes each decoded text fragment into
@@ -3426,10 +3408,12 @@ struct ComponentRegistryRecord<'a> {
     status: &'a str,
     artifact_path: &'a str,
     /// See the matching field on `RegistryComponentInfo` in `system_storage.rs`:
-    /// Tachyon publishes artifact-declared parser metadata opaquely and does
-    /// not interpret component-protocol dialects in core.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_parser: Option<String>,
+    /// whatever opaque key/value metadata the artifact sidecar declared,
+    /// stored and republished verbatim. Tachyon does not name or interpret
+    /// any entry here — only the guest reading a row downstream assigns any
+    /// key meaning.
+    #[serde(flatten)]
+    component_metadata: std::collections::BTreeMap<String, String>,
 }
 
 impl system_component_bindings::tachyon::mesh::artifact_events::Host for ComponentHostState {
@@ -3449,7 +3433,9 @@ impl system_component_bindings::tachyon::mesh::artifact_events::Host for Compone
             vram_required_mb: 0,
             status: "available",
             artifact_path: &event.artifact_path,
-            tool_call_parser: crate::system_storage::binding_tool_call_parser(&event.artifact_path),
+            component_metadata: crate::system_storage::binding_component_metadata(
+                &event.artifact_path,
+            ),
         };
         let value = serde_json::to_vec(&record)
             .map_err(|error| format!("failed to encode component registry entry: {error}"))?;

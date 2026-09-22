@@ -6,6 +6,7 @@ on:
       - "wit/**/*.wit"
       - "sdk/wit/**/*.wit"
       - ".github/workflows/wit-compat.yml"
+      - "scripts/check_wit_sdk_sync.sh"
 
 jobs:
   check-compat:
@@ -18,6 +19,10 @@ jobs:
 
       - name: Install wasm-tools
         uses: taiki-e/install-action@wasm-tools
+
+      - name: Check sdk/wit/tachyon.wit has not drifted from wit/tachyon.wit
+        shell: bash
+        run: bash scripts/check_wit_sdk_sync.sh
 
       - name: Check WIT package declarations
         shell: bash

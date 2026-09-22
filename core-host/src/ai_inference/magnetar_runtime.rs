@@ -3,8 +3,8 @@ use magnetar_inference_component::{
     ArtifactTrustPolicy, ComponentProviderAdvertisement, InferenceComponentArtifact,
     InferenceComponentPlacement, InferenceComponentSource, LoadedInferenceComponent,
 };
-use magnetar_runtime::GenerationStreamEvent;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::StreamControl;
@@ -105,6 +105,16 @@ impl MagnetarRuntime {
         self.component.resident_debug()
     }
 
+    /// `generate`/`generate_streaming` call `LoadedInferenceComponent`'s
+    /// opaque entry points (`invoke_payload_opaque`/
+    /// `invoke_payload_streaming_opaque`, astorise/Magnetar#89 — added in
+    /// response to the Tachyon integration audit's TACH-02 finding): raw
+    /// bytes and string-keyed tags, never Magnetar's own typed generation
+    /// output/stream-event shapes. This module touches no generation
+    /// vocabulary at all — not a token count, not a stream-event variant —
+    /// and neither does anything past it: [`tachyon_wire_tags`] renames
+    /// Magnetar's tag keys to Tachyon's own established wire keys by string
+    /// lookup, never by typed field access.
     pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<ComponentInvocationBatch> {
         if prompts.len() != 1 {
             bail!(
@@ -113,15 +123,14 @@ impl MagnetarRuntime {
                 prompts.len()
             );
         }
-        let outcome = self.component.invoke_payload(prompts[0])?;
-        let metadata = usage_metadata(outcome.usage.prompt_tokens, outcome.usage.generated_tokens);
-        Ok(vec![(outcome.text.into_bytes(), metadata)])
+        let outcome = self.component.invoke_payload_opaque(prompts[0])?;
+        Ok(vec![(outcome.bytes, tachyon_wire_tags(outcome.tags))])
     }
 
     pub(crate) fn generate_streaming(
         &self,
         prompts: &[&[u8]],
-        on_token: &mut dyn FnMut(&str) -> StreamControl,
+        on_frame: &mut dyn FnMut(&[u8]) -> StreamControl,
     ) -> Result<ComponentMetadata> {
         if prompts.len() != 1 {
             bail!(
@@ -130,51 +139,41 @@ impl MagnetarRuntime {
                 prompts.len()
             );
         }
-        let mut streamed_usage = None;
-        let mut on_event = |event: GenerationStreamEvent| -> std::ops::ControlFlow<()> {
-            match event {
-                GenerationStreamEvent::Token {
-                    text_delta: Some(delta),
-                    ..
-                } if !delta.is_empty() => {
-                    if on_token(&delta).is_stop() {
-                        std::ops::ControlFlow::Break(())
-                    } else {
-                        std::ops::ControlFlow::Continue(())
-                    }
-                }
-                GenerationStreamEvent::Finished { usage, .. } => {
-                    streamed_usage = Some((usage.prompt_tokens, usage.generated_tokens));
-                    std::ops::ControlFlow::Continue(())
-                }
-                _ => std::ops::ControlFlow::Continue(()),
+        let mut on_event = |frame: &[u8]| -> std::ops::ControlFlow<()> {
+            if on_frame(frame).is_stop() {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
             }
         };
-        let outcome = self
+        let tags = self
             .component
-            .invoke_payload_streaming(prompts[0], &mut on_event)?;
-        let (prompt_tokens, generated_tokens) =
-            streamed_usage.unwrap_or((outcome.prompt_tokens, outcome.generated_tokens));
-        Ok(usage_metadata(prompt_tokens, generated_tokens))
+            .invoke_payload_streaming_opaque(prompts[0], &mut on_event)?;
+        Ok(tachyon_wire_tags(tags))
     }
 }
 
-/// Token-accounting metadata for one invocation, in the opaque wire shape the
-/// Component/artifact boundary carries (`wit/accelerator/*.wit`'s
-/// `invocation-result.metadata`). Built here, at the Magnetar adapter, rather
-/// than as a typed field threaded through `ai_inference`/`component_hosts`:
-/// the count is Magnetar's own to report, and the core only ever relays it.
-fn usage_metadata(prompt_tokens: usize, generated_tokens: usize) -> ComponentMetadata {
-    vec![
-        (
-            "tachyon.usage.prompt_tokens".to_owned(),
-            prompt_tokens.min(u32::MAX as usize).to_string(),
-        ),
-        (
-            "tachyon.usage.completion_tokens".to_owned(),
-            generated_tokens.min(u32::MAX as usize).to_string(),
-        ),
-    ]
+/// Renames Magnetar's own opaque tag keys (`prompt_tokens`,
+/// `generated_tokens` — `astorise/Magnetar#89`; it also reports
+/// `finish_reason`, not relayed here since Tachyon's wire contract has no
+/// slot for it yet) to Tachyon's established wire keys
+/// (`wit/accelerator/*.wit`'s `invocation-result.metadata`). Pure
+/// string-key lookup — Magnetar's tag keys are read by name, exactly like
+/// any other opaque metadata this module never interprets, never through a
+/// typed struct field. A key `MagnetarRuntime::generate`/
+/// `generate_streaming` don't recognize is silently dropped rather than
+/// relayed verbatim, so Tachyon's wire contract stays exactly what it was
+/// before Magnetar's opaque entry points existed.
+fn tachyon_wire_tags(tags: Vec<(String, String)>) -> ComponentMetadata {
+    let by_key: HashMap<String, String> = tags.into_iter().collect();
+    let mut wire_tags = Vec::new();
+    if let Some(value) = by_key.get("prompt_tokens") {
+        wire_tags.push(("tachyon.usage.prompt_tokens".to_owned(), value.clone()));
+    }
+    if let Some(value) = by_key.get("generated_tokens") {
+        wire_tags.push(("tachyon.usage.completion_tokens".to_owned(), value.clone()));
+    }
+    wire_tags
 }
 
 pub(crate) fn is_invalid_component_invocation(error: &anyhow::Error) -> bool {

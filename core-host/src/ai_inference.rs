@@ -2,9 +2,8 @@
 mod magnetar_runtime;
 
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
@@ -559,28 +558,6 @@ impl AiInferenceRuntime {
         })
     }
 
-    pub(crate) fn embed_component_input(
-        &self,
-        alias: &str,
-        _input: &str,
-    ) -> std::result::Result<Vec<f32>, ComponentInvocationError> {
-        self.ensure_component_loaded(alias, AcceleratorKind::Cpu)
-            .map_err(ComponentInvocationError::local)?;
-        let model = self
-            .inference_components
-            .read()
-            .expect("component registry lock poisoned")
-            .get(alias)
-            .cloned()
-            .ok_or_else(|| {
-                ComponentInvocationError::local(format!("component alias `{alias}` is not loaded"))
-            })?;
-        let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
-        Err(ComponentInvocationError::invalid_request(format!(
-            "component `{alias}` does not expose dense text embeddings through the generic Tachyon invocation contract"
-        )))
-    }
-
     pub(crate) fn stream_component_prompt(
         &self,
         alias: &str,
@@ -610,9 +587,9 @@ impl AiInferenceRuntime {
                 })
             }
             ComponentRuntime::Magnetar(runtime) => {
-                let mut emit = |fragment: &str| {
+                let mut emit = |frame: &[u8]| {
                     if sink.is_live() {
-                        sink.emit(StreamEvent::Payload(fragment.as_bytes()))
+                        sink.emit(StreamEvent::Payload(frame))
                     } else {
                         StreamControl::Stop
                     }
@@ -848,21 +825,17 @@ fn execute_model(
     }
 }
 
-pub(crate) fn declared_tool_call_metadata(path: &Path) -> Option<String> {
-    read_declared_tool_call_parser(path)
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelMeta {
-    #[serde(default)]
-    tool_call_parser: Option<String>,
-}
-
-fn read_declared_tool_call_parser(root: &Path) -> Option<String> {
-    let raw = std::fs::read(root.join(COMPONENT_META_JSON)).ok()?;
-    let meta: ModelMeta = serde_json::from_slice(&raw).ok()?;
-    let value = meta.tool_call_parser?.trim().to_owned();
-    (!value.is_empty()).then_some(value)
+/// Whatever opaque key/value metadata a Component artifact's sidecar
+/// (`.tachyon-component.json`) declares, read and returned verbatim.
+/// Tachyon does not name, parse, or interpret any key here — a sidecar
+/// author writes directly in whatever wire shape the consuming guest or
+/// Component expects (e.g. a tool-call dialect under whatever key it
+/// reads); only that downstream boundary assigns any key meaning.
+pub(crate) fn declared_component_metadata(root: &Path) -> BTreeMap<String, String> {
+    let Ok(raw) = std::fs::read(root.join(COMPONENT_META_JSON)) else {
+        return BTreeMap::new();
+    };
+    serde_json::from_slice(&raw).unwrap_or_default()
 }
 
 pub(crate) fn assert_no_credential_collisions<'a>(
@@ -891,7 +864,7 @@ pub(crate) fn assert_no_credential_collisions<'a>(
 
 /// Best-effort token-accounting metadata for the `mock:` test/dev Component,
 /// in the same opaque wire shape a real Component's own execution (or its
-/// adapter) reports; see `magnetar_runtime::usage_metadata`.
+/// adapter) reports; see `magnetar_runtime::tachyon_wire_tags`.
 fn mock_component_metadata(prompt: &[u8], completion: &[u8]) -> Vec<(String, String)> {
     let prompt_tokens = String::from_utf8_lossy(prompt)
         .split_whitespace()
@@ -982,12 +955,22 @@ mod tests {
 
     /// The same real, independently-compiled Llama Component Magnetar's own
     /// test suite checks in (`loaded_inference_component_load_runs_a_real_
-    /// second_architecture_end_to_end`), paired with the identical
-    /// Hugging Face-shaped bundle `write_tiny_production_qwen_bundle` writes
-    /// — same tensors, same config, same tokenizer. Proves Tachyon's own
-    /// route -> alias -> `MagnetarRuntime::try_load` pipeline can load a
-    /// second, digest-distinct compiled Component binary, not just a second
-    /// alias (Tachyon integration audit MAG-01/MAG-06, #72).
+    /// second_architecture_end_to_end`), paired with a Model Artifact whose
+    /// `config.json` declares `model_type: "llama"` — Magnetar's own
+    /// `magnetar-loader-huggingface` normalizes that directly into
+    /// `architecture.family` (astorise/Magnetar#83), and `llama-real`'s own
+    /// manifest declares `compatibility.architecture_families: [llama]`
+    /// (Tachyon integration audit round 2, TACH-05 fixture bug: this used
+    /// to share `write_tiny_production_qwen_bundle`'s `qwen2`-declaring
+    /// Model Artifact, which loaded only because Magnetar had no
+    /// Component-vs-family compatibility gate yet; it now rejects that
+    /// mismatch on purpose). Same tensor shapes and tokenizer as the Qwen
+    /// bundle — HIDDEN_SIZE/LAYER_COUNT/etc. describe a generic HF-style
+    /// transformer either family accepts; only the declared family differs.
+    /// Proves Tachyon's own route -> alias -> `MagnetarRuntime::try_load`
+    /// pipeline can load a second, digest-distinct compiled Component
+    /// binary, not just a second alias (Tachyon integration audit
+    /// MAG-01/MAG-06, #72).
     fn write_tiny_production_llama_bundle(path: &Path) {
         fs::create_dir_all(path).expect("fixture dir should be created");
         fs::write(
@@ -1000,18 +983,28 @@ mod tests {
             include_bytes!("../../vendor/Magnetar/magnetar-runtime/fixtures/components/llama-real.component.wasm.magnetar-component.yaml"),
         )
         .expect("Component artifact manifest should be written");
-        write_tiny_production_model_data(path);
+        write_tiny_production_model_data_for_family(path, "LlamaForCausalLM", "llama");
     }
 
     /// The Model Artifact half of a tiny production-shaped bundle: config,
     /// tokenizer, and safetensors weights. Shared by every fixture Component
     /// this module writes, since each accepts the identical Hugging
-    /// Face-shaped directory — only the `*.component.wasm` differs.
+    /// Face-shaped directory — only the `*.component.wasm` (and, since
+    /// Magnetar's Component-vs-family compatibility gate landed, the
+    /// declared `architectures`/`model_type`) differ.
     fn write_tiny_production_model_data(path: &Path) {
+        write_tiny_production_model_data_for_family(path, "Qwen2ForCausalLM", "qwen2");
+    }
+
+    fn write_tiny_production_model_data_for_family(
+        path: &Path,
+        architectures: &str,
+        model_type: &str,
+    ) {
         let config_json = format!(
             r#"{{
-                "architectures": ["Qwen2ForCausalLM"],
-                "model_type": "qwen2",
+                "architectures": ["{architectures}"],
+                "model_type": "{model_type}",
                 "hidden_size": {HIDDEN_SIZE},
                 "intermediate_size": {INTERMEDIATE_SIZE},
                 "num_hidden_layers": {LAYER_COUNT},
