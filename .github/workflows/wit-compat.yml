@@ -6,6 +6,7 @@ on:
       - "wit/**/*.wit"
       - "sdk/wit/**/*.wit"
       - ".github/workflows/wit-compat.yml"
+      - "scripts/check_wit_sdk_sync.sh"
 
 jobs:
   check-compat:
