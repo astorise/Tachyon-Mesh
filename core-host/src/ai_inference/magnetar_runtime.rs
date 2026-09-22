@@ -105,6 +105,21 @@ impl MagnetarRuntime {
         self.component.resident_debug()
     }
 
+    /// `generate`/`generate_streaming` are the one place in Tachyon that
+    /// touches Magnetar's typed generation vocabulary (`GenerationStreamEvent`,
+    /// `InferenceComponentOutput`/`InferenceComponentUsage`'s `text`/
+    /// `prompt_tokens`/`generated_tokens` fields). `LoadedInferenceComponent::
+    /// invoke_payload`/`invoke_payload_streaming` are Magnetar's only entry
+    /// points, and neither offers an opaque bytes/stream-frame call shape
+    /// (yet), so reading these fields by name here is unavoidable, not a
+    /// design choice. Both functions convert through
+    /// [`opaque_usage_metadata`], their only contact point with that
+    /// vocabulary, and return the already-opaque `(bytes, key/value tags)`
+    /// shape (`ComponentInvocationBatch`/`ComponentMetadata`); nothing past
+    /// this module — `ai_inference.rs`, `component_hosts.rs`, or anything a
+    /// guest/Component eventually receives — ever sees a token count, a
+    /// stream-event variant, or model output as anything but bytes and
+    /// opaque string tags.
     pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<ComponentInvocationBatch> {
         if prompts.len() != 1 {
             bail!(
@@ -114,7 +129,8 @@ impl MagnetarRuntime {
             );
         }
         let outcome = self.component.invoke_payload(prompts[0])?;
-        let metadata = usage_metadata(outcome.usage.prompt_tokens, outcome.usage.generated_tokens);
+        let metadata =
+            opaque_usage_metadata(outcome.usage.prompt_tokens, outcome.usage.generated_tokens);
         Ok(vec![(outcome.text.into_bytes(), metadata)])
     }
 
@@ -150,21 +166,26 @@ impl MagnetarRuntime {
                 _ => std::ops::ControlFlow::Continue(()),
             }
         };
-        let outcome = self
+        let usage = self
             .component
             .invoke_payload_streaming(prompts[0], &mut on_event)?;
         let (prompt_tokens, generated_tokens) =
-            streamed_usage.unwrap_or((outcome.prompt_tokens, outcome.generated_tokens));
-        Ok(usage_metadata(prompt_tokens, generated_tokens))
+            streamed_usage.unwrap_or((usage.prompt_tokens, usage.generated_tokens));
+        Ok(opaque_usage_metadata(prompt_tokens, generated_tokens))
     }
 }
 
 /// Token-accounting metadata for one invocation, in the opaque wire shape the
 /// Component/artifact boundary carries (`wit/accelerator/*.wit`'s
-/// `invocation-result.metadata`). Built here, at the Magnetar adapter, rather
+/// `invocation-result.metadata`). The sole conversion point from Magnetar's
+/// two differently-typed but structurally identical usage counters
+/// (`InferenceComponentUsage` from `invoke_payload`,
+/// `magnetar_runtime::GenerationUsage` from a streamed `Finished` event) to
+/// Tachyon's opaque metadata tags — see the doc comment on
+/// `MagnetarRuntime::generate`. Built here, at the Magnetar adapter, rather
 /// than as a typed field threaded through `ai_inference`/`component_hosts`:
 /// the count is Magnetar's own to report, and the core only ever relays it.
-fn usage_metadata(prompt_tokens: usize, generated_tokens: usize) -> ComponentMetadata {
+fn opaque_usage_metadata(prompt_tokens: usize, generated_tokens: usize) -> ComponentMetadata {
     vec![
         (
             "tachyon.usage.prompt_tokens".to_owned(),
