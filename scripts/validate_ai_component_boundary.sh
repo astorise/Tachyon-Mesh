@@ -118,6 +118,11 @@ check_absent \
   'Tachyon Magnetar adapter must expose only Component/artifact contracts'
 
 check_absent \
+  core-host/src/ai_inference/magnetar_runtime.rs \
+  'GenerationStreamEvent|InferenceComponentOutput|InferenceComponentUsage|GenerationUsage|text_delta|\binvoke_payload\(|\binvoke_payload_streaming\(' \
+  'Tachyon Magnetar adapter must call only invoke_payload_opaque/invoke_payload_streaming_opaque (astorise/Magnetar#89) and must never touch typed Magnetar generation vocabulary again (TACH-02, fully closed)'
+
+check_absent \
   core-host/src/system_storage.rs \
   'declared_model_format|TACHYON_MODEL_TRUST_STORE|\.tachyon-model\.json' \
   'system storage must not reintroduce model-format sidecar parsing'

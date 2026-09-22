@@ -587,9 +587,9 @@ impl AiInferenceRuntime {
                 })
             }
             ComponentRuntime::Magnetar(runtime) => {
-                let mut emit = |fragment: &str| {
+                let mut emit = |frame: &[u8]| {
                     if sink.is_live() {
-                        sink.emit(StreamEvent::Payload(fragment.as_bytes()))
+                        sink.emit(StreamEvent::Payload(frame))
                     } else {
                         StreamControl::Stop
                     }
@@ -864,7 +864,7 @@ pub(crate) fn assert_no_credential_collisions<'a>(
 
 /// Best-effort token-accounting metadata for the `mock:` test/dev Component,
 /// in the same opaque wire shape a real Component's own execution (or its
-/// adapter) reports; see `magnetar_runtime::opaque_usage_metadata`.
+/// adapter) reports; see `magnetar_runtime::tachyon_wire_tags`.
 fn mock_component_metadata(prompt: &[u8], completion: &[u8]) -> Vec<(String, String)> {
     let prompt_tokens = String::from_utf8_lossy(prompt)
         .split_whitespace()
