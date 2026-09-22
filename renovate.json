@@ -7,6 +7,8 @@
     "schedule:weekly"
   ],
   "timezone": "Europe/Paris",
+  "cloneSubmodules": true,
+  "cloneSubmodulesFilter": ["vendor/Magnetar"],
   "packageRules": [
     {
       "description": "All GitHub Actions updates (majors included) in a single PR — action bumps are low-risk and reviewed together.",
