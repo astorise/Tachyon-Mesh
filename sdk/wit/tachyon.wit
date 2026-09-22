@@ -77,7 +77,7 @@ interface telemetry-reader {
         network-rt-load: u32,
         network-standard-load: u32,
         network-batch-load: u32,
-        hot-models: list<string>,
+        hot-inference-components: list<string>,
         dropped-events: u64,
         last-status: u16,
         total-duration-us: u64,
@@ -132,7 +132,7 @@ interface training {
     }
 
     record training-job {
-        base-model: string,
+        base-component-ref: string,
         dataset: dataset-handle,
         rank: rank,
         max-steps: step-budget,
