@@ -375,24 +375,6 @@ impl ComponentHostState {
         Ok(loaded)
     }
 
-    #[cfg(feature = "ai-inference")]
-    pub(crate) fn embed_accelerator_component_input(
-        &self,
-        expected_accelerator: ai_inference::AcceleratorKind,
-        component_id: u32,
-        input: String,
-    ) -> std::result::Result<Vec<f32>, ai_inference::ComponentInvocationError> {
-        let loaded = self.resolve_accelerator_component(expected_accelerator, component_id)?;
-        self.ai_runtime
-            .as_ref()
-            .ok_or_else(|| {
-                ai_inference::ComponentInvocationError::local(
-                    "AI inference runtime is unavailable for this component",
-                )
-            })?
-            .embed_component_input(&loaded.alias, &input)
-    }
-
     /// Begin a streaming generation: resolve the Component handle (the same scope
     /// and accelerator checks as `invoke_accelerator_component`), then run the
     /// decode on a dedicated thread that pushes each decoded text fragment into

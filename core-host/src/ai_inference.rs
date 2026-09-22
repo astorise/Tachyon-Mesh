@@ -558,28 +558,6 @@ impl AiInferenceRuntime {
         })
     }
 
-    pub(crate) fn embed_component_input(
-        &self,
-        alias: &str,
-        _input: &str,
-    ) -> std::result::Result<Vec<f32>, ComponentInvocationError> {
-        self.ensure_component_loaded(alias, AcceleratorKind::Cpu)
-            .map_err(ComponentInvocationError::local)?;
-        let model = self
-            .inference_components
-            .read()
-            .expect("component registry lock poisoned")
-            .get(alias)
-            .cloned()
-            .ok_or_else(|| {
-                ComponentInvocationError::local(format!("component alias `{alias}` is not loaded"))
-            })?;
-        let _queue_depth = self.track_queue_depth(model.accelerator(), model.qos);
-        Err(ComponentInvocationError::invalid_request(format!(
-            "component `{alias}` does not expose dense text embeddings through the generic Tachyon invocation contract"
-        )))
-    }
-
     pub(crate) fn stream_component_prompt(
         &self,
         alias: &str,
