@@ -968,6 +968,12 @@ fn row_is_config_owned(row: Option<&[u8]>) -> bool {
 /// its own fixed fields apart from a Component's opaque declarations when
 /// diffing a row against what publishing would write today; it is not a
 /// list of metadata keys Tachyon interprets.
+///
+/// Only `stored_row_still_current` (below) reads this, and that function is
+/// itself `#[cfg(feature = "ai-inference")]`-gated, so this constant needs
+/// the same gate — without it, a default-features build has no user for it
+/// and `-D dead_code` rejects it.
+#[cfg(feature = "ai-inference")]
 const REGISTRY_ROW_FIXED_FIELDS: &[&str] = &[
     "alias",
     "engine",
