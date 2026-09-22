@@ -2,9 +2,8 @@
 mod magnetar_runtime;
 
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
@@ -848,21 +847,17 @@ fn execute_model(
     }
 }
 
-pub(crate) fn declared_tool_call_metadata(path: &Path) -> Option<String> {
-    read_declared_tool_call_parser(path)
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelMeta {
-    #[serde(default)]
-    tool_call_parser: Option<String>,
-}
-
-fn read_declared_tool_call_parser(root: &Path) -> Option<String> {
-    let raw = std::fs::read(root.join(COMPONENT_META_JSON)).ok()?;
-    let meta: ModelMeta = serde_json::from_slice(&raw).ok()?;
-    let value = meta.tool_call_parser?.trim().to_owned();
-    (!value.is_empty()).then_some(value)
+/// Whatever opaque key/value metadata a Component artifact's sidecar
+/// (`.tachyon-component.json`) declares, read and returned verbatim.
+/// Tachyon does not name, parse, or interpret any key here — a sidecar
+/// author writes directly in whatever wire shape the consuming guest or
+/// Component expects (e.g. a tool-call dialect under whatever key it
+/// reads); only that downstream boundary assigns any key meaning.
+pub(crate) fn declared_component_metadata(root: &Path) -> BTreeMap<String, String> {
+    let Ok(raw) = std::fs::read(root.join(COMPONENT_META_JSON)) else {
+        return BTreeMap::new();
+    };
+    serde_json::from_slice(&raw).unwrap_or_default()
 }
 
 pub(crate) fn assert_no_credential_collisions<'a>(
@@ -891,7 +886,7 @@ pub(crate) fn assert_no_credential_collisions<'a>(
 
 /// Best-effort token-accounting metadata for the `mock:` test/dev Component,
 /// in the same opaque wire shape a real Component's own execution (or its
-/// adapter) reports; see `magnetar_runtime::usage_metadata`.
+/// adapter) reports; see `magnetar_runtime::opaque_usage_metadata`.
 fn mock_component_metadata(prompt: &[u8], completion: &[u8]) -> Vec<(String, String)> {
     let prompt_tokens = String::from_utf8_lossy(prompt)
         .split_whitespace()

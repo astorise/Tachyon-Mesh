@@ -404,49 +404,36 @@ struct RegistryComponentInfo<'a> {
     withdrawn: bool,
 }
 
-/// The wire key a declared tool-call dialect rides under in a registry row's
-/// opaque `component_metadata` bag — `guest-openai`'s `ModelInfo` reads this
-/// exact camelCase key. Tachyon core does not interpret the value; this is
-/// only the one key name core-host itself still writes into the bag.
-const TOOL_CALL_PARSER_METADATA_KEY: &str = "toolCallParser";
-
-/// Build a registry row's opaque metadata bag from whatever a binding's
-/// artifact sidecar declared, or an empty bag when it declared nothing.
-fn registry_component_metadata(
-    declared_parser: Option<String>,
-) -> std::collections::BTreeMap<String, String> {
-    declared_parser
-        .map(|parser| {
-            std::collections::BTreeMap::from([(TOOL_CALL_PARSER_METADATA_KEY.to_owned(), parser)])
-        })
-        .unwrap_or_default()
-}
-
-/// The tool-call dialect to advertise for a configured binding.
+/// Whatever opaque key/value metadata a configured binding's artifact
+/// sidecar declares, or an empty bag when it declares nothing.
 ///
 /// Only local Component artifact roots are probed. Remote-provider protocol
 /// metadata belongs in the guest or selected Component, not in core storage.
+/// Tachyon does not name or interpret a single key here — it stores and
+/// republishes whatever the Component/artifact boundary attached, verbatim;
+/// only the guest reading a row downstream (e.g. `guest-openai`'s
+/// `toolCallParser`) assigns any key meaning.
 ///
 /// Present in every build, not just `ai-inference` ones: the upload path that
-/// calls it is not feature-gated. Without the detector there is nothing to
-/// classify a checkpoint with, so the field stays absent and `guest-openai`
-/// falls back to its own resolution — the same behaviour as a component that
+/// calls it is not feature-gated. Without the reader there is nothing to
+/// read a sidecar with, so the bag stays empty and a consuming guest falls
+/// back to its own resolution — the same behaviour as a component that
 /// declares nothing.
-pub(crate) fn binding_tool_call_parser(path: &str) -> Option<String> {
+pub(crate) fn binding_component_metadata(path: &str) -> std::collections::BTreeMap<String, String> {
     let path = path.trim();
     if path == "mock" || path.starts_with("mock:") {
-        return None;
+        return std::collections::BTreeMap::new();
     }
     #[cfg(feature = "ai-inference")]
     {
         let metadata_path = path
             .strip_prefix(crate::ai_inference::MAGNETAR_PATH_PREFIX)
             .unwrap_or(path);
-        crate::ai_inference::declared_tool_call_metadata(std::path::Path::new(metadata_path))
+        crate::ai_inference::declared_component_metadata(std::path::Path::new(metadata_path))
     }
     #[cfg(not(feature = "ai-inference"))]
     {
-        None
+        std::collections::BTreeMap::new()
     }
 }
 
@@ -517,9 +504,7 @@ pub(crate) fn publish_configured_component_bindings(
                 status: "available",
                 artifact_path: &binding.path,
                 source: Some(REGISTRY_SOURCE_CONFIG),
-                component_metadata: registry_component_metadata(binding_tool_call_parser(
-                    &binding.path,
-                )),
+                component_metadata: binding_component_metadata(&binding.path),
                 withdrawn: false,
             };
             let Ok(value) = serde_json::to_vec(&info) else {
@@ -977,34 +962,50 @@ fn row_is_config_owned(row: Option<&[u8]>) -> bool {
         .unwrap_or(false)
 }
 
+/// Wire keys `RegistryComponentInfo` always writes itself — everything else
+/// in a stored row is exactly whatever `component_metadata` bag was
+/// flattened into it by `#[serde(flatten)]`. Tachyon needs this list to tell
+/// its own fixed fields apart from a Component's opaque declarations when
+/// diffing a row against what publishing would write today; it is not a
+/// list of metadata keys Tachyon interprets.
+const REGISTRY_ROW_FIXED_FIELDS: &[&str] = &[
+    "alias",
+    "engine",
+    "vramRequiredMb",
+    "status",
+    "artifactPath",
+    "source",
+    "withdrawn",
+];
+
 /// Whether the registry row for `alias` still matches what publishing `path`
 /// would write today.
 ///
-/// Compares the two fields the publisher derives from the directory's
-/// contents rather than from the manifest — `engine` and `tool_call_parser` —
-/// so a checkpoint replaced in place is seen for what it is. A missing row is
-/// "not current": there is nothing to keep listed, and withdrawing reserves
-/// the alias for the publication that follows the swap.
+/// Compares `engine` and the entire opaque `component_metadata` bag — the
+/// fields the publisher derives from the directory's contents rather than
+/// from the manifest — so a checkpoint replaced in place is seen for what it
+/// is, whatever keys its sidecar declares. A missing row is "not current":
+/// there is nothing to keep listed, and withdrawing reserves the alias for
+/// the publication that follows the swap.
 #[cfg(feature = "ai-inference")]
 fn stored_row_still_current(core_store: &crate::store::CoreStore, alias: &str, path: &str) -> bool {
     let Ok(Some(raw)) = core_store.kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, alias) else {
         return false;
     };
-    let Ok(row) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+    let Ok(serde_json::Value::Object(row)) = serde_json::from_slice::<serde_json::Value>(&raw)
+    else {
         return false;
     };
-    let stored = |field: &str| {
-        row.get(field)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    };
-    // `RegistryComponentInfo` is `rename_all = "camelCase"`, so the stored key is
-    // `toolCallParser`. Reading the Rust field name here would have found
-    // nothing every time and withdrawn every parser-declaring binding on every
-    // reload — a silent availability cost, in the code meant to avoid one.
-    let declared_parser = binding_tool_call_parser(path);
-    stored("engine").as_deref() == Some(binding_engine_label(path))
-        && stored("toolCallParser").as_deref() == declared_parser.as_deref()
+    let stored_engine = row.get("engine").and_then(serde_json::Value::as_str);
+    if stored_engine != Some(binding_engine_label(path)) {
+        return false;
+    }
+    let stored_metadata: std::collections::BTreeMap<String, String> = row
+        .iter()
+        .filter(|(key, _)| !REGISTRY_ROW_FIXED_FIELDS.contains(&key.as_str()))
+        .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+        .collect();
+    stored_metadata == binding_component_metadata(path)
 }
 
 /// Withdraw configured rows the incoming config will not serve identically.
@@ -1041,9 +1042,10 @@ pub(crate) fn withdraw_changed_component_bindings(
         // publication would say.
         //
         // The path alone used to decide this, and the row it stands for is not
-        // a function of the path: the publisher derives `engine` and
-        // `tool_call_parser` from the directory's contents, which a checkpoint
-        // swapped in place behind an unchanged path changes underneath it. The
+        // a function of the path: the publisher derives `engine` and the
+        // opaque metadata bag from the directory's contents, which a
+        // checkpoint swapped in place behind an unchanged path changes
+        // underneath it. The
         // comparison also has to be against the *stored* row rather than
         // against the incoming config, because both configs are read here at
         // the same instant and would agree about a directory neither of them
@@ -1195,9 +1197,7 @@ impl bindings::tachyon::mesh::artifact_events::Host for StorageComponentState {
             status: "available",
             artifact_path: &event.artifact_path,
             source: None,
-            component_metadata: registry_component_metadata(binding_tool_call_parser(
-                &event.artifact_path,
-            )),
+            component_metadata: binding_component_metadata(&event.artifact_path),
             withdrawn: false,
         };
         let value = serde_json::to_vec(&info)
@@ -1628,7 +1628,7 @@ mod configured_binding_registry_tests {
         fs::create_dir_all(&component_dir).expect("artifact dir");
         fs::write(
             component_dir.join(".tachyon-component.json"),
-            serde_json::json!({ "tool_call_parser": "opaque-parser" }).to_string(),
+            serde_json::json!({ "toolCallParser": "opaque-parser" }).to_string(),
         )
         .expect("sidecar");
 
@@ -1692,11 +1692,11 @@ mod configured_binding_registry_tests {
     ///
     /// The withdrawal used to compare alias and path, on the assumption that
     /// the row a path publishes is a function of the path. It is not: the
-    /// publisher reads `engine` and `tool_call_parser` out of the directory,
-    /// so swapping the checkpoint in place produces a different row from the
-    /// same string. The old row stayed listed while the new backend served,
-    /// and a failed best-effort publication after the swap left it listed for
-    /// good.
+    /// publisher reads `engine` and the sidecar's opaque metadata bag out of
+    /// the directory, so swapping the checkpoint in place produces a
+    /// different row from the same string. The old row stayed listed while
+    /// the new backend served, and a failed best-effort publication after the
+    /// swap left it listed for good.
     ///
     /// Comparing the two *configs* would not have caught it either — both are
     /// read at the same instant and neither describes the directory. The
@@ -1708,13 +1708,13 @@ mod configured_binding_registry_tests {
         let component_dir = dir.join("qwen-coder");
         std::fs::create_dir_all(&component_dir).expect("component dir");
         let sidecar = component_dir.join(".tachyon-component.json");
-        std::fs::write(&sidecar, br#"{"tool_call_parser":"qwen"}"#).expect("write sidecar");
+        std::fs::write(&sidecar, br#"{"toolCallParser":"qwen"}"#).expect("write sidecar");
 
         let path = component_dir.to_string_lossy().into_owned();
         assert_eq!(
-            binding_tool_call_parser(&path),
-            Some("qwen".to_owned()),
-            "the sidecar is what the publisher reads the dialect from"
+            binding_component_metadata(&path),
+            std::collections::BTreeMap::from([("toolCallParser".to_owned(), "qwen".to_owned())]),
+            "the sidecar is what the publisher reads its opaque metadata from, verbatim"
         );
         let config = config_with(vec![binding("qwen-coder", &path, false)]);
         publish_configured_component_bindings(&store, &config);
@@ -1726,11 +1726,11 @@ mod configured_binding_registry_tests {
         let published: serde_json::Value = serde_json::from_slice(&published).expect("row json");
         assert_eq!(
             published["toolCallParser"], "qwen",
-            "the published row records the dialect the directory declared"
+            "the published row records exactly what the directory declared"
         );
 
         // Same alias, same path, different checkpoint.
-        std::fs::write(&sidecar, br#"{"tool_call_parser":"mistral"}"#).expect("rewrite sidecar");
+        std::fs::write(&sidecar, br#"{"toolCallParser":"mistral"}"#).expect("rewrite sidecar");
         withdraw_changed_component_bindings(&store, &config, &config);
 
         let raw = store
@@ -1751,7 +1751,7 @@ mod configured_binding_registry_tests {
         std::fs::create_dir_all(&component_dir).expect("component dir");
         std::fs::write(
             component_dir.join(".tachyon-component.json"),
-            br#"{"tool_call_parser":"qwen"}"#,
+            br#"{"toolCallParser":"qwen"}"#,
         )
         .expect("metadata");
 
@@ -1782,7 +1782,7 @@ mod configured_binding_registry_tests {
         std::fs::create_dir_all(&component_dir).expect("component dir");
         std::fs::write(
             component_dir.join(".tachyon-component.json"),
-            br#"{"tool_call_parser":"qwen"}"#,
+            br#"{"toolCallParser":"qwen"}"#,
         )
         .expect("write sidecar");
 
@@ -2484,7 +2484,10 @@ mod registry_casing_tests {
             status: "available",
             artifact_path: "/data/tachyon_data/components/tinyllama",
             source: None,
-            component_metadata: registry_component_metadata(Some("qwen".to_owned())),
+            component_metadata: std::collections::BTreeMap::from([(
+                "toolCallParser".to_owned(),
+                "qwen".to_owned(),
+            )]),
             withdrawn: false,
         };
         let bytes = serde_json::to_vec(&info).expect("serialize registry entry");
@@ -2533,7 +2536,7 @@ mod registry_casing_tests {
             status: "available",
             artifact_path: "/data/tachyon_data/components/tinyllama",
             source: None,
-            component_metadata: registry_component_metadata(None),
+            component_metadata: std::collections::BTreeMap::new(),
             withdrawn: false,
         };
         let value: serde_json::Value =
@@ -2553,9 +2556,9 @@ mod registry_casing_tests {
             "mock:tiny",
         ] {
             assert_eq!(
-                binding_tool_call_parser(path),
-                None,
-                "`{path}` must not be probed for a tool-call dialect"
+                binding_component_metadata(path),
+                std::collections::BTreeMap::new(),
+                "`{path}` must not be probed for opaque metadata"
             );
         }
     }
