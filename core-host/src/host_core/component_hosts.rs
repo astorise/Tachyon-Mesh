@@ -4,20 +4,21 @@ impl LegacyHostState {
     pub(crate) fn new(
         wasi: WasiP1Ctx,
         max_memory_bytes: usize,
-        #[cfg(feature = "ai-inference")] ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
+        #[cfg(feature = "ai-inference")]
+        #[cfg_attr(not(test), allow(unused_variables))]
+        ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
     ) -> Self {
+        #[cfg(all(feature = "ai-inference", test))]
+        let legacy_wasi_nn_aliases = ai_runtime.loaded_component_aliases();
+        #[cfg(all(feature = "ai-inference", not(test)))]
+        let legacy_wasi_nn_aliases = Vec::new();
         Self {
             wasi,
             #[cfg(feature = "ai-inference")]
-            wasi_nn: build_wasi_nn_ctx(ai_runtime.as_ref()),
+            wasi_nn: super::legacy_wasi_nn::build_legacy_wasi_nn_ctx(legacy_wasi_nn_aliases),
             limits: GuestResourceLimiter::new(max_memory_bytes),
         }
     }
-}
-
-#[cfg(feature = "ai-inference")]
-pub(crate) fn build_wasi_nn_ctx(runtime: &ai_inference::AiInferenceRuntime) -> WasiNnCtx {
-    runtime.build_wasi_nn_ctx()
 }
 
 impl SecretsVault {
@@ -342,7 +343,7 @@ impl ComponentHostState {
                     "AI inference runtime is unavailable for this component",
                 )
             })?
-            .compute_component_prompt_generation(&loaded.alias, &payload)
+            .invoke_loaded_component(&loaded.alias, &payload)
     }
 
     /// Resolve a guest-held Component handle to the alias it was opened for.
@@ -386,7 +387,7 @@ impl ComponentHostState {
         expected_accelerator: ai_inference::AcceleratorKind,
         component_id: u32,
         payload: Vec<u8>,
-    ) -> std::result::Result<StreamedGeneration, ai_inference::ComponentInvocationError> {
+    ) -> std::result::Result<StreamedInvocation, ai_inference::ComponentInvocationError> {
         let loaded = self.resolve_accelerator_component(expected_accelerator, component_id)?;
         let alias = loaded.alias.clone();
         let ai_runtime = Arc::clone(self.ai_runtime.as_ref().ok_or_else(|| {
@@ -450,7 +451,7 @@ impl ComponentHostState {
                     stalled: &generation_stalled,
                     reported_stall: false,
                 };
-                match ai_runtime.stream_component_prompt(&alias, &payload, &mut sink) {
+                match ai_runtime.stream_loaded_component(&alias, &payload, &mut sink) {
                     // An absent count means the backend could not measure, and
                     // stays absent in the slot: `usage()` then reports nothing
                     // rather than zeros, which a client would read as a
@@ -472,7 +473,7 @@ impl ComponentHostState {
                     "failed to spawn streaming generation thread: {error}"
                 ))
             })?;
-        Ok(StreamedGeneration {
+        Ok(StreamedInvocation {
             receiver,
             outcome,
             consumer_alive,
@@ -2589,7 +2590,7 @@ impl StreamPayload {
 }
 
 #[cfg(feature = "ai-inference")]
-pub(crate) struct StreamedGeneration {
+pub(crate) struct StreamedInvocation {
     receiver: std::sync::mpsc::Receiver<
         std::result::Result<StreamPayload, ai_inference::ComponentInvocationError>,
     >,
@@ -2600,7 +2601,7 @@ pub(crate) struct StreamedGeneration {
 }
 
 #[cfg(feature = "ai-inference")]
-pub(crate) struct HostTokenStream {
+pub(crate) struct HostByteStream {
     receiver: std::sync::mpsc::Receiver<
         std::result::Result<StreamPayload, ai_inference::ComponentInvocationError>,
     >,
@@ -2642,7 +2643,7 @@ pub(crate) struct HostTokenStream {
 /// that a closed channel does not wake, so it would hold its thread and its
 /// upstream admission permit until the request timed out.
 #[cfg(feature = "ai-inference")]
-impl Drop for HostTokenStream {
+impl Drop for HostByteStream {
     fn drop(&mut self) {
         self.consumer_alive
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2685,7 +2686,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
         >,
         WitInvocationError,
     > {
-        let StreamedGeneration {
+        let StreamedInvocation {
             receiver,
             outcome,
             consumer_alive,
@@ -2696,7 +2697,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::Host for Compone
             .map_err(wit_invocation_error)?;
         let handle = self
             .table
-            .push(HostTokenStream {
+            .push(HostByteStream {
                 receiver,
                 outcome,
                 consumer_alive,
@@ -2726,7 +2727,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostByteStream
         Option<accelerator_component_bindings::tachyon::accelerator::cpu::StreamEvent>,
         WitInvocationError,
     > {
-        let handle = wasmtime::component::Resource::<HostTokenStream>::new_borrow(self_.rep());
+        let handle = wasmtime::component::Resource::<HostByteStream>::new_borrow(self_.rep());
         let stream = self.table.get_mut(&handle).map_err(|error| {
             wit_invocation_error(ai_inference::ComponentInvocationError::local(format!(
                 "failed to access token stream resource: {error}"
@@ -2781,7 +2782,7 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostByteStream
             accelerator_component_bindings::tachyon::accelerator::cpu::ByteStream,
         >,
     ) -> Vec<(String, String)> {
-        let handle = wasmtime::component::Resource::<HostTokenStream>::new_borrow(self_.rep());
+        let handle = wasmtime::component::Resource::<HostByteStream>::new_borrow(self_.rep());
         let Some(stream) = self.table.get(&handle).ok() else {
             return Vec::new();
         };
@@ -2802,11 +2803,11 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostByteStream
     ) -> wasmtime::Result<()> {
         let stream =
             self.table
-                .delete(wasmtime::component::Resource::<HostTokenStream>::new_own(
+                .delete(wasmtime::component::Resource::<HostByteStream>::new_own(
                     rep.rep(),
                 ))?;
         // Deleting the entry drops the receiver, which already makes the next
-        // `send` fail, and `HostTokenStream::drop` says the same thing to a
+        // `send` fail, and `HostByteStream::drop` says the same thing to a
         // backend that is *waiting* rather than sending — clearing
         // `consumer_alive` for one parked between frames, and waking one parked
         // on the byte budget, where a closed channel is not a signal it can
