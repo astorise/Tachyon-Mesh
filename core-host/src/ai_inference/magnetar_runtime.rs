@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use magnetar_inference_component::{
-    ArtifactTrustPolicy, ComponentProviderAdvertisement, InferenceComponentArtifact,
-    InferenceComponentPlacement, InferenceComponentSource, LoadedInferenceComponent,
+    ArtifactTrustPolicy, InferenceComponentArtifact, InferenceComponentPlacement,
+    InferenceComponentSource, LoadedInferenceComponent,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,6 @@ pub(crate) const MAGNETAR_PATH_PREFIX: &str = "magnetar:";
 /// Opaque wire-shape metadata tags (`wit/accelerator/*.wit`'s
 /// `invocation-result.metadata`), and one payload paired with its own tags.
 type ComponentMetadata = Vec<(String, String)>;
-type ComponentInvocationBatch = Vec<(Vec<u8>, ComponentMetadata)>;
 /// Trusts the WASM Component binary itself (the code Magnetar instantiates
 /// and executes) — never the model weights it happens to load. See
 /// [`TACHYON_ARTIFACT_TRUST_STORE_ENV`] for the separate, model-artifact trust
@@ -24,24 +23,16 @@ pub(crate) const TACHYON_COMPONENT_TRUST_STORE_ENV: &str = "TACHYON_COMPONENT_TR
 /// `ArtifactTrustPolicy::trust_digest`.
 pub(crate) const TACHYON_ARTIFACT_TRUST_STORE_ENV: &str = "TACHYON_ARTIFACT_TRUST_STORE";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ProviderAdvertisement {
-    pub(crate) provider_name: String,
-    pub(crate) provider_version: String,
-    pub(crate) device_ids: Vec<String>,
-    pub(crate) device_class: ProviderDeviceClass,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProviderDeviceClass {
-    ReferenceCpu,
-    Cuda,
-}
-
+/// A pure Component-invocation bridge: [`MagnetarRuntime`] carries no
+/// Provider/Device identity of its own. Which generic accelerator class
+/// (`AcceleratorKind`) a bound Component runs on is the placement Tachyon
+/// itself requested at load time (kept by the caller alongside this handle,
+/// in `ComponentRuntime::Magnetar`) — never something read back out of
+/// Magnetar's own Provider advertisement, so there is nothing here to mirror
+/// or interpret (audit round 5, TACH-01).
 pub(crate) struct MagnetarRuntime {
     alias: String,
     root: PathBuf,
-    provider: ProviderAdvertisement,
     component: LoadedInferenceComponent,
 }
 
@@ -50,8 +41,6 @@ impl std::fmt::Debug for MagnetarRuntime {
         f.debug_struct("MagnetarRuntime")
             .field("alias", &self.alias)
             .field("root", &self.root)
-            .field("provider", &self.provider)
-            .field("target", &self.provider.device_class)
             .finish_non_exhaustive()
     }
 }
@@ -81,22 +70,12 @@ impl MagnetarRuntime {
                         "Magnetar failed to materialize resident inference Component for `{alias}`"
                     )
                 })?;
-        let provider = provider_advertisement(component.provider());
 
         Ok(Some(Self {
             alias: alias.to_owned(),
             root,
-            provider,
             component,
         }))
-    }
-
-    pub(crate) fn executed_on(&self) -> &str {
-        self.provider.provider_name.as_str()
-    }
-
-    pub(crate) fn provider(&self) -> &ProviderAdvertisement {
-        &self.provider
     }
 
     #[cfg(test)]
@@ -104,40 +83,28 @@ impl MagnetarRuntime {
         self.component.resident_debug()
     }
 
-    /// `generate`/`generate_streaming` call `LoadedInferenceComponent`'s
-    /// opaque entry points (`invoke_payload_opaque`/
-    /// `invoke_payload_streaming_opaque`, astorise/Magnetar#89 — added in
-    /// response to the Tachyon integration audit's TACH-02 finding): raw
-    /// bytes and string-keyed tags, never Magnetar's own typed generation
-    /// output/stream-event shapes. This module touches no generation
-    /// vocabulary at all — not a token count, not a finish reason, not a
-    /// stream-event variant. Whatever tags Magnetar attaches are handed
-    /// back exactly as received, by identity, never read, renamed, or
-    /// filtered by key — this bridge does not know what any of them mean.
-    pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<ComponentInvocationBatch> {
-        if prompts.len() != 1 {
-            bail!(
-                "Magnetar inference Component invocation for `{}` expects exactly one payload, got {}",
-                self.alias,
-                prompts.len()
-            );
-        }
-        let outcome = self.component.invoke_payload_opaque(prompts[0])?;
-        Ok(vec![(outcome.bytes, outcome.tags)])
+    /// `invoke`/`invoke_streaming` call `LoadedInferenceComponent`'s opaque
+    /// entry points (`invoke_payload_opaque`/`invoke_payload_streaming_opaque`,
+    /// astorise/Magnetar#89 — added in response to the Tachyon integration
+    /// audit's TACH-02 finding): raw bytes and string-keyed tags, never
+    /// Magnetar's own typed generation output/stream-event shapes. This
+    /// module touches no generation vocabulary at all — not a token count,
+    /// not a finish reason, not a stream-event variant, not even a naming
+    /// convention borrowed from one: the prior generation-flavored method
+    /// and plural payload-list parameter names are gone (audit round 5,
+    /// TACH-02). Whatever tags Magnetar attaches are handed back exactly as
+    /// received, by identity, never read, renamed, or filtered by key —
+    /// this bridge does not know what any of them mean.
+    pub(crate) fn invoke(&self, payload: &[u8]) -> Result<(Vec<u8>, ComponentMetadata)> {
+        let outcome = self.component.invoke_payload_opaque(payload)?;
+        Ok((outcome.bytes, outcome.tags))
     }
 
-    pub(crate) fn generate_streaming(
+    pub(crate) fn invoke_streaming(
         &self,
-        prompts: &[&[u8]],
+        payload: &[u8],
         on_frame: &mut dyn FnMut(&[u8]) -> StreamControl,
     ) -> Result<ComponentMetadata> {
-        if prompts.len() != 1 {
-            bail!(
-                "Magnetar inference Component streaming invocation for `{}` expects exactly one payload, got {}",
-                self.alias,
-                prompts.len()
-            );
-        }
         let mut on_event = |frame: &[u8]| -> std::ops::ControlFlow<()> {
             if on_frame(frame).is_stop() {
                 std::ops::ControlFlow::Break(())
@@ -147,7 +114,7 @@ impl MagnetarRuntime {
         };
         let tags = self
             .component
-            .invoke_payload_streaming_opaque(prompts[0], &mut on_event)?;
+            .invoke_payload_streaming_opaque(payload, &mut on_event)?;
         Ok(tags)
     }
 }
@@ -293,18 +260,4 @@ fn reject_trust_policy_inside_artifact(root: &Path, trust_path: &Path) -> Result
         );
     }
     Ok(())
-}
-
-fn provider_advertisement(provider: &ComponentProviderAdvertisement) -> ProviderAdvertisement {
-    ProviderAdvertisement {
-        provider_name: provider.provider_name.clone(),
-        provider_version: provider.provider_version.clone(),
-        device_ids: provider.device_ids.clone(),
-        device_class: match provider.device_class {
-            magnetar_inference_component::ProviderDeviceClass::ReferenceCpu => {
-                ProviderDeviceClass::ReferenceCpu
-            }
-            magnetar_inference_component::ProviderDeviceClass::Cuda => ProviderDeviceClass::Cuda,
-        },
-    }
 }

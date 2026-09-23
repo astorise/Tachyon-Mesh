@@ -150,10 +150,20 @@ check_absent \
   'tachyon_wire_tags|"prompt_tokens"|"generated_tokens"|"completion_tokens"|"finish_reason"|tachyon\.usage\.' \
   'Tachyon Magnetar adapter must relay Magnetar opaque tags exactly as received, with no renaming, filtering, or interpretation of token-usage or finish-reason keys (TACH-01, audit round 3)'
 
+check_absent \
+  core-host/src/ai_inference/magnetar_runtime.rs \
+  'ProviderAdvertisement|ProviderDeviceClass|\bprovider_name\b|\bprovider_version\b|\bdevice_ids\b|\bfn generate\b|\bfn generate_streaming\b|\bprompts\b' \
+  'Tachyon Magnetar adapter must not mirror Magnetar Provider/Device identity (ProviderAdvertisement/ProviderDeviceClass/provider_name/provider_version/device_ids) and must name its opaque invocation entry points invoke/invoke_streaming over a payload, never generate/generate_streaming over prompts (TACH-01/TACH-02, audit round 5)'
+
 check_production_prefix_absent \
   core-host/src/ai_inference.rs \
   'tachyon_wire_tags|MOCK_LLM_RESPONSE|"prompt_tokens"|"generated_tokens"|"completion_tokens"|"finish_reason"|tachyon\.usage\.' \
   'core-host AI inference production code must not fabricate, rename, or interpret token-usage or finish-reason metadata, and the mock Component must not use LLM-flavored naming for its canned response (TACH-02, audit round 3)'
+
+check_production_prefix_absent \
+  core-host/src/ai_inference.rs \
+  'ProviderAdvertisement|ProviderDeviceClass|\bmagnetar_provider_is_cuda\b|\bmagnetar_capability_advertisements\b|\.generate\(|\.generate_streaming\(' \
+  'core-host AI inference production code must not resurrect a local Provider/Device mirror or capability-advertisement export, a CUDA-specific placement helper, or generate-vocabulary invocation calls — classify placement only via the generic AcceleratorKind requested at load time (TACH-01/TACH-02, audit round 5)'
 
 check_production_prefix_absent \
   core-host/src/ai_inference.rs \

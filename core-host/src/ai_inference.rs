@@ -215,8 +215,20 @@ pub(crate) struct SchedulerSnapshot {
 
 #[derive(Clone)]
 enum ComponentRuntime {
-    Mock { accelerator: AcceleratorKind },
-    Magnetar(Arc<magnetar_runtime::MagnetarRuntime>),
+    Mock {
+        accelerator: AcceleratorKind,
+    },
+    Magnetar {
+        runtime: Arc<magnetar_runtime::MagnetarRuntime>,
+        /// The generic accelerator class Tachyon itself requested when this
+        /// Component was loaded (`AcceleratorKind::from_component_placement`
+        /// in `load_binding`). Placement failures fail the load outright —
+        /// Magnetar never silently substitutes a different class on success
+        /// — so this is exactly what the bound Component is running on,
+        /// without reading anything back out of Magnetar's own Provider
+        /// advertisement (audit round 5, TACH-01).
+        accelerator: AcceleratorKind,
+    },
 }
 
 #[derive(Clone)]
@@ -229,33 +241,16 @@ struct LoadedInferenceComponent {
 impl LoadedInferenceComponent {
     fn accelerator(&self) -> AcceleratorKind {
         match &self.runtime {
-            ComponentRuntime::Mock { accelerator } => *accelerator,
-            ComponentRuntime::Magnetar(runtime) => {
-                if magnetar_provider_is_cuda(runtime.provider()) {
-                    AcceleratorKind::Gpu
-                } else {
-                    AcceleratorKind::Cpu
-                }
-            }
+            ComponentRuntime::Mock { accelerator }
+            | ComponentRuntime::Magnetar { accelerator, .. } => *accelerator,
         }
     }
 
     fn memory_residency(&self) -> AcceleratorMemoryResidency {
-        match &self.runtime {
-            ComponentRuntime::Mock {
-                accelerator: AcceleratorKind::Gpu,
-            } => AcceleratorMemoryResidency::Vram,
-            ComponentRuntime::Mock {
-                accelerator: AcceleratorKind::Npu | AcceleratorKind::Tpu,
-            } => AcceleratorMemoryResidency::Sram,
-            ComponentRuntime::Mock { .. } => AcceleratorMemoryResidency::HostRam,
-            ComponentRuntime::Magnetar(runtime) => {
-                if magnetar_provider_is_cuda(runtime.provider()) {
-                    AcceleratorMemoryResidency::Vram
-                } else {
-                    AcceleratorMemoryResidency::HostRam
-                }
-            }
+        match self.accelerator() {
+            AcceleratorKind::Gpu => AcceleratorMemoryResidency::Vram,
+            AcceleratorKind::Npu | AcceleratorKind::Tpu => AcceleratorMemoryResidency::Sram,
+            AcceleratorKind::Cpu | AcceleratorKind::Network => AcceleratorMemoryResidency::HostRam,
         }
     }
 }
@@ -488,7 +483,7 @@ impl AiInferenceRuntime {
                     metadata: mock_component_metadata(payload, MOCK_INFERENCE_RESPONSE.as_bytes()),
                 })
             }
-            ComponentRuntime::Magnetar(runtime) => {
+            ComponentRuntime::Magnetar { runtime, .. } => {
                 let mut emit = |frame: &[u8]| {
                     if sink.is_live() {
                         sink.emit(StreamEvent::Payload(frame))
@@ -497,36 +492,17 @@ impl AiInferenceRuntime {
                     }
                 };
                 let result = runtime
-                    .generate_streaming(&[payload], &mut emit)
+                    .invoke_streaming(payload, &mut emit)
                     .map(|metadata| StreamOutcome { metadata })
                     .map_err(magnetar_invocation_error);
-                record_execution(&component.alias, runtime.executed_on(), result.is_ok());
+                record_execution(
+                    &component.alias,
+                    component.accelerator().as_str(),
+                    result.is_ok(),
+                );
                 result
             }
         }
-    }
-
-    pub(crate) fn magnetar_capability_advertisements(
-        &self,
-    ) -> Vec<magnetar_runtime::ProviderAdvertisement> {
-        let mut advertisements = self
-            .inference_components
-            .read()
-            .expect("component registry lock poisoned")
-            .values()
-            .filter_map(|component| match &component.runtime {
-                ComponentRuntime::Magnetar(runtime) => Some(runtime.provider().clone()),
-                ComponentRuntime::Mock { .. } => None,
-            })
-            .collect::<Vec<_>>();
-        advertisements.sort_by(|a, b| {
-            a.provider_name
-                .cmp(&b.provider_name)
-                .then_with(|| a.device_ids.cmp(&b.device_ids))
-        });
-        advertisements
-            .dedup_by(|a, b| a.provider_name == b.provider_name && a.device_ids == b.device_ids);
-        advertisements
     }
 
     #[cfg(test)]
@@ -573,7 +549,7 @@ impl AiInferenceRuntime {
             .expect("component registry lock poisoned")
             .get(alias)
             .and_then(|component| match &component.runtime {
-                ComponentRuntime::Magnetar(runtime) => runtime.resident_debug().ok(),
+                ComponentRuntime::Magnetar { runtime, .. } => runtime.resident_debug().ok(),
                 _ => None,
             })
     }
@@ -595,10 +571,6 @@ impl AiInferenceRuntime {
             qos,
         }
     }
-}
-
-fn magnetar_provider_is_cuda(provider: &magnetar_runtime::ProviderAdvertisement) -> bool {
-    provider.device_class == magnetar_runtime::ProviderDeviceClass::Cuda
 }
 
 fn magnetar_invocation_error(error: anyhow::Error) -> ComponentInvocationError {
@@ -675,17 +647,19 @@ struct ComponentOutput {
 
 fn load_binding(binding: &IntegrityInferenceComponentBinding) -> Result<LoadedInferenceComponent> {
     let path = binding.path.trim();
+    let accelerator = AcceleratorKind::from_component_placement(&binding.device);
     let runtime = if path == "mock" || path.starts_with("mock:") {
-        ComponentRuntime::Mock {
-            accelerator: AcceleratorKind::from_component_placement(&binding.device),
-        }
+        ComponentRuntime::Mock { accelerator }
     } else {
         match magnetar_runtime::MagnetarRuntime::try_load(
             &binding.alias,
             path,
             binding.device.as_str(),
         )? {
-            Some(runtime) => ComponentRuntime::Magnetar(Arc::new(runtime)),
+            Some(runtime) => ComponentRuntime::Magnetar {
+                runtime: Arc::new(runtime),
+                accelerator,
+            },
             _ => {
                 if magnetar_runtime::is_magnetar_path(path) {
                     return Err(anyhow!(
@@ -712,25 +686,26 @@ fn load_binding(binding: &IntegrityInferenceComponentBinding) -> Result<LoadedIn
 
 fn invoke_component(
     component: &LoadedInferenceComponent,
-    prompt: &[u8],
+    payload: &[u8],
 ) -> std::result::Result<ComponentOutput, ComponentInvocationError> {
     match &component.runtime {
         ComponentRuntime::Mock { .. } => {
             record_execution(&component.alias, component.accelerator().as_str(), true);
             Ok(ComponentOutput {
                 bytes: MOCK_INFERENCE_RESPONSE.as_bytes().to_vec(),
-                metadata: mock_component_metadata(prompt, MOCK_INFERENCE_RESPONSE.as_bytes()),
+                metadata: mock_component_metadata(payload, MOCK_INFERENCE_RESPONSE.as_bytes()),
             })
         }
-        ComponentRuntime::Magnetar(runtime) => {
+        ComponentRuntime::Magnetar { runtime, .. } => {
             let result = runtime
-                .generate(&[prompt])
+                .invoke(payload)
                 .map_err(magnetar_invocation_error)
-                .map(|mut outputs| {
-                    let (bytes, metadata) = outputs.remove(0);
-                    ComponentOutput { bytes, metadata }
-                });
-            record_execution(&component.alias, runtime.executed_on(), result.is_ok());
+                .map(|(bytes, metadata)| ComponentOutput { bytes, metadata });
+            record_execution(
+                &component.alias,
+                component.accelerator().as_str(),
+                result.is_ok(),
+            );
             result
         }
     }
@@ -1811,8 +1786,8 @@ mod tests {
         assert!(
             telemetry.iter().any(|event| event.alias == "qwen-cuda"
                 && event.succeeded
-                && event.executed_on.to_ascii_lowercase().contains("cuda")),
-            "CUDA generation must record a real Magnetar CUDA provider execution"
+                && event.executed_on.to_ascii_lowercase().contains("gpu")),
+            "CUDA generation must record execution on the generic GPU accelerator class"
         );
         let _ = std::fs::remove_dir_all(component_dir);
     }
@@ -1857,8 +1832,8 @@ mod tests {
         assert!(
             telemetry.iter().any(|event| event.alias == "qwen-cuda"
                 && event.succeeded
-                && event.executed_on.to_ascii_lowercase().contains("cuda")),
-            "CUDA multi-token generation must record a real Magnetar CUDA provider execution"
+                && event.executed_on.to_ascii_lowercase().contains("gpu")),
+            "CUDA multi-token generation must record execution on the generic GPU accelerator class"
         );
         let _ = std::fs::remove_dir_all(component_dir);
     }
@@ -1975,8 +1950,8 @@ mod tests {
                 .iter()
                 .any(|event| event.alias == "dynamic-cpu-qwen"
                     && event.succeeded
-                    && event.executed_on.to_ascii_lowercase().contains("reference")),
-            "dynamic CPU generation must record Reference CPU execution"
+                    && event.executed_on.to_ascii_lowercase().contains("cpu")),
+            "dynamic CPU generation must record execution on the generic CPU accelerator class"
         );
         let _ = std::fs::remove_dir_all(root);
     }
