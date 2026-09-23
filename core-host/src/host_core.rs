@@ -145,6 +145,8 @@ mod guest_runtime;
 mod integrity_config;
 pub(crate) mod kv_cache;
 mod leader_election;
+#[cfg(feature = "ai-inference")]
+mod legacy_wasi_nn;
 mod mesh_dispatch_metrics;
 #[cfg(feature = "admin-plane")]
 pub(crate) mod openapi;

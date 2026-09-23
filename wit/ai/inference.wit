@@ -13,8 +13,9 @@ interface inference {
 
     record inference-response {
         output: list<u8>,
-        prompt-tokens: u32,
-        completion-tokens: u32,
+        /// Opaque key/value metadata the Component chose to return alongside
+        /// `output`. Tachyon does not name, parse, or interpret any key here.
+        metadata: list<tuple<string, string>>,
         /// Total accelerator-side fuel consumed (host stamps this for metering).
         fuel-consumed: u64,
     }

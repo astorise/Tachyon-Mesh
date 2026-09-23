@@ -155,6 +155,21 @@ check_production_prefix_absent \
   'tachyon_wire_tags|MOCK_LLM_RESPONSE|"prompt_tokens"|"generated_tokens"|"completion_tokens"|"finish_reason"|tachyon\.usage\.' \
   'core-host AI inference production code must not fabricate, rename, or interpret token-usage or finish-reason metadata, and the mock Component must not use LLM-flavored naming for its canned response (TACH-02, audit round 3)'
 
+check_production_prefix_absent \
+  core-host/src/ai_inference.rs \
+  '\bexecute_model\b|\bcompute_component_prompt_generation\b|\bstream_component_prompt\b|\bStreamedGeneration\b|\bHostTokenStream\b|\bmodel_dir\b|WasiNnCtx|GraphRegistry|WasiRegistry|wasmtime_wasi_nn' \
+  'core-host AI inference production code must use Component-centric names (not model/generation-flavored ones) and must not reference WASI-NN types directly — that legacy (non-Component) plumbing belongs exclusively in host_core::legacy_wasi_nn (TACH-01, audit round 4)'
+
+check_absent \
+  core-host/src/host_core/component_hosts.rs \
+  '\bexecute_model\b|\bcompute_component_prompt_generation\b|\bstream_component_prompt\b|\bStreamedGeneration\b|\bHostTokenStream\b' \
+  'component host bindings must use Component-centric names, not model/generation-flavored ones (TACH-01, audit round 4)'
+
+check_absent \
+  wit/ai/inference.wit \
+  'prompt-tokens|completion-tokens' \
+  'the local-inference WIT contract must return opaque metadata, not named token-usage fields (TACH-02, audit round 4)'
+
 check_absent \
   core-host/src/system_storage.rs \
   'declared_model_format|TACHYON_MODEL_TRUST_STORE|\.tachyon-model\.json' \
