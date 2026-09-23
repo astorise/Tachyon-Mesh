@@ -9,7 +9,7 @@ mod bindings {
     export!(Component);
 }
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bindings::exports::tachyon::identity::authn::{
     AuthSession, AuthnError, GroupInput, GroupSummary, IdentityPayload, RegistrationTokenClaims,
     SignupProfile, StagedLoginSession, StagedUserSession, UserSummary, UserUpdate,
@@ -995,10 +995,10 @@ fn jwt_secret() -> String {
     // builds use a deterministic hermetic secret, and a (theoretical) missing
     // secret in a release build yields an unpredictable per-call value that fails
     // every signature check closed rather than trusting a shared default.
-    if let Ok(secret) = env::var(JWT_SECRET_ENV) {
-        if !secret.trim().is_empty() {
-            return secret;
-        }
+    if let Ok(secret) = env::var(JWT_SECRET_ENV)
+        && !secret.trim().is_empty()
+    {
+        return secret;
     }
     #[cfg(test)]
     {
@@ -1563,10 +1563,10 @@ fn delete_user_record(actor: &str, username: &str) -> Result<(), String> {
 fn count_group_members(group_name: &str) -> Result<u32, String> {
     let mut count: u32 = 0;
     for record in list_user_records()? {
-        if let Some(profile) = record.profile {
-            if profile.groups.iter().any(|g| g == group_name) {
-                count = count.saturating_add(1);
-            }
+        if let Some(profile) = record.profile
+            && profile.groups.iter().any(|g| g == group_name)
+        {
+            count = count.saturating_add(1);
         }
     }
     Ok(count)
@@ -1767,9 +1767,9 @@ mod tests {
             rand::rng().random::<u64>()
         ));
         fs::create_dir_all(&temp_dir).expect("temporary auth state directory should exist");
-        std::env::set_var(AUTH_STATE_DIR_ENV, &temp_dir);
+        unsafe { std::env::set_var(AUTH_STATE_DIR_ENV, &temp_dir) };
         let result = test();
-        std::env::remove_var(AUTH_STATE_DIR_ENV);
+        unsafe { std::env::remove_var(AUTH_STATE_DIR_ENV) };
         let _ = fs::remove_dir_all(temp_dir);
         result
     }
@@ -1782,7 +1782,7 @@ mod tests {
         issued_at: u64,
         expires_at: u64,
     ) -> String {
-        std::env::set_var(JWT_SECRET_ENV, secret);
+        unsafe { std::env::set_var(JWT_SECRET_ENV, secret) };
         let header = json!({
             "alg": "HS256",
             "typ": "JWT",
@@ -1838,7 +1838,7 @@ mod tests {
     #[test]
     fn issued_tokens_round_trip_through_verifier() {
         with_test_env(|| {
-            std::env::set_var(JWT_SECRET_ENV, "unit-test-secret");
+            unsafe { std::env::set_var(JWT_SECRET_ENV, "unit-test-secret") };
             let token = issue_jwt(
                 "admin@example.test",
                 &[String::from("admin"), String::from("ops")],
@@ -1852,7 +1852,7 @@ mod tests {
             assert_eq!(claims.subject, "admin@example.test");
             assert_eq!(claims.roles, vec!["admin".to_owned(), "ops".to_owned()]);
             assert_eq!(claims.scopes, vec!["manage:tokens".to_owned()]);
-            std::env::remove_var(JWT_SECRET_ENV);
+            unsafe { std::env::remove_var(JWT_SECRET_ENV) };
         });
     }
 
@@ -1932,7 +1932,7 @@ mod tests {
                 assert_eq!(session.roles, vec!["admin".to_owned(), "ops".to_owned()]);
                 assert!(validate_registration_token_claims(&token).is_err());
             });
-            std::env::remove_var(JWT_SECRET_ENV);
+            unsafe { std::env::remove_var(JWT_SECRET_ENV) };
         });
     }
 
@@ -1968,7 +1968,7 @@ mod tests {
                 assert_eq!(replay.roles, first.roles);
                 assert_eq!(replay.scopes, first.scopes);
             });
-            std::env::remove_var(JWT_SECRET_ENV);
+            unsafe { std::env::remove_var(JWT_SECRET_ENV) };
         });
     }
 
@@ -1985,7 +1985,7 @@ mod tests {
     }
 
     fn enroll_test_user(secret: &str, username: &str, roles: &[&str], scopes: &[&str]) -> u64 {
-        std::env::set_var(JWT_SECRET_ENV, secret);
+        unsafe { std::env::set_var(JWT_SECRET_ENV, secret) };
         let issued_at =
             unix_timestamp_seconds().expect("clock should be available for enrollment helper");
         let expires_at = issued_at + 300;
@@ -2031,7 +2031,7 @@ mod tests {
                 assert!(users.iter().all(|u| u.disabled_at.is_none()));
                 assert!(users.iter().all(|u| u.last_login_at.is_none()));
             });
-            std::env::remove_var(JWT_SECRET_ENV);
+            unsafe { std::env::remove_var(JWT_SECRET_ENV) };
         });
     }
 
@@ -2076,7 +2076,7 @@ mod tests {
                 assert_eq!(summary.roles, vec!["ops".to_owned()]);
                 assert!(summary.groups.is_empty());
             });
-            std::env::remove_var(JWT_SECRET_ENV);
+            unsafe { std::env::remove_var(JWT_SECRET_ENV) };
         });
     }
 
@@ -2103,7 +2103,7 @@ mod tests {
                     "alice should still be active"
                 );
             });
-            std::env::remove_var(JWT_SECRET_ENV);
+            unsafe { std::env::remove_var(JWT_SECRET_ENV) };
         });
     }
 
@@ -2120,7 +2120,7 @@ mod tests {
                 let summary = list_user_summaries().expect("list should succeed");
                 assert_eq!(summary.len(), 1);
             });
-            std::env::remove_var(JWT_SECRET_ENV);
+            unsafe { std::env::remove_var(JWT_SECRET_ENV) };
         });
     }
 
@@ -2137,7 +2137,7 @@ mod tests {
                 assert_eq!(users.len(), 1);
                 assert_eq!(users[0].username, "bob");
             });
-            std::env::remove_var(JWT_SECRET_ENV);
+            unsafe { std::env::remove_var(JWT_SECRET_ENV) };
         });
     }
 
@@ -2161,7 +2161,7 @@ mod tests {
                     .expect_err("staging should refuse a disabled account");
                 assert!(error.contains("disabled") || error.contains("invalid"));
             });
-            std::env::remove_var(JWT_SECRET_ENV);
+            unsafe { std::env::remove_var(JWT_SECRET_ENV) };
         });
     }
 
@@ -2198,7 +2198,7 @@ mod tests {
                 stage_pending_login("alice", "correct horse battery staple")
                     .expect("staging should succeed once re-enabled");
             });
-            std::env::remove_var(JWT_SECRET_ENV);
+            unsafe { std::env::remove_var(JWT_SECRET_ENV) };
         });
     }
 
@@ -2246,7 +2246,7 @@ mod tests {
                 let users = list_user_summaries().expect("list should succeed");
                 assert!(users[0].last_login_at.is_some());
             });
-            std::env::remove_var(JWT_SECRET_ENV);
+            unsafe { std::env::remove_var(JWT_SECRET_ENV) };
         });
     }
 
@@ -2287,7 +2287,7 @@ mod tests {
 
                 assert_eq!(session.roles, vec!["viewer".to_owned()]);
             });
-            std::env::remove_var(JWT_SECRET_ENV);
+            unsafe { std::env::remove_var(JWT_SECRET_ENV) };
         });
     }
 
@@ -2385,7 +2385,7 @@ mod tests {
                     .expect("ops group should be present");
                 assert_eq!(ops.member_count, 2);
             });
-            std::env::remove_var(JWT_SECRET_ENV);
+            unsafe { std::env::remove_var(JWT_SECRET_ENV) };
         });
     }
 

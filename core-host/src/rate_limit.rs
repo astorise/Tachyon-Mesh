@@ -5,9 +5,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use governor::{
+    Quota, RateLimiter,
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
-    Quota, RateLimiter,
 };
 use moka::sync::Cache;
 use std::{
@@ -72,10 +72,9 @@ pub(super) async fn rate_limit_middleware(
     if let Some(client_ip) = resolve_client_ip(
         req.headers(),
         req.extensions().get::<ConnectInfo<SocketAddr>>(),
-    ) {
-        if !limiter.check(client_ip) {
-            return StatusCode::TOO_MANY_REQUESTS.into_response();
-        }
+    ) && !limiter.check(client_ip)
+    {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
 
     next.run(req).await
@@ -107,7 +106,7 @@ fn parse_ip_candidate(candidate: &str) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request, middleware::from_fn_with_state, routing::get, Router};
+    use axum::{Router, body::Body, http::Request, middleware::from_fn_with_state, routing::get};
     use std::net::Ipv4Addr;
     use tower::util::ServiceExt;
 

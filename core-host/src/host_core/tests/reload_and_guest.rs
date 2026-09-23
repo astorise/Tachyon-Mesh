@@ -99,9 +99,11 @@ async fn reload_runtime_from_disk_keeps_previous_state_on_invalid_manifest() {
         .await
         .expect_err("invalid manifest should not replace the runtime");
 
-    assert!(error
-        .to_string()
-        .contains("failed to parse integrity manifest"));
+    assert!(
+        error
+            .to_string()
+            .contains("failed to parse integrity manifest")
+    );
     let runtime = state.runtime.load_full();
     assert!(runtime.config.sealed_route(DEFAULT_ROUTE).is_some());
     assert!(runtime.config.sealed_route("/api/guest-loop").is_none());
@@ -517,7 +519,9 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
             "guest-openai wasm artifact required but not found ({missing}); \
              build it with `cargo build -p guest-openai --target wasm32-wasip2 --release`"
         );
-        eprintln!("SKIP: guest-openai artifact not present; run `cargo build -p guest-openai --target wasm32-wasip2` first");
+        eprintln!(
+            "SKIP: guest-openai artifact not present; run `cargo build -p guest-openai --target wasm32-wasip2` first"
+        );
         return;
     }
 
@@ -789,7 +793,9 @@ async fn streaming_guest_openai_disconnect_finishes_worker_without_done_frame() 
             "guest-openai wasm artifact required but not found ({missing}); \
              build it with `cargo build -p guest-openai --target wasm32-wasip2 --release`"
         );
-        eprintln!("SKIP: guest-openai artifact not present; run `cargo build -p guest-openai --target wasm32-wasip2` first");
+        eprintln!(
+            "SKIP: guest-openai artifact not present; run `cargo build -p guest-openai --target wasm32-wasip2` first"
+        );
         return;
     }
 

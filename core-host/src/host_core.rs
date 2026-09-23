@@ -5,14 +5,14 @@ pub(crate) use crate::ai_inference;
 #[cfg(test)]
 pub(crate) use crate::identity::CallerIdentityClaims;
 pub(crate) use crate::identity::HostIdentity;
+#[cfg(feature = "websockets")]
+pub(crate) use crate::network::{
+    WEBSOCKET_MAX_FRAME_BYTES, WEBSOCKET_MAX_MESSAGE_BYTES, handle_websocket_connection,
+};
 #[cfg(test)]
 pub(crate) use crate::network::{
     handle_tcp_layer4_connection, layer4_bind_address,
     start_udp_layer4_listeners_with_queue_capacity,
-};
-#[cfg(feature = "websockets")]
-pub(crate) use crate::network::{
-    handle_websocket_connection, WEBSOCKET_MAX_FRAME_BYTES, WEBSOCKET_MAX_MESSAGE_BYTES,
 };
 pub(crate) use crate::network::{
     serve_http_listener, start_http3_listener, start_https_listener, start_mtls_gateway_listener,
@@ -22,11 +22,11 @@ pub(crate) use crate::network::{
 pub(crate) use crate::rate_limit;
 #[cfg(feature = "resiliency")]
 pub(crate) use crate::resiliency;
-pub(crate) use crate::runtime::{build_command_engine, build_runtime_state};
 #[cfg(test)]
 pub(crate) use crate::runtime::{
-    build_engine, INSTANCE_POOL_DEFAULT_CAPACITY, INSTANCE_POOL_IDLE_TIMEOUT,
+    INSTANCE_POOL_DEFAULT_CAPACITY, INSTANCE_POOL_IDLE_TIMEOUT, build_engine,
 };
+pub(crate) use crate::runtime::{build_command_engine, build_runtime_state};
 pub(crate) use crate::state::{
     AppState, CachedPeerCapabilities, Capabilities, HostLoadCounters, PeerCapabilityCache,
     RuntimeState,
@@ -40,21 +40,21 @@ pub(crate) use crate::{
 };
 
 pub(crate) use aes_gcm::{
-    aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
 };
-pub(crate) use anyhow::{anyhow, Context, Result};
+pub(crate) use anyhow::{Context, Result, anyhow};
 pub(crate) use arc_swap::ArcSwap;
 #[cfg(feature = "websockets")]
 pub(crate) use axum::extract::ws::{Message as AxumWebSocketMessage, WebSocket, WebSocketUpgrade};
 pub(crate) use axum::{
+    Extension, Router,
     body::{Body, Bytes},
     extract::{Request as AxumRequest, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::from_fn,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Extension, Router,
 };
 // DELETE/PATCH/PUT leading route handlers only appear in `admin_plane`'s
 // `/admin/*` surface today; every always-on route (FaaS fallback, enrollment
@@ -93,36 +93,36 @@ pub(crate) use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex, Once, OnceLock,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime},
 };
 pub(crate) use telemetry::{
-    push_custom_metric, CustomMetric, CustomMetricType, RequestCompletion, TelemetryEvent,
-    TelemetryHandle, TelemetrySnapshot,
+    CustomMetric, CustomMetricType, RequestCompletion, TelemetryEvent, TelemetryHandle,
+    TelemetrySnapshot, push_custom_metric,
 };
 #[cfg(unix)]
 pub(crate) use tokio::net::UnixListener;
 pub(crate) use tokio::sync::Mutex as TokioMutex;
 pub(crate) use tokio::sync::{
-    broadcast, mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError,
+    Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, broadcast, mpsc, oneshot, watch,
 };
 pub(crate) use tokio_rustls::LazyConfigAcceptor;
 pub(crate) use uuid::Uuid;
 pub(crate) use wasmtime::{
-    component::{Component, InstancePre as ComponentInstancePre, Linker as ComponentLinker},
     Config, Engine, Instance, InstancePre as ModuleInstancePre, Linker as ModuleLinker, Module,
     PoolingAllocationConfig, ResourceLimiter, Store, Trap, TypedFunc,
+    component::{Component, InstancePre as ComponentInstancePre, Linker as ComponentLinker},
 };
 #[cfg(test)]
 pub(crate) use wasmtime_wasi::cli::OutputFile;
 pub(crate) use wasmtime_wasi::{
+    FsPerms, I32Exit, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
     cli::{InputFile, IsTerminal, StdinStream, StdoutStream},
     p1::{self, WasiP1Ctx},
     p2::{InputStream, OutputStream, Pollable, StreamError, StreamResult},
-    FsPerms, I32Exit, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
 };
 #[cfg(feature = "ai-inference")]
 pub(crate) use wasmtime_wasi_nn::witx::WasiNnCtx;

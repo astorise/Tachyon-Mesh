@@ -1,18 +1,18 @@
 #![cfg(feature = "resiliency")]
 
 use super::{
-    execute_route_with_middleware_inner, ResiliencyConfig, RouteExecutionResult, RouteInvocation,
-    RouteServiceError,
+    ResiliencyConfig, RouteExecutionResult, RouteInvocation, RouteServiceError,
+    execute_route_with_middleware_inner,
 };
 use axum::http::StatusCode;
 use std::{collections::BTreeSet, future, time::Duration};
 use sysinfo::System;
 use tower::util::ServiceExt;
 use tower::{
+    BoxError, Layer,
     retry::{Policy, RetryLayer},
     service_fn,
-    timeout::{error::Elapsed, TimeoutLayer},
-    BoxError, Layer,
+    timeout::{TimeoutLayer, error::Elapsed},
 };
 
 pub(crate) fn available_system_ram_bytes() -> u64 {
@@ -162,8 +162,8 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     fn response(status: StatusCode, body: &str) -> RouteExecutionResult {

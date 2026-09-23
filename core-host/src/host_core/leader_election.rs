@@ -65,10 +65,10 @@ fn list_node_ids(state: &AppState) -> Vec<String> {
 /// MUST be registered into the node registry by `system-faas-node-registry`
 /// for the comparison to succeed.
 pub(crate) fn local_node_id() -> String {
-    if let Ok(id) = std::env::var("TACHYON_NODE_ID") {
-        if !id.trim().is_empty() {
-            return id;
-        }
+    if let Ok(id) = std::env::var("TACHYON_NODE_ID")
+        && !id.trim().is_empty()
+    {
+        return id;
     }
     std::env::var("HOSTNAME")
         .ok()

@@ -531,7 +531,7 @@ fn parse_globset(
             return Err(ScopeManifestError::NonStringPattern {
                 category: category.to_owned(),
                 value: patterns_value.clone(),
-            })
+            });
         }
     };
     let mut builder = GlobSetBuilder::new();
@@ -542,7 +542,7 @@ fn parse_globset(
                 return Err(ScopeManifestError::NonStringPattern {
                     category: category.to_owned(),
                     value: pat_value.clone(),
-                })
+                });
             }
         };
         let glob = globset::Glob::new(pat).map_err(|e| ScopeManifestError::InvalidGlob {
@@ -574,7 +574,7 @@ fn parse_routing(
             return Err(ScopeManifestError::NonStringPattern {
                 category: "routing".to_owned(),
                 value: value.clone(),
-            })
+            });
         }
     };
     let mut entries = Vec::with_capacity(arr.len());
@@ -585,7 +585,7 @@ fn parse_routing(
                 return Err(ScopeManifestError::NonStringPattern {
                     category: "routing".to_owned(),
                     value: item.clone(),
-                })
+                });
             }
         };
         let (route_path, destination) = parse_routing_entry(s)

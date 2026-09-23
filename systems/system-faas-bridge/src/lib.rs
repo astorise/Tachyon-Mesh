@@ -104,27 +104,27 @@ fn create_bridge(
         Err(error) => return response(400, format!("invalid create bridge payload: {error}")),
     };
 
-    if !has_header(&req.headers, DELEGATED_HEADER) {
-        if let Some(peer) = choose_delegate_peer() {
-            match delegate_bridge_create(&peer.base_url, &req.body) {
-                Ok(bridge) => {
-                    let session = build_session_record(
-                        &request,
-                        &bridge,
-                        "delegated",
-                        Some(peer.base_url.clone()),
+    if !has_header(&req.headers, DELEGATED_HEADER)
+        && let Some(peer) = choose_delegate_peer()
+    {
+        match delegate_bridge_create(&peer.base_url, &req.body) {
+            Ok(bridge) => {
+                let session = build_session_record(
+                    &request,
+                    &bridge,
+                    "delegated",
+                    Some(peer.base_url.clone()),
+                );
+                if let Err(error) = persist_session(&session) {
+                    return response(
+                        500,
+                        format!("failed to persist delegated bridge session: {error}"),
                     );
-                    if let Err(error) = persist_session(&session) {
-                        return response(
-                            500,
-                            format!("failed to persist delegated bridge session: {error}"),
-                        );
-                    }
-                    return json_response(200, &bridge);
                 }
-                Err(error) => {
-                    eprintln!("system-faas-bridge failed to delegate bridge allocation: {error}");
-                }
+                return json_response(200, &bridge);
+            }
+            Err(error) => {
+                eprintln!("system-faas-bridge failed to delegate bridge allocation: {error}");
             }
         }
     }

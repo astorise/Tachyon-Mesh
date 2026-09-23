@@ -1,7 +1,7 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };

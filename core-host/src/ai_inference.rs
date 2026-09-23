@@ -1,14 +1,14 @@
 #[path = "ai_inference/magnetar_runtime.rs"]
 mod magnetar_runtime;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
 use wasmtime_wasi_nn::{
-    witx::WasiNnCtx, Graph as WasiGraph, GraphRegistry, Registry as WasiRegistry,
+    Graph as WasiGraph, GraphRegistry, Registry as WasiRegistry, witx::WasiNnCtx,
 };
 
 use crate::{IntegrityConfig, IntegrityInferenceComponentBinding, RouteQos};
@@ -237,9 +237,9 @@ struct MockPreloadedGraphRegistry {
 impl MockPreloadedGraphRegistry {
     fn from_aliases(aliases: impl IntoIterator<Item = String>) -> Self {
         use wasmtime_wasi_nn::{
+            ExecutionContext, Graph,
             backend::{BackendError, BackendExecutionContext, BackendGraph, Id, NamedTensor},
             wit::{Tensor as WasiTensor, TensorType as WasiTensorType},
-            ExecutionContext, Graph,
         };
 
         struct MockGraph;
@@ -775,22 +775,29 @@ fn load_binding(binding: &IntegrityInferenceComponentBinding) -> Result<LoadedIn
         ComponentRuntime::Mock {
             accelerator: AcceleratorKind::from_component_placement(&binding.device),
         }
-    } else if let Some(runtime) =
-        magnetar_runtime::MagnetarRuntime::try_load(&binding.alias, path, binding.device.as_str())?
-    {
-        ComponentRuntime::Magnetar(Arc::new(runtime))
-    } else if magnetar_runtime::is_magnetar_path(path) {
-        return Err(anyhow!(
-            "unsupported Magnetar Component binding `{}` at `{}`: expected an authorized inference Component artifact directory",
-            binding.alias,
-            binding.path
-        ));
     } else {
-        return Err(anyhow!(
-            "unsupported AI binding `{}` at `{}`: local inference accepts explicit mock paths or magnetar Component artifact directories; remote provider protocols must run in a guest or Component",
-            binding.alias,
-            binding.path
-        ));
+        match magnetar_runtime::MagnetarRuntime::try_load(
+            &binding.alias,
+            path,
+            binding.device.as_str(),
+        )? {
+            Some(runtime) => ComponentRuntime::Magnetar(Arc::new(runtime)),
+            _ => {
+                if magnetar_runtime::is_magnetar_path(path) {
+                    return Err(anyhow!(
+                        "unsupported Magnetar Component binding `{}` at `{}`: expected an authorized inference Component artifact directory",
+                        binding.alias,
+                        binding.path
+                    ));
+                } else {
+                    return Err(anyhow!(
+                        "unsupported AI binding `{}` at `{}`: local inference accepts explicit mock paths or magnetar Component artifact directories; remote provider protocols must run in a guest or Component",
+                        binding.alias,
+                        binding.path
+                    ));
+                }
+            }
+        }
     };
     Ok(LoadedInferenceComponent {
         alias: binding.alias.clone(),
@@ -1185,17 +1192,27 @@ mod tests {
     impl Drop for TrustStoreEnvGuard {
         fn drop(&mut self) {
             if let Some(previous) = self.previous_component.take() {
-                std::env::set_var(
-                    magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
-                    previous,
-                );
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                unsafe {
+                    std::env::set_var(
+                        magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
+                        previous,
+                    )
+                };
             } else {
-                std::env::remove_var(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                unsafe {
+                    std::env::remove_var(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV)
+                };
             }
             if let Some(previous) = self.previous_model.take() {
-                std::env::set_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV, previous);
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                unsafe {
+                    std::env::set_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV, previous)
+                };
             } else {
-                std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                unsafe { std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV) };
             }
             let _ = std::fs::remove_file(&self.component_path);
             let _ = std::fs::remove_file(&self.model_path);
@@ -1205,13 +1222,19 @@ mod tests {
     impl Drop for TrustStoreEnvUnsetGuard {
         fn drop(&mut self) {
             if let Some(previous) = self.previous_component.take() {
-                std::env::set_var(
-                    magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
-                    previous,
-                );
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                unsafe {
+                    std::env::set_var(
+                        magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
+                        previous,
+                    )
+                };
             }
             if let Some(previous) = self.previous_model.take() {
-                std::env::set_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV, previous);
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                unsafe {
+                    std::env::set_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV, previous)
+                };
             }
         }
     }
@@ -1262,9 +1285,11 @@ mod tests {
         let lock = trust_env_lock();
         let previous_component =
             std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
-        std::env::remove_var(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV) };
         let previous_model = std::env::var_os(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
-        std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV) };
         TrustStoreEnvUnsetGuard {
             _qwen_lock: qwen_lock,
             _lock: lock,
@@ -1327,15 +1352,21 @@ mod tests {
 
         let previous_component =
             std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
-        std::env::set_var(
-            magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
-            &component_path,
-        );
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe {
+            std::env::set_var(
+                magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
+                &component_path,
+            )
+        };
         let previous_model = std::env::var_os(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
-        std::env::set_var(
-            magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV,
-            &model_path,
-        );
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe {
+            std::env::set_var(
+                magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV,
+                &model_path,
+            )
+        };
 
         TrustStoreEnvGuard {
             _qwen_lock: qwen_lock,
@@ -1387,15 +1418,21 @@ mod tests {
 
         let previous_component =
             std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
-        std::env::set_var(
-            magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
-            &component_path,
-        );
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe {
+            std::env::set_var(
+                magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
+                &component_path,
+            )
+        };
         let previous_model = std::env::var_os(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
-        std::env::set_var(
-            magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV,
-            &model_path,
-        );
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe {
+            std::env::set_var(
+                magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV,
+                &model_path,
+            )
+        };
 
         TrustStoreEnvGuard {
             _qwen_lock: qwen_lock,
@@ -1690,7 +1727,8 @@ mod tests {
         let model_dir = unique_model_dir("component-trusted-model-untrusted");
         write_tiny_production_qwen_bundle(&model_dir);
         let _trust = trust_tachyon_component_artifact(&model_dir);
-        std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV) };
 
         let error = match load_binding(&IntegrityInferenceComponentBinding {
             alias: "qwen-model-untrusted".to_owned(),
@@ -1758,7 +1796,8 @@ mod tests {
             .expect("test trust policy should be configured");
         std::fs::copy(&trust_path, model_dir.join(".tachyon-artifact-trust.json"))
             .expect("embedded fake trust policy should be copied");
-        std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV) };
 
         let error = match load_binding(&IntegrityInferenceComponentBinding {
             alias: "qwen-self-trusting".to_owned(),

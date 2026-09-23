@@ -1,5 +1,5 @@
 #[cfg(not(target_arch = "wasm32"))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn faas_entry() {}
 
 #[cfg(target_arch = "wasm32")]

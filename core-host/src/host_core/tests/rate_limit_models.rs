@@ -215,9 +215,11 @@ fn validate_integrity_config_rejects_static_model_bindings_without_paths() {
 
     let error = validate_integrity_config(config)
         .expect_err("static component bindings without paths must be rejected");
-    assert!(error
-        .to_string()
-        .contains("must include a non-empty `path`"));
+    assert!(
+        error
+            .to_string()
+            .contains("must include a non-empty `path`")
+    );
 }
 
 #[test]
@@ -657,9 +659,11 @@ fn validate_integrity_config_rejects_zero_max_concurrency() {
     let error =
         validate_integrity_config(config).expect_err("zero max_concurrency should fail validation");
 
-    assert!(error
-        .to_string()
-        .contains("must set `max_concurrency` above zero"));
+    assert!(
+        error
+            .to_string()
+            .contains("must set `max_concurrency` above zero")
+    );
 }
 
 #[test]
@@ -709,9 +713,11 @@ fn validate_integrity_config_rejects_retry_policy_without_statuses() {
     let error = validate_integrity_config(config)
         .expect_err("retry policy without retry_on statuses should fail validation");
 
-    assert!(error
-        .to_string()
-        .contains("must configure at least one `resiliency.retry_policy.retry_on` status"));
+    assert!(
+        error
+            .to_string()
+            .contains("must configure at least one `resiliency.retry_policy.retry_on` status")
+    );
 }
 
 #[cfg(not(feature = "resiliency"))]
@@ -855,9 +861,11 @@ fn guest_module_candidates_cover_release_and_container_paths() {
         path.ends_with("/target/wasm32-wasip1/release/guest_example.wasm")
             || path == "target/wasm32-wasip1/release/guest_example.wasm"
     }));
-    assert!(candidates
-        .iter()
-        .any(|path| path.ends_with("guest-modules/guest_example.wasm")));
+    assert!(
+        candidates
+            .iter()
+            .any(|path| path.ends_with("guest-modules/guest_example.wasm"))
+    );
 }
 
 #[test]
@@ -867,9 +875,11 @@ fn guest_module_candidates_normalize_hyphenated_names_to_underscores() {
         .map(|path| path.to_string_lossy().replace('\\', "/"))
         .collect::<Vec<_>>();
 
-    assert!(candidates
-        .iter()
-        .any(|path| path.ends_with("guest-modules/guest_csharp.wasm")));
+    assert!(
+        candidates
+            .iter()
+            .any(|path| path.ends_with("guest-modules/guest_csharp.wasm"))
+    );
 }
 
 #[test]

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -444,21 +444,21 @@ impl CoreStore {
                 .context("failed to read cwasm engine hash metadata")?
                 .map(|value| value.value().to_owned());
 
-            if let Some(stored_hash) = stored_hash {
-                if stored_hash != current_engine_hash {
-                    drop(metadata);
-                    tracing::warn!(
-                        "Purging stale Cwasm cache: Wasmtime engine compatibility hash changed"
-                    );
-                    let _ = write_txn.delete_table(CWASM_CACHE_TABLE);
-                    write_txn
-                        .open_table(CWASM_CACHE_TABLE)
-                        .context("failed to recreate cwasm_cache table")?;
-                    metadata = write_txn
-                        .open_table(METADATA_TABLE)
-                        .context("failed to reopen metadata table")?;
-                    purged = true;
-                }
+            if let Some(stored_hash) = stored_hash
+                && stored_hash != current_engine_hash
+            {
+                drop(metadata);
+                tracing::warn!(
+                    "Purging stale Cwasm cache: Wasmtime engine compatibility hash changed"
+                );
+                let _ = write_txn.delete_table(CWASM_CACHE_TABLE);
+                write_txn
+                    .open_table(CWASM_CACHE_TABLE)
+                    .context("failed to recreate cwasm_cache table")?;
+                metadata = write_txn
+                    .open_table(METADATA_TABLE)
+                    .context("failed to reopen metadata table")?;
+                purged = true;
             }
 
             metadata
@@ -1936,9 +1936,11 @@ mod tests {
         assert_eq!(matches[0].id, "doc-a");
         assert_eq!(matches[0].payload.as_deref(), Some(&b"alpha"[..]));
 
-        assert!(store
-            .remove_vector("tenant-a", "kb", "doc-a")
-            .expect("vector remove should succeed"));
+        assert!(
+            store
+                .remove_vector("tenant-a", "kb", "doc-a")
+                .expect("vector remove should succeed")
+        );
         let matches = store
             .search_vectors("tenant-a", "kb", &[0.9, 0.1, 0.0], 5)
             .expect("vector search should succeed after delete");

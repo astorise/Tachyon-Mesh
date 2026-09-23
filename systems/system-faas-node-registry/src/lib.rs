@@ -16,7 +16,7 @@ pub mod zero_touch;
 
 include!(concat!(env!("OUT_DIR"), "/static_catalog.rs"));
 
-use enrollment::{deterministic_pin, node_id_from_public_key, EnrollmentSession};
+use enrollment::{EnrollmentSession, deterministic_pin, node_id_from_public_key};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use types::{EnrolledNode, NodeCapabilities};

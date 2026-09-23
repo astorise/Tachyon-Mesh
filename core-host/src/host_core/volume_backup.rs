@@ -73,7 +73,7 @@ fn resolve_host_dir(
 /// Upload all files from `host_dir` to `s3://bucket/<s3_prefix>/`.
 #[cfg(feature = "s3-persistence")]
 async fn upload_dir(host_dir: &std::path::Path, bucket: &str, s3_prefix: &str) -> Result<usize> {
-    use object_store::{path::Path as OsPath, ObjectStoreExt};
+    use object_store::{ObjectStoreExt, path::Path as OsPath};
 
     let store = build_s3_store(bucket)?;
     let mut stack = vec![host_dir.to_path_buf()];
@@ -112,7 +112,7 @@ async fn download_snapshot(
     host_dir: &std::path::Path,
 ) -> Result<()> {
     use futures::StreamExt as _;
-    use object_store::{path::Path as OsPath, ObjectStore, ObjectStoreExt};
+    use object_store::{ObjectStore, ObjectStoreExt, path::Path as OsPath};
 
     let store = build_s3_store(bucket)?;
     let prefix_path = OsPath::parse(s3_prefix).map_err(|e| anyhow!("{e}"))?;
@@ -182,13 +182,13 @@ pub(crate) async fn backup_volume(
 
         let object_count = upload_dir(&source_dir, &bucket, &s3_prefix).await?;
 
-        if let Some(snap) = cow_snapshot {
-            if let Err(error) = tokio::fs::remove_dir_all(&snap).await {
-                tracing::warn!(
-                    path = %snap.display(),
-                    "failed to clean up copy-on-write snapshot: {error}"
-                );
-            }
+        if let Some(snap) = cow_snapshot
+            && let Err(error) = tokio::fs::remove_dir_all(&snap).await
+        {
+            tracing::warn!(
+                path = %snap.display(),
+                "failed to clean up copy-on-write snapshot: {error}"
+            );
         }
 
         tracing::info!(
@@ -227,10 +227,10 @@ async fn copy_on_write_snapshot(source: &std::path::Path, dest: &std::path::Path
             .args(["--reflink=auto", "-a", &src_glob, &dest_str])
             .status()
             .await;
-        if let Ok(s) = status {
-            if s.success() {
-                return Ok(());
-            }
+        if let Ok(s) = status
+            && s.success()
+        {
+            return Ok(());
         }
         // Filesystem does not support reflinks — fall through to recursive copy.
         tracing::debug!(
@@ -312,7 +312,7 @@ pub(crate) async fn list_volume_backups(
     #[cfg(feature = "s3-persistence")]
     {
         use futures::StreamExt as _;
-        use object_store::{path::Path as OsPath, ObjectStore};
+        use object_store::{ObjectStore, path::Path as OsPath};
 
         // Validate the volume exists before hitting S3.
         let _ = resolve_host_dir(config, route_path, guest_path)?;
@@ -334,10 +334,10 @@ pub(crate) async fn list_volume_backups(
             let after_volume = key
                 .strip_prefix(&format!("{volume_prefix_str}/"))
                 .unwrap_or("");
-            if let Some(ts_str) = after_volume.split('/').next() {
-                if let Ok(ts) = ts_str.parse::<u64>() {
-                    timestamps.insert(ts);
-                }
+            if let Some(ts_str) = after_volume.split('/').next()
+                && let Ok(ts) = ts_str.parse::<u64>()
+            {
+                timestamps.insert(ts);
             }
         }
 

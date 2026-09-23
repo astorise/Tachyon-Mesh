@@ -1,6 +1,6 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
 };
 use serde::{Deserialize, Serialize};
 
@@ -165,13 +165,13 @@ struct ChunkResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{decrypt_chunk, encrypt_chunk, TDE_KEY_HEX_ENV};
+    use super::{TDE_KEY_HEX_ENV, decrypt_chunk, encrypt_chunk};
 
     #[test]
     fn aes_gcm_chunk_round_trips_and_authenticates() {
         // Fail-closed: with no key configured, TDE refuses to operate rather
         // than silently using a constant default key.
-        std::env::remove_var(TDE_KEY_HEX_ENV);
+        unsafe { std::env::remove_var(TDE_KEY_HEX_ENV) };
         assert!(
             encrypt_chunk(b"unconfigured", 1).is_err(),
             "TDE must refuse to encrypt when {TDE_KEY_HEX_ENV} is unset"
@@ -179,10 +179,12 @@ mod tests {
 
         // With a configured 256-bit key, encrypt/decrypt round-trips and the
         // AEAD tag rejects tampered ciphertext.
-        std::env::set_var(
-            TDE_KEY_HEX_ENV,
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        );
+        unsafe {
+            std::env::set_var(
+                TDE_KEY_HEX_ENV,
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+        };
 
         let plaintext = b"patient-record: secret";
         let ciphertext = encrypt_chunk(plaintext, 7).expect("encryption should succeed");
@@ -197,6 +199,6 @@ mod tests {
         tampered[0] ^= 0x01;
         assert!(decrypt_chunk(&tampered, 7).is_err());
 
-        std::env::remove_var(TDE_KEY_HEX_ENV);
+        unsafe { std::env::remove_var(TDE_KEY_HEX_ENV) };
     }
 }

@@ -2,7 +2,7 @@ use std::io::{self, Read};
 
 const EXCESSIVE_ALLOCATION_BYTES: usize = 100 * 1024 * 1024;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn faas_entry() {
     let mut payload = String::new();
     let _ = io::stdin().read_to_string(&mut payload);

@@ -185,7 +185,7 @@ async fn router_skips_telemetry_export_for_unsampled_requests() {
 // peer's stream actually ends.
 #[tokio::test]
 async fn streaming_override_response_keeps_active_requests_elevated_until_stream_ends() {
-    use axum::{body::Body as AxumBody, response::Response as AxumResponse, routing::any, Router};
+    use axum::{Router, body::Body as AxumBody, response::Response as AxumResponse, routing::any};
     use std::{
         sync::{Arc, Mutex},
         time::Duration,
@@ -393,10 +393,10 @@ async fn metering_exporter_drains_sampled_records_off_request_path() {
     let metering_file = metering_dir.join("metering.ndjson");
     let contents = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if let Ok(contents) = fs::read_to_string(&metering_file) {
-                if !contents.trim().is_empty() {
-                    break contents;
-                }
+            if let Ok(contents) = fs::read_to_string(&metering_file)
+                && !contents.trim().is_empty()
+            {
+                break contents;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

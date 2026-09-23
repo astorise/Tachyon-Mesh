@@ -2,8 +2,8 @@ use serde_json::json;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard, OnceLock, PoisonError,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -430,22 +430,25 @@ where
     let emitter: TelemetryEmitter = Arc::new(emitter);
     let snapshot = TelemetrySnapshotStore::default();
 
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(run_telemetry_worker(
-            receiver,
-            Arc::clone(&emitter),
-            snapshot.clone(),
-        ));
-    } else {
-        let emitter = Arc::clone(&emitter);
-        let snapshot_for_worker = snapshot.clone();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("test telemetry worker runtime should initialize");
-            runtime.block_on(run_telemetry_worker(receiver, emitter, snapshot_for_worker));
-        });
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(run_telemetry_worker(
+                receiver,
+                Arc::clone(&emitter),
+                snapshot.clone(),
+            ));
+        }
+        _ => {
+            let emitter = Arc::clone(&emitter);
+            let snapshot_for_worker = snapshot.clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test telemetry worker runtime should initialize");
+                runtime.block_on(run_telemetry_worker(receiver, emitter, snapshot_for_worker));
+            });
+        }
     }
 
     TelemetryHandle { sender, snapshot }
@@ -459,10 +462,11 @@ async fn run_telemetry_worker(
     let mut requests = HashMap::new();
 
     while let Some(event) = receiver.recv().await {
-        if let Some(completed) = apply_event(&mut requests, &snapshot, event) {
-            if completed.sampled && !(emitter)(completed.line) {
-                snapshot.record_dropped_event();
-            }
+        if let Some(completed) = apply_event(&mut requests, &snapshot, event)
+            && completed.sampled
+            && !(emitter)(completed.line)
+        {
+            snapshot.record_dropped_event();
         }
     }
 }

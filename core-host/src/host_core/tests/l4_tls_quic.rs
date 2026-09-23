@@ -168,11 +168,11 @@ async fn voip_gate_allocates_bridge_via_system_route_and_relays_packets() {
 #[tokio::test(flavor = "multi_thread")]
 async fn voip_gate_delegates_bridge_to_healthier_peer_when_local_l4_is_saturated() {
     use axum::{
+        Json, Router,
         body::Bytes as AxumBytes,
         extract::State,
         response::IntoResponse,
         routing::{get, post},
-        Json, Router,
     };
     use serde_json::json;
     use std::sync::Mutex;

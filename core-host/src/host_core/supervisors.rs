@@ -186,13 +186,13 @@ pub(crate) fn spawn_authz_purge_subscriber(state: AppState) {
                 for (key, payload) in rows {
                     match serde_json::from_slice::<auth::AuthzPurgeEvent>(&payload) {
                         Ok(event) => {
-                            if let Err(error) = auth::apply_authz_purge(&cache, &event) {
+                            match auth::apply_authz_purge(&cache, &event) { Err(error) => {
                                 tracing::warn!(
                                     "authz purge event `{key}` ignored due to apply failure: {error:#}"
                                 );
-                            } else {
+                            } _ => {
                                 applied += 1;
-                            }
+                            }}
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -1039,8 +1039,8 @@ mod tests {
 
     #[test]
     fn watcher_ignores_access_events_but_not_writes() {
-        use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind};
         use notify::EventKind;
+        use notify::event::{AccessKind, AccessMode, CreateKind, ModifyKind, RemoveKind};
         // Non-mutating access — the events the WSL2/k3s `local-path` PVC emits on
         // every read of the manifest (e.g. the S3 backup flush) — must NOT reload.
         assert!(watcher_event_is_ignorable(&EventKind::Access(

@@ -878,10 +878,10 @@ pub(crate) fn clone_headers_with_original_route(
     route: &IntegrityRoute,
 ) -> HeaderMap {
     let mut cloned = headers.clone();
-    if !cloned.contains_key(TACHYON_ORIGINAL_ROUTE_HEADER) {
-        if let Ok(value) = HeaderValue::from_str(&route.path) {
-            cloned.insert(TACHYON_ORIGINAL_ROUTE_HEADER, value);
-        }
+    if !cloned.contains_key(TACHYON_ORIGINAL_ROUTE_HEADER)
+        && let Ok(value) = HeaderValue::from_str(&route.path)
+    {
+        cloned.insert(TACHYON_ORIGINAL_ROUTE_HEADER, value);
     }
     cloned
 }
@@ -1440,7 +1440,7 @@ pub(crate) fn should_consult_mesh_qos_override(
 
 #[cfg(not(feature = "resiliency"))]
 mod resiliency {
-    use super::{execute_route_with_middleware_inner, RouteExecutionResult, RouteInvocation};
+    use super::{RouteExecutionResult, RouteInvocation, execute_route_with_middleware_inner};
     use axum::http::StatusCode;
     use sysinfo::System;
 
@@ -1569,10 +1569,10 @@ pub(crate) async fn faas_handler(
     if method == Method::POST && normalized_path == "/api/v1/generate" {
         return enqueue_async_ai_inference_job(body);
     }
-    if method == Method::GET {
-        if let Some(job_id) = normalized_path.strip_prefix("/api/v1/jobs/") {
-            return ai_inference_job_status_response(job_id);
-        }
+    if method == Method::GET
+        && let Some(job_id) = normalized_path.strip_prefix("/api/v1/jobs/")
+    {
+        return ai_inference_job_status_response(job_id);
     }
     let trace_id = Uuid::new_v4().to_string();
     let sampled_execution = normalized_path != SYSTEM_METERING_ROUTE
@@ -2287,10 +2287,10 @@ pub(crate) async fn execute_route_request(
     }
 
     // VRAM-aware admission: AI inference routes are gated on accelerator headroom.
-    if !route.inference_components.is_empty() {
-        if let Some(rejection) = enforce_vram_admission(state, route) {
-            return Ok(rejection);
-        }
+    if !route.inference_components.is_empty()
+        && let Some(rejection) = enforce_vram_admission(state, route)
+    {
+        return Ok(rejection);
     }
 
     let semaphore = runtime
@@ -3212,8 +3212,8 @@ pub(crate) async fn try_dispatch_local_mesh_request(
         // `execute_route_request_with_acquired_permit` already uses) instead
         // of looping back into this same node's UDS/TCP fast path. The local
         // queue remains the last resort when no peer is eligible.
-        if route.allow_overflow {
-            if let Some(response) = try_peer_overflow_dispatch(
+        if route.allow_overflow
+            && let Some(response) = try_peer_overflow_dispatch(
                 state,
                 &route,
                 selected_target.required_capability_mask,
@@ -3225,9 +3225,8 @@ pub(crate) async fn try_dispatch_local_mesh_request(
                 started_at,
             )
             .await?
-            {
-                return Ok(LocalMeshDispatchAttempt::Handled(response));
-            }
+        {
+            return Ok(LocalMeshDispatchAttempt::Handled(response));
         }
         record_mesh_dispatch(MeshDispatchMode::InProcess, reason, started_at.elapsed());
         return Ok(LocalMeshDispatchAttempt::Fallback(reason));
@@ -4097,13 +4096,15 @@ mod tee_dispatch_tests {
         let GuestExecutionOutput::Http(response) = outcome.output else {
             panic!("TEE annotation should preserve HTTP outcomes");
         };
-        assert!(response
-            .headers
-            .iter()
-            .any(|(name, value)| { name == "x-tachyon-runtime" && value == "tee-local-enclave" }));
-        assert!(response
-            .headers
-            .iter()
-            .any(|(name, value)| { name == "x-tachyon-tee-backend" && value == "local-enclave" }));
+        assert!(
+            response.headers.iter().any(|(name, value)| {
+                name == "x-tachyon-runtime" && value == "tee-local-enclave"
+            })
+        );
+        assert!(
+            response.headers.iter().any(|(name, value)| {
+                name == "x-tachyon-tee-backend" && value == "local-enclave"
+            })
+        );
     }
 }

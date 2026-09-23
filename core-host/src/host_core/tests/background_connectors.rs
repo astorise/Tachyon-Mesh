@@ -3,7 +3,7 @@ use crate::*;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn background_scaler_tick_respects_cooldown() {
-    use axum::{extract::State, routing::patch, Router};
+    use axum::{Router, extract::State, routing::patch};
     use std::sync::Mutex;
 
     async fn capture_patch(
@@ -36,7 +36,8 @@ async fn background_scaler_tick_respects_cooldown() {
             .expect("mock server should stay up");
     });
 
-    std::env::set_var(MOCK_K8S_URL_ENV, format!("http://{address}"));
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var(MOCK_K8S_URL_ENV, format!("http://{address}")) };
 
     let config = autoscaling_test_config(true);
     let concurrency_limits = build_concurrency_limits(&config);
@@ -72,7 +73,8 @@ async fn background_scaler_tick_respects_cooldown() {
     .await
     .expect("background runner task should complete");
 
-    std::env::remove_var(MOCK_K8S_URL_ENV);
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var(MOCK_K8S_URL_ENV) };
     server.abort();
 
     let requests = captured
@@ -84,8 +86,8 @@ async fn background_scaler_tick_respects_cooldown() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn background_sqs_connector_dispatches_and_acks_messages() {
-    use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
-    use serde_json::{json, Value};
+    use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
+    use serde_json::{Value, json};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -204,8 +206,8 @@ async fn background_sqs_connector_dispatches_and_acks_messages() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn background_sqs_connector_leaves_failed_messages_unacked() {
-    use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
-    use serde_json::{json, Value};
+    use axum::{Json, Router, extract::State, response::IntoResponse, routing::post};
+    use serde_json::{Value, json};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -448,11 +450,11 @@ async fn background_cdc_dispatches_events_and_acks_outbox_rows() {
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_proxy_forwards_upload_and_buffers_mesh_event() {
     use axum::{
+        Router,
         body::Bytes as AxumBytes,
         extract::{Path as AxumPath, State},
         response::IntoResponse,
         routing::put,
-        Router,
     };
     use serde_json::Value;
     use std::sync::Mutex;

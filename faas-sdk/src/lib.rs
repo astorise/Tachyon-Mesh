@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, parse_quote, ItemFn};
+use syn::{ItemFn, parse_macro_input, parse_quote};
 
 #[proc_macro_attribute]
 pub fn faas_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {

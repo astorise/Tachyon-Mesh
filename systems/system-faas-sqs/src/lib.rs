@@ -176,9 +176,11 @@ mod tests {
 
     #[test]
     fn decode_messages_accepts_empty_body() {
-        assert!(decode_messages(&[])
-            .expect("empty response should succeed")
-            .is_empty());
+        assert!(
+            decode_messages(&[])
+                .expect("empty response should succeed")
+                .is_empty()
+        );
     }
 
     #[test]

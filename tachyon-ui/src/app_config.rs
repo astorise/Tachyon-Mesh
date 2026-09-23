@@ -163,7 +163,7 @@ impl LogLevel {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, LogLevel, CONFIG_FILE_NAME};
+    use super::{AppConfig, CONFIG_FILE_NAME, LogLevel};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

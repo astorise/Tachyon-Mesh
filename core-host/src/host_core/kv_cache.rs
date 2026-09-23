@@ -110,7 +110,7 @@ pub(crate) async fn kv_cache_put_handler(
                 StatusCode::NOT_FOUND,
                 format!("no component-cache configured for Component `{component_ref}`"),
             )
-                .into_response()
+                .into_response();
         }
     };
     drop(runtime);

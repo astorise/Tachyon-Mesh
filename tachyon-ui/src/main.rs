@@ -8,7 +8,7 @@ mod app_logging;
 
 use app_config::{AppConfig, LogLevel};
 use app_logging::{AppLogger, FrontendLogPayload};
-use rand::{rngs::SysRng, TryRng};
+use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -1040,7 +1040,9 @@ fn main() {
             app.manage(config);
             // Export the runtime workspace root so tachyon-client can resolve
             // integrity.lock without relying on the compile-time CARGO_MANIFEST_DIR.
-            std::env::set_var("TACHYON_WORKSPACE_ROOT", &data_dir);
+            // Safe: `.setup()` runs on the main thread before `.run()` starts the
+            // event loop, so no other thread can read env vars concurrently here.
+            unsafe { std::env::set_var("TACHYON_WORKSPACE_ROOT", &data_dir) };
             let salt_path = data_dir.join("stronghold-salt.txt");
             let profile_key = stronghold_profile_key(&data_dir)
                 .map_err(|error| tauri::Error::Anyhow(std::io::Error::other(error).into()))?;

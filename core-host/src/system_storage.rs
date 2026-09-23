@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::{
     body::{Body, Bytes},
     extract::{Request, State},
@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use wasmtime::{component::Linker as ComponentLinker, Engine, Store};
+use wasmtime::{Engine, Store, component::Linker as ComponentLinker};
 use wasmtime_wasi::{FsPerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 const ASSET_URI_PREFIX: &str = "tachyon://sha256:";
@@ -595,11 +595,10 @@ pub(crate) fn publish_configured_component_bindings(
                     // sweep would later delete the config row with nothing to
                     // restore. Displacing an upload once must not become
                     // deleting it on the next reload.
-                    if let Some(parked) = current.and_then(shadowed_upload_row) {
-                        if let Some(carried) = carry_shadowed_upload(&value, &parked) {
+                    if let Some(parked) = current.and_then(shadowed_upload_row)
+                        && let Some(carried) = carry_shadowed_upload(&value, &parked) {
                             return crate::store::KvPartitionUpdate::Set(carried);
                         }
-                    }
                     crate::store::KvPartitionUpdate::Set(value)
                 },
             ) {
@@ -631,27 +630,28 @@ pub(crate) fn publish_configured_component_bindings(
         }
         // Same race: an upload may have replaced this row since the scan, so
         // ownership is re-checked inside the deleting transaction.
-        if let Err(error) =
-            core_store.kv_partition_update(AI_COMPONENTS_REGISTRY_TABLE, &alias, |current| {
-                if !row_is_config_owned(current) {
-                    return crate::store::KvPartitionUpdate::Keep;
-                }
-                // An upload this binding displaced comes back rather than
-                // going down with it. Its files never moved; only the row that
-                // made them findable did.
-                match current.and_then(shadowed_upload_row) {
-                    Some(restored) => crate::store::KvPartitionUpdate::Set(restored),
-                    None => crate::store::KvPartitionUpdate::Delete,
-                }
-            })
-        {
-            failures += 1;
-            tracing::warn!(
-                %alias,
-                "failed to drop a stale configured component binding from the registry: {error:#}"
-            );
-        } else {
-            tracing::info!(%alias, "dropped a configured component binding that left the manifest");
+        match core_store.kv_partition_update(AI_COMPONENTS_REGISTRY_TABLE, &alias, |current| {
+            if !row_is_config_owned(current) {
+                return crate::store::KvPartitionUpdate::Keep;
+            }
+            // An upload this binding displaced comes back rather than
+            // going down with it. Its files never moved; only the row that
+            // made them findable did.
+            match current.and_then(shadowed_upload_row) {
+                Some(restored) => crate::store::KvPartitionUpdate::Set(restored),
+                None => crate::store::KvPartitionUpdate::Delete,
+            }
+        }) {
+            Err(error) => {
+                failures += 1;
+                tracing::warn!(
+                    %alias,
+                    "failed to drop a stale configured component binding from the registry: {error:#}"
+                );
+            }
+            _ => {
+                tracing::info!(%alias, "dropped a configured component binding that left the manifest");
+            }
         }
     }
     failures
@@ -1258,19 +1258,22 @@ impl StorageComponentState {
             let alias = _alias.to_owned();
             let core_store_path = self.core_store_path.clone();
             tokio::spawn(async move {
-                if let Err(error) = backend.flush_path(&component_dir).await {
-                    tracing::warn!(
-                        alias = %alias,
-                        path = %component_dir.display(),
-                        error = %error,
-                        "failed to flush uploaded artifact to S3"
-                    );
-                } else {
-                    tracing::info!(
-                        alias = %alias,
-                        path = %component_dir.display(),
-                        "flushed uploaded artifact files to S3"
-                    );
+                match backend.flush_path(&component_dir).await {
+                    Err(error) => {
+                        tracing::warn!(
+                            alias = %alias,
+                            path = %component_dir.display(),
+                            error = %error,
+                            "failed to flush uploaded artifact to S3"
+                        );
+                    }
+                    _ => {
+                        tracing::info!(
+                            alias = %alias,
+                            path = %component_dir.display(),
+                            "flushed uploaded artifact files to S3"
+                        );
+                    }
                 }
                 if let Err(error) = backend.flush_path(&core_store_path).await {
                     tracing::warn!(
@@ -1472,10 +1475,12 @@ mod configured_binding_registry_tests {
         // camelCase, or `guest-openai`'s reader silently drops the row.
         assert_eq!(entry["vramRequiredMb"], 0);
 
-        assert!(store
-            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "uploaded-later")
-            .expect("registry read should succeed")
-            .is_none());
+        assert!(
+            store
+                .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "uploaded-later")
+                .expect("registry read should succeed")
+                .is_none()
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1574,10 +1579,12 @@ mod configured_binding_registry_tests {
             )]),
         );
 
-        assert!(store
-            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "keep")
-            .expect("read")
-            .is_some());
+        assert!(
+            store
+                .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "keep")
+                .expect("read")
+                .is_some()
+        );
         assert!(
             store
                 .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "drop")
@@ -1941,10 +1948,12 @@ mod configured_binding_registry_tests {
         )]);
         // Deliberately no `publish_configured_component_bindings` call: the table
         // has no row for this alias.
-        assert!(store
-            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "never-published")
-            .expect("read")
-            .is_none());
+        assert!(
+            store
+                .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "never-published")
+                .expect("read")
+                .is_none()
+        );
 
         withdraw_changed_component_bindings(&store, &previous, &config_with(Vec::new()));
 

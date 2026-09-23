@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use magnetar_inference_component::{
     ArtifactTrustPolicy, ComponentProviderAdvertisement, InferenceComponentArtifact,
     InferenceComponentPlacement, InferenceComponentSource, LoadedInferenceComponent,

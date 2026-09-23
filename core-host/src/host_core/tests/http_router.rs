@@ -390,12 +390,12 @@ fn async_log_capture_is_faster_than_sync_file_capture() {
         "storm-complete"
     );
     eprintln!(
-            "guest-log-storm benchmark: async_capture={async_elapsed:?}, sync_file_capture={sync_elapsed:?}"
-        );
+        "guest-log-storm benchmark: async_capture={async_elapsed:?}, sync_file_capture={sync_elapsed:?}"
+    );
     assert!(
-            async_elapsed < sync_elapsed,
-            "expected async capture to beat sync file capture (async={async_elapsed:?}, sync={sync_elapsed:?})"
-        );
+        async_elapsed < sync_elapsed,
+        "expected async capture to beat sync file capture (async={async_elapsed:?}, sync={sync_elapsed:?})"
+    );
 }
 
 #[tokio::test]

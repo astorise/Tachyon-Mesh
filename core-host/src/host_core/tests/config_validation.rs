@@ -78,18 +78,24 @@ fn validate_integrity_config_accepts_scheduler_policy_for_known_tenants() {
     let config = validate_integrity_config(config).expect("scheduler policy should validate");
 
     assert_eq!(config.scheduler.tenant_weights["tenant-a"], 3);
-    assert!(!config
-        .scheduler
-        .tier_preemptible
-        .is_preemptible(RouteQos::RealTime));
-    assert!(config
-        .scheduler
-        .tier_preemptible
-        .is_preemptible(RouteQos::Standard));
-    assert!(config
-        .scheduler
-        .tier_preemptible
-        .is_preemptible(RouteQos::Batch));
+    assert!(
+        !config
+            .scheduler
+            .tier_preemptible
+            .is_preemptible(RouteQos::RealTime)
+    );
+    assert!(
+        config
+            .scheduler
+            .tier_preemptible
+            .is_preemptible(RouteQos::Standard)
+    );
+    assert!(
+        config
+            .scheduler
+            .tier_preemptible
+            .is_preemptible(RouteQos::Batch)
+    );
 }
 
 #[test]
@@ -157,9 +163,11 @@ fn validate_integrity_config_rejects_scheduler_unknown_tenant() {
     let error =
         validate_integrity_config(config).expect_err("unknown tenant weights must fail validation");
 
-    assert!(error
-        .to_string()
-        .contains("unknown tenant `tenant-missing`"));
+    assert!(
+        error
+            .to_string()
+            .contains("unknown tenant `tenant-missing`")
+    );
 }
 
 #[test]
@@ -544,9 +552,11 @@ fn validate_integrity_config_rejects_resource_names_that_conflict_with_routes() 
     let error = validate_integrity_config(config)
         .expect_err("resource names that shadow routes should fail validation");
 
-    assert!(error
-        .to_string()
-        .contains("conflicts with a sealed route name"));
+    assert!(
+        error
+            .to_string()
+            .contains("conflicts with a sealed route name")
+    );
 }
 
 #[test]
@@ -564,9 +574,11 @@ fn validate_integrity_config_rejects_external_resources_without_allowed_methods(
     let error = validate_integrity_config(config)
         .expect_err("external resources must declare an allow-list");
 
-    assert!(error
-        .to_string()
-        .contains("must declare at least one allowed HTTP method"));
+    assert!(
+        error
+            .to_string()
+            .contains("must declare at least one allowed HTTP method")
+    );
 }
 
 #[test]
@@ -690,9 +702,11 @@ fn validate_integrity_config_rejects_unknown_middleware_route() {
     let error = validate_integrity_config(config)
         .expect_err("unknown middleware route should fail validation");
 
-    assert!(error
-        .to_string()
-        .contains("route middleware `missing-auth`"));
+    assert!(
+        error
+            .to_string()
+            .contains("route middleware `missing-auth`")
+    );
 }
 
 #[test]
@@ -913,10 +927,13 @@ fn validate_integrity_config_preserves_encrypted_volume_flag() {
 fn encrypted_volume_seal_hides_plaintext_and_prepare_restores_it() {
     // Encrypted volumes require an explicit data-encryption key; configure one
     // for the round-trip assertions below.
-    std::env::set_var(
-        "TDE_KEY_HEX",
-        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
-    );
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::set_var(
+            "TDE_KEY_HEX",
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        )
+    };
 
     let volume_dir = unique_test_dir("tachyon-tde-volume");
     let mut route = storage_broker_test_route(&volume_dir);
@@ -939,7 +956,8 @@ fn encrypted_volume_seal_hides_plaintext_and_prepare_restores_it() {
 
     // Fail-closed: without a configured key, sealing an encrypted volume must
     // error rather than silently fall back to a constant default key.
-    std::env::remove_var("TDE_KEY_HEX");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("TDE_KEY_HEX") };
     fs::write(&file_path, b"patient-record: secret").expect("plaintext should be re-written");
     assert!(
         seal_encrypted_route_volumes(&route).is_err(),
@@ -952,7 +970,8 @@ fn encrypted_volume_seal_hides_plaintext_and_prepare_restores_it() {
 #[test]
 fn component_training_job_exports_artifact_with_finops_metadata() {
     let broker_dir = unique_test_dir("tachyon-train-train");
-    std::env::set_var(ARTIFACT_BROKER_DIR_ENV, &broker_dir);
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var(ARTIFACT_BROKER_DIR_ENV, &broker_dir) };
     let statuses = Arc::new(Mutex::new(HashMap::new()));
     let job = ComponentTrainingJob {
         id: "train-test".to_owned(),
@@ -977,7 +996,8 @@ fn component_training_job_exports_artifact_with_finops_metadata() {
     assert_eq!(value["finops"]["ram_spillover"], true);
     assert!(artifact_path.ends_with(".training.json"));
 
-    std::env::remove_var(ARTIFACT_BROKER_DIR_ENV);
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var(ARTIFACT_BROKER_DIR_ENV) };
     let _ = fs::remove_dir_all(broker_dir);
 }
 
@@ -994,9 +1014,11 @@ fn validate_integrity_config_rejects_tee_route_without_backend() {
     let error =
         validate_integrity_config(config).expect_err("TEE routes must require an explicit backend");
 
-    assert!(error
-        .to_string()
-        .contains("routes with `requires_tee: true` require `tee_backend`"));
+    assert!(
+        error
+            .to_string()
+            .contains("routes with `requires_tee: true` require `tee_backend`")
+    );
 }
 
 #[test]
@@ -1055,9 +1077,11 @@ fn validate_integrity_config_rejects_writable_user_route_volumes() {
     let error = validate_integrity_config(config)
         .expect_err("writable user volumes should fail validation");
 
-    assert!(error
-        .to_string()
-        .contains("cannot request writable direct host mounts"));
+    assert!(
+        error
+            .to_string()
+            .contains("cannot request writable direct host mounts")
+    );
 }
 
 fn asset_uri_route(path: &str, asset_uri: &str) -> IntegrityRoute {

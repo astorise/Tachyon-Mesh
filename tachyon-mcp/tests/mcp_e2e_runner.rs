@@ -55,11 +55,7 @@ fn mcp_binary() -> std::path::PathBuf {
     #[cfg(target_os = "windows")]
     let (release, debug) = (release.with_extension("exe"), debug.with_extension("exe"));
 
-    if release.exists() {
-        release
-    } else {
-        debug
-    }
+    if release.exists() { release } else { debug }
 }
 
 fn send_and_recv(stdin: &mut impl Write, stdout_reader: &mut impl BufRead, line: &str) -> String {
@@ -79,7 +75,9 @@ fn send_and_recv(stdin: &mut impl Write, stdout_reader: &mut impl BufRead, line:
 fn test_initialize_returns_protocol_version() {
     let bin = mcp_binary();
     if !bin.exists() {
-        eprintln!("tachyon-mcp binary not found at {bin:?}; build it first with `cargo build -p tachyon-mcp`");
+        eprintln!(
+            "tachyon-mcp binary not found at {bin:?}; build it first with `cargo build -p tachyon-mcp`"
+        );
         return;
     }
 

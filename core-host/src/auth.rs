@@ -1,10 +1,10 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::{
+    Json,
     extract::{Extension, Request, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "s3-persistence")]
@@ -17,8 +17,8 @@ use std::{
 };
 use uuid::Uuid;
 use wasmtime::{
-    component::{Component, Linker as ComponentLinker},
     Engine, Store,
+    component::{Component, Linker as ComponentLinker},
 };
 use wasmtime_wasi::{FsPerms, ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
@@ -425,10 +425,10 @@ pub(crate) fn auth_state_dir(manifest_path: &Path) -> PathBuf {
 ///    stability. A warning is emitted because a per-node generated secret cannot
 ///    be shared across a mesh.
 fn resolve_jwt_secret(state_dir: &Path) -> String {
-    if let Ok(secret) = std::env::var(JWT_SECRET_ENV) {
-        if !secret.trim().is_empty() {
-            return secret;
-        }
+    if let Ok(secret) = std::env::var(JWT_SECRET_ENV)
+        && !secret.trim().is_empty()
+    {
+        return secret;
     }
 
     let secret_path = state_dir.join(JWT_SECRET_FILE);
@@ -1867,12 +1867,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp state dir");
 
         // 1. An explicit operator-provided secret always wins.
-        std::env::set_var(JWT_SECRET_ENV, "explicit-operator-secret");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(JWT_SECRET_ENV, "explicit-operator-secret") };
         assert_eq!(resolve_jwt_secret(dir.path()), "explicit-operator-secret");
 
         // 2. With no secret configured, a random 256-bit value is generated and
         //    persisted — never the old hard-coded constant.
-        std::env::remove_var(JWT_SECRET_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(JWT_SECRET_ENV) };
         let generated = resolve_jwt_secret(dir.path());
         assert_eq!(generated.len(), 64);
         assert!(generated.chars().all(|c| c.is_ascii_hexdigit()));
@@ -1974,10 +1976,12 @@ mod tests {
     #[test]
     fn auth_state_dir_prefers_explicit_env_then_manifest_parent() {
         let manifest = Path::new("/tmp/tachyon/manifest.json");
-        std::env::set_var(AUTH_STATE_DIR_ENV, "/app/auth-state");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(AUTH_STATE_DIR_ENV, "/app/auth-state") };
         assert_eq!(auth_state_dir(manifest), PathBuf::from("/app/auth-state"));
 
-        std::env::remove_var(AUTH_STATE_DIR_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(AUTH_STATE_DIR_ENV) };
         assert_eq!(
             auth_state_dir(manifest),
             Path::new("/tmp/tachyon/auth-state")
@@ -2023,71 +2027,91 @@ mod tests {
         };
         let engine = Engine::default();
 
-        assert!(manager
-            .validate_registration_token(&engine, "invalid-registration-token")
-            .is_err());
-        assert!(manager
-            .stage_user(
-                &engine,
-                StageSignupRequest {
-                    token: "invalid-registration-token".to_owned(),
-                    first_name: "Alice".to_owned(),
-                    last_name: "Mesh".to_owned(),
-                    username: "alice".to_owned(),
-                    password: "correct horse battery staple".to_owned(),
-                },
-            )
-            .is_err());
-        assert!(manager
-            .finalize_enrollment(&engine, "missing-session", "123456")
-            .is_err());
-        assert!(manager
-            .stage_login(&engine, "alice", "wrong-password")
-            .is_err());
-        assert!(manager
-            .finalize_login(&engine, "missing-session", "123456")
-            .is_err());
+        assert!(
+            manager
+                .validate_registration_token(&engine, "invalid-registration-token")
+                .is_err()
+        );
+        assert!(
+            manager
+                .stage_user(
+                    &engine,
+                    StageSignupRequest {
+                        token: "invalid-registration-token".to_owned(),
+                        first_name: "Alice".to_owned(),
+                        last_name: "Mesh".to_owned(),
+                        username: "alice".to_owned(),
+                        password: "correct horse battery staple".to_owned(),
+                    },
+                )
+                .is_err()
+        );
+        assert!(
+            manager
+                .finalize_enrollment(&engine, "missing-session", "123456")
+                .is_err()
+        );
+        assert!(
+            manager
+                .stage_login(&engine, "alice", "wrong-password")
+                .is_err()
+        );
+        assert!(
+            manager
+                .finalize_login(&engine, "missing-session", "123456")
+                .is_err()
+        );
         assert!(manager.generate_recovery_codes(&engine, "alice").is_err());
-        assert!(manager
-            .consume_recovery_code(&engine, "alice", "bad-code")
-            .is_err());
-        assert!(manager
-            .issue_pat(&engine, "alice", "laptop", &["scope:a".to_owned()], 30)
-            .is_err());
+        assert!(
+            manager
+                .consume_recovery_code(&engine, "alice", "bad-code")
+                .is_err()
+        );
+        assert!(
+            manager
+                .issue_pat(&engine, "alice", "laptop", &["scope:a".to_owned()], 30)
+                .is_err()
+        );
         assert!(manager.list_users(&engine).is_err());
-        assert!(manager
-            .update_user(
-                &engine,
-                "admin",
-                "alice",
-                AuthnUserUpdate {
-                    add_groups: None,
-                    remove_groups: None,
-                    add_roles: None,
-                    remove_roles: None,
-                    add_scopes: None,
-                    remove_scopes: None,
-                    disabled: None,
-                },
-            )
-            .is_err());
+        assert!(
+            manager
+                .update_user(
+                    &engine,
+                    "admin",
+                    "alice",
+                    AuthnUserUpdate {
+                        add_groups: None,
+                        remove_groups: None,
+                        add_roles: None,
+                        remove_roles: None,
+                        add_scopes: None,
+                        remove_scopes: None,
+                        disabled: None,
+                    },
+                )
+                .is_err()
+        );
         assert!(manager.delete_user(&engine, "admin", "alice").is_err());
         assert!(manager.list_groups(&engine).is_err());
-        assert!(manager
-            .upsert_group(
-                &engine,
-                AuthnGroupInput {
-                    name: "ops".to_owned(),
-                    description: String::new(),
-                    roles: Vec::new(),
-                    scopes: Vec::new(),
-                },
-            )
-            .is_err());
+        assert!(
+            manager
+                .upsert_group(
+                    &engine,
+                    AuthnGroupInput {
+                        name: "ops".to_owned(),
+                        description: String::new(),
+                        roles: Vec::new(),
+                        scopes: Vec::new(),
+                    },
+                )
+                .is_err()
+        );
         assert!(manager.delete_group(&engine, "ops").is_err());
-        assert!(manager
-            .authorize(&engine, &fresh_claims("alice", &[]), "GET", "/admin/status")
-            .is_err());
+        assert!(
+            manager
+                .authorize(&engine, &fresh_claims("alice", &[]), "GET", "/admin/status")
+                .is_err()
+        );
     }
 
     #[test]
@@ -2145,19 +2169,23 @@ mod tests {
             token_hash: "not-hex".to_owned(),
             ts_ms: 1,
         };
-        assert!(apply_authz_purge(&cache, &bad_hex)
-            .expect_err("invalid hex must fail")
-            .to_string()
-            .contains("hex"));
+        assert!(
+            apply_authz_purge(&cache, &bad_hex)
+                .expect_err("invalid hex must fail")
+                .to_string()
+                .contains("hex")
+        );
 
         let short_hash = AuthzPurgeEvent::Token {
             token_hash: "abcd".to_owned(),
             ts_ms: 1,
         };
-        assert!(apply_authz_purge(&cache, &short_hash)
-            .expect_err("short hashes must fail")
-            .to_string()
-            .contains("32 bytes"));
+        assert!(
+            apply_authz_purge(&cache, &short_hash)
+                .expect_err("short hashes must fail")
+                .to_string()
+                .contains("32 bytes")
+        );
 
         apply_authz_purge(
             &cache,
@@ -2271,7 +2299,7 @@ mod tests {
         issued_at: u64,
         expires_at: u64,
     ) -> String {
-        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
         use hmac::{Hmac, KeyInit, Mac};
         use serde_json::json;
         type HmacSha256 = Hmac<sha2::Sha256>;

@@ -228,22 +228,20 @@ fn embed_texts(model: &str, texts: &[&str]) -> (Vec<Vec<f32>>, String) {
         "/ai/v1/embeddings",
         &[("content-type".to_owned(), "application/json".to_owned())],
         &body,
-    ) {
-        if response.status == 200 {
-            if let Ok(decoded) = serde_json::from_slice::<OpenAiEmbeddingResponse>(&response.body) {
-                let embeddings = decoded
-                    .data
-                    .into_iter()
-                    .map(|item| normalize_embedding(item.embedding))
-                    .collect::<Vec<_>>();
-                let dim = embeddings.first().map(Vec::len).unwrap_or_default();
-                if embeddings.len() == texts.len()
-                    && dim > 0
-                    && embeddings.iter().all(|embedding| embedding.len() == dim)
-                {
-                    return (embeddings, format!("openai-compatible:{model}"));
-                }
-            }
+    ) && response.status == 200
+        && let Ok(decoded) = serde_json::from_slice::<OpenAiEmbeddingResponse>(&response.body)
+    {
+        let embeddings = decoded
+            .data
+            .into_iter()
+            .map(|item| normalize_embedding(item.embedding))
+            .collect::<Vec<_>>();
+        let dim = embeddings.first().map(Vec::len).unwrap_or_default();
+        if embeddings.len() == texts.len()
+            && dim > 0
+            && embeddings.iter().all(|embedding| embedding.len() == dim)
+        {
+            return (embeddings, format!("openai-compatible:{model}"));
         }
     }
 

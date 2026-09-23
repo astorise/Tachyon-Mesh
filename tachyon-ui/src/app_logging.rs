@@ -242,7 +242,7 @@ fn prune_rotations(file_path: &Path, retained_files: usize) -> Result<(), String
 
 #[cfg(test)]
 mod tests {
-    use super::{rotated_path, AppLogger};
+    use super::{AppLogger, rotated_path};
     use crate::app_config::{LogLevel, LoggingConfig};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};

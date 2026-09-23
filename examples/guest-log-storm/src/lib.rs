@@ -1,6 +1,6 @@
 const LOG_LINES: usize = 100_000;
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn faas_entry() {
     for index in 0..LOG_LINES {
         println!(

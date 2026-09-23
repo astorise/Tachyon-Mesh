@@ -9,7 +9,7 @@ mod bindings {
     export!(Component);
 }
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{fs::OpenOptions, io::Write};
 
 const METERING_OUTPUT_PATH: &str = "/app/data/metering.ndjson";

@@ -319,7 +319,7 @@ fn queued_files(root: &Path) -> Result<Vec<PathBuf>, String> {
                 return Err(format!(
                     "failed to enumerate buffered queue `{}`: {error}",
                     queue_dir.display()
-                ))
+                ));
             }
         };
         for entry in entries {

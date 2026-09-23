@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn upload_headers_prefer_explicit_env_authorization() {
-        std::env::set_var(S3_AUTHORIZATION_ENV, "Bearer proxy");
+        unsafe { std::env::set_var(S3_AUTHORIZATION_ENV, "Bearer proxy") };
         let headers = upload_headers(&[
             (
                 "content-type".to_owned(),
@@ -250,7 +250,7 @@ mod tests {
                 ("authorization".to_owned(), "Bearer proxy".to_owned()),
             ]
         );
-        std::env::remove_var(S3_AUTHORIZATION_ENV);
+        unsafe { std::env::remove_var(S3_AUTHORIZATION_ENV) };
     }
 
     #[test]

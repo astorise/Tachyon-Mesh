@@ -183,9 +183,11 @@ mod tests {
 
         assert_eq!(response.status, 200);
         assert_eq!(response.content_type, "text/html; charset=utf-8");
-        assert!(std::str::from_utf8(response.body)
-            .expect("index is utf-8")
-            .contains("tachyon-chat-assistant"));
+        assert!(
+            std::str::from_utf8(response.body)
+                .expect("index is utf-8")
+                .contains("tachyon-chat-assistant")
+        );
     }
 
     #[test]
@@ -197,9 +199,11 @@ mod tests {
             response.content_type,
             "application/javascript; charset=utf-8"
         );
-        assert!(std::str::from_utf8(response.body)
-            .expect("script is utf-8")
-            .contains("customElements.define"));
+        assert!(
+            std::str::from_utf8(response.body)
+                .expect("script is utf-8")
+                .contains("customElements.define")
+        );
     }
 
     #[test]

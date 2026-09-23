@@ -1,6 +1,6 @@
 use std::{fs, path::Path, time::Duration};
 
-use reqwest::{blocking::Client, StatusCode};
+use reqwest::{StatusCode, blocking::Client};
 
 const ATTACKS: [(&str, &str); 3] = [
     ("infinite-loop", ""),

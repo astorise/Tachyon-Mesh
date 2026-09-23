@@ -129,13 +129,13 @@ mod tests {
 
     #[test]
     fn parse_batch_size_uses_positive_values_only() {
-        std::env::set_var(BATCH_SIZE_ENV, "32");
+        unsafe { std::env::set_var(BATCH_SIZE_ENV, "32") };
         assert_eq!(parse_batch_size(), 32);
 
-        std::env::set_var(BATCH_SIZE_ENV, "0");
+        unsafe { std::env::set_var(BATCH_SIZE_ENV, "0") };
         assert_eq!(parse_batch_size(), DEFAULT_BATCH_SIZE);
 
-        std::env::remove_var(BATCH_SIZE_ENV);
+        unsafe { std::env::remove_var(BATCH_SIZE_ENV) };
     }
 
     #[test]

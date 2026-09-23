@@ -273,14 +273,14 @@ pub fn validate_manifest_payload(payload: &Value) -> DryRunResult {
                         }
                     }
                     // maxConcurrency must be a positive integer if present.
-                    if let Some(v) = route_obj.get("maxConcurrency") {
-                        if v.as_u64().is_none_or(|n| n == 0) {
-                            errors.push(ValidationError {
-                                path: format!("/routes/{i}/maxConcurrency"),
-                                message: "`maxConcurrency` must be a positive integer".to_owned(),
-                                error_code: "CONSTRAINT_VIOLATION".to_owned(),
-                            });
-                        }
+                    if let Some(v) = route_obj.get("maxConcurrency")
+                        && v.as_u64().is_none_or(|n| n == 0)
+                    {
+                        errors.push(ValidationError {
+                            path: format!("/routes/{i}/maxConcurrency"),
+                            message: "`maxConcurrency` must be a positive integer".to_owned(),
+                            error_code: "CONSTRAINT_VIOLATION".to_owned(),
+                        });
                     }
                     validate_canary_metrics(route_obj.get("canary"), i, &mut errors);
                 }
@@ -404,8 +404,8 @@ impl ai_contract::exports::tachyon::ai_config::config_ai::Guest for AiConfigComp
         Ok(())
     }
 
-    fn get_ai_config(
-    ) -> Result<ai_contract::exports::tachyon::ai_config::config_ai::AiConfiguration, String> {
+    fn get_ai_config()
+    -> Result<ai_contract::exports::tachyon::ai_config::config_ai::AiConfiguration, String> {
         Err("AI configuration store is not wired in this component yet".to_owned())
     }
 
@@ -824,7 +824,9 @@ mod tests {
     #[test]
     fn rbac_config_scaffold_allows_access_by_default() {
         validate_rbac_config(()).expect("rbac config scaffold accepts payloads");
-        assert!(evaluate_access((), (), "config-routing", ())
-            .expect("rbac evaluation scaffold accepts payloads"));
+        assert!(
+            evaluate_access((), (), "config-routing", ())
+                .expect("rbac evaluation scaffold accepts payloads")
+        );
     }
 }

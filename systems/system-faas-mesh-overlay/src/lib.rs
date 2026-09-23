@@ -99,7 +99,7 @@ fn serve_module(
                 400,
                 format!("invalid module fetch request: {error}").into_bytes(),
                 &[],
-            )
+            );
         }
     };
     let root = PathBuf::from(env_or_default(MODULE_ROOT_ENV, DEFAULT_MODULE_ROOT));
@@ -114,7 +114,7 @@ fn serve_module(
                 404,
                 format!("failed to read module `{}`: {error}", path.display()).into_bytes(),
                 &[],
-            )
+            );
         }
     };
     if let Some(expected) = request.expected_sha256.as_deref() {
@@ -143,7 +143,7 @@ fn pull_config_update(
                 400,
                 format!("invalid config update event: {error}").into_bytes(),
                 &[],
-            )
+            );
         }
     };
     let local_version = std::env::var("TACHYON_CONFIG_VERSION")
@@ -181,7 +181,7 @@ fn pull_config_update(
                 502,
                 format!("failed to pull manifest from `{url}`: {error}").into_bytes(),
                 &[],
-            )
+            );
         }
     };
     if remote.status >= 400 {
@@ -243,7 +243,7 @@ fn get_best_peer(
                     400,
                     format!("invalid peer requirements: {error}").into_bytes(),
                     &[],
-                )
+                );
             }
         }
     };

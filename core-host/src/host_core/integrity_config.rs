@@ -488,7 +488,7 @@ pub(crate) async fn admin_nodes_handler(State(state): State<AppState>) -> Respon
     let mut nodes = match list_registry_nodes(&state.core_store) {
         Ok(nodes) => nodes,
         Err(error) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
         }
     };
     let self_id = &state.host_identity.public_key_hex;
@@ -578,7 +578,7 @@ pub(crate) async fn admin_node_capabilities_handler(
             ..RegistryEnrolledNode::default()
         },
         Err(error) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
         }
     };
     node.capabilities = capabilities;
@@ -587,7 +587,7 @@ pub(crate) async fn admin_node_capabilities_handler(
     let payload = match serde_json::to_vec(&node) {
         Ok(payload) => payload,
         Err(error) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
         }
     };
     match state
@@ -609,7 +609,7 @@ pub(crate) async fn admin_deployed_systems_handler(State(state): State<AppState>
     let nodes = match list_registry_nodes(&state.core_store) {
         Ok(nodes) => nodes,
         Err(error) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
         }
     };
     let systems = read_system_manifest()
@@ -858,13 +858,12 @@ pub(crate) async fn admin_manifest_update_handler(
         ts_ms,
     };
     let _ = state.config_updates.send(event.clone());
-    if let Ok(payload) = serde_json::to_vec(&event) {
-        if let Err(error) = state
+    if let Ok(payload) = serde_json::to_vec(&event)
+        && let Err(error) = state
             .core_store
             .append_outbox(store::CoreStoreBucket::ConfigUpdateOutbox, &payload)
-        {
-            tracing::warn!("manifest accepted but config_update_outbox append failed: {error:#}");
-        }
+    {
+        tracing::warn!("manifest accepted but config_update_outbox append failed: {error:#}");
     }
 
     (
@@ -1034,10 +1033,10 @@ pub(crate) fn validate_kv_caches(config: &IntegrityConfig) -> Result<()> {
 pub(crate) fn validate_scheduler_config(config: &IntegrityConfig) -> Result<()> {
     let mut known_tenants = BTreeSet::from(["default".to_owned()]);
     for route in &config.routes {
-        if let Some(artifact_id) = route.artifact_id.as_deref().map(str::trim) {
-            if !artifact_id.is_empty() {
-                known_tenants.insert(artifact_id.to_owned());
-            }
+        if let Some(artifact_id) = route.artifact_id.as_deref().map(str::trim)
+            && !artifact_id.is_empty()
+        {
+            known_tenants.insert(artifact_id.to_owned());
         }
     }
 
@@ -1106,15 +1105,15 @@ fn validate_require_scopes(routes: &[IntegrityRoute]) -> Result<()> {
             }
             Some(value) => {
                 // Already validated by validate_route_scopes; re-parse to check allow-all.
-                if let Ok(scopes) = DeploymentScopes::from_manifest(value) {
-                    if scopes.allow_all {
-                        return Err(anyhow!(
-                            "Integrity Validation Failed: route `{}` resolves to allow-all scopes \
+                if let Ok(scopes) = DeploymentScopes::from_manifest(value)
+                    && scopes.allow_all
+                {
+                    return Err(anyhow!(
+                        "Integrity Validation Failed: route `{}` resolves to allow-all scopes \
                              and `require_scopes` is enabled on this node; add explicit scope patterns \
                              — call `tachyon_suggest_scopes` for a starting scopes configuration for this route",
-                            route.path
-                        ));
-                    }
+                        route.path
+                    ));
                 }
             }
         }
@@ -1563,13 +1562,13 @@ fn validate_concurrency_policy(
             }
         }
     }
-    if let Some(ttl) = policy.lock_ttl_ms {
-        if ttl == 0 {
-            return Err(anyhow!(
-                "Integrity Validation Failed: route `{route_path}` `concurrency.lock_ttl_ms` \
+    if let Some(ttl) = policy.lock_ttl_ms
+        && ttl == 0
+    {
+        return Err(anyhow!(
+            "Integrity Validation Failed: route `{route_path}` `concurrency.lock_ttl_ms` \
                  must be greater than zero"
-            ));
-        }
+        ));
     }
     Ok(policy)
 }
@@ -1809,7 +1808,8 @@ pub(crate) fn ensure_unique_component_aliases(routes: &[IntegrityRoute]) -> Resu
             {
                 return Err(anyhow!(
                     "Integrity Validation Failed: component alias `{}` is declared by both route `{previous_route}` and route `{}`",
-                    component.alias, route.path
+                    component.alias,
+                    route.path
                 ));
             }
         }
@@ -2552,10 +2552,10 @@ pub(crate) async fn admin_manifest_bundle_handler(
     // Record the resolved asset versions in the config so future bundle applies
     // can detect when the cluster already holds a better-compatible version.
     for dep in &manifest_fields.dependencies {
-        if dep.source.is_some() {
-            if let Some(version) = extract_semver_version(&dep.version) {
-                new_config.asset_versions.insert(dep.name.clone(), version);
-            }
+        if dep.source.is_some()
+            && let Some(version) = extract_semver_version(&dep.version)
+        {
+            new_config.asset_versions.insert(dep.name.clone(), version);
         }
     }
 
@@ -2683,13 +2683,12 @@ pub(crate) async fn admin_manifest_bundle_handler(
         ts_ms,
     };
     let _ = state.config_updates.send(event.clone());
-    if let Ok(payload) = serde_json::to_vec(&event) {
-        if let Err(error) = state
+    if let Ok(payload) = serde_json::to_vec(&event)
+        && let Err(error) = state
             .core_store
             .append_outbox(crate::store::CoreStoreBucket::ConfigUpdateOutbox, &payload)
-        {
-            tracing::warn!("failed to append bundle config-update outbox: {error}");
-        }
+    {
+        tracing::warn!("failed to append bundle config-update outbox: {error}");
     }
 
     let response = BundleApplyResponse {

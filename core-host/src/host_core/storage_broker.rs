@@ -168,22 +168,27 @@ impl StorageVolumeQueue {
         while let Ok(operation) = receiver.recv() {
             match operation {
                 StorageBrokerOperation::Write(request) => {
-                    if let Err(error) = process_storage_write_request(&request) {
-                        tracing::warn!(
-                            route = %request.route_path,
-                            guest_path = %request.guest_path,
-                            host_target = %request.host_target.display(),
-                            "storage broker write failed: {error}"
-                        );
-                    } else if request.sync_to_cloud {
-                        if let Err(error) = emit_storage_mutation_event(&self.core_store, &request)
-                        {
+                    match process_storage_write_request(&request) {
+                        Err(error) => {
                             tracing::warn!(
                                 route = %request.route_path,
                                 guest_path = %request.guest_path,
                                 host_target = %request.host_target.display(),
-                                "storage broker CDC event emit failed: {error:#}"
+                                "storage broker write failed: {error}"
                             );
+                        }
+                        _ => {
+                            if request.sync_to_cloud
+                                && let Err(error) =
+                                    emit_storage_mutation_event(&self.core_store, &request)
+                            {
+                                tracing::warn!(
+                                    route = %request.route_path,
+                                    guest_path = %request.guest_path,
+                                    host_target = %request.host_target.display(),
+                                    "storage broker CDC event emit failed: {error:#}"
+                                );
+                            }
                         }
                     }
                 }

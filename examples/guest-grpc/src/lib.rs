@@ -53,11 +53,7 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
 
 fn default_name(name: &str) -> &str {
     let trimmed = name.trim();
-    if trimmed.is_empty() {
-        "world"
-    } else {
-        trimmed
-    }
+    if trimmed.is_empty() { "world" } else { trimmed }
 }
 
 fn decode_grpc_message<T>(payload: &[u8]) -> Result<T, String>
