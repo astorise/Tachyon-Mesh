@@ -4,7 +4,6 @@ use magnetar_inference_component::{
     InferenceComponentPlacement, InferenceComponentSource, LoadedInferenceComponent,
 };
 use serde_json::Value;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::StreamControl;
@@ -111,10 +110,10 @@ impl MagnetarRuntime {
     /// response to the Tachyon integration audit's TACH-02 finding): raw
     /// bytes and string-keyed tags, never Magnetar's own typed generation
     /// output/stream-event shapes. This module touches no generation
-    /// vocabulary at all — not a token count, not a stream-event variant —
-    /// and neither does anything past it: [`tachyon_wire_tags`] renames
-    /// Magnetar's tag keys to Tachyon's own established wire keys by string
-    /// lookup, never by typed field access.
+    /// vocabulary at all — not a token count, not a finish reason, not a
+    /// stream-event variant. Whatever tags Magnetar attaches are handed
+    /// back exactly as received, by identity, never read, renamed, or
+    /// filtered by key — this bridge does not know what any of them mean.
     pub(crate) fn generate(&self, prompts: &[&[u8]]) -> Result<ComponentInvocationBatch> {
         if prompts.len() != 1 {
             bail!(
@@ -124,7 +123,7 @@ impl MagnetarRuntime {
             );
         }
         let outcome = self.component.invoke_payload_opaque(prompts[0])?;
-        Ok(vec![(outcome.bytes, tachyon_wire_tags(outcome.tags))])
+        Ok(vec![(outcome.bytes, outcome.tags)])
     }
 
     pub(crate) fn generate_streaming(
@@ -149,31 +148,8 @@ impl MagnetarRuntime {
         let tags = self
             .component
             .invoke_payload_streaming_opaque(prompts[0], &mut on_event)?;
-        Ok(tachyon_wire_tags(tags))
+        Ok(tags)
     }
-}
-
-/// Renames Magnetar's own opaque tag keys (`prompt_tokens`,
-/// `generated_tokens` — `astorise/Magnetar#89`; it also reports
-/// `finish_reason`, not relayed here since Tachyon's wire contract has no
-/// slot for it yet) to Tachyon's established wire keys
-/// (`wit/accelerator/*.wit`'s `invocation-result.metadata`). Pure
-/// string-key lookup — Magnetar's tag keys are read by name, exactly like
-/// any other opaque metadata this module never interprets, never through a
-/// typed struct field. A key `MagnetarRuntime::generate`/
-/// `generate_streaming` don't recognize is silently dropped rather than
-/// relayed verbatim, so Tachyon's wire contract stays exactly what it was
-/// before Magnetar's opaque entry points existed.
-fn tachyon_wire_tags(tags: Vec<(String, String)>) -> ComponentMetadata {
-    let by_key: HashMap<String, String> = tags.into_iter().collect();
-    let mut wire_tags = Vec::new();
-    if let Some(value) = by_key.get("prompt_tokens") {
-        wire_tags.push(("tachyon.usage.prompt_tokens".to_owned(), value.clone()));
-    }
-    if let Some(value) = by_key.get("generated_tokens") {
-        wire_tags.push(("tachyon.usage.completion_tokens".to_owned(), value.clone()));
-    }
-    wire_tags
 }
 
 pub(crate) fn is_invalid_component_invocation(error: &anyhow::Error) -> bool {

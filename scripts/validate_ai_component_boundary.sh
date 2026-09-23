@@ -14,6 +14,14 @@ check_absent() {
   fi
 }
 
+# Skips each #[cfg(test)]-attributed item individually — from the attribute
+# line through its own matching closing brace (or, for a brace-less item
+# like `#[cfg(test)] use foo;`, through that one line) — then resumes
+# scanning production code for whatever follows. A file can carry any number
+# of scattered #[cfg(test)] items (a few inline test-only helpers plus a
+# trailing `mod tests { ... }`), not just one contiguous block at the end;
+# stopping at the *first* one and never resuming (the previous behavior)
+# silently exempted everything after it, including real production code.
 check_production_prefix_absent() {
   local file="$1"
   local pattern="$2"
@@ -21,8 +29,23 @@ check_production_prefix_absent() {
   local tmp
   tmp="$(mktemp)"
   awk '
-    /^[[:space:]]*#\[cfg\(test\)\]/ { stop = 1 }
-    stop != 1 { print }
+    BEGIN { skip = 0; depth = 0 }
+    {
+      line = $0
+      if (skip == 1) {
+        opens = gsub(/\{/, "{", line)
+        closes = gsub(/\}/, "}", line)
+        depth += opens - closes
+        if (depth <= 0) { skip = 0 }
+        next
+      }
+      if (line ~ /^[[:space:]]*#\[cfg\(test\)\]/) {
+        skip = 1
+        depth = 0
+        next
+      }
+      print
+    }
   ' "$file" > "$tmp"
   if grep -En "$pattern" "$tmp" >/tmp/tachyon-ai-boundary-match.txt; then
     echo "::error file=$file::$message"
@@ -121,6 +144,16 @@ check_absent \
   core-host/src/ai_inference/magnetar_runtime.rs \
   'GenerationStreamEvent|InferenceComponentOutput|InferenceComponentUsage|GenerationUsage|text_delta|\binvoke_payload\(|\binvoke_payload_streaming\(' \
   'Tachyon Magnetar adapter must call only invoke_payload_opaque/invoke_payload_streaming_opaque (astorise/Magnetar#89) and must never touch typed Magnetar generation vocabulary again (TACH-02, fully closed)'
+
+check_absent \
+  core-host/src/ai_inference/magnetar_runtime.rs \
+  'tachyon_wire_tags|"prompt_tokens"|"generated_tokens"|"completion_tokens"|"finish_reason"|tachyon\.usage\.' \
+  'Tachyon Magnetar adapter must relay Magnetar opaque tags exactly as received, with no renaming, filtering, or interpretation of token-usage or finish-reason keys (TACH-01, audit round 3)'
+
+check_production_prefix_absent \
+  core-host/src/ai_inference.rs \
+  'tachyon_wire_tags|MOCK_LLM_RESPONSE|"prompt_tokens"|"generated_tokens"|"completion_tokens"|"finish_reason"|tachyon\.usage\.' \
+  'core-host AI inference production code must not fabricate, rename, or interpret token-usage or finish-reason metadata, and the mock Component must not use LLM-flavored naming for its canned response (TACH-02, audit round 3)'
 
 check_absent \
   core-host/src/system_storage.rs \

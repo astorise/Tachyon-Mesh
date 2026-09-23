@@ -217,12 +217,8 @@ fn metadata_value(metadata: &[(String, String)], key: &str) -> Option<String> {
 }
 
 fn metadata_usage(metadata: &[(String, String)]) -> Option<HostTokenUsage> {
-    let prompt_tokens = metadata_value(metadata, "tachyon.usage.prompt_tokens")?
-        .parse()
-        .ok()?;
-    let completion_tokens = metadata_value(metadata, "tachyon.usage.completion_tokens")?
-        .parse()
-        .ok()?;
+    let prompt_tokens = metadata_value(metadata, "prompt_tokens")?.parse().ok()?;
+    let completion_tokens = metadata_value(metadata, "generated_tokens")?.parse().ok()?;
     Some(HostTokenUsage {
         prompt_tokens,
         completion_tokens,
@@ -237,7 +233,7 @@ fn decode_invocation_result(
     Ok(HostGeneration {
         text,
         usage: metadata_usage(&result.metadata),
-        finish_reason: metadata_value(&result.metadata, "tachyon.finish_reason"),
+        finish_reason: metadata_value(&result.metadata, "finish_reason"),
         refusal: metadata_value(&result.metadata, "tachyon.refusal"),
     })
 }
@@ -1250,7 +1246,7 @@ fn handle_chat_completions_streaming(
     // Read now rather than at the top: like `usage`, it is only known once the
     // stream has ended, which the loop above has just observed.
     let stream_metadata = token_stream.metadata();
-    let host_finish_reason = metadata_value(&stream_metadata, "tachyon.finish_reason");
+    let host_finish_reason = metadata_value(&stream_metadata, "finish_reason");
     let finish_reason =
         resolve_finish_reason(host_finish_reason.as_deref(), !tool_calls.is_empty());
     if !tool_calls.is_empty() {

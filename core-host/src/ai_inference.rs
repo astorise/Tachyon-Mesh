@@ -15,7 +15,7 @@ use crate::{IntegrityConfig, IntegrityInferenceComponentBinding, RouteQos};
 
 pub(crate) use magnetar_runtime::MAGNETAR_PATH_PREFIX;
 const COMPONENT_META_JSON: &str = ".tachyon-component.json";
-const MOCK_INFERENCE_RESPONSE: &str = "MOCK_LLM_RESPONSE";
+const MOCK_INFERENCE_RESPONSE: &str = "MOCK_COMPONENT_RESPONSE";
 
 pub(crate) fn binding_runs_upstream(binding: &IntegrityInferenceComponentBinding) -> bool {
     let _ = binding;
@@ -862,9 +862,16 @@ pub(crate) fn assert_no_credential_collisions<'a>(
     Ok(())
 }
 
-/// Best-effort token-accounting metadata for the `mock:` test/dev Component,
-/// in the same opaque wire shape a real Component's own execution (or its
-/// adapter) reports; see `magnetar_runtime::tachyon_wire_tags`.
+/// Test-only stand-in for what a real Component's own tags might look like,
+/// in the same opaque `Vec<(String, String)>` shape `MagnetarRuntime::
+/// generate`/`generate_streaming` hand back untouched from a real Magnetar
+/// Component. This is a test double's own fixture data, not core inference
+/// logic: it exists solely so integration tests exercising the `mock:`
+/// Component through the full host↔guest wire can observe non-empty,
+/// input-dependent tags without a real Component present. It is not
+/// reachable outside `cargo test` — see the `#[cfg(not(test))]` stub below,
+/// which is what every non-test build actually ships.
+#[cfg(test)]
 fn mock_component_metadata(prompt: &[u8], completion: &[u8]) -> Vec<(String, String)> {
     let prompt_tokens = String::from_utf8_lossy(prompt)
         .split_whitespace()
@@ -875,15 +882,18 @@ fn mock_component_metadata(prompt: &[u8], completion: &[u8]) -> Vec<(String, Str
         .count()
         .max(1);
     vec![
-        (
-            "tachyon.usage.prompt_tokens".to_owned(),
-            prompt_tokens.to_string(),
-        ),
-        (
-            "tachyon.usage.completion_tokens".to_owned(),
-            completion_tokens.to_string(),
-        ),
+        ("prompt_tokens".to_owned(), prompt_tokens.to_string()),
+        ("generated_tokens".to_owned(), completion_tokens.to_string()),
     ]
+}
+
+/// The `mock:` Component's real (non-test) behavior: a transport double with
+/// no metadata at all. Tachyon's core has no model to count tokens for and
+/// must not pretend otherwise, so a non-test build reports nothing rather
+/// than fabricating plausible-looking numbers.
+#[cfg(not(test))]
+fn mock_component_metadata(_prompt: &[u8], _completion: &[u8]) -> Vec<(String, String)> {
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -1607,7 +1617,7 @@ mod tests {
             "Tachyon must stop relaying after the downstream stream disconnects"
         );
         assert!(
-            metadata_u32(&outcome.metadata, "tachyon.usage.completion_tokens")
+            metadata_u32(&outcome.metadata, "generated_tokens")
                 .map(|completion_tokens| completion_tokens <= 1)
                 .unwrap_or(true),
             "cancelled Magnetar stream must not continue to produce the full request"
@@ -1882,7 +1892,7 @@ mod tests {
 
         assert!(!generation.payload.is_empty());
         assert_eq!(
-            metadata_u32(&generation.metadata, "tachyon.usage.completion_tokens"),
+            metadata_u32(&generation.metadata, "generated_tokens"),
             Some(16),
             "CUDA multi-token proof must generate exactly the requested token budget"
         );
