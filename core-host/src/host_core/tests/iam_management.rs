@@ -1,12 +1,12 @@
 use super::support_and_cache::*;
 use crate::auth::{AuditLogQuery, AuthClaims, IamUserSummaryResponse, UpdateUserRequest};
 use crate::iam_audit::{IamAuditEntry, MAX_TAIL};
+use axum::Extension;
 use axum::extract::{Path, Query, State};
 #[cfg(feature = "experimental")]
-use axum::http::header::AUTHORIZATION;
-#[cfg(feature = "experimental")]
 use axum::http::HeaderMap;
-use axum::Extension;
+#[cfg(feature = "experimental")]
+use axum::http::header::AUTHORIZATION;
 use std::sync::Arc;
 
 // =====================================================================
@@ -385,9 +385,11 @@ async fn audit_log_handler_records_outcomes_distinctly() {
     let outcomes: Vec<&str> = entries.iter().map(|e| e.outcome.as_str()).collect();
     assert!(outcomes.contains(&"ok"));
     assert!(outcomes.contains(&"error"));
-    assert!(entries
-        .iter()
-        .any(|entry| entry.detail.contains("self delete refused")));
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.detail.contains("self delete refused"))
+    );
 }
 
 // =====================================================================

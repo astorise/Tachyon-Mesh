@@ -184,8 +184,8 @@ fn extract_semver_version_strips_operators() {
 #[test]
 fn split_guest_stdout_removes_json_log_lines() {
     let stdout = Bytes::from(
-            "{\"level\":\"INFO\",\"target\":\"guest_example\",\"fields\":{\"message\":\"guest-example received a request payload\"}}\nFaaS received: Hello Lean FaaS!\n",
-        );
+        "{\"level\":\"INFO\",\"target\":\"guest_example\",\"fields\":{\"message\":\"guest-example received a request payload\"}}\nFaaS received: Hello Lean FaaS!\n",
+    );
 
     let response = split_guest_stdout("guest-example", stdout);
 
@@ -571,7 +571,11 @@ async fn bundle_handler_dependency_conflict_returns_428() {
     let config_json = serde_json::to_string(&next).expect("serializes");
     let yaml = format!(
         "configPayload: |\n{}\ndependencies:\n  mylib:\n    version: \"^2.3.0\"\n    source: \"./assets/mylib.wasm\"\n",
-        config_json.lines().map(|l| format!("  {l}")).collect::<Vec<_>>().join("\n")
+        config_json
+            .lines()
+            .map(|l| format!("  {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
     let bundle = tar_gz_bundle(&yaml);
 

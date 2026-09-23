@@ -827,10 +827,10 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
     // Checked here rather than at encode time so the refusal is a 400 the
     // client can act on, and so it lands before a model is loaded — a request
     // this route cannot honour should not cost a checkpoint residency.
-    if let Some(format) = request.response_format.as_ref() {
-        if let Err(detail) = format.schema_source() {
-            return Ok(openai_error_payload(400, detail, "invalid_request_error"));
-        }
+    if let Some(format) = request.response_format.as_ref()
+        && let Err(detail) = format.schema_source()
+    {
+        return Ok(openai_error_payload(400, detail, "invalid_request_error"));
     }
 
     let models = list_models()?;
@@ -857,7 +857,7 @@ fn handle_chat_completions(body: &[u8]) -> Result<(u16, Vec<u8>), String> {
                 404,
                 format!("model `{}` is unavailable: {error}", request.model),
                 "model_not_found",
-            ))
+            ));
         }
     };
 
@@ -1293,18 +1293,17 @@ fn handle_chat_completions_streaming(
         .stream_options
         .as_ref()
         .is_some_and(|options| options.include_usage)
+        && let Some(reported) = metadata_usage(&stream_metadata)
     {
-        if let Some(reported) = metadata_usage(&stream_metadata) {
-            let usage_chunk = ChatCompletionChunk {
-                id,
-                object: "chat.completion.chunk",
-                created,
-                model: request.model,
-                choices: Vec::new(),
-                usage: Some(Usage::from_host(reported)),
-            };
-            write_sse_chunk(&writer, &usage_chunk)?;
-        }
+        let usage_chunk = ChatCompletionChunk {
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model: request.model,
+            choices: Vec::new(),
+            usage: Some(Usage::from_host(reported)),
+        };
+        write_sse_chunk(&writer, &usage_chunk)?;
     }
 
     writer
@@ -1767,15 +1766,15 @@ impl StreamingContentGate {
         // be computed relative to, making `capped < local_emitted` below and
         // turning that slice into a start-past-end range.
         let search_ceiling_from = search_ceiling_from.max(local_emitted);
-        if self.drop_ceiling.is_none() && search_ceiling_from < raw_safe {
-            if let Some(at) = self.seen[search_ceiling_from..raw_safe]
+        if self.drop_ceiling.is_none()
+            && search_ceiling_from < raw_safe
+            && let Some(at) = self.seen[search_ceiling_from..raw_safe]
                 .find(|c: char| self.tag_start_chars.contains(&c))
-            {
-                let dc = self.dropped + search_ceiling_from + at;
-                self.drop_ceiling = Some(dc);
-                self.protected_until = dc + self.hold + 1;
-                self.scan_cursor = dc + 1;
-            }
+        {
+            let dc = self.dropped + search_ceiling_from + at;
+            self.drop_ceiling = Some(dc);
+            self.protected_until = dc + self.hold + 1;
+            self.scan_cursor = dc + 1;
         }
 
         // With any pin now resolved as far as this round's data allows, the
@@ -3257,8 +3256,7 @@ mod tests {
 
     #[test]
     fn qwen_parser_extracts_tagged_tool_call_and_preserves_text() {
-        let output =
-            "Let me check.\n<tool_call>{\"name\":\"search\",\"arguments\":{\"q\":\"mesh\"}}</tool_call>";
+        let output = "Let me check.\n<tool_call>{\"name\":\"search\",\"arguments\":{\"q\":\"mesh\"}}</tool_call>";
         let parsed = parse_tagged_tool_calls(output, &[("<tool_call>", "</tool_call>")])
             .expect("tagged tool call should parse");
 
@@ -4221,10 +4219,10 @@ mod tests {
         // long, call-free response would push it toward the retention cap.
         let mut gate = StreamingContentGate::new(ToolCallParser::Qwen);
         gate.push("fn f() -> Vec<T> { "); // a `<` that never becomes a tag
-                                          // The `<` starts out inside the trailing `hold` bytes, so it takes a
-                                          // little more content arriving after it before the gate's own
-                                          // opener-length lookahead resolves it as "definitely not a tag" and
-                                          // the drop logic notices it at all.
+        // The `<` starts out inside the trailing `hold` bytes, so it takes a
+        // little more content arriving after it before the gate's own
+        // opener-length lookahead resolves it as "definitely not a tag" and
+        // the drop logic notices it at all.
         gate.push("return Default::default();");
         assert!(
             gate.drop_ceiling.is_some(),

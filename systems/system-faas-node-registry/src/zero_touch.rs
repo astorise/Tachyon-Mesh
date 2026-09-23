@@ -4,7 +4,7 @@
 //! the trust decisions here so they are unit-testable. Signature verification
 //! itself lives in [`crate::jwt`].
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
 
 /// Decode the JWT header and return its `kid` (key id), if present.

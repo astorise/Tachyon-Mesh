@@ -1,7 +1,7 @@
 //! Pure-Rust (wasm-safe) RS256 verification for machine-identity enrollment
 //! tokens. No `ring`/`jsonwebtoken` (not wasm-friendly).
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::signature::Verifier;
 use rsa::{BigUint, RsaPublicKey};
@@ -51,11 +51,11 @@ pub fn split_jwt(token: &str) -> Result<(String, String, Vec<u8>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsa::RsaPrivateKey;
     use rsa::pkcs1v15::SigningKey as RsaSigningKey;
     use rsa::rand_core::OsRng;
     use rsa::signature::{SignatureEncoding, Signer};
     use rsa::traits::PublicKeyParts;
-    use rsa::RsaPrivateKey;
 
     #[test]
     fn split_rejects_non_compact_tokens() {

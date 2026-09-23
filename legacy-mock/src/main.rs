@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use axum::{
+    Router,
     extract::State,
     http::StatusCode,
     routing::{get, post},
-    Router,
 };
 use reqwest::Client;
 use std::sync::Once;

@@ -882,12 +882,11 @@ pub(crate) const TACHYON_TRACEPARENT_ENV: &str = "TRACEPARENT";
 /// Context spec, otherwise mint a fresh one via the existing `generate_traceparent`
 /// so every request that reaches the host gets a globally identifiable trace id.
 pub(crate) fn trace_context_for_request(headers: &HeaderMap) -> String {
-    if let Some(value) = headers.get("traceparent") {
-        if let Ok(s) = value.to_str() {
-            if is_valid_w3c_traceparent(s) {
-                return s.to_owned();
-            }
-        }
+    if let Some(value) = headers.get("traceparent")
+        && let Ok(s) = value.to_str()
+        && is_valid_w3c_traceparent(s)
+    {
+        return s.to_owned();
     }
     generate_traceparent()
 }
@@ -2541,7 +2540,7 @@ impl GuestStreamSink<'_> {
             match sender.try_send(payload) {
                 Ok(()) => return SlotSend::Sent,
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
-                    return SlotSend::Disconnected
+                    return SlotSend::Disconnected;
                 }
                 Err(std::sync::mpsc::TrySendError::Full(returned)) => {
                     if Instant::now() >= deadline {
@@ -2763,10 +2762,12 @@ impl accelerator_component_bindings::tachyon::accelerator::cpu::HostByteStream
                     .stalled
                     .swap(false, std::sync::atomic::Ordering::AcqRel)
                 {
-                    return Err(wit_invocation_error(ai_inference::ComponentInvocationError::local(
-                        "the client stopped reading this stream for longer than the backpressure \
+                    return Err(wit_invocation_error(
+                        ai_inference::ComponentInvocationError::local(
+                            "the client stopped reading this stream for longer than the backpressure \
                          limit allows, so generation was cancelled",
-                    )));
+                        ),
+                    ));
                 }
                 stream.saw_eof = true;
                 Ok(None)
@@ -3556,18 +3557,17 @@ impl background_component_bindings::tachyon::mesh::outbound_http::Host for Compo
             outbound_target_host(&url).as_deref(),
         );
         #[cfg(unix)]
-        if resolved_target.kind.is_internal() {
-            if let Some(context) = self.local_mesh_dispatch.as_ref() {
-                if let Some(response) = send_blocking_uds_fast_path_request(
-                    context.state.uds_fast_path.as_ref(),
-                    &url,
-                    &method,
-                    &headers,
-                    &body,
-                ) {
-                    return Ok(response);
-                }
-            }
+        if resolved_target.kind.is_internal()
+            && let Some(context) = self.local_mesh_dispatch.as_ref()
+            && let Some(response) = send_blocking_uds_fast_path_request(
+                context.state.uds_fast_path.as_ref(),
+                &url,
+                &method,
+                &headers,
+                &body,
+            )
+        {
+            return Ok(response);
         }
 
         let mut request = self.outbound_http_client.request(method, &url);

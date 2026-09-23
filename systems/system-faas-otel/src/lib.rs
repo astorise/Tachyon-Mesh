@@ -10,7 +10,7 @@ mod bindings {
 }
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{fs::OpenOptions, io::Write};
 
 const OTEL_OUTPUT_PATH: &str = "/app/data/otel-spans.ndjson";
@@ -197,8 +197,10 @@ mod tests {
 
         let normalized = normalize_telemetry_batch(payload).expect("payload should normalize");
 
-        assert!(String::from_utf8(normalized)
-            .expect("span should be utf-8")
-            .contains("\"status\":204"));
+        assert!(
+            String::from_utf8(normalized)
+                .expect("span should be utf-8")
+                .contains("\"status\":204")
+        );
     }
 }

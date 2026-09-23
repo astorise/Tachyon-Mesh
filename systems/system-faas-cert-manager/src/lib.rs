@@ -275,9 +275,9 @@ fn issue_leaf_certificate(domain: &str) -> Result<CertificateBundle, String> {
 /// unit-testable on the host target. Mints a cluster-CA-signed leaf for
 /// `domain` using `ca_signing_key` as the issuing CA.
 mod cert {
-    use super::{now_seconds, CertificateBundle, SigningKey};
-    use const_oid::db::rfc5280::ID_KP_SERVER_AUTH;
+    use super::{CertificateBundle, SigningKey, now_seconds};
     use const_oid::AssociatedOid;
+    use const_oid::db::rfc5280::ID_KP_SERVER_AUTH;
     use der::asn1::{GeneralizedTime, Ia5String, OctetString, UtcTime};
     use der::flagset::FlagSet;
     use der::{Decode, Encode, EncodePem};
@@ -286,7 +286,7 @@ mod cert {
     use spki::{EncodePublicKey, SubjectPublicKeyInfoOwned};
     use std::str::FromStr;
     use std::time::Duration;
-    use x509_cert::builder::{profile::BuilderProfile, Builder, CertificateBuilder};
+    use x509_cert::builder::{Builder, CertificateBuilder, profile::BuilderProfile};
     use x509_cert::certificate::{Certificate, TbsCertificate};
     use x509_cert::ext::pkix::name::GeneralName;
     use x509_cert::ext::pkix::{
@@ -627,9 +627,9 @@ mod tests {
         let _guard = CA_SEED_ENV_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        std::env::set_var(CA_SEED_ENV, TEST_CA_SEED_HEX);
+        unsafe { std::env::set_var(CA_SEED_ENV, TEST_CA_SEED_HEX) };
         let bundle = issue_leaf_certificate(domain).expect("leaf certificate should be issued");
-        std::env::remove_var(CA_SEED_ENV);
+        unsafe { std::env::remove_var(CA_SEED_ENV) };
         bundle
     }
 
@@ -732,7 +732,7 @@ mod tests {
     /// loadable by the host TLS runtime.
     #[test]
     fn bundle_loads_into_a_rustls_server_config() {
-        use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
         let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -790,7 +790,7 @@ mod tests {
 
     /// Helper: decode the first PEM certificate (the leaf) into DER.
     fn first_certificate_der(pem: &str) -> Vec<u8> {
-        use rustls::pki_types::{pem::PemObject, CertificateDer};
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
 
         let mut certs = CertificateDer::pem_slice_iter(pem.as_bytes());
         let first = certs

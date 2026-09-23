@@ -21,13 +21,12 @@ use std::{
 };
 pub(super) use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub(super) use tokio_rustls::{
+    TlsConnector,
     rustls::{
-        self,
+        self, DigitallySignedStruct, Error as RustlsError, SignatureScheme,
         client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
         pki_types::{CertificateDer, ServerName, UnixTime},
-        DigitallySignedStruct, Error as RustlsError, SignatureScheme,
     },
-    TlsConnector,
 };
 pub(super) use tower::util::ServiceExt;
 

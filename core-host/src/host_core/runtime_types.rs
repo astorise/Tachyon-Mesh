@@ -835,10 +835,10 @@ impl hyper::body::Body for GuestResponseBody {
         mut self: Pin<&mut Self>,
         _cx: &mut TaskContext<'_>,
     ) -> Poll<Option<std::result::Result<Frame<Self::Data>, Self::Error>>> {
-        if let Some(data) = self.data.take() {
-            if !data.is_empty() {
-                return Poll::Ready(Some(Ok(Frame::data(data))));
-            }
+        if let Some(data) = self.data.take()
+            && !data.is_empty()
+        {
+            return Poll::Ready(Some(Ok(Frame::data(data))));
         }
 
         if let Some(trailers) = self.trailers.take() {

@@ -86,31 +86,37 @@ mod tests {
 
     #[test]
     fn admin_role_bypasses_scope_checks() {
-        assert!(Component::evaluate_policy(
-            identity(&["admin"], &[]),
-            "POST".to_owned(),
-            "/admin/security/pats".to_owned()
-        )
-        .expect("policy should evaluate"));
+        assert!(
+            Component::evaluate_policy(
+                identity(&["admin"], &[]),
+                "POST".to_owned(),
+                "/admin/security/pats".to_owned()
+            )
+            .expect("policy should evaluate")
+        );
     }
 
     #[test]
     fn scoped_pat_can_upload_assets() {
-        assert!(Component::evaluate_policy(
-            identity(&[], &["deploy:wasm"]),
-            "POST".to_owned(),
-            "/admin/assets".to_owned()
-        )
-        .expect("policy should evaluate"));
+        assert!(
+            Component::evaluate_policy(
+                identity(&[], &["deploy:wasm"]),
+                "POST".to_owned(),
+                "/admin/assets".to_owned()
+            )
+            .expect("policy should evaluate")
+        );
     }
 
     #[test]
     fn policy_denies_unknown_admin_routes_without_admin_role() {
-        assert!(!Component::evaluate_policy(
-            identity(&[], &["read:nodes"]),
-            "GET".to_owned(),
-            "/admin/unknown".to_owned()
-        )
-        .expect("policy should evaluate"));
+        assert!(
+            !Component::evaluate_policy(
+                identity(&[], &["read:nodes"]),
+                "GET".to_owned(),
+                "/admin/unknown".to_owned()
+            )
+            .expect("policy should evaluate")
+        );
     }
 }

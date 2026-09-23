@@ -4,11 +4,11 @@ use crate::*;
 #[tokio::test(flavor = "multi_thread")]
 async fn control_plane_gossip_redirects_requests_to_a_healthier_peer() {
     use axum::{
+        Json, Router,
         body::Bytes as AxumBytes,
         extract::State,
         response::IntoResponse,
         routing::{get, post},
-        Json, Router,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -171,11 +171,11 @@ async fn control_plane_gossip_redirects_requests_to_a_healthier_peer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn model_aware_gossip_prefers_peer_with_matching_hot_model() {
     use axum::{
+        Json, Router,
         body::Bytes as AxumBytes,
         extract::State,
         response::IntoResponse,
         routing::{get, post},
-        Json, Router,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -390,11 +390,11 @@ async fn model_aware_gossip_prefers_peer_with_matching_hot_model() {
 #[tokio::test(flavor = "multi_thread")]
 async fn model_aware_gossip_keeps_request_local_when_no_peer_has_hot_model() {
     use axum::{
+        Json, Router,
         body::Bytes as AxumBytes,
         extract::State,
         response::IntoResponse,
         routing::{get, post},
-        Json, Router,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -555,7 +555,7 @@ async fn model_aware_gossip_keeps_request_local_when_no_peer_has_hot_model() {
 #[tokio::test(flavor = "multi_thread")]
 async fn capability_routing_skips_override_candidates_without_required_capabilities() {
     use axum::{
-        body::Bytes as AxumBytes, extract::State, response::IntoResponse, routing::post, Router,
+        Router, body::Bytes as AxumBytes, extract::State, response::IntoResponse, routing::post,
     };
     use std::sync::Mutex;
 
@@ -736,7 +736,7 @@ async fn capability_routing_returns_503_when_local_and_mesh_lack_requirements() 
 #[tokio::test(flavor = "multi_thread")]
 async fn mesh_qos_router_forwards_realtime_gpu_requests_to_prefixed_override() {
     use axum::{
-        body::Bytes as AxumBytes, extract::State, response::IntoResponse, routing::post, Router,
+        Router, body::Bytes as AxumBytes, extract::State, response::IntoResponse, routing::post,
     };
     use std::sync::Mutex;
 
@@ -850,7 +850,7 @@ async fn mesh_qos_router_forwards_realtime_gpu_requests_to_prefixed_override() {
 #[tokio::test(flavor = "multi_thread")]
 async fn mesh_qos_router_keeps_batch_gpu_requests_local_below_remote_threshold() {
     use axum::{
-        body::Bytes as AxumBytes, extract::State, response::IntoResponse, routing::post, Router,
+        Router, body::Bytes as AxumBytes, extract::State, response::IntoResponse, routing::post,
     };
     use std::sync::Mutex;
 

@@ -16,7 +16,7 @@ fn main() {
         format!(
             "/// WASM custom section — embeds the crate version for offline inspection.\n\
              #[cfg(target_arch = \"wasm32\")]\n\
-             #[link_section = \"tachyon.version\"]\n\
+             #[unsafe(link_section = \"tachyon.version\")]\n\
              #[used]\n\
              static _TACHYON_VERSION: [u8; {n}] = [{bytes_str}];\n"
         ),

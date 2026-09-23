@@ -1,6 +1,6 @@
 use wasmtime::{
-    component::{Component, Linker as ComponentLinker},
     Engine, Store,
+    component::{Component, Linker as ComponentLinker},
 };
 
 use crate::host_core::domain_types::{IntegrityConfig, IntegrityRoute};

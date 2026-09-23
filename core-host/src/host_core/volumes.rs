@@ -328,7 +328,7 @@ pub(crate) fn sweep_ttl_managed_path(managed_path: &TtlManagedPath) -> Result<()
                     "failed to read TTL-managed path `{}`",
                     managed_path.host_path.display()
                 )
-            })
+            });
         }
     };
 
@@ -356,7 +356,7 @@ pub(crate) fn sweep_ttl_managed_path(managed_path: &TtlManagedPath) -> Result<()
                         "failed to read metadata for TTL-managed entry `{}`",
                         entry_path.display()
                     )
-                })
+                });
             }
         };
         let modified = match metadata.modified() {
@@ -375,7 +375,7 @@ pub(crate) fn sweep_ttl_managed_path(managed_path: &TtlManagedPath) -> Result<()
                         "failed to read modified time for TTL-managed entry `{}`",
                         entry_path.display()
                     )
-                })
+                });
             }
         };
 
@@ -944,7 +944,7 @@ async fn download_s3_prefix_to_dir(
     dest: &Path,
 ) -> anyhow::Result<std::collections::HashMap<String, String>> {
     use futures::StreamExt as _;
-    use object_store::{path::Path as OsPath, ObjectStore, ObjectStoreExt};
+    use object_store::{ObjectStore, ObjectStoreExt, path::Path as OsPath};
 
     let store = build_s3_store(bucket)?;
     let prefix_path = if prefix.is_empty() {
@@ -982,7 +982,7 @@ async fn download_s3_prefix_to_dir(
 
 #[cfg(feature = "s3-persistence")]
 async fn upload_dir_to_s3_prefix(dir: &Path, bucket: &str, prefix: &str) -> anyhow::Result<()> {
-    use object_store::{path::Path as OsPath, ObjectStoreExt};
+    use object_store::{ObjectStoreExt, path::Path as OsPath};
 
     let store = build_s3_store(bucket)?;
     let mut stack = vec![dir.to_path_buf()];
@@ -1026,7 +1026,7 @@ async fn upload_dir_to_s3_prefix_with_etag(
     prefix: &str,
     initial_etags: &std::collections::HashMap<String, String>,
 ) -> anyhow::Result<()> {
-    use object_store::{path::Path as OsPath, ObjectStore, PutMode, PutOptions};
+    use object_store::{ObjectStore, PutMode, PutOptions, path::Path as OsPath};
 
     let store = build_s3_store(bucket)?;
     let mut stack = vec![dir.to_path_buf()];
@@ -1080,7 +1080,9 @@ async fn upload_dir_to_s3_prefix_with_etag(
 }
 
 #[cfg(feature = "s3-persistence")]
-pub(crate) fn build_s3_store(bucket: &str) -> anyhow::Result<impl object_store::ObjectStore> {
+pub(crate) fn build_s3_store(
+    bucket: &str,
+) -> anyhow::Result<impl object_store::ObjectStore + use<>> {
     use object_store::aws::AmazonS3Builder;
     let mut builder = AmazonS3Builder::new()
         .with_bucket_name(bucket)

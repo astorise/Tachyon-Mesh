@@ -1,9 +1,9 @@
 #[cfg(not(target_arch = "wasm32"))]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn faas_entry() {}
 
 #[cfg(target_arch = "wasm32")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn faas_entry() {
     let mut buffer = [0_u8; 1024];
 
@@ -33,7 +33,7 @@ struct Ciovec {
 
 #[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "wasi_snapshot_preview1")]
-extern "C" {
+unsafe extern "C" {
     fn fd_read(fd: u32, iovs: *const Iovec, iovs_len: usize, nread: *mut usize) -> u16;
     fn fd_write(fd: u32, iovs: *const Ciovec, iovs_len: usize, nwritten: *mut usize) -> u16;
 }

@@ -589,7 +589,7 @@ async fn local_mesh_dispatch_yields_to_transport_when_route_is_saturated() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn local_mesh_dispatch_overflows_to_peer_when_saturated_and_overflow_allowed() {
-    use axum::{body::Bytes as AxumBytes, routing::any, Router};
+    use axum::{Router, body::Bytes as AxumBytes, routing::any};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -710,7 +710,7 @@ async fn local_mesh_dispatch_overflows_to_peer_when_saturated_and_overflow_allow
 // status — a guest would see a corrupted "successful" response.
 #[tokio::test]
 async fn local_mesh_dispatch_buffers_ram_pressure_mesh_retry_overflow() {
-    use axum::{body::Bytes as AxumBytes, routing::any, Router};
+    use axum::{Router, body::Bytes as AxumBytes, routing::any};
 
     let peer_app = Router::new().route(
         DEFAULT_ROUTE,
@@ -796,7 +796,7 @@ async fn local_mesh_dispatch_buffers_ram_pressure_mesh_retry_overflow() {
 // to the client.
 #[tokio::test]
 async fn forward_as_streaming_response_cuts_off_a_peer_that_stalls_mid_body() {
-    use axum::{body::Body as AxumBody, response::Response as AxumResponse, routing::any, Router};
+    use axum::{Router, body::Body as AxumBody, response::Response as AxumResponse, routing::any};
 
     async fn stalls_after_first_chunk() -> AxumResponse {
         let (sender, receiver) = mpsc::channel::<std::result::Result<Bytes, StreamForwardError>>(1);
@@ -935,7 +935,8 @@ async fn local_mesh_dispatch_honors_bench_force_transport_override() {
     let state = build_test_state(config, telemetry::init_test_telemetry());
     let runtime = state.runtime.load_full();
 
-    std::env::set_var(FORCE_MESH_TRANSPORT_ENV, "1");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var(FORCE_MESH_TRANSPORT_ENV, "1") };
     let before = mesh_dispatch_total_for(MeshDispatchMode::InProcess, MeshDispatchReason::Remote);
     let response = try_dispatch_local_mesh_request(
         &state,
@@ -948,7 +949,8 @@ async fn local_mesh_dispatch_honors_bench_force_transport_override() {
         HopLimit(DEFAULT_HOP_LIMIT),
     )
     .await;
-    std::env::remove_var(FORCE_MESH_TRANSPORT_ENV);
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var(FORCE_MESH_TRANSPORT_ENV) };
     let response = response.expect("forced-transport dispatch should not error");
 
     assert!(matches!(

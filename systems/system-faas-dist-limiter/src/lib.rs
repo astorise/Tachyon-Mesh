@@ -52,7 +52,7 @@ fn check(body: Vec<u8>) -> bindings::exports::tachyon::mesh::handler::Response {
             return response(
                 400,
                 format!("invalid limiter request: {error}").into_bytes(),
-            )
+            );
         }
     };
     let node_id = env_or_default(NODE_ID_ENV, "local");

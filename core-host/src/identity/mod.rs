@@ -207,10 +207,11 @@ impl HostIdentity {
             .route_token_cache
             .lock()
             .map_err(|_| anyhow::anyhow!("host identity route token cache is poisoned"))?;
-        if let Some(cached) = cache.get(key) {
-            if now <= cached.refresh_after && now <= cached.expires_at {
-                return Ok(Some(cached.token.clone()));
-            }
+        if let Some(cached) = cache.get(key)
+            && now <= cached.refresh_after
+            && now <= cached.expires_at
+        {
+            return Ok(Some(cached.token.clone()));
         }
         cache.remove(key);
         Ok(None)

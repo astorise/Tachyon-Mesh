@@ -37,16 +37,16 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
         }
 
         let hash = sha256_hash(&req.body);
-        if let Some(expected_hash) = header_value(&req.headers, EXPECTED_HASH_HEADER) {
-            if expected_hash.trim() != hash {
-                return response(
-                    400,
-                    format!(
-                        "asset checksum mismatch: expected `{}`, computed `{hash}`",
-                        expected_hash.trim()
-                    ),
-                );
-            }
+        if let Some(expected_hash) = header_value(&req.headers, EXPECTED_HASH_HEADER)
+            && expected_hash.trim() != hash
+        {
+            return response(
+                400,
+                format!(
+                    "asset checksum mismatch: expected `{}`, computed `{hash}`",
+                    expected_hash.trim()
+                ),
+            );
         }
 
         if let Err(error) = persist_asset(&hash, &req.body) {

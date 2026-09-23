@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::{
     body::Bytes,
     http::{HeaderMap, HeaderValue, StatusCode},
@@ -8,16 +8,15 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 use tokio::sync::Mutex as TokioMutex;
 use tokio_rustls::rustls::{
-    self,
+    self, ServerConfig,
     crypto::CryptoProvider,
-    pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
-    ServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
 };
 
 pub(crate) fn ensure_crypto_provider() {

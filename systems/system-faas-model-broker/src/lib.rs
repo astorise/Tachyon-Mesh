@@ -550,7 +550,7 @@ impl AliasCommitLock {
                 Err(error) => {
                     return Err(format!(
                         "failed to take the commit lock for model `{alias}`: {error}"
-                    ))
+                    ));
                 }
             }
         }
@@ -836,7 +836,7 @@ fn sanitize_relative(path: &Path) -> Result<PathBuf, String> {
                 return Err(format!(
                     "model archive contains an unsafe path `{}`",
                     path.display()
-                ))
+                ));
             }
         }
     }

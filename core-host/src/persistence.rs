@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use futures::StreamExt as _;
 use object_store::{
-    aws::AmazonS3Builder, path::Path as OsPath, ObjectStore, ObjectStoreExt, PutPayload,
+    ObjectStore, ObjectStoreExt, PutPayload, aws::AmazonS3Builder, path::Path as OsPath,
 };
 use std::{
     path::{Path, PathBuf},
@@ -293,7 +293,8 @@ mod tests {
 
     #[test]
     fn from_env_returns_none_when_bucket_absent() {
-        std::env::remove_var(S3_BUCKET_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(S3_BUCKET_ENV) };
         assert!(S3PersistenceConfig::from_env().is_none());
     }
 

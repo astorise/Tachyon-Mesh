@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::SysRng;
 use rand_core::UnwrapErr;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -10,8 +10,8 @@ use std::{
     net::IpAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
         OnceLock, RwLock,
+        atomic::{AtomicU64, Ordering},
     },
 };
 use sysinfo::System;
@@ -763,10 +763,10 @@ pub fn workspace_root() -> PathBuf {
 
     // 2. Directory of the running executable (works for bare binary invocations
     //    and for packaged Tauri apps when core-host writes next to itself).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.to_path_buf());
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.to_path_buf());
     }
 
     // 3. Compile-time workspace root (correct for `cargo run` / dev builds).
@@ -1332,15 +1332,15 @@ pub async fn get_topology_graph() -> Result<TopologyGraphSpec> {
         });
 
         // Edge: kv-cache depends on its bound LLM node.
-        if !model_ref.is_empty() {
-            if let Some(llm_id) = path_to_id.values().find(|v| v.contains(model_ref)) {
-                edge_counter += 1;
-                edges.push(TopologyEdgeSpec {
-                    id: format!("e{edge_counter}"),
-                    from: id.clone(),
-                    to: llm_id.clone(),
-                });
-            }
+        if !model_ref.is_empty()
+            && let Some(llm_id) = path_to_id.values().find(|v| v.contains(model_ref))
+        {
+            edge_counter += 1;
+            edges.push(TopologyEdgeSpec {
+                id: format!("e{edge_counter}"),
+                from: id.clone(),
+                to: llm_id.clone(),
+            });
         }
     }
 
@@ -1830,7 +1830,7 @@ fn build_deployment_bundle(
     manifest: &IntegrityManifest,
     dependencies: &[BundleDependency],
 ) -> Result<Vec<u8>> {
-    use flate2::{write::GzEncoder, Compression};
+    use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
     use tar::{Builder, Header};
 
@@ -2674,10 +2674,10 @@ pub async fn detach_s3_volume(route_path: &str, guest_path: &str) -> Result<()> 
 /// Fetch the live IntegrityConfig payload as a mutable JSON Value.
 /// Falls back to the local integrity.lock file when not connected.
 async fn load_live_config_payload() -> Result<serde_json::Value> {
-    if current_connection().is_some() {
-        if let Ok(config) = get_admin_json::<serde_json::Value>(ADMIN_MANIFEST_PATH).await {
-            return Ok(config);
-        }
+    if current_connection().is_some()
+        && let Ok(config) = get_admin_json::<serde_json::Value>(ADMIN_MANIFEST_PATH).await
+    {
+        return Ok(config);
     }
 
     // Fall back to local integrity.lock (wrapper format: { config_payload, public_key, signature })
@@ -2852,7 +2852,10 @@ pub fn recommend_concurrency_policy(
             ("mesh_leader", "none"),
             "Batch jobs typically run on a leader node with one invocation at a time per node.",
             "low",
-            vec!["Higher latency when bursts queue", "Predictable resource usage"],
+            vec![
+                "Higher latency when bursts queue",
+                "Predictable resource usage",
+            ],
         ),
         "interactive" => (
             ("unrestricted", "queue", None),
@@ -5020,10 +5023,10 @@ mod tests {
         let second_archive = model_archive_bytes(&dir);
         assert_eq!(sha256_hash(&archive), sha256_hash(&second_archive));
         assert_eq!(manifest.len(), 2);
-        assert!(manifest
-            .iter()
-            .any(|file| file.path == "model.safetensors"
-                && file.sha256 == sha256_hash(b"\x00\x01\x02")));
+        assert!(
+            manifest.iter().any(|file| file.path == "model.safetensors"
+                && file.sha256 == sha256_hash(b"\x00\x01\x02"))
+        );
         let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(&archive[..]));
         let mut names: Vec<String> = tar
             .entries()
@@ -5226,19 +5229,19 @@ mod tests {
         // No other test in this crate reads or writes TACHYON_INSECURE_TLS,
         // so no cross-test synchronization is needed for this process-global
         // env var.
-        std::env::remove_var("TACHYON_INSECURE_TLS");
+        unsafe { std::env::remove_var("TACHYON_INSECURE_TLS") };
         assert!(!insecure_tls_override_is_set());
 
-        std::env::set_var("TACHYON_INSECURE_TLS", "1");
+        unsafe { std::env::set_var("TACHYON_INSECURE_TLS", "1") };
         assert!(insecure_tls_override_is_set());
 
-        std::env::set_var("TACHYON_INSECURE_TLS", "true");
+        unsafe { std::env::set_var("TACHYON_INSECURE_TLS", "true") };
         assert!(insecure_tls_override_is_set());
 
-        std::env::set_var("TACHYON_INSECURE_TLS", "0");
+        unsafe { std::env::set_var("TACHYON_INSECURE_TLS", "0") };
         assert!(!insecure_tls_override_is_set());
 
-        std::env::remove_var("TACHYON_INSECURE_TLS");
+        unsafe { std::env::remove_var("TACHYON_INSECURE_TLS") };
     }
 
     #[test]

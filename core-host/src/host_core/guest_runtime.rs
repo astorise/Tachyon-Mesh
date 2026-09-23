@@ -188,13 +188,13 @@ pub(crate) fn load_component_with_pool(
     let modified = metadata.modified().ok();
     let len = metadata.len();
 
-    if let Some(cache) = component_cache {
-        if let Some(cached) = cache.get(&normalized) {
-            if cached.modified == modified && cached.len == len {
-                return Ok(cached.component);
-            }
-            cache.invalidate(&normalized);
+    if let Some(cache) = component_cache
+        && let Some(cached) = cache.get(&normalized)
+    {
+        if cached.modified == modified && cached.len == len {
+            return Ok(cached.component);
         }
+        cache.invalidate(&normalized);
     }
 
     let component = Arc::new(load_component_with_core_store(
@@ -244,23 +244,23 @@ fn component_instance_pre(
         len,
     };
 
-    if !env_flag(DISABLE_INSTANCE_PRE_CACHE_ENV) {
-        if let Some(cache) = &execution.component_instance_pre_cache {
-            if let Some(cached) = cache.get(&key) {
-                return Ok(cached);
-            }
-            let pre = Arc::new(linker.instantiate_pre(component).map_err(|error| {
-                guest_execution_error(
-                    error,
-                    format!(
-                        "failed to pre-instantiate guest component from {}",
-                        component_path.display()
-                    ),
-                )
-            })?);
-            cache.insert(key, Arc::clone(&pre));
-            return Ok(pre);
+    if !env_flag(DISABLE_INSTANCE_PRE_CACHE_ENV)
+        && let Some(cache) = &execution.component_instance_pre_cache
+    {
+        if let Some(cached) = cache.get(&key) {
+            return Ok(cached);
         }
+        let pre = Arc::new(linker.instantiate_pre(component).map_err(|error| {
+            guest_execution_error(
+                error,
+                format!(
+                    "failed to pre-instantiate guest component from {}",
+                    component_path.display()
+                ),
+            )
+        })?);
+        cache.insert(key, Arc::clone(&pre));
+        return Ok(pre);
     }
 
     Ok(Arc::new(linker.instantiate_pre(component).map_err(
@@ -290,18 +290,19 @@ fn legacy_instance_pre(
         len,
     };
 
-    if !env_flag(DISABLE_INSTANCE_PRE_CACHE_ENV) {
-        if let Some(cache) = &execution.legacy_instance_pre_cache {
-            if let Some(cached) = cache.get(&key) {
-                return Ok(cached);
-            }
-            let linker = build_linker(engine)?;
-            let pre = Arc::new(linker.instantiate_pre(module).map_err(|error| {
+    if !env_flag(DISABLE_INSTANCE_PRE_CACHE_ENV)
+        && let Some(cache) = &execution.legacy_instance_pre_cache
+    {
+        if let Some(cached) = cache.get(&key) {
+            return Ok(cached);
+        }
+        let linker = build_linker(engine)?;
+        let pre =
+            Arc::new(linker.instantiate_pre(module).map_err(|error| {
                 guest_execution_error(error, "failed to pre-link guest module")
             })?);
-            cache.insert(key, Arc::clone(&pre));
-            return Ok(pre);
-        }
+        cache.insert(key, Arc::clone(&pre));
+        return Ok(pre);
     }
 
     let linker = build_linker(engine)?;
@@ -345,12 +346,12 @@ pub(crate) fn resolve_legacy_guest_module_with_pool(
         }
 
         let normalized = normalize_path(candidate.clone());
-        if let Some(pool) = instance_pool {
-            if let Some(cached) = pool.get(&normalized) {
-                // `Module` is internally Arc-backed; cloning the `Module` value out
-                // of the `Arc<Module>` returned by the pool is cheap.
-                return Ok((normalized, (*cached).clone()));
-            }
+        if let Some(pool) = instance_pool
+            && let Some(cached) = pool.get(&normalized)
+        {
+            // `Module` is internally Arc-backed; cloning the `Module` value out
+            // of the `Arc<Module>` returned by the pool is cheap.
+            return Ok((normalized, (*cached).clone()));
         }
 
         match load_module_with_core_store(engine, &candidate, core_store, cache_scope) {
@@ -1811,13 +1812,11 @@ impl BackgroundTickRunner {
             .set_fuel(config.guest_fuel_budget)
             .map_err(|error| guest_execution_error(error, "failed to inject guest fuel budget"))?;
 
-        let bindings = if let Ok(bindings) =
-            control_plane_component_bindings::ControlPlaneFaas::instantiate(
-                &mut store, &component, &linker,
-            ) {
-            BackgroundGuestBindings::ControlPlane(bindings)
-        } else {
-            BackgroundGuestBindings::Background(
+        let bindings = match control_plane_component_bindings::ControlPlaneFaas::instantiate(
+            &mut store, &component, &linker,
+        ) {
+            Ok(bindings) => BackgroundGuestBindings::ControlPlane(bindings),
+            _ => BackgroundGuestBindings::Background(
                 background_component_bindings::BackgroundSystemFaas::instantiate(
                     &mut store, &component, &linker,
                 )
@@ -1830,7 +1829,7 @@ impl BackgroundTickRunner {
                         ),
                     )
                 })?,
-            )
+            ),
         };
 
         Ok(Self {

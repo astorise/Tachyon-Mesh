@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     env,
@@ -484,10 +484,10 @@ fn load_required_token() -> Result<String> {
                 return Ok(token);
             }
         }
-        if let Some(token) = arg.strip_prefix("--token=") {
-            if !token.trim().is_empty() {
-                return Ok(token.to_owned());
-            }
+        if let Some(token) = arg.strip_prefix("--token=")
+            && !token.trim().is_empty()
+        {
+            return Ok(token.to_owned());
         }
     }
 
@@ -546,11 +546,11 @@ async fn handle_line(line: &str, context: &McpContext) -> Result<Option<Value>> 
         }
     }
 
-    if method != "initialize" {
-        if let Err(error) = validate_request_auth(context).await {
-            let rpc_err = JsonRpcError::cluster_unreachable(&error.to_string());
-            return Ok(Some(json_rpc_error_response(id, &rpc_err)));
-        }
+    if method != "initialize"
+        && let Err(error) = validate_request_auth(context).await
+    {
+        let rpc_err = JsonRpcError::cluster_unreachable(&error.to_string());
+        return Ok(Some(json_rpc_error_response(id, &rpc_err)));
     }
 
     let result = match method {
@@ -2359,12 +2359,14 @@ mod tests {
 
     #[test]
     fn validate_manifest_patch_rejects_structural_fields() {
-        assert!(validate_manifest_patch(&json!({
-            "enrollment": {"mode": "both"},
-            "require_scopes": true,
-            "kv_caches": [{"model": "llama-3"}],
-        }))
-        .is_ok());
+        assert!(
+            validate_manifest_patch(&json!({
+                "enrollment": {"mode": "both"},
+                "require_scopes": true,
+                "kv_caches": [{"model": "llama-3"}],
+            }))
+            .is_ok()
+        );
         assert!(validate_manifest_patch(&json!({"routes": []})).is_err());
         assert!(validate_manifest_patch(&json!({"routes": null})).is_err());
         assert!(validate_manifest_patch(&json!({"config_version": 2})).is_err());
@@ -2380,11 +2382,13 @@ mod tests {
             missing_required_args("tachyon_patch_manifest", Some(&json!({}))),
             Some(vec!["patch".to_owned()])
         );
-        assert!(missing_required_args(
-            "tachyon_patch_manifest",
-            Some(&json!({"patch": {"require_scopes": true}}))
-        )
-        .is_none());
+        assert!(
+            missing_required_args(
+                "tachyon_patch_manifest",
+                Some(&json!({"patch": {"require_scopes": true}}))
+            )
+            .is_none()
+        );
 
         let spec = rate_limit_spec("tachyon_patch_manifest")
             .expect("patch_manifest must have a rate limit");
@@ -2486,11 +2490,10 @@ mod tests {
             missing_required_args("tachyon_kv_cache_flush", Some(&json!({}))),
             Some(vec!["model".to_owned()])
         );
-        assert!(missing_required_args(
-            "tachyon_kv_cache_stats",
-            Some(&json!({"model": "llama-3"}))
-        )
-        .is_none());
+        assert!(
+            missing_required_args("tachyon_kv_cache_stats", Some(&json!({"model": "llama-3"})))
+                .is_none()
+        );
     }
 
     #[test]
@@ -2556,11 +2559,13 @@ mod tests {
                 "top_k".to_owned()
             ])
         );
-        assert!(missing_required_args(
-            "tachyon_vector_search",
-            Some(&json!({"query": "q", "index": "tenant-kb", "top_k": 3}))
-        )
-        .is_none());
+        assert!(
+            missing_required_args(
+                "tachyon_vector_search",
+                Some(&json!({"query": "q", "index": "tenant-kb", "top_k": 3}))
+            )
+            .is_none()
+        );
 
         let spec =
             rate_limit_spec("tachyon_vector_search").expect("vector search must have a rate limit");

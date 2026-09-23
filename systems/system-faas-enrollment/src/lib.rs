@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Duration};

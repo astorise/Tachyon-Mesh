@@ -15,10 +15,10 @@ pub(crate) mod http3 {
 
 pub(crate) mod ebpf {
     #[cfg(all(target_os = "linux", feature = "ebpf-loader"))]
-    use anyhow::{bail, Context};
+    use anyhow::{Context, bail};
     #[cfg(all(target_os = "linux", feature = "ebpf-loader"))]
     #[allow(deprecated)]
-    use aya::{include_bytes_aligned, Bpf};
+    use aya::{Bpf, include_bytes_aligned};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum EbpfFastPathStatus {

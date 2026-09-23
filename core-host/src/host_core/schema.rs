@@ -59,13 +59,13 @@ fn write_schema_file(path: &Path, schema: serde_json::Value) -> Result<()> {
 }
 
 fn schema_with_id(mut schema: serde_json::Value, schema_id: Option<&str>) -> serde_json::Value {
-    if let Some(schema_id) = schema_id {
-        if let Some(object) = schema.as_object_mut() {
-            object.insert(
-                "$id".to_owned(),
-                serde_json::Value::String(schema_id.to_owned()),
-            );
-        }
+    if let Some(schema_id) = schema_id
+        && let Some(object) = schema.as_object_mut()
+    {
+        object.insert(
+            "$id".to_owned(),
+            serde_json::Value::String(schema_id.to_owned()),
+        );
     }
     schema
 }

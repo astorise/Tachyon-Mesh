@@ -266,7 +266,7 @@ impl UdsFastPathRegistry {
                     .peers
                     .lock()
                     .expect("UDS peer cache should not be poisoned")
-                    .clone()
+                    .clone();
             }
         };
 

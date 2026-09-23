@@ -101,15 +101,24 @@ pub enum TopologyError {
 impl fmt::Display for TopologyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InsufficientDeviceCount { required, available } => write!(
+            Self::InsufficientDeviceCount {
+                required,
+                available,
+            } => write!(
                 f,
                 "plan requires {required} device(s) but only {available} are available"
             ),
-            Self::IncompatibleInterconnect { required, available } => write!(
+            Self::IncompatibleInterconnect {
+                required,
+                available,
+            } => write!(
                 f,
                 "plan requires {required:?} interconnect but cluster only provides {available:?}"
             ),
-            Self::VramPerShardExceeded { required_bytes, available_bytes } => write!(
+            Self::VramPerShardExceeded {
+                required_bytes,
+                available_bytes,
+            } => write!(
                 f,
                 "shard requires {required_bytes} bytes of VRAM but target device has {available_bytes} free"
             ),
@@ -175,13 +184,13 @@ pub fn validate_parallel_topology(
 
     if plan.required_vram_bytes_per_device > 0 {
         for device_id in &plan.device_ids {
-            if let Some(device) = topology.device(*device_id) {
-                if plan.required_vram_bytes_per_device > device.free_vram_bytes {
-                    return Err(TopologyError::VramPerShardExceeded {
-                        required_bytes: plan.required_vram_bytes_per_device,
-                        available_bytes: device.free_vram_bytes,
-                    });
-                }
+            if let Some(device) = topology.device(*device_id)
+                && plan.required_vram_bytes_per_device > device.free_vram_bytes
+            {
+                return Err(TopologyError::VramPerShardExceeded {
+                    required_bytes: plan.required_vram_bytes_per_device,
+                    available_bytes: device.free_vram_bytes,
+                });
             }
         }
     }
@@ -229,12 +238,12 @@ pub fn validate_plan_shape(plan: &ParallelExecutionPlan) -> Result<(), String> {
                         "pipeline-parallel's first stage must start at layer 0, got {start}"
                     ));
                 }
-                if let Some(prev) = previous_end {
-                    if start != prev + 1 {
-                        return Err(format!(
-                            "pipeline-parallel stage ranges must be contiguous: range starting at {start} does not follow the previous range ending at {prev}"
-                        ));
-                    }
+                if let Some(prev) = previous_end
+                    && start != prev + 1
+                {
+                    return Err(format!(
+                        "pipeline-parallel stage ranges must be contiguous: range starting at {start} does not follow the previous range ending at {prev}"
+                    ));
                 }
                 previous_end = Some(end);
             }
