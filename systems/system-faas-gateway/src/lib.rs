@@ -67,7 +67,6 @@ enum GatewayTargetKind {
 
 struct GatewayTarget {
     route: String,
-    #[allow(dead_code)]
     kind: GatewayTargetKind,
 }
 
