@@ -397,7 +397,7 @@ fn execute_guest_ai_uses_preloaded_model_alias_and_returns_mock_text() {
                 "POST",
                 "/api/guest-ai",
                 Bytes::from_static(
-                    br#"{"model":"llama3","shape":[1,4],"values":[1.0,2.0,3.0,4.0],"output_len":17,"response_kind":"text"}"#,
+                    br#"{"model":"llama3","shape":[1,4],"values":[1.0,2.0,3.0,4.0],"output_len":23,"response_kind":"text"}"#,
                 ),
             ),
             &route,
@@ -419,7 +419,7 @@ fn execute_guest_ai_uses_preloaded_model_alias_and_returns_mock_text() {
         payload["text"],
         Value::String("MOCK_COMPONENT_RESPONSE".to_owned())
     );
-    assert_eq!(payload["output_bytes"], Value::from(17));
+    assert_eq!(payload["output_bytes"], Value::from(23));
 }
 
 #[test]
