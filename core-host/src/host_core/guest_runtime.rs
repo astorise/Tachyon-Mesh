@@ -2411,10 +2411,7 @@ pub(crate) fn build_linker(
     Ok(linker)
 }
 
-#[cfg_attr(
-    any(feature = "ai-inference", feature = "ai-inference"),
-    allow(dead_code)
-)]
+#[cfg_attr(feature = "ai-inference", allow(dead_code))]
 pub(crate) fn requires_ai_inference_feature(function_name: &str) -> bool {
     normalize_target_module_name(function_name) == "guest-ai"
 }
