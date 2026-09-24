@@ -2402,7 +2402,7 @@ pub(crate) fn build_linker(
     p1::add_to_linker_sync(&mut linker, |state: &mut LegacyHostState| &mut state.wasi).map_err(
         |error| guest_execution_error(error, "failed to add WASI preview1 functions to linker"),
     )?;
-    #[cfg(feature = "ai-inference")]
+    #[cfg(feature = "legacy-wasi-nn")]
     wasmtime_wasi_nn::witx::add_to_linker(&mut linker, |state: &mut LegacyHostState| {
         &mut state.wasi_nn
     })

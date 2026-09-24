@@ -297,7 +297,7 @@ scripts/build-guest-artifacts.sh examples/guest-example
 
 - [x] VRAM-aware routing and multi-GPU optimization.
 - [x] Tensor/pipeline/expert-parallel inference engines (intra-node tensor sharding, cross-node pipeline stages, MoE expert routing — see `openspec/changes/2026-06-19-distributed-model-parallel-inference`).
-- [x] Magnetar Component inference is wired into the live local inference path at Magnetar `ee7ef9e9c414f3b59ea91b11a2f519bfb5085152`: Tachyon stages Component artifacts, applies trust and routing policy, then delegates model ingestion, tokenizer handling, manifest normalization, resident model instance construction, execution planning, streaming, and Provider execution to Magnetar. CUDA validation uses the `magnetar-cuda` lane and exercises multi-token generation through Magnetar's device-resident decode path.
+- [x] Magnetar Component inference is wired into the live local inference path at Magnetar `a71a11aaf5979bb11f48f4bd85974359d6209e88`: Tachyon stages Component artifacts, applies trust and routing policy, then delegates model ingestion, tokenizer handling, manifest normalization, resident model instance construction, execution planning, streaming, and Provider execution to Magnetar. CUDA validation uses the `magnetar-cuda` lane and exercises multi-token generation through Magnetar's device-resident decode path. (`scripts/validate_magnetar_pin_doc.sh` fails CI if this SHA ever drifts from the `vendor/Magnetar` gitlink again — see TACH-06, 2026-09-24 audit.)
 - [x] Distributed KV-Store (Partitioning V2).
 - [x] Tauri Interface (Phase 3: Routing Dashboards complete).
 - [ ] **Upcoming**: GPU pressure-based auto-scaling (KEDA integration).

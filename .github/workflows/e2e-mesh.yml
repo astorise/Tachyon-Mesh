@@ -38,19 +38,19 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       # Shared GHA cache scope with publish-docker-images and the other E2E
       # workflows: the FaaS/system wasm + legacy-mock layers are
       # feature-independent (the cargo-feature ARG comes later in the
       # Dockerfile), so a cache hit here skips ~15 min of compilation.
       - name: Build local Docker image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           tags: ${{ env.IMAGE_TAG }}
@@ -59,7 +59,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=docker-default
 
       - name: Set up kind host cluster
-        uses: helm/kind-action@v1
+        uses: helm/kind-action@0b5c88445f37b7e12a2ce1ecca7805b9046a74db # v1
         with:
           cluster_name: ${{ env.KIND_CLUSTER }}
           wait: 180s
@@ -68,7 +68,7 @@ jobs:
         run: kind load docker-image $IMAGE_TAG --name $KIND_CLUSTER
 
       - name: Install vcluster CLI
-        uses: loft-sh/setup-vcluster@v0.0.1
+        uses: loft-sh/setup-vcluster@446bb6ad2bbf25d3fde666db01685c410f579a0d # v0.0.1
         with:
           version: v0.34.0
 

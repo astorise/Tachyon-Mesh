@@ -124,7 +124,7 @@ pub(crate) use wasmtime_wasi::{
     p1::{self, WasiP1Ctx},
     p2::{InputStream, OutputStream, Pollable, StreamError, StreamResult},
 };
-#[cfg(feature = "ai-inference")]
+#[cfg(feature = "legacy-wasi-nn")]
 pub(crate) use wasmtime_wasi_nn::witx::WasiNnCtx;
 
 #[cfg(feature = "admin-plane")]
@@ -145,7 +145,7 @@ mod guest_runtime;
 mod integrity_config;
 pub(crate) mod kv_cache;
 mod leader_election;
-#[cfg(feature = "ai-inference")]
+#[cfg(feature = "legacy-wasi-nn")]
 mod legacy_wasi_nn;
 mod mesh_dispatch_metrics;
 #[cfg(feature = "admin-plane")]
