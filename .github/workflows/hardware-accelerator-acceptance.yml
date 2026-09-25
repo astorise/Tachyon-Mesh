@@ -7,10 +7,10 @@ jobs:
   openvino-npu:
     runs-on: [self-hosted, tachyon-openvino-npu]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Require OpenVINO NPU runner and model
         shell: bash
         run: |
@@ -28,10 +28,10 @@ jobs:
   coral-edgetpu:
     runs-on: [self-hosted, tachyon-coral-edgetpu]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Require Edge TPU runner and compiled model
         shell: bash
         run: |

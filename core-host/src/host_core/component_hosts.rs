@@ -5,16 +5,19 @@ impl LegacyHostState {
         wasi: WasiP1Ctx,
         max_memory_bytes: usize,
         #[cfg(feature = "ai-inference")]
-        #[cfg_attr(not(test), allow(unused_variables))]
+        // Only actually read below when both `legacy-wasi-nn` and `test`
+        // hold (see `legacy_wasi_nn_aliases`) — `ai-inference` alone no
+        // longer implies that.
+        #[cfg_attr(not(all(test, feature = "legacy-wasi-nn")), allow(unused_variables))]
         ai_runtime: Arc<ai_inference::AiInferenceRuntime>,
     ) -> Self {
-        #[cfg(all(feature = "ai-inference", test))]
+        #[cfg(all(feature = "legacy-wasi-nn", feature = "ai-inference", test))]
         let legacy_wasi_nn_aliases = ai_runtime.loaded_component_aliases();
-        #[cfg(all(feature = "ai-inference", not(test)))]
+        #[cfg(all(feature = "legacy-wasi-nn", not(all(feature = "ai-inference", test))))]
         let legacy_wasi_nn_aliases = Vec::new();
         Self {
             wasi,
-            #[cfg(feature = "ai-inference")]
+            #[cfg(feature = "legacy-wasi-nn")]
             wasi_nn: super::legacy_wasi_nn::build_legacy_wasi_nn_ctx(legacy_wasi_nn_aliases),
             limits: GuestResourceLimiter::new(max_memory_bytes),
         }
@@ -3437,7 +3440,7 @@ impl system_component_bindings::tachyon::mesh::artifact_events::Host for Compone
             artifact_path: &event.artifact_path,
             component_metadata: crate::system_storage::binding_component_metadata(
                 &event.artifact_path,
-            ),
+            )?,
         };
         let value = serde_json::to_vec(&record)
             .map_err(|error| format!("failed to encode component registry entry: {error}"))?;

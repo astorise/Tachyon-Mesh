@@ -93,7 +93,7 @@ pub(crate) fn new_uds_fast_path_registry() -> UdsFastPathRegistry {
 
 pub(crate) struct LegacyHostState {
     pub(crate) wasi: WasiP1Ctx,
-    #[cfg(feature = "ai-inference")]
+    #[cfg(feature = "legacy-wasi-nn")]
     pub(crate) wasi_nn: WasiNnCtx,
     pub(crate) limits: GuestResourceLimiter,
 }

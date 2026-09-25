@@ -56,15 +56,15 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: wasm32-wasip1,wasm32-wasip2
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: wasm-guests
 
@@ -75,7 +75,7 @@ jobs:
         run: tar -czf wasm-guests.tar.gz target/wasm32-wasip1/release/*.wasm target/wasm32-wasip2/release/*.wasm
 
       - name: Upload guest artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: wasm-guests-${{ github.sha }}
           path: wasm-guests.tar.gz
@@ -90,7 +90,7 @@ jobs:
             examples/guest-examples/manifest.json
 
       - name: Upload example guest modules archive
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: guest-examples-${{ github.sha }}
           path: guest-examples.tar.gz
@@ -139,15 +139,15 @@ jobs:
             target: fips-builder
             cache_scope: docker-fips
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Warm ${{ matrix.cache_scope }} cache (${{ matrix.dockerfile }} → ${{ matrix.target }})
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         continue-on-error: true
         with:
           context: .
@@ -163,14 +163,14 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Install cargo-audit and cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
         with:
           tool: cargo-audit,cargo-deny
 
@@ -195,13 +195,13 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       BREAKING_MANIFEST_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'breaking-manifest') }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Generate HEAD integrity schemas
         run: cargo run -p core-host -- schema --output-dir target/schemas-head
@@ -253,7 +253,7 @@ jobs:
       # See "Renovate compile-only fast lane" at the top of this file.
       RENOVATE_PR: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/') }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
@@ -279,12 +279,12 @@ jobs:
           # are unaffected, and RUSTFLAGS is untouched.
           sudo ln -sf "$(command -v mold)" /usr/bin/ld
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt, clippy
           targets: wasm32-wasip1,wasm32-wasip2
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Check formatting
         if: env.RENOVATE_PR != 'true'
@@ -303,6 +303,7 @@ jobs:
         run: |
           for feature in \
             http3 \
+            legacy-wasi-nn \
             mtls \
             rate-limit \
             resiliency \
@@ -324,9 +325,9 @@ jobs:
         # -A clippy::result_large_err allows on that lane specifically.
         run: |
           if [ "${RENOVATE_PR}" = "true" ]; then
-            cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used -A deprecated -A clippy::result_large_err
+            cargo clippy --workspace --all-targets --features core-host/ai-inference,core-host/legacy-wasi-nn -- -D warnings -D clippy::unwrap_used -A deprecated -A clippy::result_large_err
           else
-            cargo clippy --workspace --all-targets --features core-host/ai-inference -- -D warnings -D clippy::unwrap_used
+            cargo clippy --workspace --all-targets --features core-host/ai-inference,core-host/legacy-wasi-nn -- -D warnings -D clippy::unwrap_used
           fi
 
       - name: Cross-Layer Validation
@@ -336,6 +337,10 @@ jobs:
       - name: AI Component Boundary Validation
         if: env.RENOVATE_PR != 'true'
         run: bash scripts/validate_ai_component_boundary.sh
+
+      - name: Magnetar Pin Documentation Validation
+        if: env.RENOVATE_PR != 'true'
+        run: bash scripts/validate_magnetar_pin_doc.sh
 
       - name: Check ai-inference host build
         run: cargo check -p core-host --features ai-inference
@@ -372,15 +377,15 @@ jobs:
       # clippy and every GPU execution proof are skipped.
       RENOVATE_PR: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/') }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: cuda-quality
           # Keep the expensive CUDA dependency build when a later GPU proof
@@ -441,7 +446,7 @@ jobs:
       # GPU runner image is RPM/UBI-based (no apt), so install protoc in a
       # distro-agnostic way. Skipped if the runner image already ships protoc.
       - name: Install protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -506,11 +511,11 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       RUSTFLAGS: "-D dead_code"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: wasm32-wasip1,wasm32-wasip2
 
@@ -524,13 +529,13 @@ jobs:
           sudo apt-get install -y mold
           sudo ln -sf "$(command -v mold)" /usr/bin/ld
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -557,9 +562,9 @@ jobs:
   ui:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version-file: .node-version
           cache: npm
@@ -604,11 +609,11 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       RUSTFLAGS: "-D dead_code"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: wasm32-wasip1,wasm32-wasip2
 
@@ -618,13 +623,13 @@ jobs:
           sudo apt-get install -y mold
           sudo ln -sf "$(command -v mold)" /usr/bin/ld
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@4314395b773db6ec53370cf7e57cc6bfefb6ae8f # cargo-llvm-cov
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -634,7 +639,7 @@ jobs:
         run: cargo llvm-cov -p core-host --lcov --output-path lcov.info
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: core-host-lcov-${{ github.sha }}
           if-no-files-found: error
@@ -657,11 +662,11 @@ jobs:
       CARGO_PROFILE_RELEASE_LTO: "thin"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: wasm32-wasip1,wasm32-wasip2
 
@@ -671,10 +676,10 @@ jobs:
           sudo apt-get install -y mold
           sudo ln -sf "$(command -v mold)" /usr/bin/ld
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -684,7 +689,7 @@ jobs:
         run: cargo build -p core-host --release
 
       - name: Upload CI build artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: tachyon-mesh-build-${{ github.sha }}
           if-no-files-found: error
@@ -747,7 +752,7 @@ jobs:
           # separately by the cuda-quality job on the GPU runner), and
           # A bare `--all-features` would break on these CPU-only runners.
           # Mirrors publish-docker-images' "-all-features" variant.
-          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
+          - "--features ai-inference,legacy-wasi-nn,ebpf-loader,experimental,fips,http3,mtls,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
           # Worker data-plane profile (#310): `admin-plane` is in `default`, so
@@ -762,11 +767,11 @@ jobs:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D dead_code"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: wasm32-wasip1,wasm32-wasip2
 
@@ -776,7 +781,7 @@ jobs:
           sudo apt-get install -y mold
           sudo ln -sf "$(command -v mold)" /usr/bin/ld
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: feature-matrix
           save-if: ${{ matrix.features == '' }}
@@ -788,10 +793,10 @@ jobs:
           sudo apt-get install -y cmake nasm protobuf-compiler
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -821,7 +826,7 @@ jobs:
           # separately by the cuda-quality job on the GPU runner), and
           # A bare `--all-features` would break on these CPU-only runners.
           # Mirrors publish-docker-images' "-all-features" variant.
-          - "--features ai-inference,ebpf-loader,experimental,fips,http3,mtls,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
+          - "--features ai-inference,legacy-wasi-nn,ebpf-loader,experimental,fips,http3,mtls,rate-limit,resiliency,ring,s3-persistence,secrets-vault,websockets"
           - "--features http3"
           - "--features rate-limit,resiliency,mtls,secrets-vault,websockets"
           # Worker data-plane profile (#310) — see the matching comment on
@@ -835,15 +840,15 @@ jobs:
       CARGO_PROFILE_RELEASE_LTO: "thin"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: wasm32-wasip1,wasm32-wasip2
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: feature-matrix
           save-if: ${{ matrix.features == '' }}
@@ -855,7 +860,7 @@ jobs:
           sudo apt-get install -y cmake nasm protobuf-compiler
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -880,7 +885,7 @@ jobs:
           echo "label=${label}" >> "$GITHUB_OUTPUT"
 
       - name: Upload core-host binary artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: core-host-linux-x86_64-${{ steps.feat_label.outputs.label }}-${{ github.sha }}
           path: target/release/core-host
@@ -897,11 +902,11 @@ jobs:
       # cache already holds the aws-lc FIPS build artifacts.
       RENOVATE_PR: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'renovate/') }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: wasm32-wasip1,wasm32-wasip2
 
@@ -910,15 +915,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake nasm protobuf-compiler
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Install cargo-nextest
         if: env.RENOVATE_PR != 'true'
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@45fceba0fc176f41d2aee1ca9d6598ba628eea62 # nextest
 
       - name: Download guest artifacts
         if: env.RENOVATE_PR != 'true'
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -949,11 +954,11 @@ jobs:
       CARGO_PROFILE_RELEASE_LTO: "thin"
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: wasm32-wasip1,wasm32-wasip2
 
@@ -962,10 +967,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake nasm protobuf-compiler
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
 
       - name: Download guest artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: wasm-guests-${{ github.sha }}
       - name: Unpack guest artifacts
@@ -975,7 +980,7 @@ jobs:
         run: cargo build -p core-host --release --features fips
 
       - name: Upload FIPS core-host binary artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: core-host-linux-x86_64-fips-${{ github.sha }}
           path: target/release/core-host
@@ -1035,16 +1040,16 @@ jobs:
           - image_name: tachyon-mesh
             dockerfile: ./Dockerfile
             context: .
-            cargo_features: "ai-inference,ebpf-loader,experimental,http3,mtls,rate-limit,resiliency,s3-persistence,secrets-vault,websockets"
+            cargo_features: "ai-inference,legacy-wasi-nn,ebpf-loader,experimental,http3,mtls,rate-limit,resiliency,s3-persistence,secrets-vault,websockets"
             feature_tag: "-all-features"
             cache_scope: docker-default
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Normalize image owner
         id: owner
@@ -1052,7 +1057,7 @@ jobs:
         run: echo "value=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1060,7 +1065,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ghcr.io/${{ steps.owner.outputs.value }}/${{ matrix.image_name }}
           tags: |
@@ -1077,7 +1082,7 @@ jobs:
       # the transient push failure (re-pushing from the warm buildkit/gha cache).
       - name: Build and publish Docker image
         id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         continue-on-error: true
         with:
           context: ${{ matrix.context }}
@@ -1092,7 +1097,7 @@ jobs:
 
       - name: Build and publish Docker image (retry)
         if: steps.build.outcome == 'failure'
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}

@@ -419,10 +419,17 @@ struct RegistryComponentInfo<'a> {
 /// read a sidecar with, so the bag stays empty and a consuming guest falls
 /// back to its own resolution — the same behaviour as a component that
 /// declares nothing.
-pub(crate) fn binding_component_metadata(path: &str) -> std::collections::BTreeMap<String, String> {
+///
+/// Returns `Err` when a sidecar is present but unreadable or malformed,
+/// rather than silently falling back to an empty bag — see
+/// `ai_inference::declared_component_metadata`'s own doc comment
+/// (TACH-04). A missing sidecar still yields `Ok({})`.
+pub(crate) fn binding_component_metadata(
+    path: &str,
+) -> std::result::Result<std::collections::BTreeMap<String, String>, String> {
     let path = path.trim();
     if path == "mock" || path.starts_with("mock:") {
-        return std::collections::BTreeMap::new();
+        return Ok(std::collections::BTreeMap::new());
     }
     #[cfg(feature = "ai-inference")]
     {
@@ -433,7 +440,7 @@ pub(crate) fn binding_component_metadata(path: &str) -> std::collections::BTreeM
     }
     #[cfg(not(feature = "ai-inference"))]
     {
-        std::collections::BTreeMap::new()
+        Ok(std::collections::BTreeMap::new())
     }
 }
 
@@ -494,6 +501,19 @@ pub(crate) fn publish_configured_component_bindings(
                 continue;
             }
             configured.insert(binding.alias.as_str());
+            let component_metadata = match binding_component_metadata(&binding.path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    tracing::warn!(
+                        alias = %binding.alias,
+                        path = %binding.path,
+                        %error,
+                        "skipping configured component binding: its artifact sidecar failed to read"
+                    );
+                    failures += 1;
+                    continue;
+                }
+            };
             let info = RegistryComponentInfo {
                 alias: &binding.alias,
                 engine: binding_engine_label(&binding.path),
@@ -504,7 +524,7 @@ pub(crate) fn publish_configured_component_bindings(
                 status: "available",
                 artifact_path: &binding.path,
                 source: Some(REGISTRY_SOURCE_CONFIG),
-                component_metadata: binding_component_metadata(&binding.path),
+                component_metadata,
                 withdrawn: false,
             };
             let Ok(value) = serde_json::to_vec(&info) else {
@@ -1011,7 +1031,10 @@ fn stored_row_still_current(core_store: &crate::store::CoreStore, alias: &str, p
         .filter(|(key, _)| !REGISTRY_ROW_FIXED_FIELDS.contains(&key.as_str()))
         .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
         .collect();
-    stored_metadata == binding_component_metadata(path)
+    // A sidecar that currently fails to read/parse must never compare equal
+    // to a previously-stored row — treating a broken sidecar as "unchanged"
+    // would suppress the withdrawal a real change deserves (TACH-04).
+    binding_component_metadata(path).is_ok_and(|metadata| stored_metadata == metadata)
 }
 
 /// Withdraw configured rows the incoming config will not serve identically.
@@ -1203,7 +1226,7 @@ impl bindings::tachyon::mesh::artifact_events::Host for StorageComponentState {
             status: "available",
             artifact_path: &event.artifact_path,
             source: None,
-            component_metadata: binding_component_metadata(&event.artifact_path),
+            component_metadata: binding_component_metadata(&event.artifact_path)?,
             withdrawn: false,
         };
         let value = serde_json::to_vec(&info)
@@ -1725,7 +1748,7 @@ mod configured_binding_registry_tests {
 
         let path = component_dir.to_string_lossy().into_owned();
         assert_eq!(
-            binding_component_metadata(&path),
+            binding_component_metadata(&path).expect("sidecar should be readable"),
             std::collections::BTreeMap::from([("toolCallParser".to_owned(), "qwen".to_owned())]),
             "the sidecar is what the publisher reads its opaque metadata from, verbatim"
         );
@@ -1925,6 +1948,40 @@ mod configured_binding_registry_tests {
         // an error as an empty page.
         let owned = config_owned_aliases(&store).expect("a healthy table scans");
         assert_eq!(owned, vec!["coder".to_owned()]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A sidecar that exists but fails to parse must never be treated the
+    /// same as one that simply declares nothing (TACH-04): publication
+    /// fails loudly for that binding instead of silently registering it
+    /// with an empty metadata bag.
+    #[test]
+    fn a_binding_with_an_unparseable_sidecar_is_a_publication_failure() {
+        let (store, dir) = temp_store();
+        let component_dir = dir.join("broken-sidecar");
+        fs::create_dir_all(&component_dir).expect("component dir");
+        fs::write(
+            component_dir.join(".tachyon-component.json"),
+            b"not valid json",
+        )
+        .expect("write malformed sidecar");
+
+        let path = component_dir.to_string_lossy().into_owned();
+        let config = config_with(vec![binding("broken-sidecar", &path, false)]);
+        assert_eq!(
+            publish_configured_component_bindings(&store, &config),
+            1,
+            "a binding whose sidecar fails to parse must be counted as a publication failure"
+        );
+
+        let published = store
+            .kv_partition_get(AI_COMPONENTS_REGISTRY_TABLE, "broken-sidecar")
+            .expect("read");
+        assert!(
+            published.is_none(),
+            "a binding that failed to publish must not leave a registry row behind"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -2571,7 +2628,7 @@ mod registry_casing_tests {
             "mock:tiny",
         ] {
             assert_eq!(
-                binding_component_metadata(path),
+                binding_component_metadata(path).expect("must not touch the filesystem"),
                 std::collections::BTreeMap::new(),
                 "`{path}` must not be probed for opaque metadata"
             );

@@ -27,12 +27,20 @@ default = ["admin-plane", "ring", "websockets", "rate-limit", "resiliency", "mtl
 # admin-plane node via Tachyon Studio.
 admin-plane = []
 # Magnetar-only inference. Local execution delegates opaque inference Component
-# invocations to Magnetar.
-ai-inference = [
-    "dep:magnetar-inference-component",
-    "dep:magnetar-runtime",
-    "dep:wasmtime-wasi-nn",
-]
+# invocations to Magnetar. Deliberately does not pull in `legacy-wasi-nn`
+# (audit finding TACH-07): the modern Magnetar Component path shares no
+# code with the WASI-NN plumbing that exists solely for the pre-Component
+# `guest-ai` ABI, so a build wanting only Magnetar inference no longer pays
+# for `wasmtime-wasi-nn` it will never use.
+ai-inference = ["dep:magnetar-inference-component", "dep:magnetar-runtime"]
+# Legacy (pre-Component) WASI-NN plumbing — see
+# `core-host/src/host_core/legacy_wasi_nn.rs`'s own doc comment. Exists
+# solely to satisfy the `wasi_ephemeral_nn` imports of the old-style,
+# non-Component `guest-ai` WASM module; the modern Magnetar Component
+# invocation path (`ai-inference`) never references it. Independent of
+# `ai-inference` — enable both to support `guest-ai` alongside Magnetar
+# Components.
+legacy-wasi-nn = ["dep:wasmtime-wasi-nn"]
 ebpf-loader = ["dep:aya"]
 # `experimental` gates unwired v1.1 stubs (QUIC safetensors replication, predictive
 # VRAM helpers, BaaS scratch tables) so they are excluded from the default build but

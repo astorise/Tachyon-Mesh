@@ -374,7 +374,7 @@ fn execute_legacy_guest_reads_stdin_for_tcp_echo_module() {
     }
 }
 
-#[cfg(feature = "ai-inference")]
+#[cfg(all(feature = "ai-inference", feature = "legacy-wasi-nn"))]
 #[test]
 fn execute_guest_ai_uses_preloaded_model_alias_and_returns_mock_text() {
     let mut route = IntegrityRoute::user("/api/guest-ai");

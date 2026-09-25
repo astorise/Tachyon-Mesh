@@ -6,7 +6,7 @@
 # size and are irrelevant to the mesh/enrollment E2E, which only exercises
 # core-host + system FaaS (node-registry, cert-manager, …). Keeping this
 # separate avoids any risk to the release image build.
-FROM ubuntu:24.04 AS rust-base
+FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 AS rust-base
 
 ARG DEBIAN_FRONTEND=noninteractive
 
