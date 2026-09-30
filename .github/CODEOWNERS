@@ -16,6 +16,14 @@
 # The host/guest contract. A change here can silently break every guest.
 /wit/                           @astorise
 
+# The Tachyon<->Magnetar trust and inference boundary — artifact trust
+# policy, the Magnetar bridge, and the vendored Magnetar pin itself.
+/core-host/src/ai_inference.rs             @astorise
+/core-host/src/ai_inference/               @astorise
+/vendor/Magnetar                           @astorise
+/scripts/validate_ai_component_boundary.sh @astorise
+/scripts/validate_cross_layer.sh           @astorise
+
 # CI/CD, release signing, and dependency/license policy.
 /.github/workflows/             @astorise
 /deny.toml                      @astorise

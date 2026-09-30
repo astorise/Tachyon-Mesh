@@ -14,6 +14,11 @@ use wasmtime_wasi_nn::{
     Graph as WasiGraph, GraphRegistry, Registry as WasiRegistry, witx::WasiNnCtx,
 };
 
+// Only `build_legacy_wasi_nn_ctx`'s `#[cfg(not(test))]` arm constructs
+// this, so a `cfg(test)` compilation (`--all-targets`, any feature
+// combination) sees it as dead — same reasoning as `component_aliases`'s
+// `cfg_attr` just below.
+#[cfg_attr(test, allow(dead_code))]
 struct EmptyGraphRegistry;
 
 impl GraphRegistry for EmptyGraphRegistry {
