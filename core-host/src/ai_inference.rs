@@ -5,7 +5,10 @@ use anyhow::{Result, anyhow};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{
+        Arc, Mutex, OnceLock, RwLock,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 use crate::{IntegrityConfig, IntegrityInferenceComponentBinding, RouteQos};
@@ -68,9 +71,30 @@ pub(crate) struct InferenceExecutionTelemetry {
 
 static INFERENCE_TELEMETRY: OnceLock<Mutex<Vec<InferenceExecutionTelemetry>>> = OnceLock::new();
 
+/// Recovers from a poisoned lock while leaving an audit trail, mirroring
+/// `telemetry::recover_poisoned`. A poisoned lock means some other thread
+/// panicked while holding it, not that the guarded data is corrupt —
+/// treating it as fatal here would turn one earlier panic into a
+/// permanent source of repeated panics on every later access to the same
+/// lock (audit finding TACH-02). Every poison event SHALL be logged so it
+/// is never silently swallowed.
+fn recover_poisoned<T>(context: &'static str, result: std::sync::LockResult<T>) -> T {
+    match result {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!(
+                target: "tachyon::ai_inference",
+                lock = context,
+                "lock was poisoned by an earlier panic; continuing with the recovered guard"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
 fn record_execution(alias: impl Into<String>, executed_on: impl Into<String>, succeeded: bool) {
     let records = INFERENCE_TELEMETRY.get_or_init(|| Mutex::new(Vec::new()));
-    let mut records = records.lock().expect("inference telemetry lock poisoned");
+    let mut records = recover_poisoned("inference_telemetry", records.lock());
     records.push(InferenceExecutionTelemetry {
         alias: alias.into(),
         executed_on: executed_on.into(),
@@ -82,11 +106,8 @@ fn record_execution(alias: impl Into<String>, executed_on: impl Into<String>, su
 }
 
 pub(crate) fn inference_execution_telemetry() -> Vec<InferenceExecutionTelemetry> {
-    INFERENCE_TELEMETRY
-        .get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .expect("inference telemetry lock poisoned")
-        .clone()
+    let records = INFERENCE_TELEMETRY.get_or_init(|| Mutex::new(Vec::new()));
+    recover_poisoned("inference_telemetry", records.lock()).clone()
 }
 
 /// One decoded event from a Component invocation stream. Opaque on both
@@ -213,6 +234,57 @@ pub(crate) struct SchedulerSnapshot {
     pub(crate) completed_aliases: Vec<String>,
 }
 
+/// A Magnetar Component instance serializes its own execution internally:
+/// `LoadedInferenceComponent::invoke_payload_opaque`'s own doc comment in
+/// the vendored crate says it blocks until any generation already in
+/// flight on that instance finishes. Tachyon holds exactly one instance
+/// per alias, so this was previously an invisible property of a
+/// dependency — a second concurrent request for the same alias just
+/// blocked silently with no signal to Tachyon at all (audit finding
+/// TACH-03). This constant makes that ceiling an explicit, Tachyon-owned
+/// admission fact: `AliasInFlightGuard` counts requests in flight per
+/// alias and logs a structured warning the moment a second one starts
+/// before the first finishes, so operators can see the contention Magnetar
+/// is silently absorbing instead of only inferring it from tail latency.
+/// Deliberately non-rejecting — raising it to a hard reject would turn a
+/// currently-succeeding (if serialized) traffic pattern into request
+/// failures, which is a bigger behavior change than this audit finding
+/// calls for.
+pub(crate) const MAGNETAR_MAX_CONCURRENCY_PER_ALIAS: u32 = 1;
+
+/// RAII admission tracker enforcing visibility (not rejection) of
+/// [`MAGNETAR_MAX_CONCURRENCY_PER_ALIAS`] for one Magnetar alias. Held for
+/// the duration of one `invoke`/`invoke_streaming` call; `Drop` always
+/// decrements, including on early return or panic-unwind, so the count
+/// can never leak upward under error paths.
+struct AliasInFlightGuard {
+    in_flight: Arc<AtomicU32>,
+}
+
+impl AliasInFlightGuard {
+    fn enter(alias: &str, in_flight: &Arc<AtomicU32>) -> Self {
+        let previous = in_flight.fetch_add(1, Ordering::AcqRel);
+        if previous >= MAGNETAR_MAX_CONCURRENCY_PER_ALIAS {
+            tracing::warn!(
+                target: "tachyon::ai_inference",
+                alias,
+                in_flight = previous + 1,
+                limit = MAGNETAR_MAX_CONCURRENCY_PER_ALIAS,
+                "concurrent Magnetar invocations for this alias exceed the declared per-alias concurrency limit; Magnetar is serializing them internally and this request is blocked behind an in-flight one"
+            );
+        }
+        Self {
+            in_flight: Arc::clone(in_flight),
+        }
+    }
+}
+
+impl Drop for AliasInFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[derive(Clone)]
 enum ComponentRuntime {
     Mock {
@@ -228,6 +300,11 @@ enum ComponentRuntime {
         /// without reading anything back out of Magnetar's own Provider
         /// advertisement (audit round 5, TACH-01).
         accelerator: AcceleratorKind,
+        /// Shared with every clone of this alias's `LoadedInferenceComponent`
+        /// entry (never re-created per clone) so it accurately reflects
+        /// concurrent callers of the one Magnetar instance this alias
+        /// resolves to. See [`AliasInFlightGuard`].
+        in_flight: Arc<AtomicU32>,
     },
 }
 
@@ -331,7 +408,7 @@ impl AiInferenceRuntime {
         if self
             .inference_components
             .read()
-            .expect("component registry lock poisoned")
+            .map_err(|_| "component registry lock poisoned".to_owned())?
             .contains_key(alias)
         {
             return Ok(());
@@ -354,41 +431,31 @@ impl AiInferenceRuntime {
         let component = load_binding(&binding).map_err(|error| format!("{error:#}"))?;
         self.inference_components
             .write()
-            .expect("component registry lock poisoned")
+            .map_err(|_| "component registry lock poisoned".to_owned())?
             .entry(alias.to_owned())
             .or_insert(component);
         Ok(())
     }
 
     pub(crate) fn loaded_component_aliases(&self) -> Vec<String> {
-        let mut aliases = self
-            .inference_components
-            .read()
-            .expect("component registry lock poisoned")
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let registry = recover_poisoned("component_registry", self.inference_components.read());
+        let mut aliases = registry.keys().cloned().collect::<Vec<_>>();
         aliases.sort();
         aliases
     }
 
     pub(crate) fn supports_accelerator(&self, accelerator: AcceleratorKind) -> bool {
-        matches!(accelerator, AcceleratorKind::Cpu)
-            || self
-                .inference_components
-                .read()
-                .expect("component registry lock poisoned")
+        matches!(accelerator, AcceleratorKind::Cpu) || {
+            let registry = recover_poisoned("component_registry", self.inference_components.read());
+            registry
                 .values()
                 .any(|component| component.accelerator() == accelerator)
+        }
     }
 
     pub(crate) fn queue_tier_snapshot(&self, accelerator: AcceleratorKind) -> QueueTierSnapshot {
-        self.queue_snapshots
-            .read()
-            .expect("queue snapshots lock poisoned")
-            .get(&accelerator)
-            .copied()
-            .unwrap_or_default()
+        let snapshots = recover_poisoned("queue_snapshots", self.queue_snapshots.read());
+        snapshots.get(&accelerator).copied().unwrap_or_default()
     }
 
     pub(crate) fn load_inference_component(
@@ -400,7 +467,7 @@ impl AiInferenceRuntime {
         let components = self
             .inference_components
             .read()
-            .expect("component registry lock poisoned");
+            .map_err(|_| "component registry lock poisoned".to_owned())?;
         let component = components
             .get(alias)
             .ok_or_else(|| format!("component alias `{alias}` is not loaded"))?;
@@ -441,7 +508,7 @@ impl AiInferenceRuntime {
         let component = self
             .inference_components
             .read()
-            .expect("component registry lock poisoned")
+            .map_err(|_| ComponentInvocationError::local("component registry lock poisoned"))?
             .get(alias)
             .cloned()
             .ok_or_else(|| {
@@ -466,7 +533,7 @@ impl AiInferenceRuntime {
         let component = self
             .inference_components
             .read()
-            .expect("component registry lock poisoned")
+            .map_err(|_| ComponentInvocationError::local("component registry lock poisoned"))?
             .get(alias)
             .cloned()
             .ok_or_else(|| {
@@ -483,7 +550,10 @@ impl AiInferenceRuntime {
                     metadata: mock_component_metadata(payload, MOCK_INFERENCE_RESPONSE.as_bytes()),
                 })
             }
-            ComponentRuntime::Magnetar { runtime, .. } => {
+            ComponentRuntime::Magnetar {
+                runtime, in_flight, ..
+            } => {
+                let _admission = AliasInFlightGuard::enter(&component.alias, in_flight);
                 let mut emit = |frame: &[u8]| {
                     if sink.is_live() {
                         sink.emit(StreamEvent::Payload(frame))
@@ -559,10 +629,7 @@ impl AiInferenceRuntime {
             return QueueDepthGuard::noop();
         }
         {
-            let mut snapshots = self
-                .queue_snapshots
-                .write()
-                .expect("queue snapshots lock poisoned");
+            let mut snapshots = recover_poisoned("queue_snapshots", self.queue_snapshots.write());
             adjust_queue_depth(&mut snapshots, accelerator, qos, 1);
         }
         QueueDepthGuard {
@@ -616,7 +683,7 @@ impl Drop for QueueDepthGuard {
         let Some(snapshots) = &self.snapshots else {
             return;
         };
-        let mut snapshots = snapshots.write().expect("queue snapshots lock poisoned");
+        let mut snapshots = recover_poisoned("queue_snapshots", snapshots.write());
         adjust_queue_depth(&mut snapshots, self.accelerator, self.qos, -1);
     }
 }
@@ -659,6 +726,7 @@ fn load_binding(binding: &IntegrityInferenceComponentBinding) -> Result<LoadedIn
             Some(runtime) => ComponentRuntime::Magnetar {
                 runtime: Arc::new(runtime),
                 accelerator,
+                in_flight: Arc::new(AtomicU32::new(0)),
             },
             _ => {
                 if magnetar_runtime::is_magnetar_path(path) {
@@ -696,7 +764,10 @@ fn invoke_component(
                 metadata: mock_component_metadata(payload, MOCK_INFERENCE_RESPONSE.as_bytes()),
             })
         }
-        ComponentRuntime::Magnetar { runtime, .. } => {
+        ComponentRuntime::Magnetar {
+            runtime, in_flight, ..
+        } => {
+            let _admission = AliasInFlightGuard::enter(&component.alias, in_flight);
             let result = runtime
                 .invoke(payload)
                 .map_err(magnetar_invocation_error)
@@ -717,11 +788,34 @@ fn invoke_component(
 /// author writes directly in whatever wire shape the consuming guest or
 /// Component expects (e.g. a tool-call dialect under whatever key it
 /// reads); only that downstream boundary assigns any key meaning.
-pub(crate) fn declared_component_metadata(root: &Path) -> BTreeMap<String, String> {
-    let Ok(raw) = std::fs::read(root.join(COMPONENT_META_JSON)) else {
-        return BTreeMap::new();
+///
+/// A missing sidecar is a legitimate "declares nothing" and yields an
+/// empty bag, but a sidecar that exists and fails to read (permissions,
+/// I/O) or fails to parse (invalid JSON, or valid JSON that is not a
+/// flat string-keyed object) is an error, not silently treated the same
+/// as absence — audit finding TACH-04. Collapsing "absent" and "present
+/// but broken" into the same empty result hid real authoring mistakes
+/// behind a component that looked like it simply declared nothing.
+pub(crate) fn declared_component_metadata(
+    root: &Path,
+) -> std::result::Result<BTreeMap<String, String>, String> {
+    let sidecar_path = root.join(COMPONENT_META_JSON);
+    let raw = match std::fs::read(&sidecar_path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => {
+            return Err(format!(
+                "failed to read component sidecar `{}`: {error}",
+                sidecar_path.display()
+            ));
+        }
     };
-    serde_json::from_slice(&raw).unwrap_or_default()
+    serde_json::from_slice(&raw).map_err(|error| {
+        format!(
+            "component sidecar `{}` is not valid opaque metadata (expected a flat JSON object of string keys to string values): {error}",
+            sidecar_path.display()
+        )
+    })
 }
 
 pub(crate) fn assert_no_credential_collisions<'a>(
@@ -750,7 +844,7 @@ pub(crate) fn assert_no_credential_collisions<'a>(
 
 /// Test-only stand-in for what a real Component's own tags might look like,
 /// in the same opaque `Vec<(String, String)>` shape `MagnetarRuntime::
-/// generate`/`generate_streaming` hand back untouched from a real Magnetar
+/// invoke`/`invoke_streaming` hand back untouched from a real Magnetar
 /// Component. This is a test double's own fixture data, not core inference
 /// logic: it exists solely so integration tests exercising the `mock:`
 /// Component through the full host↔guest wire can observe non-empty,
@@ -803,6 +897,44 @@ mod tests {
             .iter()
             .find(|(candidate, _)| candidate == key)
             .and_then(|(_, value)| value.parse().ok())
+    }
+
+    #[test]
+    fn alias_in_flight_guard_counts_concurrent_holders_and_releases_on_drop() {
+        let in_flight = Arc::new(AtomicU32::new(0));
+        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+
+        let first = AliasInFlightGuard::enter("qwen-alias", &in_flight);
+        assert_eq!(
+            in_flight.load(Ordering::Acquire),
+            1,
+            "one in-flight caller should be counted"
+        );
+
+        // A second concurrent holder for the same alias exceeds
+        // MAGNETAR_MAX_CONCURRENCY_PER_ALIAS (1) — TACH-03 makes this an
+        // observable fact (a warning is logged) rather than an invisible
+        // block inside Magnetar's own instance mutex, without rejecting it.
+        let second = AliasInFlightGuard::enter("qwen-alias", &in_flight);
+        assert_eq!(
+            in_flight.load(Ordering::Acquire),
+            2,
+            "a second concurrent caller must still be admitted, only observed"
+        );
+
+        drop(second);
+        assert_eq!(
+            in_flight.load(Ordering::Acquire),
+            1,
+            "dropping one guard must release exactly its own admission"
+        );
+
+        drop(first);
+        assert_eq!(
+            in_flight.load(Ordering::Acquire),
+            0,
+            "dropping the last guard must return the counter to zero"
+        );
     }
 
     const HIDDEN_SIZE: u64 = 4;
