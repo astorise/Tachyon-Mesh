@@ -19,6 +19,12 @@ ignore = [
     # RS256 JWT signature verification with public keys.
     "RUSTSEC-2023-0071",
 
+    # Also ignored in deny.toml — zip 8.6.0 is a build-only dependency of
+    # libsodium-sys-stable; no attacker-controlled archive is extracted.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+
     # cargo-audit-only: in glib's VariantStrIter. glib is present through
     # the desktop/Tauri GTK dependency tree, not the headless core-host
     # runtime path. cargo-deny doesn't currently flag this crate/version at
