@@ -525,7 +525,7 @@ impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
         let _ = self
             .active_requests
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_sub(1)
             });
     }
