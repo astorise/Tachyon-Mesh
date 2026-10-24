@@ -20,7 +20,7 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: miri-cwasm-cache
           cache-on-failure: true
