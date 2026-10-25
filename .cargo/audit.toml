@@ -31,4 +31,15 @@ ignore = [
     # all (its dependency-graph walk differs), so it has no home in
     # deny.toml.
     "RUSTSEC-2024-0429",
+
+    # Also ignored in deny.toml — crypto-bigint 0.5.5 timing side-channel,
+    # via iota_stronghold -> iota-crypto -> k256 -> elliptic-curve 0.13.8
+    # (tachyon-ui's secret-storage dependency, not the headless core-host
+    # runtime path). elliptic-curve 0.13.8 pins `crypto-bigint = "^0.5"`;
+    # no release of elliptic-curve/k256/iota-crypto/iota_stronghold using
+    # the patched crypto-bigint 0.7.x line exists yet. The separate
+    # crypto-bigint 0.7.5 instance (system-faas-cert-manager's p256/ecdsa
+    # dependency chain) is fixed directly (bumped to 0.7.6) and is not
+    # what this entry covers.
+    "RUSTSEC-2026-0387",
 ]
