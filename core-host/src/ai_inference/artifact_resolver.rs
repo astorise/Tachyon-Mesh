@@ -168,7 +168,7 @@ pub(crate) fn resolve(reference: &ArtifactReference, cache_root: &Path) -> Resul
         );
     }
 
-    let pulled = pull(reference)?;
+    let pulled = pull_off_any_tokio_runtime_thread(reference)?;
     stage_atomically(&artifact_path, &pulled.layer_bytes)?;
     stage_atomically(&digest_sidecar_path, pulled.layer_digest.as_bytes())?;
     Ok(artifact_path)
@@ -177,6 +177,32 @@ pub(crate) fn resolve(reference: &ArtifactReference, cache_root: &Path) -> Resul
 struct PulledArtifact {
     layer_bytes: Vec<u8>,
     layer_digest: String,
+}
+
+/// `reqwest::blocking::Client` builds and drives its own Tokio runtime
+/// internally; entering it from a thread that is itself already a Tokio
+/// runtime worker panics ("Cannot start a runtime from within a runtime").
+/// `resolve` is a plain synchronous fn reachable from `core-host`'s fully
+/// synchronous AI-inference load path, which `main`'s `#[tokio::main]`
+/// entrypoint calls directly (no `spawn_blocking`, no `.await`) while
+/// building the route registry at host startup -- so a cache-miss pull
+/// here would otherwise crash a fresh host outright instead of returning
+/// a typed load error. Running `pull` on a plain OS thread, never a Tokio
+/// one, sidesteps that regardless of which thread `resolve` itself runs
+/// on; the calling thread's `.join()` is an ordinary blocking join, not a
+/// runtime method, so it does not trip the same guard.
+fn pull_off_any_tokio_runtime_thread(reference: &ArtifactReference) -> Result<PulledArtifact> {
+    let reference = reference.clone();
+    std::thread::spawn(move || pull(&reference))
+        .join()
+        .map_err(|panic| {
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|value| value.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_owned());
+            anyhow!("OCI artifact pull thread panicked: {message}")
+        })?
 }
 
 /// Removes every cache entry under `cache_root/sha256/<digest>` whose

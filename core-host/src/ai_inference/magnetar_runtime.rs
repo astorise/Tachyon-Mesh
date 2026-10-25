@@ -561,6 +561,53 @@ signatures: []
         );
     }
 
+    /// Regression test for a real finding: `resolve`/`materialize_oci_
+    /// component` are plain synchronous functions reachable from `core-
+    /// host`'s fully synchronous AI-inference load path, which `main`'s
+    /// `#[tokio::main]` entrypoint calls directly (no `spawn_blocking`, no
+    /// `.await`) while building the route registry at host startup.
+    /// `reqwest::blocking::Client` builds and drives its own Tokio runtime
+    /// internally, and entering it from a thread that is already a Tokio
+    /// runtime worker panics ("Cannot start a runtime from within a
+    /// runtime") -- so, before `pull_off_any_tokio_runtime_thread` existed,
+    /// a cache-miss resolve reached from exactly this call shape crashed a
+    /// fresh host outright instead of returning a typed load error. This
+    /// test reproduces that call shape directly: a plain, non-`.await`ed
+    /// call to `materialize_oci_component` from inside a running Tokio
+    /// runtime's `block_on`, against a real cache miss that forces a real
+    /// network pull -- the exact path that used to panic.
+    #[test]
+    fn resolving_from_inside_an_active_tokio_runtime_does_not_panic() {
+        let lock = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().expect("temp dir creates");
+        let cache_dir = temp.path().join("cache");
+        let binding_root = temp.path().join("binding");
+        std::fs::create_dir_all(&binding_root).expect("binding root creates");
+
+        let previous_cache = std::env::var_os(TACHYON_OCI_ARTIFACT_CACHE_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(TACHYON_OCI_ARTIFACT_CACHE_ENV, &cache_dir) };
+        let _guard = EnvGuard {
+            _lock: lock,
+            previous_cache,
+        };
+
+        let runtime = tokio::runtime::Runtime::new().expect("a Tokio runtime must build");
+        let result = runtime.block_on(async {
+            // No `.await`, no `spawn_blocking` -- this is the exact
+            // synchronous call shape `AiInferenceRuntime::from_config`
+            // uses from `build_runtime_state`, called directly from an
+            // `async fn` while already inside this runtime's `block_on`.
+            materialize_oci_component(&binding_root, REAL_COMPONENT_LOCATOR)
+        });
+        result.expect(
+            "resolving a real OCI locator from inside an active Tokio runtime must succeed, \
+             not panic, on a cache miss that forces a real network pull",
+        );
+    }
+
     fn sha256_hex_for_test(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
