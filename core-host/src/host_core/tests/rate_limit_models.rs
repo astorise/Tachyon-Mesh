@@ -139,6 +139,7 @@ fn validate_integrity_config_normalizes_model_bindings() {
     let mut config = IntegrityConfig::default_sealed();
     let mut route = IntegrityRoute::user("/api/guest-ai");
     route.inference_components = vec![IntegrityInferenceComponentBinding {
+        component_locator: String::new(),
         alias: " llama3 ".to_owned(),
         path: "  /models/llama3.gguf ".to_owned(),
         device: ComponentPlacement::Cuda,
@@ -156,6 +157,7 @@ fn validate_integrity_config_normalizes_model_bindings() {
     assert_eq!(
         route.inference_components,
         vec![IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "llama3".to_owned(),
             path: "/models/llama3.gguf".to_owned(),
             device: ComponentPlacement::Cuda,
@@ -171,6 +173,7 @@ fn validate_integrity_config_preserves_dynamic_model_bindings_without_paths() {
     let mut config = IntegrityConfig::default_sealed();
     let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
     route.inference_components = vec![IntegrityInferenceComponentBinding {
+        component_locator: String::new(),
         alias: " qwen-dynamic ".to_owned(),
         path: String::new(),
         device: ComponentPlacement::Cpu,
@@ -189,6 +192,7 @@ fn validate_integrity_config_preserves_dynamic_model_bindings_without_paths() {
     assert_eq!(
         route.inference_components,
         vec![IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "qwen-dynamic".to_owned(),
             path: String::new(),
             device: ComponentPlacement::Cpu,
@@ -204,6 +208,7 @@ fn validate_integrity_config_rejects_static_model_bindings_without_paths() {
     let mut config = IntegrityConfig::default_sealed();
     let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
     route.inference_components = vec![IntegrityInferenceComponentBinding {
+        component_locator: String::new(),
         alias: "qwen-static".to_owned(),
         path: String::new(),
         device: ComponentPlacement::Cpu,
@@ -226,6 +231,7 @@ fn validate_integrity_config_rejects_static_model_bindings_without_paths() {
 fn validate_integrity_config_rejects_duplicate_model_aliases_across_routes() {
     let mut first = IntegrityRoute::user("/api/guest-ai");
     first.inference_components = vec![IntegrityInferenceComponentBinding {
+        component_locator: String::new(),
         alias: "shared".to_owned(),
         path: "/models/shared-a.gguf".to_owned(),
         device: ComponentPlacement::Cpu,
@@ -235,6 +241,7 @@ fn validate_integrity_config_rejects_duplicate_model_aliases_across_routes() {
     }];
     let mut second = IntegrityRoute::user("/api/assistant");
     second.inference_components = vec![IntegrityInferenceComponentBinding {
+        component_locator: String::new(),
         alias: "shared".to_owned(),
         path: "/models/shared-b.gguf".to_owned(),
         device: ComponentPlacement::Metal,

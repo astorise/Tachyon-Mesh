@@ -279,6 +279,7 @@ async fn model_aware_gossip_prefers_peer_with_matching_hot_model() {
     let mut user_route =
         targeted_route("/api/guest-ai", vec![weighted_target("guest-example", 100)]);
     user_route.inference_components = vec![IntegrityInferenceComponentBinding {
+        component_locator: String::new(),
         alias: "llama3".to_owned(),
         path: "mock:llama3".to_owned(),
         device: ComponentPlacement::Cuda,
@@ -462,6 +463,7 @@ async fn model_aware_gossip_keeps_request_local_when_no_peer_has_hot_model() {
     let mut user_route =
         targeted_route("/api/guest-ai", vec![weighted_target("guest-example", 100)]);
     user_route.inference_components = vec![IntegrityInferenceComponentBinding {
+        component_locator: String::new(),
         alias: "llama3".to_owned(),
         path: "mock:llama3".to_owned(),
         device: ComponentPlacement::Cuda,
@@ -783,6 +785,7 @@ async fn mesh_qos_router_forwards_realtime_gpu_requests_to_prefixed_override() {
     let mut route = targeted_route("/api/guest-ai", vec![weighted_target("guest-example", 100)]);
     route.inference_components = vec![
         IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "gpu-live-chat".to_owned(),
             path: "mock:gpu-live-chat".to_owned(),
             device: ComponentPlacement::Cuda,
@@ -791,6 +794,7 @@ async fn mesh_qos_router_forwards_realtime_gpu_requests_to_prefixed_override() {
             hardware_strategy: Default::default(),
         },
         IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "gpu-batch".to_owned(),
             path: "mock:gpu-batch".to_owned(),
             device: ComponentPlacement::Cuda,
@@ -897,6 +901,7 @@ async fn mesh_qos_router_keeps_batch_gpu_requests_local_below_remote_threshold()
     let mut route = targeted_route("/api/guest-ai", vec![weighted_target("guest-example", 100)]);
     route.inference_components = vec![
         IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "gpu-live-chat".to_owned(),
             path: "mock:gpu-live-chat".to_owned(),
             device: ComponentPlacement::Cuda,
@@ -905,6 +910,7 @@ async fn mesh_qos_router_keeps_batch_gpu_requests_local_below_remote_threshold()
             hardware_strategy: Default::default(),
         },
         IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "gpu-batch".to_owned(),
             path: "mock:gpu-batch".to_owned(),
             device: ComponentPlacement::Cuda,

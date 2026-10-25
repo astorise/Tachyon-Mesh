@@ -14,14 +14,16 @@ check_absent() {
   fi
 }
 
-# Skips each #[cfg(test)]-attributed item individually — from the attribute
-# line through its own matching closing brace (or, for a brace-less item
-# like `#[cfg(test)] use foo;`, through that one line) — then resumes
-# scanning production code for whatever follows. A file can carry any number
-# of scattered #[cfg(test)] items (a few inline test-only helpers plus a
-# trailing `mod tests { ... }`), not just one contiguous block at the end;
-# stopping at the *first* one and never resuming (the previous behavior)
-# silently exempted everything after it, including real production code.
+# Skips each #[cfg(test)]- or #[cfg(all(test, ...))]-attributed item
+# individually — from the attribute line through its own matching closing
+# brace (or, for a brace-less item like `#[cfg(test)] use foo;`, through
+# that one line) — then resumes scanning production code for whatever
+# follows. A file can carry any number of scattered test-only items (a few
+# inline test-only helpers plus a trailing `mod tests { ... }`, or a
+# feature-gated `mod foo_tests` using `#[cfg(all(test, feature = "..."))]`),
+# not just one contiguous block at the end; stopping at the *first* one and
+# never resuming (the previous behavior) silently exempted everything after
+# it, including real production code.
 check_production_prefix_absent() {
   local file="$1"
   local pattern="$2"
@@ -39,7 +41,7 @@ check_production_prefix_absent() {
         if (depth <= 0) { skip = 0 }
         next
       }
-      if (line ~ /^[[:space:]]*#\[cfg\(test\)\]/) {
+      if (line ~ /^[[:space:]]*#\[cfg\(test\)\]/ || line ~ /^[[:space:]]*#\[cfg\(all\(test,/) {
         skip = 1
         depth = 0
         next
@@ -135,22 +137,22 @@ check_absent \
   'load-model|model-id|compute-detailed|generation-request|generation-error|token-usage|tool-call' \
   'accelerator TPU WIT must expose opaque Component invocation bytes'
 
-check_absent \
+check_production_prefix_absent \
   core-host/src/ai_inference/magnetar_runtime.rs \
   'qwen|qwen_coder|mistral|llama|gemma|gguf|safetensors|onnx|tokenizer\.json|config\.json|ProductionQwenLoadedModel|HuggingFace(Ingestor|Tokenizer)|ModelTrustStore|TACHYON_MODEL_TRUST_STORE|tachyon-model' \
   'Tachyon Magnetar adapter must expose only Component/artifact contracts'
 
-check_absent \
+check_production_prefix_absent \
   core-host/src/ai_inference/magnetar_runtime.rs \
   'GenerationStreamEvent|InferenceComponentOutput|InferenceComponentUsage|GenerationUsage|text_delta|\binvoke_payload\(|\binvoke_payload_streaming\(' \
   'Tachyon Magnetar adapter must call only invoke_payload_opaque/invoke_payload_streaming_opaque (astorise/Magnetar#89) and must never touch typed Magnetar generation vocabulary again (TACH-02, fully closed)'
 
-check_absent \
+check_production_prefix_absent \
   core-host/src/ai_inference/magnetar_runtime.rs \
   'tachyon_wire_tags|"prompt_tokens"|"generated_tokens"|"completion_tokens"|"finish_reason"|tachyon\.usage\.' \
   'Tachyon Magnetar adapter must relay Magnetar opaque tags exactly as received, with no renaming, filtering, or interpretation of token-usage or finish-reason keys (TACH-01, audit round 3)'
 
-check_absent \
+check_production_prefix_absent \
   core-host/src/ai_inference/magnetar_runtime.rs \
   'ProviderAdvertisement|ProviderDeviceClass|\bprovider_name\b|\bprovider_version\b|\bdevice_ids\b|\bfn generate\b|\bfn generate_streaming\b|\bprompts\b' \
   'Tachyon Magnetar adapter must not mirror Magnetar Provider/Device identity (ProviderAdvertisement/ProviderDeviceClass/provider_name/provider_version/device_ids) and must name its opaque invocation entry points invoke/invoke_streaming over a payload, never generate/generate_streaming over prompts (TACH-01/TACH-02, audit round 5)'

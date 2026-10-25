@@ -4192,6 +4192,7 @@ mod registry_scope_tests {
                     .iter()
                     .map(|alias| {
                         crate::host_core::domain_types::IntegrityInferenceComponentBinding {
+                            component_locator: String::new(),
                             alias: (*alias).to_owned(),
                             path: String::new(),
                             device: Default::default(),

@@ -427,6 +427,7 @@ impl AiInferenceRuntime {
             qos: RouteQos::Standard,
             dynamic: false,
             hardware_strategy: Default::default(),
+            component_locator: String::new(),
         };
         let component = load_binding(&binding).map_err(|error| format!("{error:#}"))?;
         self.inference_components
@@ -718,10 +719,13 @@ fn load_binding(binding: &IntegrityInferenceComponentBinding) -> Result<LoadedIn
     let runtime = if path == "mock" || path.starts_with("mock:") {
         ComponentRuntime::Mock { accelerator }
     } else {
+        let component_locator =
+            Some(binding.component_locator.trim()).filter(|locator| !locator.is_empty());
         match magnetar_runtime::MagnetarRuntime::try_load(
             &binding.alias,
             path,
             binding.device.as_str(),
+            component_locator,
         )? {
             Some(runtime) => ComponentRuntime::Magnetar {
                 runtime: Arc::new(runtime),
@@ -1479,6 +1483,7 @@ mod tests {
         let _trust = trust_tachyon_component_artifact(&component_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.inference_components = vec![IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "qwen2_5".to_owned(),
             path: format!("magnetar:{}", component_dir.display()),
             device: ComponentPlacement::Cpu,
@@ -1507,6 +1512,7 @@ mod tests {
         let _trust = trust_tachyon_component_artifact(&component_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.inference_components = vec![IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "qwen_resident".to_owned(),
             path: format!("magnetar:{}", component_dir.display()),
             device: ComponentPlacement::Cpu,
@@ -1545,6 +1551,7 @@ mod tests {
         let _trust = trust_tachyon_component_artifact(&component_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.inference_components = vec![IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "qwen_concurrent".to_owned(),
             path: format!("magnetar:{}", component_dir.display()),
             device: ComponentPlacement::Cpu,
@@ -1601,6 +1608,7 @@ mod tests {
         let _trust = trust_tachyon_component_artifact(&component_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.inference_components = vec![IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "qwen2_5".to_owned(),
             path: format!("magnetar:{}", component_dir.display()),
             device: ComponentPlacement::Cpu,
@@ -1632,6 +1640,7 @@ mod tests {
         let _trust = trust_tachyon_component_artifact(&component_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.inference_components = vec![IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "qwen-stream".to_owned(),
             path: format!("magnetar:{}", component_dir.display()),
             device: ComponentPlacement::Cpu,
@@ -1695,6 +1704,7 @@ mod tests {
         )
         .expect("config should be written");
         let error = match load_binding(&IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "llama".to_owned(),
             path: format!("magnetar:{}", component_dir.display()),
             device: ComponentPlacement::Cpu,
@@ -1722,6 +1732,7 @@ mod tests {
         let component_dir = unique_component_dir("untrusted-qwen");
         write_tiny_production_qwen_bundle(&component_dir);
         let error = match load_binding(&IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "qwen-untrusted".to_owned(),
             path: format!("magnetar:{}", component_dir.display()),
             device: ComponentPlacement::Cpu,
@@ -1756,6 +1767,7 @@ mod tests {
         unsafe { std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV) };
 
         let error = match load_binding(&IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "qwen-model-untrusted".to_owned(),
             path: format!("magnetar:{}", component_dir.display()),
             device: ComponentPlacement::Cpu,
@@ -1785,6 +1797,7 @@ mod tests {
             .expect("component artifact should be removable");
 
         let error = match load_binding(&IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "component-required".to_owned(),
             path: format!("magnetar:{}", component_dir.display()),
             device: ComponentPlacement::Cpu,
@@ -1828,6 +1841,7 @@ mod tests {
         unsafe { std::env::remove_var(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV) };
 
         let error = match load_binding(&IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "qwen-self-trusting".to_owned(),
             path: format!("magnetar:{}", component_dir.display()),
             device: ComponentPlacement::Cpu,
@@ -1855,6 +1869,7 @@ mod tests {
         write_tiny_production_qwen_bundle(&component_dir);
         let _trust = trust_tachyon_component_artifact(&component_dir);
         let error = match load_binding(&IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "qwen-cuda".to_owned(),
             path: format!("magnetar:{}", component_dir.display()),
             device: ComponentPlacement::Cuda,
@@ -1898,6 +1913,7 @@ mod tests {
         route.inference_components = vec![IntegrityInferenceComponentBinding {
             alias: "qwen-cuda".to_owned(),
             path: format!("magnetar:{}", component_dir.display()),
+            component_locator: String::new(),
             device: ComponentPlacement::Cuda,
             qos: RouteQos::Standard,
             dynamic: false,
@@ -1939,6 +1955,7 @@ mod tests {
         route.inference_components = vec![IntegrityInferenceComponentBinding {
             alias: "qwen-cuda".to_owned(),
             path: format!("magnetar:{}", component_dir.display()),
+            component_locator: String::new(),
             device: ComponentPlacement::Cuda,
             qos: RouteQos::Standard,
             dynamic: false,
@@ -1985,6 +2002,7 @@ mod tests {
             routes: vec![{
                 let mut route = IntegrityRoute::user("/api/guest-ai");
                 route.inference_components = vec![IntegrityInferenceComponentBinding {
+                    component_locator: String::new(),
                     alias: "llama".to_owned(),
                     path: component_dir.to_string_lossy().into_owned(),
                     device: ComponentPlacement::Cpu,
@@ -2011,6 +2029,7 @@ mod tests {
                 let mut route = IntegrityRoute::user("/api/guest-ai");
                 route.artifact_id = Some("artifact-a".to_owned());
                 route.inference_components = vec![IntegrityInferenceComponentBinding {
+                    component_locator: String::new(),
                     alias: "mock-model".to_owned(),
                     path: "mock".to_owned(),
                     device: ComponentPlacement::Cpu,
@@ -2034,6 +2053,7 @@ mod tests {
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.inference_components = vec![
             IntegrityInferenceComponentBinding {
+                component_locator: String::new(),
                 alias: "vendor-a".to_owned(),
                 path: "openai:http://placeholder.invalid/v1".to_owned(),
                 device: ComponentPlacement::Cpu,
@@ -2042,6 +2062,7 @@ mod tests {
                 hardware_strategy: Default::default(),
             },
             IntegrityInferenceComponentBinding {
+                component_locator: String::new(),
                 alias: "vendor_a".to_owned(),
                 path: "openai:http://placeholder.invalid/v1".to_owned(),
                 device: ComponentPlacement::Cpu,
@@ -2092,6 +2113,7 @@ mod tests {
     fn requested_gpu_rejects_cpu_loaded_model() {
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.inference_components = vec![IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "cpu-only".to_owned(),
             path: "mock".to_owned(),
             device: ComponentPlacement::Cpu,
@@ -2157,6 +2179,7 @@ mod tests {
         let _trust = trust_tachyon_component_artifact(&component_dir);
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.inference_components = vec![IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "gpu-a".to_owned(),
             path: "mock".to_owned(),
             device: ComponentPlacement::Cuda,
@@ -2238,6 +2261,7 @@ mod tests {
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.inference_components = vec![
             IntegrityInferenceComponentBinding {
+                component_locator: String::new(),
                 alias: "component-a".to_owned(),
                 path: "mock:component-a".to_owned(),
                 device: ComponentPlacement::Cpu,
@@ -2246,6 +2270,7 @@ mod tests {
                 hardware_strategy: Default::default(),
             },
             IntegrityInferenceComponentBinding {
+                component_locator: String::new(),
                 alias: "component-b".to_owned(),
                 path: "mock:component-b".to_owned(),
                 device: ComponentPlacement::Cpu,
@@ -2297,6 +2322,7 @@ mod tests {
         let mut route = IntegrityRoute::user("/api/guest-ai");
         route.inference_components = vec![
             IntegrityInferenceComponentBinding {
+                component_locator: String::new(),
                 alias: "qwen-real".to_owned(),
                 path: format!("magnetar:{}", qwen_dir.display()),
                 device: ComponentPlacement::Cpu,
@@ -2305,6 +2331,7 @@ mod tests {
                 hardware_strategy: Default::default(),
             },
             IntegrityInferenceComponentBinding {
+                component_locator: String::new(),
                 alias: "llama-real".to_owned(),
                 path: format!("magnetar:{}", llama_dir.display()),
                 device: ComponentPlacement::Cpu,

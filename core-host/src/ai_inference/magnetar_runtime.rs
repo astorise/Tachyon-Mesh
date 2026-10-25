@@ -1,3 +1,6 @@
+#[cfg(feature = "oci-artifacts")]
+mod artifact_resolver;
+
 use anyhow::{Context, Result, anyhow, bail};
 use magnetar_inference_component::{
     ArtifactTrustPolicy, InferenceComponentArtifact, InferenceComponentPlacement,
@@ -45,17 +48,39 @@ impl std::fmt::Debug for MagnetarRuntime {
     }
 }
 
+/// Name a resolved OCI Component's bytes are always materialized under
+/// inside a binding's local root — fixed rather than derived from the
+/// locator (which may name an arbitrary repository/tag), so the operator
+/// authors the trust manifest sidecar once, under this exact name
+/// (`oci-resolved.component.wasm.magnetar-component.yaml`), independent of
+/// which locator a binding happens to point at today (TACH-10/13: the
+/// published OCI artifact carries only the raw Component bytes, not
+/// Magnetar's own manifest sidecar — see `artifact_resolver`'s module
+/// doc).
+const OCI_RESOLVED_COMPONENT_FILE_NAME: &str = "oci-resolved.component.wasm";
+/// Overrides the local content-addressed cache root OCI-resolved artifacts
+/// stage into (`<root>/sha256/<digest>/artifact`). Unset falls back to a
+/// process-temp-dir-adjacent default — this cache holds no secrets, only
+/// already-digest-verified public Component/Kernel bytes, so an
+/// unconfigured default is safe, merely inconvenient to reuse across
+/// restarts.
+const TACHYON_OCI_ARTIFACT_CACHE_ENV: &str = "TACHYON_OCI_ARTIFACT_CACHE";
+
 impl MagnetarRuntime {
     pub(crate) fn try_load(
         alias: &str,
         path: &str,
         requested_target: &str,
+        component_locator: Option<&str>,
     ) -> Result<Option<Self>> {
         if !is_magnetar_path(path) {
             return Ok(None);
         }
 
         let root = magnetar_root(path);
+        if let Some(locator) = component_locator {
+            materialize_oci_component(&root, locator)?;
+        }
         let placement = InferenceComponentPlacement::parse(requested_target)?;
         let source = InferenceComponentSource::authorized_local_bundle(
             format!("tachyon:{alias}"),
@@ -117,6 +142,49 @@ impl MagnetarRuntime {
             .invoke_payload_streaming_opaque(payload, &mut on_event)?;
         Ok(tags)
     }
+}
+
+/// Resolves `locator` (an `oci://...@sha256:...` reference — see
+/// `artifact_resolver::ArtifactReference`) and copies the verified bytes
+/// into `root` under [`OCI_RESOLVED_COMPONENT_FILE_NAME`], so the existing,
+/// unmodified `component_artifact_from_root` finds them exactly as it
+/// would a hand-placed local `*.component.wasm` file — an `oci://`-sourced
+/// binding behaves identically, end to end, to a fully local one past this
+/// point (TACH-10/13's transport-neutrality requirement).
+#[cfg(feature = "oci-artifacts")]
+fn materialize_oci_component(root: &Path, locator: &str) -> Result<()> {
+    let reference = artifact_resolver::ArtifactReference::parse(locator)?;
+    let cache_root = std::env::var_os(TACHYON_OCI_ARTIFACT_CACHE_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("tachyon-oci-artifacts"));
+    let resolved_path = artifact_resolver::resolve(&reference, &cache_root)?;
+    let bytes = std::fs::read(&resolved_path).with_context(|| {
+        format!(
+            "failed to read resolved OCI artifact at `{}`",
+            resolved_path.display()
+        )
+    })?;
+    std::fs::create_dir_all(root).with_context(|| {
+        format!(
+            "failed to create Component binding root `{}`",
+            root.display()
+        )
+    })?;
+    std::fs::write(root.join(OCI_RESOLVED_COMPONENT_FILE_NAME), bytes).with_context(|| {
+        format!(
+            "failed to materialize resolved OCI Component into `{}`",
+            root.display()
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(not(feature = "oci-artifacts"))]
+fn materialize_oci_component(_root: &Path, locator: &str) -> Result<()> {
+    bail!(
+        "Component binding names an OCI locator (`{locator}`) but this build was compiled \
+         without the `oci-artifacts` feature"
+    )
 }
 
 pub(crate) fn is_invalid_component_invocation(error: &anyhow::Error) -> bool {
@@ -260,4 +328,247 @@ fn reject_trust_policy_inside_artifact(root: &Path, trust_path: &Path) -> Result
         );
     }
     Ok(())
+}
+
+/// TACH-10/TACH-13 (2026-09-24 audit): a real end-to-end proof against the
+/// actual Magnetar artifact published to GHCR by
+/// `component-artifact-distribution.yml` run #2
+/// (<https://github.com/astorise/Magnetar/actions/runs/39452249157>) --
+/// never a simulated registry or a fabricated digest. This is the one test
+/// in this module that touches the network; it is not behind any extra
+/// opt-in flag beyond the `oci-artifacts` feature itself, matching this
+/// codebase's existing convention of failing hard rather than silently
+/// skipping when a required external resource is unreachable (see
+/// `TACHYON_REQUIRE_GUEST_OPENAI`).
+#[cfg(all(test, feature = "oci-artifacts"))]
+mod oci_artifact_tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// The real, checked-in-on-Magnetar-main manifest sidecar for
+    /// `synthetic-minimal.component.wasm`, carrying that Component's real
+    /// digest (`sha256:467bfdf6...`) -- the exact bytes GHCR serves for
+    /// `ghcr.io/astorise/magnetar-component:synthetic-minimal-latest`, per
+    /// that push's own job log. `signatures: []` here is the real fixture's
+    /// own content (TACH-11 is proven separately, with local test keys —
+    /// this artifact was never signed).
+    const SYNTHETIC_MINIMAL_MANIFEST_YAML: &str = r#"schema: magnetar-component-artifact
+schema_version: 1
+artifact:
+  kind: component
+  digest:
+    algorithm: sha256
+    value: "sha256:467bfdf663fcdb6034294599f6a079a9e0af05c1d0be2e8996afe1c2ef463854"
+component:
+  name: "magnetar.test.synthetic-minimal"
+  version: "0.1.0"
+  description: "Test-only Model Component fixture, published as the real GHCR OCI artifact this test resolves."
+  role: "qwen-model-component"
+runtime:
+  magnetar:
+    min_version: "0.1.0"
+wit:
+  imports:
+    - package: "magnetar:model-component-graph"
+      interface: "graph-builder"
+      version: "1.2.0"
+    - package: "magnetar:model-component-graph"
+      interface: "model-config"
+      version: "1.2.0"
+  exports: []
+capabilities:
+  requires: []
+authority:
+  requires: []
+engine:
+  profile: "native"
+  features:
+    - component-model
+    - resource-limits
+publisher:
+  id: "local-dev"
+  name: "Local Development"
+source:
+  kind: "local"
+  uri: "./oci-resolved.component.wasm"
+signatures: []
+"#;
+
+    const REAL_COMPONENT_LOCATOR: &str = "oci://ghcr.io/astorise/magnetar-component:synthetic-minimal-latest@sha256:bb393658899d36d36dda37224861c4437f249b6e240d196585a2eea17c3fe214";
+    const REAL_COMPONENT_DIGEST: &str =
+        "sha256:467bfdf663fcdb6034294599f6a079a9e0af05c1d0be2e8996afe1c2ef463854";
+
+    /// Serializes this module's tests against each other: both mutate the
+    /// process-wide `TACHYON_COMPONENT_TRUST_STORE`/`TACHYON_OCI_ARTIFACT_
+    /// CACHE` environment variables, which `cargo test`'s default parallel
+    /// execution would otherwise race.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous_cache: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe {
+                match self.previous_cache.take() {
+                    Some(previous) => std::env::set_var(TACHYON_OCI_ARTIFACT_CACHE_ENV, previous),
+                    None => std::env::remove_var(TACHYON_OCI_ARTIFACT_CACHE_ENV),
+                }
+            }
+        }
+    }
+
+    /// Covers `materialize_oci_component` + `component_artifact_from_root`
+    /// (the exact pair `try_load` runs in sequence) against the real,
+    /// network-pulled bytes -- proving an `oci://`-sourced binding behaves
+    /// identically to a hand-placed local one at every layer transport
+    /// cannot affect. Stops short of `LoadedInferenceComponent::load`
+    /// itself: that call additionally ingests a Model Artifact bundle from
+    /// the same root regardless of which Component is loaded, a
+    /// requirement orthogonal to transport that `synthetic-minimal` (a
+    /// Component-registration fixture, never paired with a Model Artifact
+    /// bundle anywhere in Magnetar's own test suite either) was never
+    /// meant to satisfy.
+    #[test]
+    fn resolves_and_registers_the_real_published_ghcr_component_end_to_end() {
+        let lock = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().expect("temp dir creates");
+        let cache_dir = temp.path().join("cache");
+        let binding_root = temp.path().join("binding");
+        std::fs::create_dir_all(&binding_root).expect("binding root creates");
+
+        std::fs::write(
+            binding_root.join(format!(
+                "{OCI_RESOLVED_COMPONENT_FILE_NAME}.magnetar-component.yaml"
+            )),
+            SYNTHETIC_MINIMAL_MANIFEST_YAML,
+        )
+        .expect("manifest sidecar writes");
+
+        let previous_cache = std::env::var_os(TACHYON_OCI_ARTIFACT_CACHE_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(TACHYON_OCI_ARTIFACT_CACHE_ENV, &cache_dir) };
+        let _guard = EnvGuard {
+            _lock: lock,
+            previous_cache,
+        };
+
+        // Real network pull against the real artifact GHCR actually
+        // serves, verified by manifest digest, staged into the local CAS,
+        // then materialized into the binding root under the fixed name the
+        // manifest sidecar above names.
+        materialize_oci_component(&binding_root, REAL_COMPONENT_LOCATOR)
+            .expect("a real, currently-published GHCR locator must resolve and materialize");
+
+        let materialized = binding_root.join(OCI_RESOLVED_COMPONENT_FILE_NAME);
+        let materialized_bytes = std::fs::read(&materialized).expect("materialized file reads");
+        assert_eq!(
+            format!("sha256:{}", sha256_hex_for_test(&materialized_bytes)),
+            REAL_COMPONENT_DIGEST,
+            "the materialized bytes must be exactly the real, digest-verified GHCR artifact"
+        );
+
+        // Same call `try_load` makes next: the existing, unmodified local-
+        // directory scan finds the materialized bytes and their sidecar
+        // manifest exactly as it would a hand-placed local bundle --
+        // `component_artifact_from_root`'s behavior from here on is
+        // determined entirely by the bytes on disk (already verified
+        // above by digest), with no record of which transport put them
+        // there. Its return value is opaque by design (`InferenceComponent
+        // Artifact`'s fields are private to `inference-components`, by
+        // construction only consumable via `LoadedInferenceComponent::
+        // load`, which additionally requires a paired Model Artifact
+        // bundle this Component-registration-only fixture was never meant
+        // to have -- see this test's own doc comment), so succeeding
+        // without error is what this call proves: the OCI-materialized
+        // files are discoverable exactly like a hand-placed local bundle.
+        component_artifact_from_root(&binding_root).expect(
+            "the materialized bytes and sidecar manifest must be discoverable exactly like a \
+             hand-placed local bundle",
+        );
+
+        // Second resolve: same locator, now served entirely from the local
+        // CAS cache populated above -- proving the cache-hit path, not
+        // just the resolver in isolation.
+        let cache_artifact_path = cache_dir
+            .join("sha256")
+            .join(
+                REAL_COMPONENT_LOCATOR
+                    .rsplit("sha256:")
+                    .next()
+                    .expect("rsplit always yields at least one segment"),
+            )
+            .join("artifact");
+        assert!(
+            cache_artifact_path.is_file(),
+            "the first resolve must have staged the artifact into the local CAS"
+        );
+        let staged_before = std::fs::metadata(&cache_artifact_path)
+            .expect("staged artifact metadata reads")
+            .modified()
+            .expect("mtime is available on this platform");
+
+        materialize_oci_component(&binding_root, REAL_COMPONENT_LOCATOR)
+            .expect("a cache-hit resolve must still succeed");
+        let staged_after = std::fs::metadata(&cache_artifact_path)
+            .expect("staged artifact metadata reads")
+            .modified()
+            .expect("mtime is available on this platform");
+        assert_eq!(
+            staged_before, staged_after,
+            "a cache hit must not re-stage (and therefore must not re-fetch) the artifact"
+        );
+    }
+
+    /// The same real, currently-published tag as `REAL_COMPONENT_LOCATOR`,
+    /// but paired with a digest that is not the one GHCR actually serves
+    /// for it -- proving the resolver's manifest-digest check is a real
+    /// rejection, not merely a pass-through of whatever the registry
+    /// returns under that tag.
+    #[test]
+    fn rejects_a_real_tag_resolving_to_an_unexpected_digest() {
+        let lock = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().expect("temp dir creates");
+        let cache_dir = temp.path().join("cache");
+        let binding_root = temp.path().join("binding");
+        std::fs::create_dir_all(&binding_root).expect("binding root creates");
+
+        let previous_cache = std::env::var_os(TACHYON_OCI_ARTIFACT_CACHE_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(TACHYON_OCI_ARTIFACT_CACHE_ENV, &cache_dir) };
+        let _guard = EnvGuard {
+            _lock: lock,
+            previous_cache,
+        };
+
+        let wrong_digest_locator = "oci://ghcr.io/astorise/magnetar-component:synthetic-minimal-latest@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let error = materialize_oci_component(&binding_root, wrong_digest_locator)
+            .expect_err("a tag that resolves to a different real digest must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("digest"),
+            "the rejection must name the digest mismatch, got: {message}"
+        );
+    }
+
+    fn sha256_hex_for_test(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
 }

@@ -1273,6 +1273,7 @@ mod requested_component_alias_tests {
         let route = IntegrityRoute {
             path: "/ai".to_owned(),
             inference_components: vec![IntegrityInferenceComponentBinding {
+                component_locator: String::new(),
                 alias: "Qwen/Qwen3-Coder".to_owned(),
                 path: "/components/qwen".to_owned(),
                 device: ComponentPlacement::Cpu,
@@ -1295,6 +1296,7 @@ mod requested_component_alias_tests {
 
     fn component_binding(alias: &str) -> IntegrityInferenceComponentBinding {
         IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: alias.to_owned(),
             path: String::new(),
             device: ComponentPlacement::Cpu,

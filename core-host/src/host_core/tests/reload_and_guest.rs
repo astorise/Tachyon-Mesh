@@ -381,6 +381,7 @@ fn execute_guest_ai_uses_preloaded_model_alias_and_returns_mock_text() {
     route.inference_components = vec![IntegrityInferenceComponentBinding {
         alias: "llama3".to_owned(),
         path: "mock:llama3".to_owned(),
+        component_locator: String::new(),
         device: ComponentPlacement::Cuda,
         qos: RouteQos::Standard,
         dynamic: false,
@@ -498,6 +499,7 @@ async fn streaming_guest_openai_sse_deltas_reconstruct_buffered_output() {
         .try_init();
     let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
     route.inference_components = vec![IntegrityInferenceComponentBinding {
+        component_locator: String::new(),
         alias: "llama3".to_owned(),
         path: "mock:llama3".to_owned(),
         device: ComponentPlacement::Cpu,
@@ -775,6 +777,7 @@ async fn streaming_guest_openai_disconnect_finishes_worker_without_done_frame() 
         .try_init();
     let mut route = IntegrityRoute::user("/ai/v1/chat/completions");
     route.inference_components = vec![IntegrityInferenceComponentBinding {
+        component_locator: String::new(),
         alias: "llama3".to_owned(),
         path: "mock:llama3".to_owned(),
         device: ComponentPlacement::Cpu,
