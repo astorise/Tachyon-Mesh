@@ -50,6 +50,16 @@ fips = ["tokio-rustls/aws_lc_rs", "tokio-rustls/fips"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tower", "dep:tokio-stream"]
 mtls = []
 magnetar-cuda = ["ai-inference", "magnetar-inference-component/cuda"]
+# TACH-10/TACH-13 (2026-09-24 audit, `consume-magnetar-oci-artifacts`):
+# resolves an `oci://...@sha256:...` Component binding locator against a
+# registry before handing Magnetar a local path, exactly as it already
+# does for a hand-placed bundle. Deliberately independent of `ai-inference`
+# itself (which must keep working with zero network/registry code for a
+# build that only ever uses local `magnetar:` paths) — the resolver reuses
+# `reqwest`/`sha2`, both already mandatory core-host dependencies for
+# unrelated reasons, so enabling this feature adds no new dependency, only
+# the resolver's own code path.
+oci-artifacts = ["ai-inference"]
 rate-limit = ["dep:governor", "dep:forwarded-header-value"]
 resiliency = ["dep:tower"]
 ring = ["tokio-rustls/ring", "tokio-rustls/tls12"]

@@ -1450,6 +1450,7 @@ mod configured_binding_registry_tests {
 
     fn binding(alias: &str, path: &str, dynamic: bool) -> IntegrityInferenceComponentBinding {
         IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: alias.to_owned(),
             path: path.to_owned(),
             device: crate::ComponentPlacement::Cpu,

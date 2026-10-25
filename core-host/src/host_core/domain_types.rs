@@ -709,6 +709,15 @@ pub(crate) struct IntegrityInferenceComponentBinding {
     /// predate this field deserialize and re-serialize unchanged.
     #[serde(default, skip_serializing_if = "HardwareStrategy::is_single")]
     pub(crate) hardware_strategy: HardwareStrategy,
+    /// An `oci://<registry>/<repository>:<tag>@sha256:<digest>` locator
+    /// (TACH-10/13, 2026-09-24 audit) for the Component (WASM) binary
+    /// bytes specifically — never the Magnetar trust manifest sidecar,
+    /// which an operator still authors locally under `path` exactly as
+    /// for a fully local binding (the published OCI artifact carries only
+    /// the raw bytes today, not that sidecar). Requires the `oci-artifacts`
+    /// feature; ignored (and must be empty) otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) component_locator: String,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
@@ -1261,6 +1270,7 @@ mod hardware_strategy_tests {
     #[test]
     fn default_strategy_is_skipped_on_serialization() {
         let binding = IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "m".to_owned(),
             path: "/components/m".to_owned(),
             device: ComponentPlacement::Cpu,
@@ -1278,6 +1288,7 @@ mod hardware_strategy_tests {
     #[test]
     fn device_affinity_strategy_round_trips() {
         let binding = IntegrityInferenceComponentBinding {
+            component_locator: String::new(),
             alias: "m".to_owned(),
             path: "/components/m".to_owned(),
             device: ComponentPlacement::Cuda,

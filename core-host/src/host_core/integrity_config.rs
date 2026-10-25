@@ -1759,6 +1759,7 @@ pub(crate) fn normalize_route_components(
                 qos: component.qos,
                 dynamic: component.dynamic,
                 hardware_strategy: component.hardware_strategy,
+                component_locator: component.component_locator,
             });
     }
 
