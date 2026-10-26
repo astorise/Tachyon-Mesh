@@ -174,7 +174,7 @@ COPY examples/guest-js/index.js ./
 RUN mkdir -p /workspace/guest-modules \
     && javy build /workspace/examples/guest-js/index.js -o /workspace/guest-modules/guest_js.wasm
 
-FROM mcr.microsoft.com/dotnet/sdk:11.0@sha256:db7d1f28c0805ea69fe43f73e54cffd2a0689a0c637a6078328e27c5aab2314a AS dotnet-builder
+FROM mcr.microsoft.com/dotnet/sdk:11.0@sha256:3a9175b6c54b2f076817af1360f691c9994447b192faa48a1a1f112a516844c7 AS dotnet-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG WASI_SDK_VERSION=20.0
