@@ -9,4 +9,4 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-wit-bindgen = "0.62"
+wit-bindgen = "0.63"
