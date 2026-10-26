@@ -197,6 +197,16 @@ check_production_prefix_absent \
   'DEFAULT_COMPONENT|register_default_component|include_bytes!' \
   'generic Magnetar inference Component adapter must not select a compiled-in default Component'
 
+check_production_prefix_absent \
+  core-host/src/ai_inference.rs \
+  '\bed25519_dalek\b|\bed25519-dalek\b' \
+  'core-host AI inference production code must not import ed25519-dalek directly -- publisher-key signature verification is Magnetar'"'"'s responsibility, never duplicated in Tachyon (TACH-11)'
+
+check_production_prefix_absent \
+  core-host/src/ai_inference/magnetar_runtime.rs \
+  '\bed25519_dalek\b|\bed25519-dalek\b|\bSha256::digest\(|\bsha2::' \
+  'Tachyon Magnetar adapter must not import ed25519-dalek, or reimplement key-id derivation via sha2 directly -- call Magnetar'"'"'s key_id_for/verify_signature instead of duplicating them (TACH-11)'
+
 if [ "$failures" -ne 0 ]; then
   echo "AI Component boundary validation failed with $failures finding(s)."
   exit 1
