@@ -4,7 +4,8 @@ mod artifact_resolver;
 use anyhow::{Context, Result, anyhow, bail};
 use magnetar_inference_component::{
     ArtifactTrustPolicy, InferenceComponentArtifact, InferenceComponentPlacement,
-    InferenceComponentSource, LoadedInferenceComponent,
+    InferenceComponentSource, LoadedInferenceComponent, PublisherIdentity, VerifyingKeyBytes,
+    key_id_for,
 };
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -253,32 +254,52 @@ fn component_artifact_from_root(root: &Path) -> Result<InferenceComponentArtifac
 
 fn tachyon_component_trust_policy(root: &Path) -> Result<ArtifactTrustPolicy> {
     let mut trust_policy = ArtifactTrustPolicy::default();
-    trust_policy = apply_trust_digests(
+    trust_policy = apply_trust_store(
         trust_policy,
         root,
         TACHYON_COMPONENT_TRUST_STORE_ENV,
         ArtifactTrustPolicy::trust_component_digest,
+        ArtifactTrustPolicy::trust_component_publisher_key,
+        ArtifactTrustPolicy::revoke_component_key,
     )?;
-    trust_policy = apply_trust_digests(
+    trust_policy = apply_trust_store(
         trust_policy,
         root,
         TACHYON_ARTIFACT_TRUST_STORE_ENV,
         ArtifactTrustPolicy::trust_digest,
+        ArtifactTrustPolicy::trust_publisher_key,
+        ArtifactTrustPolicy::revoke_key,
     )?;
     Ok(trust_policy)
 }
 
-/// Reads `trusted_digests` out of the JSON file named by `env_var`, if set,
-/// and applies each one to `trust_policy` via `apply`. `TACHYON_COMPONENT_
-/// TRUST_STORE` and `TACHYON_ARTIFACT_TRUST_STORE` both use this same file
-/// shape and both call this — they differ only in which of `Artifact
-/// TrustPolicy`'s two independent trust decisions (Component binary vs.
-/// Model Artifact) their digests feed.
-fn apply_trust_digests(
+/// Reads one trust store JSON file (named by `env_var`, if set) and applies
+/// its `trusted_digests` (required, unchanged since before TACH-11) plus its
+/// `trusted_publisher_keys`/`revoked_keys` (both optional and additive --
+/// TACH-11, `integrate-magnetar-publisher-trust`) to `trust_policy`.
+/// `TACHYON_COMPONENT_TRUST_STORE`/`TACHYON_ARTIFACT_TRUST_STORE` both use
+/// this same file shape and both call this once each — they differ only in
+/// which of `ArtifactTrustPolicy`'s two independent trust decisions
+/// (Component binary vs. Model Artifact) their entries feed, via
+/// `apply_digest`/`apply_publisher_key`/`apply_revoke`.
+///
+/// Tachyon only ever supplies policy data (parsed digests, public key
+/// bytes, revoked key ids) to `ArtifactTrustPolicy`; the signature
+/// verification itself happens entirely on Magnetar's own side of that
+/// API, never duplicated here (enforced by `scripts/validate_ai_component_
+/// boundary.sh`, which forbids importing the signature-primitive crate or
+/// hashing one's own key fingerprint in this file).
+fn apply_trust_store(
     mut trust_policy: ArtifactTrustPolicy,
     root: &Path,
     env_var: &str,
-    apply: impl Fn(ArtifactTrustPolicy, &str) -> ArtifactTrustPolicy,
+    apply_digest: impl Fn(ArtifactTrustPolicy, &str) -> ArtifactTrustPolicy,
+    apply_publisher_key: impl Fn(
+        ArtifactTrustPolicy,
+        VerifyingKeyBytes,
+        PublisherIdentity,
+    ) -> ArtifactTrustPolicy,
+    apply_revoke: impl Fn(ArtifactTrustPolicy, String) -> ArtifactTrustPolicy,
 ) -> Result<ArtifactTrustPolicy> {
     let Some(trust_path) = std::env::var_os(env_var).map(PathBuf::from) else {
         return Ok(trust_policy);
@@ -305,8 +326,86 @@ fn apply_trust_digests(
                 trust_path.display()
             )
         })?;
-        trust_policy = apply(trust_policy, digest);
+        trust_policy = apply_digest(trust_policy, digest);
     }
+
+    let revoked_keys = value
+        .get("revoked_keys")
+        .map(|revoked_keys| {
+            revoked_keys.as_array().ok_or_else(|| {
+                anyhow!("`{}` `revoked_keys` must be an array", trust_path.display())
+            })
+        })
+        .transpose()?
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    entry.as_str().map(str::to_owned).ok_or_else(|| {
+                        anyhow!(
+                            "`{}` `revoked_keys` entries must be strings",
+                            trust_path.display()
+                        )
+                    })
+                })
+                .collect::<Result<std::collections::BTreeSet<String>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    if let Some(trusted_publisher_keys) = value.get("trusted_publisher_keys") {
+        let trusted_publisher_keys = trusted_publisher_keys.as_object().ok_or_else(|| {
+            anyhow!(
+                "`{}` `trusted_publisher_keys` must be an object mapping publisher name to a \
+                 hex-encoded Ed25519 public key",
+                trust_path.display()
+            )
+        })?;
+        for (name, public_key_hex) in trusted_publisher_keys {
+            let public_key_hex = public_key_hex.as_str().ok_or_else(|| {
+                anyhow!(
+                    "`{}` `trusted_publisher_keys.{name}` must be a hex string",
+                    trust_path.display()
+                )
+            })?;
+            let public_key_bytes = hex::decode(public_key_hex).with_context(|| {
+                format!(
+                    "`{}` `trusted_publisher_keys.{name}` is not valid hex",
+                    trust_path.display()
+                )
+            })?;
+            let public_key: VerifyingKeyBytes =
+                public_key_bytes.as_slice().try_into().with_context(|| {
+                    format!(
+                        "`{}` `trusted_publisher_keys.{name}` must decode to exactly 32 bytes \
+                         (a raw Ed25519 public key), got {}",
+                        trust_path.display(),
+                        public_key_bytes.len()
+                    )
+                })?;
+            // Fail-closed on a self-contradictory file: naming a key as
+            // both trusted and revoked in the same file is a policy-
+            // authoring error Tachyon rejects outright, rather than
+            // silently relying on Magnetar's own "revocation wins"
+            // evaluation to paper over it (TACH-11 tasks.md 1.3).
+            let key_id = key_id_for(&public_key);
+            if revoked_keys.contains(&key_id) {
+                bail!(
+                    "`{}` names publisher key `{name}` (key id `{key_id}`) under both \
+                     `trusted_publisher_keys` and `revoked_keys` -- a trust store file may not \
+                     contradict itself",
+                    trust_path.display()
+                );
+            }
+            trust_policy =
+                apply_publisher_key(trust_policy, public_key, PublisherIdentity::new(name));
+        }
+    }
+
+    for key_id in revoked_keys {
+        trust_policy = apply_revoke(trust_policy, key_id);
+    }
+
     Ok(trust_policy)
 }
 
