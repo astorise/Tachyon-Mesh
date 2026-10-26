@@ -1860,6 +1860,306 @@ mod tests {
         let _ = std::fs::remove_dir_all(component_dir);
     }
 
+    /// TACH-11 (`integrate-magnetar-publisher-trust`): `trusted_publisher_
+    /// keys`/`revoked_keys`, parsed by `magnetar_runtime::apply_trust_store`
+    /// from the same Tachyon-controlled trust-store file
+    /// `trusted_digests` already uses, additively. These drive a real
+    /// Ed25519 signature through the full `load_binding` ->
+    /// `MagnetarRuntime::try_load` -> `LoadedInferenceComponent::load` path
+    /// against the real, checked-in Qwen Component fixture (not a mock),
+    /// mirroring Magnetar's own lower-level proof of the same builder
+    /// methods (`inference-components/src/lib.rs::publisher_trust_tests`,
+    /// `astorise/Magnetar#125`) one layer up, through Tachyon's file-based
+    /// policy surface instead of calling `ArtifactTrustPolicy` directly.
+    mod publisher_trust_tests {
+        use super::*;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        /// The real, checked-in Qwen Component fixture's own digest
+        /// (`write_tiny_production_qwen_bundle`'s manifest declares this
+        /// same value) -- never a value a test invents.
+        const REAL_QWEN_COMPONENT_DIGEST: &str =
+            "sha256:cd10b875f12d70e025b27765a0abcc655d630b4150e1e29f944536f648d352a5";
+
+        /// A deterministic test keypair -- never a real publisher's key.
+        fn test_signing_key(seed_byte: u8) -> SigningKey {
+            SigningKey::from_bytes(&[seed_byte; 32])
+        }
+
+        fn hex_encode(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+
+        /// Patches the fixture manifest `write_tiny_production_qwen_bundle`
+        /// already wrote under `root`, replacing its real `signatures: []`
+        /// with one signature entry -- the same technique and the same
+        /// real Component digest Magnetar's own TACH-11 test suite uses,
+        /// so every other validation step a fresh registration performs
+        /// (engine/WIT/runtime compatibility, digest match) still passes
+        /// unchanged; only the trust decision each test cares about varies.
+        fn write_signed_component_manifest(root: &Path, key_id: &str, signature_hex: &str) {
+            let manifest_path = root.join("qwen-real.component.wasm.magnetar-component.yaml");
+            let base = std::fs::read_to_string(&manifest_path)
+                .expect("qwen fixture manifest should already be written");
+            let signed = base.replacen(
+                "signatures: []",
+                &format!(
+                    "signatures:\n  - algorithm: \"ed25519\"\n    digest: \"{REAL_QWEN_COMPONENT_DIGEST}\"\n    key_id: \"{key_id}\"\n    signature: \"{signature_hex}\"\n",
+                ),
+                1,
+            );
+            assert_ne!(
+                signed, base,
+                "fixture manifest must still contain the unsigned `signatures: []` marker to patch"
+            );
+            std::fs::write(&manifest_path, signed).expect("signed manifest should be written");
+        }
+
+        /// Writes a Component trust-store file naming `publisher_key_hex`
+        /// under `trusted_publisher_keys` (and `revoked_key_id`, if given,
+        /// under `revoked_keys`) plus the Model Artifact's own real digest
+        /// pinned the usual way -- Model Artifact trust is not what these
+        /// tests are about, so it stays a plain, already-proven digest pin
+        /// throughout, isolating the Component (publisher-key) half.
+        fn trust_component_publisher_key(
+            root: &Path,
+            publisher_key_hex: &str,
+            revoked_key_id: Option<&str>,
+        ) -> TrustStoreEnvGuard {
+            let qwen_lock = qwen_interprocess_lock();
+            let lock = trust_env_lock();
+            let model_digest = magnetar_inference_component::local_bundle_manifest_digest(root)
+                .expect("fixture should ingest before writing Tachyon trust policy");
+
+            let trust_dir = unique_component_dir("component-publisher-trust-policy");
+            std::fs::create_dir_all(&trust_dir).expect("trust policy dir should be created");
+
+            let revoked_keys_json = match revoked_key_id {
+                Some(key_id) => format!(r#"["{key_id}"]"#),
+                None => "[]".to_owned(),
+            };
+            let component_path = trust_dir.join("tachyon-component-trust.json");
+            std::fs::write(
+                &component_path,
+                format!(
+                    r#"{{"trusted_digests":[],"trusted_publisher_keys":{{"tach-11-test-publisher":"{publisher_key_hex}"}},"revoked_keys":{revoked_keys_json}}}"#
+                ),
+            )
+            .expect("component trust sidecar should be written");
+
+            let model_path = trust_dir.join("tachyon-artifact-trust.json");
+            std::fs::write(
+                &model_path,
+                format!(r#"{{"trusted_digests":["{model_digest}"]}}"#),
+            )
+            .expect("model trust sidecar should be written");
+
+            let previous_component =
+                std::env::var_os(magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV);
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe {
+                std::env::set_var(
+                    magnetar_runtime::TACHYON_COMPONENT_TRUST_STORE_ENV,
+                    &component_path,
+                )
+            };
+            let previous_model =
+                std::env::var_os(magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV);
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe {
+                std::env::set_var(
+                    magnetar_runtime::TACHYON_ARTIFACT_TRUST_STORE_ENV,
+                    &model_path,
+                )
+            };
+
+            TrustStoreEnvGuard {
+                _qwen_lock: qwen_lock,
+                _lock: lock,
+                previous_component,
+                previous_model,
+                component_path,
+                model_path,
+            }
+        }
+
+        fn load_qwen_binding(
+            alias: &str,
+            component_dir: &Path,
+        ) -> Result<LoadedInferenceComponent> {
+            load_binding(&IntegrityInferenceComponentBinding {
+                component_locator: String::new(),
+                alias: alias.to_owned(),
+                path: format!("magnetar:{}", component_dir.display()),
+                device: ComponentPlacement::Cpu,
+                qos: RouteQos::Standard,
+                dynamic: false,
+                hardware_strategy: Default::default(),
+            })
+        }
+
+        #[test]
+        fn a_valid_signature_under_a_trusted_publisher_key_authenticates_with_no_digest_pinned() {
+            let component_dir = unique_component_dir("publisher-trust-valid");
+            write_tiny_production_qwen_bundle(&component_dir);
+
+            let signing_key = test_signing_key(1);
+            let verifying_key = signing_key.verifying_key().to_bytes();
+            let key_id = magnetar_inference_component::key_id_for(&verifying_key);
+            let signature = signing_key.sign(REAL_QWEN_COMPONENT_DIGEST.as_bytes());
+            write_signed_component_manifest(
+                &component_dir,
+                &key_id,
+                &hex_encode(&signature.to_bytes()),
+            );
+
+            let _trust =
+                trust_component_publisher_key(&component_dir, &hex_encode(&verifying_key), None);
+
+            load_qwen_binding("qwen-publisher-trusted", &component_dir).expect(
+                "a signature verifying under a trusted publisher key must authorize the \
+                 Component even with no digest pinned at all",
+            );
+            let _ = std::fs::remove_dir_all(component_dir);
+        }
+
+        #[test]
+        fn a_signature_under_an_unknown_key_is_rejected() {
+            let component_dir = unique_component_dir("publisher-trust-unknown-key");
+            write_tiny_production_qwen_bundle(&component_dir);
+
+            // Signs with a key the trust store never names at all.
+            let unknown_signer = test_signing_key(2);
+            let unknown_key_id = magnetar_inference_component::key_id_for(
+                &unknown_signer.verifying_key().to_bytes(),
+            );
+            let signature = unknown_signer.sign(REAL_QWEN_COMPONENT_DIGEST.as_bytes());
+            write_signed_component_manifest(
+                &component_dir,
+                &unknown_key_id,
+                &hex_encode(&signature.to_bytes()),
+            );
+
+            // Trusts a *different* key -- the unknown signer's key never
+            // appears in this policy.
+            let trusted_signer = test_signing_key(3);
+            let _trust = trust_component_publisher_key(
+                &component_dir,
+                &hex_encode(&trusted_signer.verifying_key().to_bytes()),
+                None,
+            );
+
+            let error = match load_qwen_binding("qwen-publisher-unknown", &component_dir) {
+                Ok(_) => panic!(
+                    "a signature under a key this policy never trusted must never authorize \
+                     the Component -- a resolvable, on-disk artifact is not thereby trusted"
+                ),
+                Err(error) => error,
+            };
+            assert!(
+                error_chain_contains(&error, "no trust policy matched"),
+                "unexpected trust rejection error: {error:#}"
+            );
+            let _ = std::fs::remove_dir_all(component_dir);
+        }
+
+        #[test]
+        fn malformed_signature_bytes_under_a_trusted_key_are_rejected() {
+            let component_dir = unique_component_dir("publisher-trust-invalid-sig");
+            write_tiny_production_qwen_bundle(&component_dir);
+
+            let signing_key = test_signing_key(4);
+            let verifying_key = signing_key.verifying_key().to_bytes();
+            let key_id = magnetar_inference_component::key_id_for(&verifying_key);
+            // Syntactically well-formed (64 bytes) but not an actual
+            // signature over this digest under this key.
+            let invalid_signature_hex = "11".repeat(64);
+            write_signed_component_manifest(&component_dir, &key_id, &invalid_signature_hex);
+
+            let _trust =
+                trust_component_publisher_key(&component_dir, &hex_encode(&verifying_key), None);
+
+            let error = match load_qwen_binding("qwen-publisher-invalid-sig", &component_dir) {
+                Ok(_) => panic!(
+                    "a syntactically well-formed but cryptographically invalid signature \
+                     under a trusted key must still be rejected"
+                ),
+                Err(error) => error,
+            };
+            assert!(
+                error_chain_contains(
+                    &error,
+                    "signature does not verify under a known trusted key"
+                ),
+                "unexpected trust rejection error: {error:#}"
+            );
+            let _ = std::fs::remove_dir_all(component_dir);
+        }
+
+        /// TACH-11 tasks.md 1.3: Tachyon's own trust-store parser rejects a
+        /// file naming the same key under both `trusted_publisher_keys` and
+        /// `revoked_keys` as a self-contradictory policy, before the file
+        /// ever reaches Magnetar's trust evaluation at all -- a stricter,
+        /// earlier fail-closed check than relying on Magnetar's own
+        /// "revocation wins" evaluation-time behavior (independently
+        /// proven by `astorise/Magnetar#125`'s own test suite, not
+        /// duplicated here). Either layer rejecting it satisfies this
+        /// test's actual requirement: such a key must never authorize a
+        /// load.
+        #[test]
+        fn a_key_present_in_both_trusted_and_revoked_is_rejected() {
+            let component_dir = unique_component_dir("publisher-trust-revoked");
+            write_tiny_production_qwen_bundle(&component_dir);
+
+            let signing_key = test_signing_key(5);
+            let verifying_key = signing_key.verifying_key().to_bytes();
+            let key_id = magnetar_inference_component::key_id_for(&verifying_key);
+            let signature = signing_key.sign(REAL_QWEN_COMPONENT_DIGEST.as_bytes());
+            write_signed_component_manifest(
+                &component_dir,
+                &key_id,
+                &hex_encode(&signature.to_bytes()),
+            );
+
+            let _trust = trust_component_publisher_key(
+                &component_dir,
+                &hex_encode(&verifying_key),
+                Some(&key_id),
+            );
+
+            if load_qwen_binding("qwen-publisher-revoked", &component_dir).is_ok() {
+                panic!(
+                    "a key present in both trusted_publisher_keys and revoked_keys must never \
+                     authorize a Component -- revocation always wins"
+                );
+            }
+            let _ = std::fs::remove_dir_all(component_dir);
+        }
+
+        /// TACH-11 tasks.md 3.5: digest pinning is the floor and is never
+        /// weakened by this change -- a digest-pinned Component keeps
+        /// loading exactly as it always did even when it also carries a
+        /// signature that does not verify under any trusted key.
+        #[test]
+        fn digest_pinning_keeps_working_alongside_an_unverifiable_signature() {
+            let component_dir = unique_component_dir("publisher-trust-digest-floor");
+            write_tiny_production_qwen_bundle(&component_dir);
+            write_signed_component_manifest(
+                &component_dir,
+                "0000000000000000", // a key id naming no key on file at all
+                &"22".repeat(64),
+            );
+
+            let _trust = trust_tachyon_component_artifact(&component_dir);
+
+            load_qwen_binding("qwen-digest-floor", &component_dir).expect(
+                "a digest-pinned Component must keep loading unconditionally, regardless of \
+                 whether it also carries a signature, verifiable or not",
+            );
+            let _ = std::fs::remove_dir_all(component_dir);
+        }
+    }
+
     #[test]
     fn explicit_magnetar_cuda_binding_fails_closed_when_cuda_is_unavailable() {
         if magnetar_inference_component::cuda_provider_available() {
