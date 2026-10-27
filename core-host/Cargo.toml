@@ -125,7 +125,17 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 system-faas-enrollment = { path = "../systems/system-faas-enrollment" }
 system-faas-microvm-runner = { path = "../systems/system-faas-microvm-runner" }
 uuid = { version = "1", features = ["v4"] }
-wasmtime = { version = "50.0.0", features = ["component-model"] }
+# Default features minus `cache` (TACH-14): `cache` is the only wasmtime
+# default that pulls in zstd 0.13 (RUSTSEC-2026-0391/-0398/-0403/-0410) via
+# wasmtime-internal-cache, and core-host never calls the cache config API.
+wasmtime = { version = "50.0.0", default-features = false, features = [
+    "anyhow", "async", "backtrace", "gc", "gc-copying", "gc-drc", "gc-null",
+    "wat", "profiling", "parallel-compilation", "cranelift",
+    "pooling-allocator", "demangle", "addr2line", "coredump",
+    "debug-builtins", "runtime", "component-model", "component-model-async",
+    "threads", "stack-switching", "std", "debug", "compile-time-builtins",
+    "wit-parser",
+] }
 wasmtime-wasi = { version = "50.0.0", features = ["p1"] }
 wasmtime-wasi-nn = { version = "50.0.0", optional = true, default-features = false }
 
