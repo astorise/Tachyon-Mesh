@@ -5,10 +5,8 @@ use anyhow::{Result, anyhow};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, OnceLock, RwLock,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::{Arc, Condvar, Mutex, OnceLock, RwLock},
+    time::{Duration, Instant},
 };
 
 use crate::{IntegrityConfig, IntegrityInferenceComponentBinding, RouteQos};
@@ -186,6 +184,16 @@ impl ComponentInvocationError {
             invalid_request: true,
         }
     }
+
+    /// Transient capacity rejection (HTTP 503): not a bad request, just no
+    /// free admission slot right now. The caller should retry.
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            upstream_status: Some(503),
+            invalid_request: false,
+        }
+    }
 }
 
 impl std::fmt::Display for ComponentInvocationError {
@@ -240,48 +248,109 @@ pub(crate) struct SchedulerSnapshot {
 /// flight on that instance finishes. Tachyon holds exactly one instance
 /// per alias, so this was previously an invisible property of a
 /// dependency — a second concurrent request for the same alias just
-/// blocked silently with no signal to Tachyon at all (audit finding
-/// TACH-03). This constant makes that ceiling an explicit, Tachyon-owned
-/// admission fact: `AliasInFlightGuard` counts requests in flight per
-/// alias and logs a structured warning the moment a second one starts
-/// before the first finishes, so operators can see the contention Magnetar
-/// is silently absorbing instead of only inferring it from tail latency.
-/// Deliberately non-rejecting — raising it to a hard reject would turn a
-/// currently-succeeding (if serialized) traffic pattern into request
-/// failures, which is a bigger behavior change than this audit finding
-/// calls for.
+/// blocked silently with no signal to Tachyon at all, and no bound on how
+/// long it would wait (audit finding TACH-03). [`AliasAdmission`] makes
+/// this ceiling an explicit, Tachyon-owned admission gate: at most this
+/// many callers may hold a slot for one alias at a time, and anyone else
+/// queues behind a bounded wait (scaled by [`admission_wait_for`]'s QoS
+/// tier) rather than an unbounded one — real backpressure, not just a
+/// warning log, though still bounded by a fixed wait rather than the
+/// caller's own request deadline, which does not reach this layer today.
 pub(crate) const MAGNETAR_MAX_CONCURRENCY_PER_ALIAS: u32 = 1;
 
-/// RAII admission tracker enforcing visibility (not rejection) of
-/// [`MAGNETAR_MAX_CONCURRENCY_PER_ALIAS`] for one Magnetar alias. Held for
-/// the duration of one `invoke`/`invoke_streaming` call; `Drop` always
-/// decrements, including on early return or panic-unwind, so the count
-/// can never leak upward under error paths.
+/// Per-QoS-tier bound on how long a caller queues for a free admission
+/// slot before being rejected. Mirrors this codebase's existing
+/// RealTime-refused/Standard-and-Batch-eligible convention for scheduler
+/// preemption (`KvTierPager`): RealTime traffic cannot tolerate queueing
+/// behind another request any more than it can tolerate this alias's own
+/// generation latency, so it fails fast instead of waiting. Standard and
+/// Batch tolerate a real but bounded wait, Batch more than Standard since
+/// it is not latency-sensitive.
+fn admission_wait_for(qos: RouteQos) -> Duration {
+    match qos {
+        RouteQos::RealTime => Duration::ZERO,
+        RouteQos::Standard => Duration::from_secs(15),
+        RouteQos::Batch => Duration::from_secs(30),
+    }
+}
+
+/// Shared per-alias admission state backing [`AliasInFlightGuard`].
+struct AliasAdmission {
+    in_flight: Mutex<u32>,
+    slot_freed: Condvar,
+}
+
+impl AliasAdmission {
+    fn new() -> Self {
+        Self {
+            in_flight: Mutex::new(0),
+            slot_freed: Condvar::new(),
+        }
+    }
+}
+
+/// RAII admission guard enforcing [`MAGNETAR_MAX_CONCURRENCY_PER_ALIAS`] for
+/// one Magnetar alias. Held for the duration of one `invoke`/
+/// `invoke_streaming` call; `Drop` always releases the slot and wakes one
+/// waiter, including on early return or panic-unwind, so a slot can never
+/// leak held under error paths.
 struct AliasInFlightGuard {
-    in_flight: Arc<AtomicU32>,
+    admission: Arc<AliasAdmission>,
 }
 
 impl AliasInFlightGuard {
-    fn enter(alias: &str, in_flight: &Arc<AtomicU32>) -> Self {
-        let previous = in_flight.fetch_add(1, Ordering::AcqRel);
-        if previous >= MAGNETAR_MAX_CONCURRENCY_PER_ALIAS {
-            tracing::warn!(
-                target: "tachyon::ai_inference",
-                alias,
-                in_flight = previous + 1,
-                limit = MAGNETAR_MAX_CONCURRENCY_PER_ALIAS,
-                "concurrent Magnetar invocations for this alias exceed the declared per-alias concurrency limit; Magnetar is serializing them internally and this request is blocked behind an in-flight one"
-            );
-        }
-        Self {
-            in_flight: Arc::clone(in_flight),
+    /// Block up to `admission_wait_for(qos)` for a free slot. `Err` means
+    /// the wait ran out with the alias still at its limit — a typed,
+    /// retryable rejection (HTTP 503) rather than an unbounded block behind
+    /// Magnetar's own internal instance lock.
+    fn enter(
+        alias: &str,
+        qos: RouteQos,
+        admission: &Arc<AliasAdmission>,
+    ) -> std::result::Result<Self, ComponentInvocationError> {
+        Self::enter_until(alias, admission, Instant::now() + admission_wait_for(qos))
+    }
+
+    fn enter_until(
+        alias: &str,
+        admission: &Arc<AliasAdmission>,
+        deadline: Instant,
+    ) -> std::result::Result<Self, ComponentInvocationError> {
+        let mut in_flight = recover_poisoned("alias_admission", admission.in_flight.lock());
+        loop {
+            if *in_flight < MAGNETAR_MAX_CONCURRENCY_PER_ALIAS {
+                *in_flight += 1;
+                return Ok(Self {
+                    admission: Arc::clone(admission),
+                });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    target: "tachyon::ai_inference",
+                    alias,
+                    limit = MAGNETAR_MAX_CONCURRENCY_PER_ALIAS,
+                    "rejecting Magnetar invocation: alias is at its per-alias concurrency limit and no slot freed within the admission wait"
+                );
+                return Err(ComponentInvocationError::unavailable(format!(
+                    "alias `{alias}` is at its concurrency limit ({MAGNETAR_MAX_CONCURRENCY_PER_ALIAS}) and a free slot did not open in time; retry shortly"
+                )));
+            }
+            in_flight = recover_poisoned(
+                "alias_admission",
+                admission.slot_freed.wait_timeout(in_flight, remaining),
+            )
+            .0;
         }
     }
 }
 
 impl Drop for AliasInFlightGuard {
     fn drop(&mut self) {
-        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        let mut in_flight = recover_poisoned("alias_admission", self.admission.in_flight.lock());
+        *in_flight = in_flight.saturating_sub(1);
+        drop(in_flight);
+        self.admission.slot_freed.notify_one();
     }
 }
 
@@ -301,10 +370,10 @@ enum ComponentRuntime {
         /// advertisement (audit round 5, TACH-01).
         accelerator: AcceleratorKind,
         /// Shared with every clone of this alias's `LoadedInferenceComponent`
-        /// entry (never re-created per clone) so it accurately reflects
-        /// concurrent callers of the one Magnetar instance this alias
-        /// resolves to. See [`AliasInFlightGuard`].
-        in_flight: Arc<AtomicU32>,
+        /// entry (never re-created per clone) so it gates every concurrent
+        /// caller of the one Magnetar instance this alias resolves to. See
+        /// [`AliasAdmission`]/[`AliasInFlightGuard`].
+        admission: Arc<AliasAdmission>,
     },
 }
 
@@ -552,9 +621,10 @@ impl AiInferenceRuntime {
                 })
             }
             ComponentRuntime::Magnetar {
-                runtime, in_flight, ..
+                runtime, admission, ..
             } => {
-                let _admission = AliasInFlightGuard::enter(&component.alias, in_flight);
+                let _admission =
+                    AliasInFlightGuard::enter(&component.alias, component.qos, admission)?;
                 let mut emit = |frame: &[u8]| {
                     if sink.is_live() {
                         sink.emit(StreamEvent::Payload(frame))
@@ -730,7 +800,7 @@ fn load_binding(binding: &IntegrityInferenceComponentBinding) -> Result<LoadedIn
             Some(runtime) => ComponentRuntime::Magnetar {
                 runtime: Arc::new(runtime),
                 accelerator,
-                in_flight: Arc::new(AtomicU32::new(0)),
+                admission: Arc::new(AliasAdmission::new()),
             },
             _ => {
                 if magnetar_runtime::is_magnetar_path(path) {
@@ -769,9 +839,9 @@ fn invoke_component(
             })
         }
         ComponentRuntime::Magnetar {
-            runtime, in_flight, ..
+            runtime, admission, ..
         } => {
-            let _admission = AliasInFlightGuard::enter(&component.alias, in_flight);
+            let _admission = AliasInFlightGuard::enter(&component.alias, component.qos, admission)?;
             let result = runtime
                 .invoke(payload)
                 .map_err(magnetar_invocation_error)
@@ -904,40 +974,88 @@ mod tests {
     }
 
     #[test]
-    fn alias_in_flight_guard_counts_concurrent_holders_and_releases_on_drop() {
-        let in_flight = Arc::new(AtomicU32::new(0));
-        assert_eq!(in_flight.load(Ordering::Acquire), 0);
+    fn alias_admission_releases_its_slot_on_drop() {
+        let admission = Arc::new(AliasAdmission::new());
+        assert_eq!(*recover_poisoned("test", admission.in_flight.lock()), 0);
 
-        let first = AliasInFlightGuard::enter("qwen-alias", &in_flight);
-        assert_eq!(
-            in_flight.load(Ordering::Acquire),
-            1,
-            "one in-flight caller should be counted"
-        );
+        let guard = AliasInFlightGuard::enter("qwen-alias", RouteQos::Standard, &admission)
+            .expect("the first caller must be admitted immediately");
+        assert_eq!(*recover_poisoned("test", admission.in_flight.lock()), 1);
 
-        // A second concurrent holder for the same alias exceeds
-        // MAGNETAR_MAX_CONCURRENCY_PER_ALIAS (1) — TACH-03 makes this an
-        // observable fact (a warning is logged) rather than an invisible
-        // block inside Magnetar's own instance mutex, without rejecting it.
-        let second = AliasInFlightGuard::enter("qwen-alias", &in_flight);
+        drop(guard);
         assert_eq!(
-            in_flight.load(Ordering::Acquire),
-            2,
-            "a second concurrent caller must still be admitted, only observed"
-        );
-
-        drop(second);
-        assert_eq!(
-            in_flight.load(Ordering::Acquire),
-            1,
-            "dropping one guard must release exactly its own admission"
-        );
-
-        drop(first);
-        assert_eq!(
-            in_flight.load(Ordering::Acquire),
+            *recover_poisoned("test", admission.in_flight.lock()),
             0,
-            "dropping the last guard must return the counter to zero"
+            "dropping the guard must release its slot"
+        );
+    }
+
+    // TACH-03: the previous version of this gate only ever logged a warning
+    // and let a second concurrent caller through — this proves the gate now
+    // actually rejects one instead, with a typed, retryable (503) error.
+    #[test]
+    fn alias_admission_rejects_a_second_caller_once_the_wait_runs_out() {
+        let admission = Arc::new(AliasAdmission::new());
+        let _first = AliasInFlightGuard::enter("qwen-alias", RouteQos::Standard, &admission)
+            .expect("the first caller must be admitted immediately");
+
+        // `AliasInFlightGuard` is not `Debug` (it holds no data worth
+        // printing), so `expect_err` can't be used here; match instead.
+        let error = match AliasInFlightGuard::enter_until(
+            "qwen-alias",
+            &admission,
+            Instant::now() + Duration::from_millis(20),
+        ) {
+            Ok(_) => panic!(
+                "a second caller must be rejected once the alias is still at its limit past the deadline"
+            ),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.upstream_status,
+            Some(503),
+            "a capacity rejection must be reported as retryable, not a client error"
+        );
+        assert!(!error.invalid_request);
+    }
+
+    #[test]
+    fn alias_admission_admits_a_queued_caller_as_soon_as_the_slot_frees() {
+        let admission = Arc::new(AliasAdmission::new());
+        let first = AliasInFlightGuard::enter("qwen-alias", RouteQos::Standard, &admission)
+            .expect("the first caller must be admitted immediately");
+
+        let waiter_admission = Arc::clone(&admission);
+        let waiter = std::thread::spawn(move || {
+            AliasInFlightGuard::enter_until(
+                "qwen-alias",
+                &waiter_admission,
+                Instant::now() + Duration::from_secs(5),
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        drop(first);
+
+        waiter
+            .join()
+            .expect("the waiting thread must not panic")
+            .expect(
+                "the queued caller must be admitted once the slot frees, well inside its deadline",
+            );
+    }
+
+    #[test]
+    fn admission_wait_scales_with_qos_and_realtime_never_queues() {
+        assert_eq!(
+            admission_wait_for(RouteQos::RealTime),
+            Duration::ZERO,
+            "RealTime must fail fast rather than queue, matching this codebase's existing RealTime-refused convention"
+        );
+        assert!(admission_wait_for(RouteQos::Standard) > Duration::ZERO);
+        assert!(
+            admission_wait_for(RouteQos::Batch) > admission_wait_for(RouteQos::Standard),
+            "Batch should tolerate at least as long a queue as Standard"
         );
     }
 
