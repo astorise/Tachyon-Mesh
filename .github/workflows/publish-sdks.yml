@@ -24,7 +24,7 @@ jobs:
 
       - name: Install SDK generators
         run: |
-          cargo install wit-bindgen-cli --locked
+          cargo install wit-bindgen-cli --version 0.63.0 --locked
           npm install --global @bytecodealliance/jco
           pipx install poetry
 
@@ -81,7 +81,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Install wkg (Wasm Package Tools)
-        run: cargo install wkg --locked
+        run: cargo install wkg --version 0.16.1 --locked
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
