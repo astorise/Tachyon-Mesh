@@ -12,7 +12,54 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # TACH-17: a `v*` tag can point at any commit, including one that never
+  # ran CI's push trigger or ran it and failed -- this repo's rulesets gate
+  # merges into `main`, not tag creation. Every job below that can publish
+  # (contents: write / id-token: write) depends on this one, so a tag can
+  # never ship from a commit whose quality/cuda-quality/security-audit/
+  # build-guests check-runs (from CI's own `push` trigger on `main`) aren't
+  # all green. Job names here must stay exact matches for those CI job ids,
+  # none of which override their check-run name.
+  verify-tag-ci-green:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: Require the tagged commit's CI baseline to be green
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          required="quality cuda-quality security-audit build-guests"
+          missing=""
+          failed=""
+          for name in $required; do
+            conclusion=$(gh api "repos/${REPO}/commits/${SHA}/check-runs" \
+              --paginate \
+              -q ".check_runs[] | select(.name == \"${name}\") | .conclusion" \
+              | tail -n1)
+            if [ -z "$conclusion" ] || [ "$conclusion" = "null" ]; then
+              missing="${missing} ${name}"
+            elif [ "$conclusion" != "success" ]; then
+              failed="${failed} ${name}=${conclusion}"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Tag ${SHA} is missing required CI check-run(s):${missing} -- tag a commit that has already run CI on main." >&2
+            exit 1
+          fi
+          if [ -n "$failed" ]; then
+            echo "::error::Tag ${SHA} has failing required CI check(s):${failed}" >&2
+            exit 1
+          fi
+          echo "All required checks are green on ${SHA}: ${required}"
+
   publish-integrity-schemas:
+    needs: verify-tag-ci-green
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-26.04
     permissions:
@@ -44,6 +91,7 @@ jobs:
   # ── Server-side binary tarballs (core-host + tachyon-mcp) ────────────────────
   # Published only on version tags; used by scripts/get-tachyon.sh.
   publish-server-binaries:
+    needs: verify-tag-ci-green
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     permissions:
       contents: write
@@ -230,6 +278,13 @@ jobs:
             ${{ steps.sbom.outputs.sbom_file }}
 
   publish-tauri:
+    needs: verify-tag-ci-green
+    # always() bypasses the implicit needs-success gate: verify-tag-ci-green
+    # is itself skipped (not failed) on every ordinary push to main, and a
+    # skipped dependency would otherwise skip this job too. The condition
+    # below is the real gate -- block only the tag-triggered release path
+    # when verify-tag-ci-green actually ran and did not succeed.
+    if: ${{ always() && (!startsWith(github.ref, 'refs/tags/v') || needs.verify-tag-ci-green.result == 'success') }}
     permissions:
       contents: write
     strategy:
