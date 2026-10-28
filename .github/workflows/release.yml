@@ -264,12 +264,10 @@ jobs:
           echo "checksum_file=${TARBALL}.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
-        if: runner.os != 'Windows'
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign binary archive with cosign (keyless OIDC)
         id: sign
-        if: runner.os != 'Windows'
         shell: bash
         run: |
           TARBALL="${{ steps.pkg.outputs.tarball }}"
@@ -281,7 +279,7 @@ jobs:
         if: matrix.os == 'ubuntu-22.04'
         shell: bash
         run: |
-          cargo install cargo-sbom --locked
+          cargo install cargo-sbom --version 0.10.0 --locked
           SBOM="${{ steps.pkg.outputs.tarball }}-sbom.spdx.json"
           cargo sbom --output-format spdx_json_2_3 > "${SBOM}"
           echo "sbom_file=${SBOM}" >> "$GITHUB_OUTPUT"
@@ -400,7 +398,7 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         shell: bash
         run: |
-          cargo install cargo-sbom --locked
+          cargo install cargo-sbom --version 0.10.0 --locked
           cargo sbom --output-format spdx_json_2_3 > tachyon-mesh.spdx.json
 
       - name: Build Tauri bundles for push artifacts
