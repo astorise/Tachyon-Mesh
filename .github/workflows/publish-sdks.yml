@@ -29,6 +29,12 @@ on:
 
 permissions:
   contents: read
+  # verify-tag-ci-green.yml's job requests `actions: read` (to list workflow
+  # runs/jobs on the tagged commit) -- a reusable workflow call is capped at
+  # the calling job's own granted permissions (never elevated), so without
+  # this the gate's `gh api .../actions/...` calls would 403 and the real
+  # SDK publish, and publish-wit-oci, could never run.
+  actions: read
 
 jobs:
   verify-tag-ci-green:
@@ -76,7 +82,12 @@ jobs:
         run: cargo publish --manifest-path sdk/rust/Cargo.toml --dry-run
 
       - name: npm publish --dry-run (JavaScript SDK)
-        run: npm publish --prefix sdk/js --access public --dry-run
+        # `--prefix` does not redirect npm publish's target package the way
+        # it does for e.g. `npm install` -- it still reads ./package.json
+        # from the invocation's cwd (the repo root here, which has none) and
+        # fails with ENOENT. Passing the directory as npm publish's own
+        # <package-spec> argument is what actually selects sdk/js.
+        run: npm publish ./sdk/js --access public --dry-run
 
       - name: poetry build already validates the Python SDK's packaging
         run: echo "poetry publish has no dry-run mode; the build step above is the packaging check."
@@ -143,7 +154,10 @@ jobs:
             exit 1
           fi
       - name: Publish JavaScript SDK (real)
-        run: npm publish --prefix sdk/js --access public --//registry.npmjs.org/:_authToken="${{ secrets.NPM_TOKEN }}"
+        # Same --prefix fix as the dry-run step above: this one was already
+        # broken the same way before this PR, just never run (no gate
+        # existed to reach it safely, and no prior CI exercised it).
+        run: npm publish ./sdk/js --access public --//registry.npmjs.org/:_authToken="${{ secrets.NPM_TOKEN }}"
 
       - name: Check PyPI token is configured
         run: |
