@@ -3,8 +3,9 @@
 //! in a content-addressed cache. Deliberately minimal rather than a
 //! dependency on a general-purpose OCI client crate (gated behind the
 //! `oci-artifacts` feature either way, so a build that never uses it pays
-//! nothing extra): this only ever needs to GET a single-manifest, single-
-//! layer artifact by tag and verify two digests, using HTTP machinery
+//! nothing extra): this only ever needs to GET a single-manifest artifact
+//! by tag, with one primary layer and an optional second (embedded
+//! manifest-sidecar) layer, and verify their digests, using HTTP machinery
 //! (`reqwest`, already a mandatory core-host dependency for the upstream
 //! OpenAI-scheme remote provider path) and hashing (`sha2`, likewise
 //! already mandatory) this crate already carries for unrelated reasons.
@@ -115,67 +116,95 @@ struct RegistryTokenResponse {
     token: String,
 }
 
-/// Resolves `reference` into a local file path, using `cache_root` as a
+/// A resolved OCI artifact's local paths: the primary artifact (the
+/// Component/Kernel bytes themselves) and, when the pulled manifest
+/// carried a second layer, the embedded manifest-sidecar bytes Magnetar's
+/// own publishing tooling attaches to a Component Artifact (MAG-08) --
+/// `None` for an artifact published without one (every Kernel Exchange
+/// Bundle, and any Component published before MAG-08).
+#[derive(Debug)]
+pub(crate) struct ResolvedArtifact {
+    pub(crate) artifact_path: PathBuf,
+    pub(crate) component_manifest_path: Option<PathBuf>,
+}
+
+/// Resolves `reference` into local file paths, using `cache_root` as a
 /// content-addressed cache keyed by `expected_digest` -- the *manifest's*
 /// digest (`<cache_root>/sha256/<manifest-digest>/`), matching exactly
 /// what `oras resolve`/a registry UI reports as "the digest" of a tag, and
 /// therefore what an operator actually has in hand to pin. The manifest
-/// digest is verified first, against the raw manifest bytes, before its
-/// *declared* layer digest is trusted for anything -- a registry serving
-/// a self-consistent but wrong manifest is caught here, not just a
-/// corrupted blob under an otherwise-correct one. The cache entry holds
-/// the raw `manifest.json` bytes alongside the layer's own content
-/// (`artifact`); the layer digest used for every later corruption check is
-/// derived by re-parsing `manifest.json` itself, not a separate flat
-/// sidecar, so a cache hit re-verifies the *whole* chain
-/// (`expected_digest` -> manifest -> declared layer digest -> artifact
-/// bytes) rather than trusting a number that was never itself re-tied to
-/// `expected_digest` (TACH-15: a coherent replacement of just the old
-/// `artifact`/`layer-digest.txt` pair could previously pass a cache hit
-/// without those bytes ever having been bound to this locator).
+/// digest is verified first, against the raw manifest bytes, before
+/// anything it declares -- a declared layer digest included -- is trusted
+/// for anything else; a registry serving a self-consistent but wrong
+/// manifest is caught here, not just a corrupted blob under an otherwise-
+/// correct one. The cache entry holds the raw `manifest.json` bytes
+/// alongside the primary layer's own content (`artifact`) and, when a
+/// second layer is present, its content too (`component-manifest`); every
+/// digest used for a later corruption check is derived by re-parsing
+/// `manifest.json` itself, not a separate flat sidecar, so a cache hit
+/// re-verifies the *whole* chain (`expected_digest` -> manifest ->
+/// declared layer digest(s) -> artifact bytes) rather than trusting a
+/// number that was never itself re-tied to `expected_digest` (TACH-15: a
+/// coherent replacement of just the old `artifact`/`layer-digest.txt` pair
+/// could previously pass a cache hit without those bytes ever having been
+/// bound to this locator).
 ///
 /// Cache-hit path (the common case once an artifact has been pulled once)
 /// takes no network access at all (`Requirement: Corrupted Cache Entries
 /// Are Detected Before Load`). A missing cache entry -- or one with a
-/// manifest present but the artifact itself missing, e.g. an interrupted
-/// stage -- is treated as a cache miss (safe: it only costs a re-fetch),
-/// never as a reason to trust an unverified file. A manifest.json or
-/// artifact that *is* present but no longer ties back to `expected_digest`
-/// is a different thing entirely -- rejected outright, not silently
-/// re-fetched, since a soft retry there could paper over tampering
-/// instead of surfacing it.
-pub(crate) fn resolve(reference: &ArtifactReference, cache_root: &Path) -> Result<PathBuf> {
+/// manifest present but the artifact (or a manifest-declared sidecar)
+/// missing, e.g. an interrupted stage -- is treated as a cache miss (safe:
+/// it only costs a re-fetch), never as a reason to trust an unverified
+/// file. A manifest.json, artifact, or sidecar that *is* present but no
+/// longer ties back to `expected_digest` is a different thing entirely --
+/// rejected outright, not silently re-fetched, since a soft retry there
+/// could paper over tampering instead of surfacing it.
+pub(crate) fn resolve(
+    reference: &ArtifactReference,
+    cache_root: &Path,
+) -> Result<ResolvedArtifact> {
     let cache_dir = cache_root
         .join("sha256")
         .join(digest_hex(&reference.expected_digest));
     let manifest_path = cache_dir.join("manifest.json");
     let artifact_path = cache_dir.join("artifact");
+    let sidecar_path = cache_dir.join("component-manifest");
 
-    if let Some(resolved) = revalidate_cache_entry(reference, &manifest_path, &artifact_path)? {
+    if let Some(resolved) =
+        revalidate_cache_entry(reference, &manifest_path, &artifact_path, &sidecar_path)?
+    {
         return Ok(resolved);
     }
 
     let pulled = pull_off_any_tokio_runtime_thread(reference)?;
-    stage_cache_entry(&cache_dir, &pulled.manifest_bytes, &pulled.layer_bytes)?;
+    stage_cache_entry(
+        &cache_dir,
+        &pulled.manifest_bytes,
+        &pulled.layer_bytes,
+        pulled.sidecar_bytes.as_deref(),
+    )?;
 
-    revalidate_cache_entry(reference, &manifest_path, &artifact_path)?.ok_or_else(|| {
-        anyhow!(
-            "internal error: OCI artifact cache entry at `{}` failed its own revalidation immediately after being staged",
-            cache_dir.display()
-        )
-    })
+    revalidate_cache_entry(reference, &manifest_path, &artifact_path, &sidecar_path)?.ok_or_else(
+        || {
+            anyhow!(
+                "internal error: OCI artifact cache entry at `{}` failed its own revalidation immediately after being staged",
+                cache_dir.display()
+            )
+        },
+    )
 }
 
 /// `Ok(None)`: no cache entry present (or only a partially-staged one),
-/// safe to pull. `Ok(Some(path))`: a cache entry is present and its
-/// content cryptographically re-ties, right now, to `reference`. `Err`:
-/// a cache entry is present but does not -- a fail-closed rejection, not a
-/// miss, exactly like a first pull's own manifest/layer digest checks.
+/// safe to pull. `Ok(Some(_))`: a cache entry is present and its content
+/// cryptographically re-ties, right now, to `reference`. `Err`: a cache
+/// entry is present but does not -- a fail-closed rejection, not a miss,
+/// exactly like a first pull's own manifest/layer digest checks.
 fn revalidate_cache_entry(
     reference: &ArtifactReference,
     manifest_path: &Path,
     artifact_path: &Path,
-) -> Result<Option<PathBuf>> {
+    sidecar_path: &Path,
+) -> Result<Option<ResolvedArtifact>> {
     let Ok(manifest_bytes) = fs::read(manifest_path) else {
         return Ok(None);
     };
@@ -196,35 +225,66 @@ fn revalidate_cache_entry(
             manifest_path.display()
         )
     })?;
-    let layer = single_layer(&manifest, &reference.repository, &reference.tag)?;
-    let declared_layer_digest = layer.digest.to_ascii_lowercase();
+    let (primary, sidecar) =
+        primary_and_optional_sidecar_layers(&manifest, &reference.repository, &reference.tag)?;
 
     let Ok(artifact_bytes) = fs::read(artifact_path) else {
         return Ok(None);
     };
-    let actual_layer_digest = format!("sha256:{}", sha256_hex(&artifact_bytes));
-    if actual_layer_digest != declared_layer_digest {
-        bail!(
-            "cached artifact at `{}` no longer matches its own cached manifest's declared layer digest \
-             (declared `{declared_layer_digest}`, computed `{actual_layer_digest}`) -- the cache entry \
-             is corrupted and is rejected rather than handed to Magnetar",
-            artifact_path.display(),
-        );
-    }
+    verify_layer_digest(&artifact_bytes, &primary.digest, artifact_path)?;
 
-    Ok(Some(artifact_path.to_path_buf()))
+    let component_manifest_path = match sidecar {
+        None => None,
+        Some(sidecar_layer) => {
+            let Ok(sidecar_bytes) = fs::read(sidecar_path) else {
+                return Ok(None);
+            };
+            verify_layer_digest(&sidecar_bytes, &sidecar_layer.digest, sidecar_path)?;
+            Some(sidecar_path.to_path_buf())
+        }
+    };
+
+    Ok(Some(ResolvedArtifact {
+        artifact_path: artifact_path.to_path_buf(),
+        component_manifest_path,
+    }))
 }
 
-fn single_layer<'a>(
+/// Shared by both the cache-hit path and a fresh pull: `bytes` must hash
+/// to `declared_digest`, exactly as the manifest that named `path`
+/// declared it, or the entry is corrupted and rejected outright.
+fn verify_layer_digest(bytes: &[u8], declared_digest: &str, path: &Path) -> Result<()> {
+    let actual = format!("sha256:{}", sha256_hex(bytes));
+    let declared = declared_digest.to_ascii_lowercase();
+    if actual != declared {
+        bail!(
+            "cached file at `{}` no longer matches its own cached manifest's declared layer digest \
+             (declared `{declared}`, computed `{actual}`) -- the cache entry is corrupted and is \
+             rejected rather than handed to Magnetar",
+            path.display(),
+        );
+    }
+    Ok(())
+}
+
+/// `manifest.layers` must be exactly one primary layer (the Component or
+/// Kernel bytes themselves), optionally paired with a second layer: the
+/// embedded manifest-sidecar Magnetar's publishing tooling attaches to a
+/// Component Artifact (MAG-08). Any other layer count is rejected --
+/// Tachyon's resolver stays deliberately ignorant of what either layer's
+/// bytes actually mean past that, per this module's own doc comment.
+fn primary_and_optional_sidecar_layers<'a>(
     manifest: &'a OciManifest,
     repository: &str,
     tag: &str,
-) -> Result<&'a OciManifestLayer> {
+) -> Result<(&'a OciManifestLayer, Option<&'a OciManifestLayer>)> {
     match manifest.layers.as_slice() {
-        [layer] => Ok(layer),
+        [primary] => Ok((primary, None)),
+        [primary, sidecar] => Ok((primary, Some(sidecar))),
         [] => bail!("OCI manifest for `{repository}:{tag}` carries no layers"),
         _ => bail!(
-            "OCI manifest for `{repository}:{tag}` carries {} layers; this resolver only supports a single-layer artifact",
+            "OCI manifest for `{repository}:{tag}` carries {} layers; this resolver only supports \
+             one primary layer, optionally paired with one embedded manifest-sidecar layer",
             manifest.layers.len()
         ),
     }
@@ -233,6 +293,7 @@ fn single_layer<'a>(
 struct PulledArtifact {
     manifest_bytes: Vec<u8>,
     layer_bytes: Vec<u8>,
+    sidecar_bytes: Option<Vec<u8>>,
 }
 
 /// `reqwest::blocking::Client` builds and drives its own Tokio runtime
@@ -328,24 +389,29 @@ fn digest_hex(expected_digest: &str) -> &str {
         .unwrap_or(expected_digest)
 }
 
-/// Publishes `manifest_bytes`/`layer_bytes` into `cache_dir` such that a
-/// concurrent reader only ever sees either nothing or the complete,
-/// internally-consistent pair of files -- never a partial write, and
-/// never one file updated without the other (`Requirement: Atomic
-/// Staging`, strengthened by TACH-16: the earlier version staged
-/// `artifact` and its digest sidecar via two *separate* renames, so a
-/// crash or a concurrent reader between them could observe a mismatched
-/// pair, and its temp filename was keyed only on the process PID, which
-/// two threads in this same process racing a cache miss for the same
-/// digest would collide on). Both files are written into a private,
-/// uniquely-named staging directory on the same filesystem as `cache_dir`
-/// (so the final rename is same-filesystem and therefore atomic) and
-/// fsynced before the whole directory is renamed into place in one
-/// operation. Losing the rename race to another concurrent stage of this
-/// exact content-addressed digest is not an error -- by definition the
-/// winner's bytes are what `expected_digest` already pins, and `resolve`
-/// revalidates whatever ends up on disk either way.
-fn stage_cache_entry(cache_dir: &Path, manifest_bytes: &[u8], artifact_bytes: &[u8]) -> Result<()> {
+/// Publishes `manifest_bytes`/`artifact_bytes`, and `sidecar_bytes` when
+/// present, into `cache_dir` such that a concurrent reader only ever sees
+/// either nothing or the complete, internally-consistent set of files --
+/// never a partial write, and never one file updated without the others
+/// (`Requirement: Atomic Staging`, strengthened by TACH-16: the earlier
+/// version staged `artifact` and its digest sidecar via two *separate*
+/// renames, so a crash or a concurrent reader between them could observe
+/// a mismatched pair, and its temp filename was keyed only on the process
+/// PID, which two threads in this same process racing a cache miss for
+/// the same digest would collide on). Every file is written into a
+/// private, uniquely-named staging directory on the same filesystem as
+/// `cache_dir` (so the final rename is same-filesystem and therefore
+/// atomic) and fsynced before the whole directory is renamed into place
+/// in one operation. Losing the rename race to another concurrent stage
+/// of this exact content-addressed digest is not an error -- by
+/// definition the winner's bytes are what `expected_digest` already pins,
+/// and `resolve` revalidates whatever ends up on disk either way.
+fn stage_cache_entry(
+    cache_dir: &Path,
+    manifest_bytes: &[u8],
+    artifact_bytes: &[u8],
+    sidecar_bytes: Option<&[u8]>,
+) -> Result<()> {
     let parent = cache_dir.parent().ok_or_else(|| {
         anyhow!(
             "cache path `{}` has no parent directory",
@@ -366,6 +432,9 @@ fn stage_cache_entry(cache_dir: &Path, manifest_bytes: &[u8], artifact_bytes: &[
         })?;
     write_and_fsync(&staging_dir.path().join("manifest.json"), manifest_bytes)?;
     write_and_fsync(&staging_dir.path().join("artifact"), artifact_bytes)?;
+    if let Some(bytes) = sidecar_bytes {
+        write_and_fsync(&staging_dir.path().join("component-manifest"), bytes)?;
+    }
 
     match fs::rename(staging_dir.path(), cache_dir) {
         Ok(()) => {
@@ -479,15 +548,38 @@ fn pull(reference: &ArtifactReference) -> Result<PulledArtifact> {
 
     let manifest: OciManifest =
         serde_json::from_slice(&manifest_bytes).context("OCI manifest was not valid JSON")?;
-    let layer = single_layer(&manifest, &reference.repository, &reference.tag)?;
+    let (primary, sidecar) =
+        primary_and_optional_sidecar_layers(&manifest, &reference.repository, &reference.tag)?;
 
+    let layer_bytes = fetch_and_verify_blob(&client, reference, &token, primary)?;
+    let sidecar_bytes = sidecar
+        .map(|layer| fetch_and_verify_blob(&client, reference, &token, layer))
+        .transpose()?;
+
+    Ok(PulledArtifact {
+        manifest_bytes: manifest_bytes.to_vec(),
+        layer_bytes,
+        sidecar_bytes,
+    })
+}
+
+/// Fetches the blob `layer` names and verifies it against `layer`'s own
+/// declared digest before returning it -- the same check a cache hit
+/// re-runs against whatever is on disk, applied here to what the
+/// registry just sent.
+fn fetch_and_verify_blob(
+    client: &reqwest::blocking::Client,
+    reference: &ArtifactReference,
+    token: &str,
+    layer: &OciManifestLayer,
+) -> Result<Vec<u8>> {
     let blob_url = format!(
         "https://{}/v2/{}/blobs/{}",
         reference.registry, reference.repository, layer.digest
     );
     let blob_bytes = client
         .get(&blob_url)
-        .bearer_auth(&token)
+        .bearer_auth(token)
         .send()
         .with_context(|| format!("failed to fetch OCI blob from `{blob_url}`"))?
         .error_for_status()
@@ -504,11 +596,7 @@ fn pull(reference: &ArtifactReference) -> Result<PulledArtifact> {
             reference.tag,
         );
     }
-
-    Ok(PulledArtifact {
-        manifest_bytes: manifest_bytes.to_vec(),
-        layer_bytes: blob_bytes.to_vec(),
-    })
+    Ok(blob_bytes.to_vec())
 }
 
 #[cfg(test)]
@@ -676,7 +764,110 @@ mod tests {
             "a correctly-staged cache entry must resolve without any network access -- \
              `example.invalid` as the registry host proves it",
         );
-        assert_eq!(resolved, cache_path);
+        assert_eq!(resolved.artifact_path, cache_path);
+        assert!(
+            resolved.component_manifest_path.is_none(),
+            "a manifest with only one layer must never report a sidecar path"
+        );
+    }
+
+    /// Builds a manifest naming both a primary layer and a second,
+    /// embedded manifest-sidecar layer (MAG-08's real shape, confirmed
+    /// live on GHCR for the `qwen`/`llama` Component tags) and returns
+    /// its own bytes/digest alongside the primary and sidecar bytes it
+    /// declares.
+    fn build_manifest_with_sidecar(layer_digest: &str, sidecar_digest: &str) -> (Vec<u8>, String) {
+        let manifest = serde_json::json!({
+            "layers": [
+                { "digest": layer_digest },
+                { "digest": sidecar_digest },
+            ]
+        });
+        let bytes = serde_json::to_vec(&manifest).expect("test manifest must serialize");
+        let digest = format!("sha256:{}", sha256_hex(&bytes));
+        (bytes, digest)
+    }
+
+    #[test]
+    fn resolve_materializes_the_embedded_component_manifest_sidecar_when_present() {
+        // MAG-08: Magnetar's real publishing tooling now embeds a
+        // Component's own `*.magnetar-component.yaml` sidecar as a second
+        // OCI layer -- closing the TACH-13 gap where Tachyon's own E2E
+        // test had to fabricate that sidecar itself, since the published
+        // artifact never carried one. Confirmed live against the real
+        // `qwen`/`llama` tags on ghcr.io/astorise/magnetar-component.
+        let temp = tempfile::tempdir().expect("temp dir creates");
+        let artifact_bytes = b"the component wasm bytes";
+        let sidecar_bytes = b"schema: magnetar-component-artifact\n";
+        let layer_digest = format!("sha256:{}", sha256_hex(artifact_bytes));
+        let sidecar_digest = format!("sha256:{}", sha256_hex(sidecar_bytes));
+        let (manifest_bytes, manifest_digest) =
+            build_manifest_with_sidecar(&layer_digest, &sidecar_digest);
+        let cache_dir = temp
+            .path()
+            .join("sha256")
+            .join(digest_hex(&manifest_digest));
+        std::fs::create_dir_all(&cache_dir).expect("test cache dir must be creatable");
+        std::fs::write(cache_dir.join("manifest.json"), &manifest_bytes)
+            .expect("test manifest must be writable");
+        std::fs::write(cache_dir.join("artifact"), artifact_bytes)
+            .expect("test artifact must be writable");
+        std::fs::write(cache_dir.join("component-manifest"), sidecar_bytes)
+            .expect("test sidecar must be writable");
+
+        let reference = ArtifactReference {
+            registry: "example.invalid".to_owned(),
+            repository: "nonexistent/repo".to_owned(),
+            tag: "latest".to_owned(),
+            expected_digest: manifest_digest,
+        };
+
+        let resolved = resolve(&reference, temp.path())
+            .expect("a two-layer cache entry with a valid sidecar must resolve");
+        assert_eq!(resolved.artifact_path, cache_dir.join("artifact"));
+        assert_eq!(
+            resolved.component_manifest_path,
+            Some(cache_dir.join("component-manifest")),
+            "a manifest declaring a second layer must report its materialized sidecar path"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_a_sidecar_that_no_longer_matches_its_cached_manifest() {
+        let temp = tempfile::tempdir().expect("temp dir creates");
+        let artifact_bytes = b"the component wasm bytes";
+        let sidecar_bytes = b"schema: magnetar-component-artifact\n";
+        let layer_digest = format!("sha256:{}", sha256_hex(artifact_bytes));
+        let sidecar_digest = format!("sha256:{}", sha256_hex(sidecar_bytes));
+        let (manifest_bytes, manifest_digest) =
+            build_manifest_with_sidecar(&layer_digest, &sidecar_digest);
+        let cache_dir = temp
+            .path()
+            .join("sha256")
+            .join(digest_hex(&manifest_digest));
+        std::fs::create_dir_all(&cache_dir).expect("test cache dir must be creatable");
+        std::fs::write(cache_dir.join("manifest.json"), &manifest_bytes)
+            .expect("test manifest must be writable");
+        std::fs::write(cache_dir.join("artifact"), artifact_bytes)
+            .expect("test artifact must be writable");
+        std::fs::write(
+            cache_dir.join("component-manifest"),
+            b"tampered after staging",
+        )
+        .expect("test sidecar must be writable");
+
+        let reference = ArtifactReference {
+            registry: "example.invalid".to_owned(),
+            repository: "nonexistent/repo".to_owned(),
+            tag: "latest".to_owned(),
+            expected_digest: manifest_digest,
+        };
+
+        let error = resolve(&reference, temp.path()).expect_err(
+            "a sidecar that no longer matches its own cached manifest's declared digest must be \
+             rejected before any network access is attempted",
+        );
+        assert!(error.to_string().contains("corrupted"));
     }
 
     #[test]
@@ -705,7 +896,7 @@ mod tests {
                 let manifest_bytes = manifest_bytes.clone();
                 let artifact_bytes = artifact_bytes.to_vec();
                 std::thread::spawn(move || {
-                    stage_cache_entry(&cache_dir, &manifest_bytes, &artifact_bytes)
+                    stage_cache_entry(&cache_dir, &manifest_bytes, &artifact_bytes, None)
                 })
             })
             .collect();
