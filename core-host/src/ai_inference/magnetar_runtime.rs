@@ -51,13 +51,15 @@ impl std::fmt::Debug for MagnetarRuntime {
 
 /// Name a resolved OCI Component's bytes are always materialized under
 /// inside a binding's local root — fixed rather than derived from the
-/// locator (which may name an arbitrary repository/tag), so the operator
-/// authors the trust manifest sidecar once, under this exact name
-/// (`oci-resolved.component.wasm.magnetar-component.yaml`), independent of
-/// which locator a binding happens to point at today (TACH-10/13: the
-/// published OCI artifact carries only the raw Component bytes, not
-/// Magnetar's own manifest sidecar — see `artifact_resolver`'s module
-/// doc).
+/// locator (which may name an arbitrary repository/tag), so that an
+/// operator who needs to author the trust manifest sidecar by hand (a
+/// Component published before MAG-08, with no embedded sidecar layer —
+/// see `artifact_resolver`'s module doc) does so once, under this exact
+/// name (`oci-resolved.component.wasm.magnetar-component.yaml`),
+/// independent of which locator a binding happens to point at. A
+/// Component published with MAG-08's embedded sidecar layer needs no such
+/// hand-authored file: `materialize_oci_component` writes the resolved
+/// sidecar under this same name itself.
 const OCI_RESOLVED_COMPONENT_FILE_NAME: &str = "oci-resolved.component.wasm";
 /// Overrides the local content-addressed cache root OCI-resolved artifacts
 /// stage into (`<root>/sha256/<digest>/artifact`). Unset falls back to a
@@ -151,18 +153,28 @@ impl MagnetarRuntime {
 /// unmodified `component_artifact_from_root` finds them exactly as it
 /// would a hand-placed local `*.component.wasm` file — an `oci://`-sourced
 /// binding behaves identically, end to end, to a fully local one past this
-/// point (TACH-10/13's transport-neutrality requirement).
+/// point (TACH-10/13's transport-neutrality requirement). When the
+/// resolved manifest carried a second, embedded layer (MAG-08: Magnetar's
+/// publishing tooling now attaches a Component's own
+/// `*.magnetar-component.yaml` sidecar to the OCI artifact itself), that
+/// sidecar is materialized too, under the exact name
+/// `component_artifact_from_root` already looks for — closing the gap
+/// this module's own doc comment used to describe, where an operator had
+/// to author that sidecar by hand for every OCI-sourced binding regardless
+/// of what the registry actually published. A Component published before
+/// MAG-08 (single layer, no embedded sidecar) still needs one authored by
+/// hand, exactly as before.
 #[cfg(feature = "oci-artifacts")]
 fn materialize_oci_component(root: &Path, locator: &str) -> Result<()> {
     let reference = artifact_resolver::ArtifactReference::parse(locator)?;
     let cache_root = std::env::var_os(TACHYON_OCI_ARTIFACT_CACHE_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("tachyon-oci-artifacts"));
-    let resolved_path = artifact_resolver::resolve(&reference, &cache_root)?;
-    let bytes = std::fs::read(&resolved_path).with_context(|| {
+    let resolved = artifact_resolver::resolve(&reference, &cache_root)?;
+    let bytes = std::fs::read(&resolved.artifact_path).with_context(|| {
         format!(
             "failed to read resolved OCI artifact at `{}`",
-            resolved_path.display()
+            resolved.artifact_path.display()
         )
     })?;
     std::fs::create_dir_all(root).with_context(|| {
@@ -177,6 +189,22 @@ fn materialize_oci_component(root: &Path, locator: &str) -> Result<()> {
             root.display()
         )
     })?;
+    if let Some(component_manifest_path) = &resolved.component_manifest_path {
+        let sidecar_bytes = std::fs::read(component_manifest_path).with_context(|| {
+            format!(
+                "failed to read resolved OCI Component manifest sidecar at `{}`",
+                component_manifest_path.display()
+            )
+        })?;
+        let sidecar_file_name =
+            format!("{OCI_RESOLVED_COMPONENT_FILE_NAME}.magnetar-component.yaml");
+        std::fs::write(root.join(sidecar_file_name), sidecar_bytes).with_context(|| {
+            format!(
+                "failed to materialize resolved OCI Component manifest sidecar into `{}`",
+                root.display()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -704,6 +732,142 @@ signatures: []
         result.expect(
             "resolving a real OCI locator from inside an active Tokio runtime must succeed, \
              not panic, on a cache miss that forces a real network pull",
+        );
+    }
+
+    /// The real, currently-published `qwen` tag on
+    /// `ghcr.io/astorise/magnetar-component`: MAG-08's embedded-manifest-
+    /// sidecar shape, confirmed live, and the exact same Component bytes
+    /// already checked into this repo's own vendored Magnetar fixtures
+    /// (`vendor/Magnetar/magnetar-runtime/fixtures/components/qwen-real.
+    /// component.wasm` -- same digest, confirmed by hand before writing
+    /// this test) that TACH-11's publisher-trust tests already load
+    /// locally. Unlike `synthetic-minimal-latest`, this manifest carries
+    /// a second layer: the Component's own `*.magnetar-component.yaml`,
+    /// so this test authors no sidecar of its own -- the first time an
+    /// OCI-sourced binding has not needed one.
+    const REAL_QWEN_COMPONENT_LOCATOR: &str = "oci://ghcr.io/astorise/magnetar-component:qwen@sha256:2fabc964f2a80c248b9a6a69e28c8aceeae8aadc770871d897baa6f1b117fb27";
+    const REAL_QWEN_COMPONENT_DIGEST: &str =
+        "sha256:cd10b875f12d70e025b27765a0abcc655d630b4150e1e29f944536f648d352a5";
+
+    struct TrustStoreEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for TrustStoreEnvGuard {
+        fn drop(&mut self) {
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe {
+                match self.previous.take() {
+                    Some(previous) => {
+                        std::env::set_var(TACHYON_COMPONENT_TRUST_STORE_ENV, previous)
+                    }
+                    None => std::env::remove_var(TACHYON_COMPONENT_TRUST_STORE_ENV),
+                }
+            }
+        }
+    }
+
+    /// TACH-13, closing half of the gap `resolves_and_registers_the_real_
+    /// published_ghcr_component_end_to_end`'s own doc comment documented:
+    /// that test stopped at `component_artifact_from_root` because
+    /// `synthetic-minimal` was a Component-registration-only fixture never
+    /// meant to satisfy `LoadedInferenceComponent::load`. `qwen` is
+    /// Magnetar's real, production Qwen Model Component, now published to
+    /// GHCR with its own real manifest sidecar embedded (MAG-08), so this
+    /// test authors no sidecar itself and drives the *real* publish ->
+    /// pull -> materialize -> Component-trust chain through
+    /// `MagnetarRuntime::try_load` with no part of it fabricated.
+    ///
+    /// It still stops short of a full `load`: Magnetar's production model
+    /// ingestion (astorise/Magnetar#75) additionally requires its own
+    /// `magnetar-artifact-format.yaml` sidecar declaring a Model Artifact's
+    /// ingestor -- a bundle producer's file, distinct from the Component's
+    /// `.magnetar-component.yaml` identity manifest this test does
+    /// materialize, and not something the `qwen` Component publish (a
+    /// compute-only Component, no bundled weights) carries. Supplying a
+    /// real Model Artifact bundle is a separate, larger piece of work than
+    /// this round's audit asked for, so this test asserts the one real
+    /// boundary that exists today: the embedded sidecar materializes and
+    /// Magnetar's own Component-digest trust check (which runs strictly
+    /// before production ingestion inside `load`) accepts it, and `load`
+    /// then fails specifically at the missing Model Artifact declaration --
+    /// never at Component trust/registration.
+    #[test]
+    fn resolves_and_loads_the_real_published_qwen_component_end_to_end() {
+        let lock = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().expect("temp dir creates");
+        let cache_dir = temp.path().join("cache");
+        let binding_root = temp.path().join("binding");
+        std::fs::create_dir_all(&binding_root).expect("binding root creates");
+
+        // The trust store must live outside the artifact root --
+        // `apply_trust_store` rejects a trust file placed inside the very
+        // root it would be deciding trust for.
+        let trust_store_path = temp.path().join("component-trust.json");
+        std::fs::write(
+            &trust_store_path,
+            serde_json::json!({ "trusted_digests": [REAL_QWEN_COMPONENT_DIGEST] }).to_string(),
+        )
+        .expect("trust store writes");
+
+        let previous_cache = std::env::var_os(TACHYON_OCI_ARTIFACT_CACHE_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(TACHYON_OCI_ARTIFACT_CACHE_ENV, &cache_dir) };
+        let _cache_guard = EnvGuard {
+            _lock: lock,
+            previous_cache,
+        };
+        let previous_trust = std::env::var_os(TACHYON_COMPONENT_TRUST_STORE_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(TACHYON_COMPONENT_TRUST_STORE_ENV, &trust_store_path) };
+        let _trust_guard = TrustStoreEnvGuard {
+            previous: previous_trust,
+        };
+
+        let path = format!("magnetar:{}", binding_root.display());
+        let error = MagnetarRuntime::try_load(
+            "qwen-real-oci-e2e",
+            &path,
+            "cpu",
+            Some(REAL_QWEN_COMPONENT_LOCATOR),
+        )
+        .expect_err(
+            "load must fail -- the real `qwen` Component publish carries no Model Artifact \
+             bundle -- but only past Component trust, at production ingestion",
+        );
+
+        // Prove the sidecar really came from the OCI pull, not from this
+        // test's own hand: unlike `SYNTHETIC_MINIMAL_MANIFEST_YAML` above,
+        // nothing here ever writes to this path. `materialize_oci_component`
+        // runs, and writes this file, strictly before `load` is even
+        // called, so it is on disk regardless of `load`'s own outcome.
+        let sidecar_path = binding_root.join(format!(
+            "{OCI_RESOLVED_COMPONENT_FILE_NAME}.magnetar-component.yaml"
+        ));
+        assert!(
+            sidecar_path.is_file(),
+            "the embedded manifest sidecar must be materialized from the real OCI pull"
+        );
+
+        // Prove the failure is the expected, specific production-ingestion
+        // boundary (no Model Artifact bundle published alongside `qwen`) --
+        // never a Component-trust/digest rejection, which would mean the
+        // real OCI-embedded sidecar this test never authored was rejected.
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("magnetar-artifact-format.yaml"),
+            "expected the real, currently-published GHCR `qwen` Component to fail load() at \
+             Magnetar's Model Artifact format declaration, got: {chain}"
+        );
+        assert!(
+            !chain.to_lowercase().contains("trust")
+                && !chain.to_lowercase().contains("digest mismatch")
+                && !chain.to_lowercase().contains("rejected"),
+            "the real OCI-embedded sidecar must be accepted by Component trust/registration \
+             before production ingestion even runs, got: {chain}"
         );
     }
 
