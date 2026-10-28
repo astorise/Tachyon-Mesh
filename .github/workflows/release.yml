@@ -12,69 +12,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # TACH-17: a `v*` tag can point at any commit, including one that never
-  # ran CI's push trigger or ran it and failed -- this repo's rulesets gate
-  # merges into `main`, not tag creation. Every job below that can publish
-  # (contents: write / id-token: write) depends on this one, so a tag can
-  # never ship from a commit whose quality/cuda-quality/security-audit/
-  # build-guests jobs, from CI's own `push` run on `main` specifically
-  # (never a `pull_request` run -- see the step below), aren't all green.
-  # Job names here must stay exact matches for those CI job ids, none of
-  # which override their default (job-id-derived) name.
+  # TACH-17/TACH-18: a `v*` tag can point at any commit, including one that
+  # never ran CI's push trigger or ran it and failed -- this repo's
+  # rulesets gate merges into `main`, not tag creation. Every job below
+  # that can publish (contents: write / id-token: write) depends on this
+  # one, so a tag can never ship from a commit whose quality/cuda-quality/
+  # security-audit/build-guests jobs, from CI's own `push` run on `main`
+  # specifically (never a `pull_request` run), aren't all green. The actual
+  # check now lives in verify-tag-ci-green.yml (TACH-18) so publish-sdks.yml
+  # -- a separate workflow file with its own real, external-registry
+  # publish paths -- shares the exact same gate instead of going ungated or
+  # drifting from a second copy of this script.
   verify-tag-ci-green:
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
-    runs-on: ubuntu-26.04
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - name: Require the tagged commit's CI baseline to be green
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          required="quality cuda-quality security-audit build-guests"
-
-          # Resolve the exact CI run that proves this: a `push` trigger on
-          # `main`, for this exact commit -- never a `pull_request` run.
-          # ci.yml's Renovate-PR lane (RENOVATE_PR, gated on
-          # github.event_name == 'pull_request') skips boundary validation
-          # and GPU execution tests while still reporting these same job
-          # names as successful, so matching by check-run name alone (the
-          # first version of this gate) could accept a PR run's checks for
-          # a commit that never ran the real push baseline on main.
-          run_id=$(gh api "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&event=push&branch=main&status=completed" \
-            -q '.workflow_runs[0].id // empty')
-
-          if [ -z "$run_id" ]; then
-            echo "::error::No completed CI push run on main exists for tagged commit ${SHA} -- tag a commit that has already run CI's push trigger on main, not just a pull_request run." >&2
-            exit 1
-          fi
-
-          missing=""
-          failed=""
-          for name in $required; do
-            conclusion=$(gh api "repos/${REPO}/actions/runs/${run_id}/jobs" \
-              --paginate \
-              -q ".jobs[] | select(.name == \"${name}\") | .conclusion" \
-              | tail -n1)
-            if [ -z "$conclusion" ] || [ "$conclusion" = "null" ]; then
-              missing="${missing} ${name}"
-            elif [ "$conclusion" != "success" ]; then
-              failed="${failed} ${name}=${conclusion}"
-            fi
-          done
-          if [ -n "$missing" ]; then
-            echo "::error::CI push run ${run_id} on main for ${SHA} is missing required job(s):${missing}." >&2
-            exit 1
-          fi
-          if [ -n "$failed" ]; then
-            echo "::error::CI push run ${run_id} on main for ${SHA} has failing required job(s):${failed}" >&2
-            exit 1
-          fi
-          echo "All required jobs are green on CI push run ${run_id} (commit ${SHA}): ${required}"
+    uses: ./.github/workflows/verify-tag-ci-green.yml
 
   publish-integrity-schemas:
     needs: verify-tag-ci-green
