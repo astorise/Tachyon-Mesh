@@ -57,9 +57,12 @@ magnetar-cuda = ["ai-inference", "magnetar-inference-component/cuda"]
 # itself (which must keep working with zero network/registry code for a
 # build that only ever uses local `magnetar:` paths) — the resolver reuses
 # `reqwest`/`sha2`, both already mandatory core-host dependencies for
-# unrelated reasons, so enabling this feature adds no new dependency, only
-# the resolver's own code path.
-oci-artifacts = ["ai-inference"]
+# unrelated reasons. `tempfile` (TACH-16: a unique staging directory per
+# cache write, not a fixed PID-based temp name two concurrent stagers of
+# the same digest could collide on) is this feature's only actual new
+# dependency, and it's optional so a build without `oci-artifacts` pays
+# nothing for it.
+oci-artifacts = ["ai-inference", "dep:tempfile"]
 rate-limit = ["dep:governor", "dep:forwarded-header-value"]
 resiliency = ["dep:tower"]
 ring = ["tokio-rustls/ring", "tokio-rustls/tls12"]
@@ -110,6 +113,7 @@ serde_json = "1"
 sha2 = "0.11"
 sysinfo = "0.39"
 tar = "0.4"
+tempfile = { version = "3", optional = true }
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
