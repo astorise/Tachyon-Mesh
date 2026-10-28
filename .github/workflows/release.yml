@@ -25,6 +25,23 @@ jobs:
   # drifting from a second copy of this script.
   verify-tag-ci-green:
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    # A reusable-workflow call is capped at what the calling job is granted
+    # (never elevated) -- release.yml declares no workflow-level
+    # `permissions`, so without this the calling job fell back to this
+    # repo's default workflow permissions (no `actions`), while
+    # verify-tag-ci-green.yml's job requests `actions: read`. GitHub
+    # rejects that at workflow-parse time, before any job runs at all:
+    # confirmed live on main (every push to main, not just a tag, failed
+    # release.yml outright with `startup_failure` -- "the nested job
+    # 'verify-tag-ci-green' is requesting 'actions: read', but is only
+    # allowed 'actions: none'"). Same fix already applied to
+    # publish-sdks.yml's workflow-level permissions; this one just needs
+    # it at the job level instead, since this file's other jobs already
+    # set their own job-level permissions and a workflow-level block here
+    # would be needless blast radius.
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/verify-tag-ci-green.yml
 
   publish-integrity-schemas:
