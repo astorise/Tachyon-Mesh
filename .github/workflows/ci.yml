@@ -1019,6 +1019,9 @@ jobs:
       - name: Package archive exactly as publish-server-binaries does on Linux/macOS
         id: pkg
         run: |
+          # Kept in sync with release.yml's own "Package archive" step
+          # (TACH-27A) -- if that command changes, update this one to match,
+          # or this smoke test silently stops testing the real contract.
           VERSION="v0.0.0-ci-smoke"
           BINDIR="target/debug"
           ARCHIVE="tachyon-mesh-${VERSION}-linux-x86_64.tar.gz"
