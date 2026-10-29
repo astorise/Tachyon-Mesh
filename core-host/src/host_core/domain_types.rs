@@ -711,10 +711,12 @@ pub(crate) struct IntegrityInferenceComponentBinding {
     pub(crate) hardware_strategy: HardwareStrategy,
     /// An `oci://<registry>/<repository>:<tag>@sha256:<digest>` locator
     /// (TACH-10/13, 2026-09-24 audit) for the Component (WASM) binary
-    /// bytes specifically — never the Magnetar trust manifest sidecar,
-    /// which an operator still authors locally under `path` exactly as
-    /// for a fully local binding (the published OCI artifact carries only
-    /// the raw bytes today, not that sidecar). Requires the `oci-artifacts`
+    /// bytes. A Component published with its manifest sidecar embedded as
+    /// a second OCI layer (`astorise/Magnetar` MAG-08) needs nothing
+    /// further — the resolver materializes that sidecar automatically. A
+    /// Component published before MAG-08 (single-layer manifest) still
+    /// needs its trust manifest sidecar authored locally under `path`,
+    /// exactly as for a fully local binding. Requires the `oci-artifacts`
     /// feature; ignored (and must be empty) otherwise.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) component_locator: String,
