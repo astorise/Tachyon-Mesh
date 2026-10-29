@@ -252,20 +252,19 @@ jobs:
               (cd "${BINDIR}" && zip "${ARCHIVE_ABS}" core-host.exe tachyon-mcp.exe)
             fi
           else
-            # TACH-27A (2026-10-29 audit, also fixed independently in PR #486
-            # -- whichever of the two merges second will see a no-op on this
-            # hunk): no --transform wrapping the contents in a
-            # tachyon-mesh-${VERSION}/ root directory. scripts/get-tachyon.sh
-            # extracts flat (`tar -xzf ... -C "$TARGET_DIR"`, no
-            # --strip-components) and expects core-host/tachyon-mcp directly
-            # at the archive root -- the old --transform (a GNU tar extension
-            # BSD tar on macOS silently doesn't support, so this previously
-            # only wrapped Linux archives, never macOS ones) broke that
-            # contract specifically for Linux. Flat, unwrapped contents on
-            # every platform is what the installer already assumes; keep it
-            # that way instead of teaching the installer to strip a root
-            # directory. Kept in sync with installer-contract-smoke-test-linux
-            # in ci.yml, which packages with this exact command.
+            # TACH-27A (2026-10-29 audit): no --transform wrapping the
+            # contents in a tachyon-mesh-${VERSION}/ root directory.
+            # scripts/get-tachyon.sh extracts flat (`tar -xzf ... -C
+            # "$TARGET_DIR"`, no --strip-components) and expects
+            # core-host/tachyon-mcp directly at the archive root -- the old
+            # --transform (a GNU tar extension BSD tar on macOS silently
+            # doesn't support, so this previously only wrapped Linux
+            # archives, never macOS ones) broke that contract specifically
+            # for Linux. Flat, unwrapped contents on every platform is what
+            # the installer already assumes; keep it that way instead of
+            # teaching the installer to strip a root directory. Kept in sync
+            # with installer-contract-smoke-test-linux in ci.yml, which
+            # packages with this exact command.
             ARCHIVE="tachyon-mesh-${VERSION}-${OS}-${ARCH}${SUFFIX}.tar.gz"
             tar -czf "${ARCHIVE}" -C "${BINDIR}" core-host tachyon-mcp
           fi
