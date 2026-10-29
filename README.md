@@ -175,10 +175,10 @@ Add the following to your component's `Cargo.toml` (requires [`cargo-component`]
 
 ```toml
 [package.metadata.component.dependencies]
-"tachyon:mesh" = { registry = "oci", package = "ghcr.io/astorise/tachyon-mesh-wit", version = "1.1.0" }
+"tachyon:mesh" = { registry = "oci", package = "ghcr.io/astorise/tachyon-mesh-wit", version = "1.0.0" }
 ```
 
-`cargo-component build` will automatically fetch and resolve the WIT interfaces during compilation. Replace `1.1.0` with the release tag you are targeting.
+`cargo-component build` will automatically fetch and resolve the WIT interfaces during compilation. Replace `1.0.0` with the release tag you are targeting (`publish-wit-oci` tags the published OCI artifact from the git release tag itself, e.g. `v1.0.0` → `1.0.0` — **not** from `wit/tachyon.wit`'s own internal `package tachyon:mesh@2.0.0;` declaration, which is a separate WIT ABI/interface-stability version that moves independently on breaking interface changes).
 
 To see all available versions:
 ```bash
@@ -297,7 +297,7 @@ scripts/build-guest-artifacts.sh examples/guest-example
 ## 🗺 Roadmap
 
 - [x] VRAM-aware routing and multi-GPU optimization.
-- [x] Tensor/pipeline/expert-parallel inference engines (intra-node tensor sharding, cross-node pipeline stages, MoE expert routing — see `openspec/changes/2026-06-19-distributed-model-parallel-inference`).
+- [x] ~~Tensor/pipeline/expert-parallel inference engines (intra-node tensor sharding, cross-node pipeline stages, MoE expert routing)~~ — superseded by the Magnetar cutover (TACH-23/TACH-37, 2026-10-29 audit): this was Tachyon-native execution planning for model-parallel inference; `core-host` no longer contains any `tensor_parallel`/`pipeline_parallel`/`expert_parallel` code (confirmed empty on a repo-wide grep) now that execution planning for a loaded Model Instance is Magnetar's responsibility, not Tachyon's (see the Magnetar Component inference line just below). The archived proposal this line originally cited also moved: `openspec/changes/archive/2026-06-25-2026-06-19-distributed-model-parallel-inference`.
 - [x] Magnetar Component inference is wired into the live local inference path at Magnetar `09976e7792e610a04aa2b8af6c6991ba7bcbc225` (Magnetar's own stable `v1.0.0`): Tachyon stages Component artifacts, applies trust and routing policy, then delegates model ingestion, tokenizer handling, manifest normalization, resident model instance construction, execution planning, streaming, and Provider execution to Magnetar. CUDA validation uses the `magnetar-cuda` lane and exercises multi-token generation through Magnetar's device-resident decode path. (`scripts/validate_magnetar_pin_doc.sh` fails CI if this SHA ever drifts from the `vendor/Magnetar` gitlink again — see TACH-06, 2026-09-24 audit.)
 - [x] Distributed KV-Store (Partitioning V2).
 - [x] Tauri Interface (Phase 3: Routing Dashboards complete).
