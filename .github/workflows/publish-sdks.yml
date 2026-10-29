@@ -26,6 +26,19 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          The exact v*.*.* tag to publish the SDKs from (e.g. v1.0.0).
+          Required (TACH-32, 2026-10-29 audit): a workflow_dispatch run can
+          be started from any ref GitHub's dispatch UI happens to have
+          selected (main, by default) -- without pinning to this explicit
+          tag, the real publish could end up signing off on whatever
+          untagged commit main was sitting at, under a version number that
+          was never actually released. Ignored for a tag-push trigger,
+          which already resolves to the tagged commit directly.
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -37,15 +50,72 @@ permissions:
   actions: read
 
 jobs:
+  # TACH-32 (2026-10-29 audit): resolves the exact commit and SemVer to
+  # publish from, before anything else runs. For a tag push, github.sha IS
+  # already the tagged commit -- this is a no-op pass-through. For a
+  # workflow_dispatch, this is the ONLY thing standing between "publish the
+  # SDKs" and "publish whatever untagged commit main happened to be at when
+  # someone clicked the button": it explicitly checks out the required
+  # `tag` input (failing closed if that tag doesn't exist) and makes every
+  # downstream job -- the CI gate included -- operate on that exact commit,
+  # never on whatever ref the dispatch run's own default context implies.
+  resolve-publish-target:
+    name: Resolve the exact commit/version to publish from
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Validate the workflow_dispatch tag input
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'tag' input '${{ inputs.tag }}' is not a valid vX.Y.Z[-pre] tag name." >&2
+            exit 1
+          fi
+
+      - name: Checkout the exact ref to publish from
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # On workflow_dispatch this explicitly resolves the required
+          # `tag` input, regardless of which ref the dispatch run itself
+          # was started from; a tag that doesn't exist fails this checkout
+          # outright, closed. On any other trigger, github.sha already IS
+          # the exact commit to use (push: tags: can only ever be the
+          # tagged commit itself).
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
+          fetch-depth: 1
+
+      - name: Resolve commit SHA and SemVer from the checked-out ref
+        id: resolve
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          version="${tag#v}"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${tag} -> commit ${sha}, SemVer ${version}"
+
   verify-tag-ci-green:
+    needs: resolve-publish-target
     uses: ./.github/workflows/verify-tag-ci-green.yml
+    with:
+      target_sha: ${{ needs.resolve-publish-target.outputs.sha }}
 
   dry-run-publish-sdks:
     name: publish-sdks / dry run (no credential required)
+    needs: resolve-publish-target
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ needs.resolve-publish-target.outputs.sha }}
           submodules: recursive
 
       - name: Install Rust toolchain
@@ -55,6 +125,32 @@ jobs:
         run: |
           npm install --global @bytecodealliance/jco@1.40.0
           pipx install poetry==2.5.1
+
+      - name: Verify SDK manifest versions match the resolved tag's SemVer
+        # TACH-32 (2026-10-29 audit): catches a tag whose own checked-out
+        # content doesn't actually carry the version the tag name claims --
+        # e.g. a tag cut before a version bump landed, or cut against the
+        # wrong commit -- before either the dry run or (downstream) the
+        # real publish ever runs against it.
+        run: |
+          set -euo pipefail
+          expected="${{ needs.resolve-publish-target.outputs.version }}"
+          rust_version="$(grep -m1 '^version' sdk/rust/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          js_version="$(node -p "require('./sdk/js/package.json').version")"
+          py_version="$(grep -m1 '^version' sdk/python/pyproject.toml | sed -E 's/version = "(.*)"/\1/')"
+          mismatch=0
+          for pair in "Rust:${rust_version}" "JavaScript:${js_version}" "Python:${py_version}"; do
+            name="${pair%%:*}"
+            got="${pair#*:}"
+            if [ "$got" != "$expected" ]; then
+              echo "::error::${name} SDK manifest version '${got}' does not match the resolved tag's SemVer '${expected}'." >&2
+              mismatch=1
+            fi
+          done
+          if [ "$mismatch" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Rust/JavaScript/Python SDK manifests all report ${expected}, matching the resolved tag."
 
       - name: Generate Rust SDK
         run: |
@@ -92,7 +188,7 @@ jobs:
 
   publish-sdks:
     name: publish-sdks / real publish (manual only)
-    needs: [verify-tag-ci-green, dry-run-publish-sdks]
+    needs: [resolve-publish-target, verify-tag-ci-green, dry-run-publish-sdks]
     # "First Real Publication Is Manually Triggered" (Magnetar
     # release-publication.yml precedent): never runs automatically off a
     # tag push or a published GitHub Release, only an explicit
@@ -102,8 +198,15 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
+      # TACH-32 (2026-10-29 audit): checks out the exact commit
+      # resolve-publish-target resolved from the required `tag` input --
+      # never whatever ref this dispatch run's own default context
+      # implies. This is what makes the version-mismatch check two jobs
+      # up (dry-run-publish-sdks) actually mean something here too: both
+      # jobs publish from the identical, explicitly-pinned commit.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ needs.resolve-publish-target.outputs.sha }}
           submodules: recursive
 
       - name: Install Rust toolchain
