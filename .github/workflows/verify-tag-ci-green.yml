@@ -35,7 +35,12 @@ jobs:
           SHA: ${{ inputs.target_sha || github.sha }}
         run: |
           set -euo pipefail
-          required="quality cuda-quality security-audit build-guests"
+          # TACH-35 (2026-10-29 audit): installer-contract-smoke-test-linux/
+          # -windows (TACH-30) catch exactly the archive-layout regressions
+          # TACH-27/TACH-31 fixed -- without them in this required list, a
+          # future commit could break the Zero-Build installer contract
+          # without ever blocking a tag.
+          required="quality cuda-quality security-audit build-guests installer-contract-smoke-test-linux installer-contract-smoke-test-windows"
 
           # Resolve the exact CI run that proves this: a `push` trigger on
           # `main`, for this exact commit -- never a `pull_request` run.
