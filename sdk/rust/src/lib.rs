@@ -1,15 +1,24 @@
 //! Official Rust SDK surface for Tachyon Mesh FaaS guests.
 //!
-//! Release automation regenerates bindings from `sdk/wit/tachyon.wit`.
+//! Release automation regenerates bindings from `wit/tachyon.wit` (this
+//! crate's own vendored copy, kept byte-for-byte identical to
+//! `sdk/wit/tachyon.wit` by `scripts/check_wit_sdk_sync.sh`).
 
 pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Guest-side bindings for the kv-partition interface, generated at compile time
-// by wit-bindgen from the `kv-consumer` world in `sdk/wit/tachyon.wit`.
+// by wit-bindgen from the `kv-consumer` world in `wit/tachyon.wit`.
+//
+// TACH-26 (2026-10-29 audit): this crate's own `cargo package`/`cargo
+// publish` sandboxes the packaged tarball's contents to this crate's own
+// directory tree -- a `path: "../wit"` pointing outside `sdk/rust` can
+// never resolve there, so `sdk/wit/tachyon.wit` is vendored as a real,
+// tracked copy at `sdk/rust/wit/tachyon.wit` instead of referenced by a
+// relative path escaping the package root.
 mod bindings {
     wit_bindgen::generate!({
         world: "kv-consumer",
-        path: "../wit",
+        path: "wit",
     });
 }
 

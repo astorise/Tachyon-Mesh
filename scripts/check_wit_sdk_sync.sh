@@ -67,3 +67,23 @@ if [ "$failures" -ne 0 ]; then
 fi
 
 echo "sdk/wit/tachyon.wit matches wit/tachyon.wit for every shared interface."
+
+# TACH-26 (2026-10-29 audit): sdk/rust/wit/tachyon.wit is a real, tracked
+# vendored copy of sdk/wit/tachyon.wit -- cargo package/publish sandbox the
+# packaged crate to its own directory tree, so sdk/rust's own
+# wit_bindgen::generate! can no longer reference ../wit (sdk/wit) directly.
+# Unlike the curated-subset relationship above, this one must be an exact,
+# byte-for-byte copy: diverging would mean the published Rust SDK generates
+# different bindings than sdk/wit/tachyon.wit actually declares.
+rust_vendored="sdk/rust/wit/tachyon.wit"
+if [ ! -f "$rust_vendored" ]; then
+  echo "::error file=$rust_vendored::missing -- sdk/rust's wit_bindgen::generate! needs its own vendored copy of $sdk (TACH-26)" >&2
+  exit 1
+fi
+if ! diff -q "$sdk" "$rust_vendored" >/dev/null; then
+  echo "::error file=$rust_vendored::has drifted from $sdk -- copy $sdk over $rust_vendored (TACH-26)" >&2
+  diff "$sdk" "$rust_vendored" || true
+  exit 1
+fi
+
+echo "sdk/rust/wit/tachyon.wit matches sdk/wit/tachyon.wit exactly."
