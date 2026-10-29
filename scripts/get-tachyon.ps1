@@ -50,8 +50,11 @@ Write-Ok "Version: $Version"
 # ── 2. Build download URL ─────────────────────────────────────────────────────
 # Matches the artifact produced by publish-server-binaries in release.yml:
 #   tachyon-mesh-{VERSION}-windows-x86_64[-variant].zip
-$VersionNoV = $Version -replace '^v', ''
-$ZipName    = "tachyon-mesh-${VersionNoV}-windows-x86_64${VariantSuffix}.zip"
+# TACH-27B (2026-10-29 audit): release.yml names the archive with the
+# v-prefixed tag (VERSION="${{ github.ref_name }}"), not the stripped
+# version -- stripping the "v" here produced a filename that never
+# matched a real release asset.
+$ZipName        = "tachyon-mesh-${Version}-windows-x86_64${VariantSuffix}.zip"
 $DownloadUrl    = "https://github.com/$Repo/releases/download/$Version/$ZipName"
 $ChecksumUrl    = "$DownloadUrl.sha256"
 Write-Ok "Variant: $Variant"
