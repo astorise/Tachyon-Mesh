@@ -68,10 +68,23 @@ jobs:
     steps:
       - name: Validate the workflow_dispatch tag input
         if: github.event_name == 'workflow_dispatch'
+        # TACH-32 follow-up (2026-10-29 audit): `${{ inputs.tag }}` is
+        # substituted into this step's script TEXT before bash ever parses
+        # it -- so a value like `v1.0.0$(printf INJECTED >&2)` executes
+        # that command substitution as part of constructing the script,
+        # before the regex check below is ever reached, regardless of what
+        # the regex would have concluded (confirmed: this exact value
+        # prints INJECTED and exits 0, bypassing the intended rejection).
+        # Passing the input through `env:` instead assigns it to a shell
+        # variable directly -- no secondary shell parsing of its contents
+        # -- so the script below only ever sees it as inert string data via
+        # `"$TAG_INPUT"`.
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::'tag' input '${{ inputs.tag }}' is not a valid vX.Y.Z[-pre] tag name." >&2
+          if [[ ! "$TAG_INPUT" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'tag' input '${TAG_INPUT}' is not a valid vX.Y.Z[-pre] tag name." >&2
             exit 1
           fi
 
@@ -84,16 +97,24 @@ jobs:
           # outright, closed. On any other trigger, github.sha already IS
           # the exact commit to use (push: tags: can only ever be the
           # tagged commit itself).
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.sha }}
+          #
+          # Qualified as `refs/tags/<tag>` rather than the bare tag name:
+          # actions/checkout's ref resolution checks matching BRANCHES
+          # before TAGS for an unqualified ref, so a branch sharing the
+          # tag's name could otherwise silently shadow the intended tag.
+          # A fully-qualified ref removes that ambiguity entirely.
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.sha }}
           fetch-depth: 1
 
       - name: Resolve commit SHA and SemVer from the checked-out ref
         id: resolve
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           sha="$(git rev-parse HEAD)"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ inputs.tag }}"
+            tag="$TAG_INPUT"
           else
             tag="${GITHUB_REF#refs/tags/}"
           fi
