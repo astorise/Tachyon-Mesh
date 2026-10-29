@@ -5,6 +5,7 @@ on:
     paths:
       - "wit/**/*.wit"
       - "sdk/wit/**/*.wit"
+      - "sdk/rust/wit/**/*.wit"
       - ".github/workflows/wit-compat.yml"
       - "scripts/check_wit_sdk_sync.sh"
 
