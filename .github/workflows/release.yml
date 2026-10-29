@@ -99,6 +99,7 @@ jobs:
           - http3
           - security
           - ai
+          - ai-cuda
           - no-default
         include:
           # ── platform properties ──────────────────────────────────────────────
@@ -143,9 +144,30 @@ jobs:
             # own `default` feature set; secrets-vault is what this variant
             # still adds on top of it.
             cargo_args: "--features secrets-vault"
+          # TACH-22 (2026-10-28 audit): previously just `ai-inference`, which
+          # excludes the OCI Component resolver (`oci-artifacts`) this exact
+          # binary needs to pull a `magnetar:`/`oci://...` binding -- the two
+          # features are independent in core-host/Cargo.toml, so declaring
+          # only `ai-inference` built a variant that advertises AI support
+          # but can't do the registry-sourced loading TACH-10/13 added.
           - features: ai
             features_label: "-ai"
-            cargo_args: "--features ai-inference"
+            cargo_args: "--features ai-inference,oci-artifacts"
+          # New alongside `ai` (TACH-22): the portable `ai` variant above
+          # never links CUDA, so a GPU operator had no precompiled binary at
+          # all for `magnetar-cuda`. Verified this links and runs fine with
+          # no CUDA Toolkit present at build time (dynamic-loading + NVRTC
+          # at runtime -- confirmed via `cargo check --features magnetar-cuda`
+          # on a Toolkit-less sandbox): it's purely a missing feature flag,
+          # not a build-infra gap, so this needs no self-hosted GPU runner,
+          # same `os: ubuntu-22.04` as the rest of this platform row.
+          # Linux x86_64 only, per the audit's own recommendation -- CUDA has
+          # no macOS/aarch64 story here and Windows already excludes `ai`
+          # below for the same ONNX Runtime reason this variant would
+          # inherit.
+          - features: ai-cuda
+            features_label: "-ai-cuda"
+            cargo_args: "--features ai-inference,oci-artifacts,magnetar-cuda"
           - features: no-default
             features_label: "-no-default"
             cargo_args: "--no-default-features"
@@ -156,6 +178,16 @@ jobs:
             features: ai
           - platform: windows-x86_64
             features: ai
+          # ai-cuda (TACH-22): Linux x86_64 only -- see the matrix comment
+          # above for why.
+          - platform: ubuntu-aarch64
+            features: ai-cuda
+          - platform: macos-x86_64
+            features: ai-cuda
+          - platform: macos-aarch64
+            features: ai-cuda
+          - platform: windows-x86_64
+            features: ai-cuda
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always

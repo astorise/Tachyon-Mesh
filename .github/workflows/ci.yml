@@ -1040,7 +1040,16 @@ jobs:
           - image_name: tachyon-mesh
             dockerfile: ./Dockerfile
             context: .
-            cargo_features: "ai-inference,legacy-wasi-nn,ebpf-loader,experimental,http3,mtls,rate-limit,resiliency,s3-persistence,secrets-vault,websockets"
+            # TACH-22 (2026-10-28 audit): added oci-artifacts, which this
+            # variant's own `ai-inference` was missing, same gap as
+            # release.yml's "-ai" binary variant. `magnetar-cuda` stays out
+            # for now: this image targets x86_64-unknown-linux-musl and
+            # hasn't been verified to build under musl's cross toolchain
+            # (ittapi-sys, a wasmtime profiling dependency, needs
+            # x86_64-linux-musl-gcc, unavailable to verify this with outside
+            # the Dockerfile's own build) -- left as a documented follow-up
+            # rather than shipped unverified.
+            cargo_features: "ai-inference,oci-artifacts,legacy-wasi-nn,ebpf-loader,experimental,http3,mtls,rate-limit,resiliency,s3-persistence,secrets-vault,websockets"
             feature_tag: "-all-features"
             cache_scope: docker-default
     steps:
