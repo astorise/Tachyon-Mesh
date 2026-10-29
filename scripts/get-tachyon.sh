@@ -17,6 +17,8 @@
 #   security   --features secrets-vault (adds the secrets vault on top of default)
 #   ai         --features ai-inference (adds AI inference on top of default;
 #              not built for windows or linux/aarch64)
+#   ai-cuda    --features ai-inference,oci-artifacts,magnetar-cuda (adds GPU
+#              inference on top of ai; linux/x86_64 only)
 #   no-default --no-default-features
 set -euo pipefail
 
@@ -52,8 +54,9 @@ case "$VARIANT" in
   http3)      VARIANT_SUFFIX="-http3" ;;
   security)   VARIANT_SUFFIX="-security" ;;
   ai)         VARIANT_SUFFIX="-ai" ;;
+  ai-cuda)    VARIANT_SUFFIX="-ai-cuda" ;;
   no-default) VARIANT_SUFFIX="-no-default" ;;
-  *) die "Unknown --variant '${VARIANT}'. Expected one of: default, fips, http3, security, ai, no-default." ;;
+  *) die "Unknown --variant '${VARIANT}'. Expected one of: default, fips, http3, security, ai, ai-cuda, no-default." ;;
 esac
 
 # ── Prerequisites ─────────────────────────────────────────────────────────────
@@ -83,6 +86,10 @@ case "$OS" in
   linux|darwin) ;;
   *) die "Unsupported OS: $OS. Use scripts/setup.ps1 on Windows." ;;
 esac
+
+if [[ "$VARIANT" == "ai-cuda" && ( "$OS" != "linux" || "$ARCH" != "x86_64" ) ]]; then
+  die "--variant ai-cuda is only published for linux/x86_64 (got ${OS}/${ARCH}). Use --variant ai instead, or build from source with --features magnetar-cuda."
+fi
 
 TARBALL="tachyon-mesh-${VERSION}-${OS}-${ARCH}${VARIANT_SUFFIX}.tar.gz"
 URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
