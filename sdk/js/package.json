@@ -8,7 +8,7 @@
     "dist"
   ],
   "scripts": {
-    "generate": "jco transpile ../wit -o src --name tachyon-sdk",
+    "generate": "jco types ../wit -o src --name tachyon-sdk -n kv-consumer",
     "build": "npm run generate"
   },
   "devDependencies": {
