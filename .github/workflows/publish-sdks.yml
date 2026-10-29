@@ -291,7 +291,7 @@ jobs:
   publish-wit-oci:
     name: Publish WIT contracts to GHCR (OCI)
     runs-on: ubuntu-latest
-    needs: verify-tag-ci-green
+    needs: [resolve-publish-target, verify-tag-ci-green]
     # Unlike the three jobs above, this one stays automatic on a tag push:
     # it authenticates with the ephemeral, repo-scoped GITHUB_TOKEN against
     # GHCR (this repository's own package namespace), never a long-lived
@@ -308,6 +308,20 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          # TACH-32 follow-up (2026-10-29 audit): this job's own `if:`
+          # above checks the *triggering* ref/event, which on a
+          # workflow_dispatch reflects whichever ref the dispatch UI
+          # happened to be started from -- not necessarily the tag named
+          # by `resolve-publish-target`'s `tag` input. Dispatching from
+          # tag A's ref while entering a different tag B would otherwise
+          # check out A here while verify-tag-ci-green (via
+          # resolve-publish-target) verifies B's CI, letting B's green
+          # CI authorize publishing A's WIT contracts. Explicitly
+          # checking out the resolved SHA removes that mismatch; for an
+          # ordinary tag push this resolves to the same commit either way
+          # (resolve-publish-target is a no-op there), so this only
+          # changes behavior for the workflow_dispatch path.
+          ref: ${{ needs.resolve-publish-target.outputs.sha }}
           submodules: recursive
 
       - name: Install Rust toolchain
@@ -328,8 +342,11 @@ jobs:
 
       - name: Package and publish WIT contracts
         run: |
-          # Strip the leading 'v' from the tag: v1.2.3 -> 1.2.3
-          VERSION="${GITHUB_REF#refs/tags/v}"
+          # TACH-32 follow-up (2026-10-29 audit): derived from
+          # resolve-publish-target's resolved output, not GITHUB_REF --
+          # see the checkout step above for why those can differ on a
+          # workflow_dispatch.
+          VERSION="${{ needs.resolve-publish-target.outputs.version }}"
           OWNER="${{ github.repository_owner }}"
           REGISTRY="ghcr.io"
           PACKAGE="tachyon-mesh-wit"
@@ -348,6 +365,6 @@ jobs:
 
       - name: Verify published artifact
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
+          VERSION="${{ needs.resolve-publish-target.outputs.version }}"
           OWNER="${{ github.repository_owner }}"
           echo "Published ghcr.io/${OWNER}/tachyon-mesh-wit:${VERSION}"
