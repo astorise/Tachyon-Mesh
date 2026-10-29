@@ -986,6 +986,115 @@ jobs:
           path: target/release/core-host
           if-no-files-found: error
 
+  # ── 8c. Zero-Build installer contract smoke test (TACH-30) ──────────────────
+  # Packages a debug build exactly as publish-server-binaries' "Package
+  # archive" step does (same tar/zip commands, same flat-at-root layout), then
+  # extracts it with the same commands get-tachyon.sh/get-tachyon.ps1 use, to
+  # catch archive-layout regressions (TACH-27, TACH-31) before a real tag ever
+  # publishes a broken installer contract. Debug build: this validates
+  # packaging/extraction shape, not binary performance. If release.yml's own
+  # packaging commands change, update these to match — there's no single
+  # source of truth to diff against since release.yml inlines them.
+  installer-contract-smoke-test-linux:
+    # Skipped on Renovate PRs — compile-only fast lane (see top of file).
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'renovate/')
+    needs: [quality]
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: installer-smoke-linux
+
+      - name: Build core-host and tachyon-mcp
+        run: cargo build --bin core-host --bin tachyon-mcp
+
+      - name: Package archive exactly as publish-server-binaries does on Linux/macOS
+        id: pkg
+        run: |
+          # Kept in sync with release.yml's own "Package archive" step
+          # (TACH-27A) -- if that command changes, update this one to match,
+          # or this smoke test silently stops testing the real contract.
+          VERSION="v0.0.0-ci-smoke"
+          BINDIR="target/debug"
+          ARCHIVE="tachyon-mesh-${VERSION}-linux-x86_64.tar.gz"
+          tar -czf "${ARCHIVE}" -C "${BINDIR}" core-host tachyon-mcp
+          sha256sum "${ARCHIVE}" | awk '{print $1}' > "${ARCHIVE}.sha256"
+          echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify checksum and extraction exactly as get-tachyon.sh does
+        run: |
+          ARCHIVE="${{ steps.pkg.outputs.archive }}"
+          echo "$(cat "${ARCHIVE}.sha256")  ${ARCHIVE}" | sha256sum -c --status
+          TARGET_DIR="$(mktemp -d)"
+          tar -xzf "${ARCHIVE}" -C "${TARGET_DIR}"
+          chmod +x "${TARGET_DIR}/core-host" "${TARGET_DIR}/tachyon-mcp" 2>/dev/null || true
+          test -x "${TARGET_DIR}/core-host" || { echo "::error::get-tachyon.sh's flat extraction (tar -xzf ... -C \"\$TARGET_DIR\", no --strip-components) would not find an executable core-host directly at the archive root"; exit 1; }
+          test -x "${TARGET_DIR}/tachyon-mcp" || { echo "::error::get-tachyon.sh's flat extraction would not find an executable tachyon-mcp directly at the archive root"; exit 1; }
+          echo "Linux/macOS installer contract OK: core-host and tachyon-mcp land directly at the target directory root."
+
+  installer-contract-smoke-test-windows:
+    # Skipped on Renovate PRs — compile-only fast lane (see top of file).
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'renovate/')
+    needs: [quality]
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: installer-smoke-windows
+
+      - name: Build core-host and tachyon-mcp
+        run: cargo build --bin core-host --bin tachyon-mcp
+
+      - name: Package archive exactly as publish-server-binaries does on Windows (TACH-31)
+        id: pkg
+        shell: bash
+        run: |
+          VERSION="v0.0.0-ci-smoke"
+          BINDIR="target/debug"
+          ARCHIVE="tachyon-mesh-${VERSION}-windows-x86_64.zip"
+          ARCHIVE_ABS="$(pwd)/${ARCHIVE}"
+          if command -v 7z >/dev/null 2>&1; then
+            (cd "${BINDIR}" && 7z a "${ARCHIVE_ABS}" core-host.exe tachyon-mcp.exe)
+          else
+            (cd "${BINDIR}" && zip "${ARCHIVE_ABS}" core-host.exe tachyon-mcp.exe)
+          fi
+          echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract exactly as get-tachyon.ps1 does
+        shell: pwsh
+        run: |
+          $Archive = "${{ steps.pkg.outputs.archive }}"
+          $ExtractDir = Join-Path $env:RUNNER_TEMP "installer-smoke-extract"
+          New-Item -ItemType Directory -Path $ExtractDir -Force | Out-Null
+          Expand-Archive -Path $Archive -DestinationPath $ExtractDir -Force
+          $CoreHost = Join-Path $ExtractDir "core-host.exe"
+          $Mcp = Join-Path $ExtractDir "tachyon-mcp.exe"
+          if (-not (Test-Path $CoreHost)) {
+            Write-Host "::error::get-tachyon.ps1's Expand-Archive would not find core-host.exe directly at the archive root"
+            exit 1
+          }
+          if (-not (Test-Path $Mcp)) {
+            Write-Host "::error::get-tachyon.ps1's Expand-Archive would not find tachyon-mcp.exe directly at the archive root"
+            exit 1
+          }
+          Write-Host "Windows installer contract OK: core-host.exe and tachyon-mcp.exe land directly at the target directory root."
+
   # ── 9. Publish Docker images (push to main, needs quality + test) ─────────
   # Docker builds core-host from source inside the Dockerfile, so it doesn't
   # consume the pre-built release artifact. It waits on the *test* jobs only

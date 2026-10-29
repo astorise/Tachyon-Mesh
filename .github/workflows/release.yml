@@ -237,14 +237,19 @@ jobs:
           BINDIR="target/${{ matrix.target }}/release"
           if [ "$OS" = "windows" ]; then
             ARCHIVE="tachyon-mesh-${VERSION}-${OS}-${ARCH}${SUFFIX}.zip"
+            # TACH-31 (2026-10-29 audit follow-up): zip/7z store paths as
+            # given, so passing "${BINDIR}/core-host.exe" would embed the
+            # whole target/<triple>/release/ directory tree inside the
+            # archive instead of a flat core-host.exe at its root --
+            # get-tachyon.ps1's Expand-Archive has no --strip-components
+            # equivalent and assumes the same flat layout the Linux/macOS
+            # tarball already gets from tar's own -C flag below. cd into
+            # BINDIR first and archive bare filenames so the two match.
+            ARCHIVE_ABS="$(pwd)/${ARCHIVE}"
             if command -v 7z >/dev/null 2>&1; then
-              7z a "${ARCHIVE}" \
-                "${BINDIR}/core-host.exe" \
-                "${BINDIR}/tachyon-mcp.exe"
+              (cd "${BINDIR}" && 7z a "${ARCHIVE_ABS}" core-host.exe tachyon-mcp.exe)
             else
-              zip "${ARCHIVE}" \
-                "${BINDIR}/core-host.exe" \
-                "${BINDIR}/tachyon-mcp.exe"
+              (cd "${BINDIR}" && zip "${ARCHIVE_ABS}" core-host.exe tachyon-mcp.exe)
             fi
           else
             # TACH-27A (2026-10-29 audit): no --transform wrapping the
@@ -257,7 +262,9 @@ jobs:
             # archives, never macOS ones) broke that contract specifically
             # for Linux. Flat, unwrapped contents on every platform is what
             # the installer already assumes; keep it that way instead of
-            # teaching the installer to strip a root directory.
+            # teaching the installer to strip a root directory. Kept in sync
+            # with installer-contract-smoke-test-linux in ci.yml, which
+            # packages with this exact command.
             ARCHIVE="tachyon-mesh-${VERSION}-${OS}-${ARCH}${SUFFIX}.tar.gz"
             tar -czf "${ARCHIVE}" -C "${BINDIR}" core-host tachyon-mcp
           fi
