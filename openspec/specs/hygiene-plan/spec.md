@@ -3,19 +3,18 @@
 ## Purpose
 TBD - created by archiving change v1-1-audit-hygiene. Update Purpose after archive.
 ## Requirements
-### Requirement: Pre-release SemVer Suffix
-All workspace manifests SHALL declare version `1.1.0-alpha` while the v1.1 feature set is incomplete.
-
-#### Scenario: Cargo workspace reports pre-release version
-- **GIVEN** the repository at the `v1.1.x` branch
-- **WHEN** `cargo metadata --format-version 1` is invoked at the workspace root
-- **THEN** every workspace member SHALL report version `1.1.0-alpha`
-
-#### Scenario: Frontend manifests report pre-release version
-- **GIVEN** `package.json` and `tachyon-ui/tauri.conf.json` exist
-- **WHEN** the version field is read
-- **THEN** both files SHALL contain `1.1.0-alpha`
-
+<!--
+TACH-36 (2026-10-29 audit): removed the "Pre-release SemVer Suffix"
+requirement that mandated `1.1.0-alpha` across every workspace manifest
+"while the v1.1 feature set is incomplete". The workspace moved past that
+pre-release phase and settled on `1.0.0` as its real v1.0.0 baseline
+(core-host, tachyon-ui's Cargo.toml/tauri.conf.json/package.json, and the
+SDKs all report `1.0.0` -- see TACH-28), so this requirement had become
+permanently false rather than describing a real, current rule. There is no
+longer a `v1.1.x` branch for it to apply to. If a future pre-1.0 branch
+needs an equivalent rule, open a new openspec change scoped to that branch
+rather than reviving this one.
+-->
 ### Requirement: Telemetry Mutex Poison Visibility
 The telemetry registries in `core-host/src/telemetry/mod.rs` SHALL surface poisoned-lock recovery via an explicit warning log entry rather than silently returning the inner value.
 
