@@ -204,7 +204,7 @@ jobs:
       - name: Install wkg (Wasm Package Tools)
         run: cargo install wkg --version 0.16.1 --locked
 
-      - name: Stage tachyon:mesh's own files into an isolated package root
+      - name: Stage tachyon:mesh's own file into an isolated package root
         # TACH-33 (2026-10-29 audit): `./wit` is a flat directory holding
         # MANY independent WIT packages as siblings of tachyon:mesh
         # (tachyon:identity, tachyon:*-config, tachyon:accelerator,
@@ -213,27 +213,39 @@ jobs:
         # identifier `tachyon:ai-config@1.1.0` does not match previous
         # package name of `tachyon:identity@1.1.0`" before ever reaching
         # GHCR, because wkg tries to build the whole directory as one
-        # package. tachyon:mesh's own files are scattered across
-        # wit/tachyon.wit plus four subdirectories that sit alongside other
-        # packages' subdirectories at the same tree depth
-        # (wit/{mesh,ai,events,store} belong to tachyon:mesh;
-        # wit/{accelerator,storage} and the top-level config-*.wit/
-        # authn.wit/authz.wit/identity.wit do not). `grep -rl "^package
-        # tachyon:mesh@" wit/` names the exact 10 files that make up the
-        # package; staging just those into their own clean directory
-        # (preserving relative subpaths) let a real `wkg publish --dry-run`
-        # build and resolve successfully (verified locally -- it got all
-        # the way to a GHCR auth check with no credentials configured,
-        # rather than failing on WIT resolution).
+        # package.
+        #
+        # An earlier version of this step staged all 10 files that
+        # `grep -rl "^package tachyon:mesh@" wit/` finds, including four
+        # subdirectories (wit/{mesh,ai,events,store}), preserving their
+        # relative paths. `wkg publish --dry-run` against that staged
+        # directory built and resolved without error, which looked like
+        # proof it worked -- but decoding the actual built package
+        # (`wasm-tools component wit <dir> --wasm -o out.wasm`, then
+        # `wasm-tools component wit out.wasm`) showed it silently dropped
+        # 9 of those 10 files: wit_parser's directory-based build only
+        # picks up *.wit files sitting directly in the given directory,
+        # never in subdirectories, so "no error" was never proof the
+        # subdirectory content was actually included in the package.
+        #
+        # wit/tachyon.wit alone is the correct, self-sufficient publish
+        # target: its own header names it "the single source of truth for
+        # all Tachyon Mesh WIT interfaces" and says not to fork worlds or
+        # create -with-X variants; it builds standalone with zero
+        # resolution errors (verified the same way: build, then decode,
+        # and compare against the file's own content); and
+        # sdk/wit/tachyon.wit (the consumer-facing SDK subset) never
+        # references any interface/world that only the four subdirectories
+        # declare. Those subdirectories' files remain referenced elsewhere
+        # in the repo by direct path (e.g.
+        # crates/parallel-topology/src/lib.rs,
+        # scripts/validate_ai_component_boundary.sh) -- they are not dead
+        # code, just not part of the externally-published GHCR artifact.
         run: |
           set -euo pipefail
           STAGE_DIR="$(mktemp -d)"
           echo "STAGE_DIR=${STAGE_DIR}" >> "$GITHUB_ENV"
-          while IFS= read -r wit; do
-            dest="${STAGE_DIR}/${wit#wit/}"
-            mkdir -p "$(dirname "$dest")"
-            cp "$wit" "$dest"
-          done < <(grep -rl "^package tachyon:mesh@" wit/)
+          cp wit/tachyon.wit "${STAGE_DIR}/"
           echo "Staged tachyon:mesh file(s) into ${STAGE_DIR}:"
           find "$STAGE_DIR" -name '*.wit' | sort
 
