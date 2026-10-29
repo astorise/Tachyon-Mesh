@@ -53,19 +53,17 @@ jobs:
 
       - name: Install SDK generators
         run: |
-          cargo install wit-bindgen-cli --version 0.63.0 --locked
-          npm install --global @bytecodealliance/jco
-          pipx install poetry
+          npm install --global @bytecodealliance/jco@1.40.0
+          pipx install poetry==2.5.1
 
       - name: Generate Rust SDK
         run: |
-          wit-bindgen rust sdk/wit --out-dir sdk/rust/src/generated
           cargo package --manifest-path sdk/rust/Cargo.toml
 
       - name: Generate JavaScript SDK
         run: |
           cd sdk/js
-          npm ci || npm install
+          npm ci
           npm run build
 
       - name: Build Python SDK
@@ -113,19 +111,17 @@ jobs:
 
       - name: Install SDK generators
         run: |
-          cargo install wit-bindgen-cli --version 0.63.0 --locked
-          npm install --global @bytecodealliance/jco
-          pipx install poetry
+          npm install --global @bytecodealliance/jco@1.40.0
+          pipx install poetry==2.5.1
 
       - name: Generate Rust SDK
         run: |
-          wit-bindgen rust sdk/wit --out-dir sdk/rust/src/generated
           cargo package --manifest-path sdk/rust/Cargo.toml
 
       - name: Generate JavaScript SDK
         run: |
           cd sdk/js
-          npm ci || npm install
+          npm ci
           npm run build
 
       - name: Build Python SDK
