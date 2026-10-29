@@ -56,7 +56,7 @@ Optional: `-Version v1.2.3`, `-Dir C:\Tools\tachyon`, or `-Variant http3`.
 
 > **Security:** Binaries are automatically verified via SHA-256 upon download, plus a cosign signature check when `cosign` is on `PATH`. Cosign signatures (`.bundle`) and SBOMs (`.spdx.json`) are available in the [GitHub Releases](https://github.com/astorise/tachyon-mesh/releases) for each version tag.
 
-**Which variant do I want?** Every release ships six pre-built binaries per platform, each compiled with a different Cargo feature set. The plain installer command above always fetches `default` — the other five are opt-in via `--variant`/`-Variant`:
+**Which variant do I want?** Every release ships a platform-dependent set of pre-built binaries, each compiled with a different Cargo feature set — not every variant is built for every platform (see below). The plain installer command above always fetches `default` — the others are opt-in via `--variant`/`-Variant`:
 
 | Variant | Cargo features | Adds |
 |---|---|---|
@@ -64,7 +64,8 @@ Optional: `-Version v1.2.3`, `-Dir C:\Tools\tachyon`, or `-Variant http3`.
 | `fips` | `fips` (no defaults) | FIPS-mode TLS (`aws_lc_rs` + `tls12`). No admin plane. |
 | `http3` | `admin-plane`, `ring`, `http3` | HTTP/3 / QUIC transport, on top of everything `default` has. |
 | `security` | everything `default` has, plus `secrets-vault` | The secrets vault, on top of everything `default` has. |
-| `ai` | everything `default` has, plus `ai-inference` | AI model routing/serving, on top of everything `default` has. Not built for Windows or Linux/aarch64. |
+| `ai` | everything `default` has, plus `ai-inference`, `oci-artifacts` | AI model routing/serving, including pulling Magnetar Components from an OCI registry, on top of everything `default` has. Not built for Windows or Linux/aarch64. |
+| `ai-cuda` | everything `ai` has, plus `magnetar-cuda` | GPU-accelerated inference, on top of everything `ai` has. Linux/x86_64 only. |
 | `no-default` | *(none)* | The smallest possible worker-data-plane binary: no `/admin/*` surface, no WebSockets, rate limiting, resiliency, or mTLS. |
 
 A route or capability that 404s or refuses to start is often just a feature the installed variant wasn't built with — `core-host`'s startup log always names the features it was compiled with, so `grep features` in its output (or `RUST_LOG=info` if you've redirected logs) tells you which variant you're running. Combine features by building from source (Path B) with your own `cargo build --features ...` instead.
