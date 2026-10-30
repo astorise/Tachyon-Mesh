@@ -127,40 +127,36 @@ jobs:
     with:
       target_sha: ${{ needs.resolve-publish-target.outputs.sha }}
 
-  dry-run-publish-sdks:
-    name: publish-sdks / dry run (no credential required)
+  # TACH-40 (2026-10-30 audit): this used to be one job running cargo/npm/
+  # poetry/go sequentially -- a transient failure on any one language (or
+  # just an expired/misconfigured token) failed the whole job, and
+  # re-running it re-attempted every language from scratch, including ones
+  # that had already published for real. cargo/npm/poetry registries all
+  # reject a re-upload of an already-published version, so that retry was
+  # "safe" but noisy: a human watching the re-run sees spurious failures
+  # for languages that were already done, with no way to retry just the
+  # one that actually failed. Splitting into one job per language --
+  # dry-run-rust-sdk/dry-run-js-sdk/dry-run-python-sdk/dry-run-go-sdk below,
+  # publish-rust-sdk/publish-js-sdk/publish-python-sdk/publish-go-sdk
+  # further down -- lets GitHub's own "re-run failed jobs" retry exactly
+  # the one that failed, each depending only on resolve-publish-target and
+  # verify-tag-ci-green (the shared preflight), never on a sibling
+  # language's job.
+  #
+  # This lightweight check has no language-specific toolchain dependency
+  # (plain grep/sed against each manifest) and gates all four per-language
+  # jobs below, so a tag whose content doesn't match its own name is
+  # caught once, centrally, rather than three times redundantly.
+  verify-sdk-manifest-versions:
+    name: Verify SDK manifest versions match the resolved tag's SemVer
     needs: resolve-publish-target
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.resolve-publish-target.outputs.sha }}
-          submodules: recursive
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-
-      - name: Install Go toolchain
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version: "1.24.7"
-
-      - name: Install SDK generators
-        # componentize-py and wit-bindgen-go (TACH-41, 2026-10-30 audit):
-        # real generators for the Python and Go SDKs' bindings, the same
-        # role jco/wit-bindgen already play for JavaScript/Rust above --
-        # before this, sdk/python and sdk/go shipped no generated bindings
-        # at all (sdk/python's __init__.py was a bare version string; Go
-        # had no generate step and wasn't even published).
-        run: |
-          npm install --global @bytecodealliance/jco@1.40.0
-          pipx install poetry==2.5.1
-          pip install --user componentize-py==0.25.1
-          go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-      - name: Verify SDK manifest versions match the resolved tag's SemVer
+      - name: Verify
         # TACH-32 (2026-10-29 audit): catches a tag whose own checked-out
         # content doesn't actually carry the version the tag name claims --
         # e.g. a tag cut before a version bump landed, or cut against the
@@ -170,7 +166,7 @@ jobs:
           set -euo pipefail
           expected="${{ needs.resolve-publish-target.outputs.version }}"
           rust_version="$(grep -m1 '^version' sdk/rust/Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-          js_version="$(node -p "require('./sdk/js/package.json').version")"
+          js_version="$(grep -m1 '"version"' sdk/js/package.json | sed -E 's/.*"version": *"([^"]+)".*/\1/')"
           py_version="$(grep -m1 '^version' sdk/python/pyproject.toml | sed -E 's/version = "(.*)"/\1/')"
           mismatch=0
           for pair in "Rust:${rust_version}" "JavaScript:${js_version}" "Python:${py_version}"; do
@@ -186,9 +182,37 @@ jobs:
           fi
           echo "Rust/JavaScript/Python SDK manifests all report ${expected}, matching the resolved tag."
 
+  dry-run-rust-sdk:
+    name: dry-run / Rust SDK (no credential required)
+    needs: resolve-publish-target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.resolve-publish-target.outputs.sha }}
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
       - name: Generate Rust SDK
-        run: |
-          cargo package --manifest-path sdk/rust/Cargo.toml
+        run: cargo package --manifest-path sdk/rust/Cargo.toml
+
+      - name: cargo publish --dry-run (Rust SDK)
+        run: cargo publish --manifest-path sdk/rust/Cargo.toml --dry-run
+
+  dry-run-js-sdk:
+    name: dry-run / JavaScript SDK (no credential required)
+    needs: resolve-publish-target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.resolve-publish-target.outputs.sha }}
+          submodules: recursive
+
+      - name: Install jco
+        run: npm install --global @bytecodealliance/jco@1.40.0
 
       - name: Generate JavaScript SDK
         run: |
@@ -196,13 +220,41 @@ jobs:
           npm ci
           npm run build
 
+      - name: npm publish --dry-run (JavaScript SDK)
+        # `--prefix` does not redirect npm publish's target package the way
+        # it does for e.g. `npm install` -- it still reads ./package.json
+        # from the invocation's cwd (the repo root here, which has none) and
+        # fails with ENOENT. Passing the directory as npm publish's own
+        # <package-spec> argument is what actually selects sdk/js.
+        run: npm publish ./sdk/js --access public --dry-run
+
+  dry-run-python-sdk:
+    name: dry-run / Python SDK (no credential required)
+    needs: resolve-publish-target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.resolve-publish-target.outputs.sha }}
+          submodules: recursive
+
+      - name: Install SDK generators
+        # componentize-py (TACH-41, 2026-10-30 audit): the real generator
+        # for the Python SDK's bindings, the same role jco plays for
+        # JavaScript -- before this, sdk/python shipped no generated
+        # bindings at all (its __init__.py was a bare version string).
+        run: |
+          pipx install poetry==2.5.1
+          pip install --user componentize-py==0.25.1
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Generate Python SDK (drift check against committed bindings)
         # TACH-41 (2026-10-30 audit): componentize-py's `bindings` command
         # only emits typed, documented stubs (every method body raises
         # NotImplementedError) -- componentize-py's own `componentize`
         # step swaps in the real Component Model ABI calls when a guest
         # app is actually bundled. That's real, by-design behavior (JS's
-        # jco types below works the same way), not a placeholder we forgot
+        # jco types above works the same way), not a placeholder we forgot
         # to finish -- what this check catches is sdk/wit/tachyon.wit
         # drifting from the generated/committed bindings sdk/python ships.
         run: |
@@ -227,6 +279,35 @@ jobs:
         run: |
           cd sdk/python
           poetry build
+
+      - name: poetry publish --dry-run (Python SDK)
+        # TACH-40 (2026-10-30 audit): Poetry has supported `publish
+        # --dry-run` since well before the 2.5.1 pinned above (confirmed
+        # via `poetry publish --help`: "Perform all actions except upload
+        # the package.", and it runs with no PYPI_TOKEN configured) -- the
+        # prior comment here claiming no dry-run mode exists was simply
+        # wrong.
+        run: poetry publish --directory sdk/python --dry-run
+
+  dry-run-go-sdk:
+    name: dry-run / Go SDK (no credential required)
+    needs: resolve-publish-target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.resolve-publish-target.outputs.sha }}
+          submodules: recursive
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.24.7"
+
+      - name: Install wit-bindgen-go
+        run: |
+          go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Generate Go SDK (drift check against committed bindings)
         # TACH-41 (2026-10-30 audit): wit-bindgen-go emits real, complete
@@ -254,52 +335,26 @@ jobs:
         # it for wasip1/wasip2 -- go:wasmimport only accepts flat scalar
         # parameter types there; wit-bindgen-go's generated Result/List/
         # Tuple-typed signatures require TinyGo's wasm backend instead
-        # (see sdk/go/generate.go and sdk/go/README.md).
+        # (see sdk/go/generate.go and sdk/go/README.md). Go has no
+        # package-registry dry-run equivalent to cargo/npm/poetry's --
+        # generate, build, and vet are this language's whole dry run.
         run: |
           cd sdk/go
           go build ./...
           go vet ./...
 
-      - name: cargo publish --dry-run (Rust SDK)
-        run: cargo publish --manifest-path sdk/rust/Cargo.toml --dry-run
-
-      - name: npm publish --dry-run (JavaScript SDK)
-        # `--prefix` does not redirect npm publish's target package the way
-        # it does for e.g. `npm install` -- it still reads ./package.json
-        # from the invocation's cwd (the repo root here, which has none) and
-        # fails with ENOENT. Passing the directory as npm publish's own
-        # <package-spec> argument is what actually selects sdk/js.
-        run: npm publish ./sdk/js --access public --dry-run
-
-      - name: poetry publish --dry-run (Python SDK)
-        # TACH-40 (2026-10-30 audit): Poetry has supported `publish
-        # --dry-run` since well before the 2.5.1 pinned elsewhere in this
-        # file (confirmed via `poetry publish --help`: "Perform all
-        # actions except upload the package.", and it runs with no
-        # PYPI_TOKEN configured) -- the prior comment here claiming no
-        # dry-run mode exists was simply wrong.
-        run: poetry publish --directory sdk/python --dry-run
-
-  publish-sdks:
-    name: publish-sdks / real publish (manual only)
-    needs: [resolve-publish-target, verify-tag-ci-green, dry-run-publish-sdks]
-    # "First Real Publication Is Manually Triggered" (Magnetar
-    # release-publication.yml precedent): never runs automatically off a
-    # tag push or a published GitHub Release, only an explicit
-    # workflow_dispatch, until a human has confirmed the dry run end to
-    # end on this exact ref.
+  # "First Real Publication Is Manually Triggered" (Magnetar
+  # release-publication.yml precedent): none of the four jobs below runs
+  # automatically off a tag push or a published GitHub Release, only an
+  # explicit workflow_dispatch, until a human has confirmed the matching
+  # dry-run job passed end to end on this exact ref.
+  publish-rust-sdk:
+    name: publish-sdks / Rust SDK (real, manual only)
+    needs: [resolve-publish-target, verify-tag-ci-green, verify-sdk-manifest-versions, dry-run-rust-sdk]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: release
-    permissions:
-      contents: write # TACH-41 (2026-10-30 audit): needed to push the sdk/go/vX.Y.Z module tag below
     steps:
-      # TACH-32 (2026-10-29 audit): checks out the exact commit
-      # resolve-publish-target resolved from the required `tag` input --
-      # never whatever ref this dispatch run's own default context
-      # implies. This is what makes the version-mismatch check two jobs
-      # up (dry-run-publish-sdks) actually mean something here too: both
-      # jobs publish from the identical, explicitly-pinned commit.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.resolve-publish-target.outputs.sha }}
@@ -308,57 +363,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
-      - name: Install Go toolchain
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version: "1.24.7"
-
-      - name: Install SDK generators
-        run: |
-          npm install --global @bytecodealliance/jco@1.40.0
-          pipx install poetry==2.5.1
-          pip install --user componentize-py==0.25.1
-          go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
       - name: Generate Rust SDK
-        run: |
-          cargo package --manifest-path sdk/rust/Cargo.toml
-
-      - name: Generate JavaScript SDK
-        run: |
-          cd sdk/js
-          npm ci
-          npm run build
-
-      - name: Generate Python SDK
-        # componentize-py's `bindings` command asserts its output paths
-        # don't already exist -- harmless for a one-shot generate-into-a-
-        # temp-dir drift check (dry-run-publish-sdks), but this job
-        # regenerates in place over a tree already checked out with these
-        # same committed paths, so they're cleared first.
-        run: |
-          rm -rf sdk/python/wit_world sdk/python/componentize_py_async_support \
-            sdk/python/componentize_py_types.py sdk/python/componentize_py_runtime.pyi \
-            sdk/python/poll_loop.py
-          componentize-py -d sdk/wit -w kv-consumer bindings sdk/python
-
-      - name: Build Python SDK
-        run: |
-          cd sdk/python
-          poetry build
-
-      - name: Generate Go SDK
-        run: |
-          rm -rf sdk/go/gen
-          wit-bindgen-go generate -w kv-consumer -o sdk/go/gen -p github.com/astorise/Tachyon-Mesh/sdk/go/gen sdk/go/wit
+        run: cargo package --manifest-path sdk/rust/Cargo.toml
 
       # "Credential-Gated Publish Steps Fail Closed" (Magnetar precedent):
-      # assert each secret is present and non-empty, with an explicit
-      # ::error:: message, before the matching publish step runs -- never
-      # let an empty token reach the registry as an unauthenticated or
-      # malformed request.
+      # assert the secret is present and non-empty, with an explicit
+      # ::error:: message, before the publish step runs -- never let an
+      # empty token reach the registry as an unauthenticated or malformed
+      # request.
       - name: Check crates.io token is configured
         run: |
           if [ -z "${{ secrets.CARGO_REGISTRY_TOKEN }}" ]; then
@@ -367,6 +379,27 @@ jobs:
           fi
       - name: Publish Rust SDK (real)
         run: cargo publish --manifest-path sdk/rust/Cargo.toml --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+
+  publish-js-sdk:
+    name: publish-sdks / JavaScript SDK (real, manual only)
+    needs: [resolve-publish-target, verify-tag-ci-green, verify-sdk-manifest-versions, dry-run-js-sdk]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.resolve-publish-target.outputs.sha }}
+          submodules: recursive
+
+      - name: Install jco
+        run: npm install --global @bytecodealliance/jco@1.40.0
+
+      - name: Generate JavaScript SDK
+        run: |
+          cd sdk/js
+          npm ci
+          npm run build
 
       - name: Check npm token is configured
         run: |
@@ -380,6 +413,41 @@ jobs:
         # existed to reach it safely, and no prior CI exercised it).
         run: npm publish ./sdk/js --access public --//registry.npmjs.org/:_authToken="${{ secrets.NPM_TOKEN }}"
 
+  publish-python-sdk:
+    name: publish-sdks / Python SDK (real, manual only)
+    needs: [resolve-publish-target, verify-tag-ci-green, verify-sdk-manifest-versions, dry-run-python-sdk]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.resolve-publish-target.outputs.sha }}
+          submodules: recursive
+
+      - name: Install SDK generators
+        run: |
+          pipx install poetry==2.5.1
+          pip install --user componentize-py==0.25.1
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Generate Python SDK
+        # componentize-py's `bindings` command asserts its output paths
+        # don't already exist -- harmless for a one-shot generate-into-a-
+        # temp-dir drift check (dry-run-python-sdk), but this job
+        # regenerates in place over a tree already checked out with these
+        # same committed paths, so they're cleared first.
+        run: |
+          rm -rf sdk/python/wit_world sdk/python/componentize_py_async_support \
+            sdk/python/componentize_py_types.py sdk/python/componentize_py_runtime.pyi \
+            sdk/python/poll_loop.py
+          componentize-py -d sdk/wit -w kv-consumer bindings sdk/python
+
+      - name: Build Python SDK
+        run: |
+          cd sdk/python
+          poetry build
+
       - name: Check PyPI token is configured
         run: |
           if [ -z "${{ secrets.PYPI_TOKEN }}" ]; then
@@ -389,16 +457,30 @@ jobs:
       - name: Publish Python SDK (real)
         run: poetry publish --directory sdk/python --username __token__ --password "${{ secrets.PYPI_TOKEN }}"
 
+  publish-go-sdk:
+    name: publish-sdks / Go SDK (real, manual only)
+    needs: [resolve-publish-target, verify-tag-ci-green, dry-run-go-sdk]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write # TACH-41 (2026-10-30 audit): needed to push the sdk/go/vX.Y.Z module tag below
+    steps:
+      # TACH-41/TACH-40: unlike cargo/npm/poetry, a Go module has no
+      # package-registry upload step at all -- the module proxy resolves
+      # versions directly from the module's own VCS tags, so this job
+      # needs no language toolchain, no regeneration, nothing but git.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.resolve-publish-target.outputs.sha }}
+
       - name: Publish Go SDK (real)
-        # TACH-41 (2026-10-30 audit): unlike cargo/npm/poetry, a Go module
-        # has no package-registry upload step -- the module proxy
-        # resolves versions directly from the module's own VCS tags, and
-        # for a module living in a monorepo subdirectory that means a
-        # "<subdir>/vX.Y.Z" tag, not the repo-root release tag this
-        # workflow already runs from. Without this, `go get
+        # For a module living in a monorepo subdirectory, that VCS tag is
+        # "<subdir>/vX.Y.Z", not the repo-root release tag this workflow
+        # already runs from. Without this, `go get
         # github.com/astorise/Tachyon-Mesh/sdk/go@v<version>` could never
         # resolve no matter how complete sdk/go's bindings are -- Go
-        # wasn't even in this job before this fix.
+        # wasn't even in this workflow's real-publish path before TACH-41.
         run: |
           set -euo pipefail
           VERSION="${{ needs.resolve-publish-target.outputs.version }}"
@@ -415,3 +497,39 @@ jobs:
           fi
           git tag "${TAG}" "${SHA}"
           git push origin "${TAG}"
+
+  # TACH-40 (2026-10-30 audit): the audit's own "plus a final aggregator"
+  # -- a single named check that reflects whether every language actually
+  # published, for anything (branch protection, a human skimming the
+  # workflow run list) that wants one status rather than four. always()
+  # bypasses the implicit needs-success gate so this job still runs -- and
+  # reports -- when one of the four failed, instead of itself being
+  # skipped.
+  publish-sdks-summary:
+    name: publish-sdks / summary (all languages)
+    needs: [publish-rust-sdk, publish-js-sdk, publish-python-sdk, publish-go-sdk]
+    if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report per-language publish results
+        run: |
+          set -euo pipefail
+          declare -A results=(
+            [Rust]="${{ needs.publish-rust-sdk.result }}"
+            [JavaScript]="${{ needs.publish-js-sdk.result }}"
+            [Python]="${{ needs.publish-python-sdk.result }}"
+            [Go]="${{ needs.publish-go-sdk.result }}"
+          )
+          failed=0
+          for lang in "${!results[@]}"; do
+            status="${results[$lang]}"
+            echo "${lang}: ${status}"
+            if [ "${status}" != "success" ]; then
+              failed=1
+            fi
+          done
+          if [ "${failed}" -ne 0 ]; then
+            echo "::error::At least one SDK failed to publish -- see the per-language job above for which one and why. Re-run only that job; the others already succeeded and registries reject a re-upload of an already-published version." >&2
+            exit 1
+          fi
+          echo "All four SDKs published successfully."
