@@ -104,9 +104,11 @@ if ($Cosign) {
         Remove-Item $TmpZip -Force -ErrorAction SilentlyContinue
         Write-Fail "cosign is installed but the signature bundle could not be fetched.`n  URL: $BundleUrl`n  Re-run without cosign on PATH to skip this check, or verify manually once the bundle is available."
     }
+    # TACH-45 (2026-10-30 audit): same (?i) fix as get-tachyon.sh -- see
+    # its comment on the matching line for why.
     & cosign verify-blob `
         --bundle $TmpBundle `
-        --certificate-identity-regexp "^https://github\.com/$Repo/\.github/workflows/release\.yml@" `
+        --certificate-identity-regexp "(?i)^https://github\.com/$Repo/\.github/workflows/release\.yml@" `
         --certificate-oidc-issuer "https://token.actions.githubusercontent.com" `
         $TmpZip
     if ($LASTEXITCODE -ne 0) {
