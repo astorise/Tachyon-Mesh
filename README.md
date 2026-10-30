@@ -264,17 +264,43 @@ Add the following to your `claude_desktop_config.json`:
 
 ## 🛠 Function Development (Guests)
 
-Tachyon leverages the **WASM Component Model**. Here is a minimal Rust example:
+Tachyon leverages the **WASM Component Model**. Here is a minimal Rust example
+(the actual contents of [`examples/guest-example`](examples/guest-example/),
+generated directly from the published WIT contract with
+[`wit-bindgen`](https://github.com/bytecodealliance/wit-bindgen) -- see
+[`faas-sdk/README.md`](faas-sdk/README.md) for the full Quick Start,
+including the `kv-partition` interface's `tachyon-faas-sdk` client crate):
 
 ```rust
-use tachyon_sdk::prelude::*;
+mod bindings {
+    use super::Component;
 
-#[tachyon_function]
-fn handle_request(req: Request) -> Response {
-    Response::builder()
-        .status(200)
-        .body("Hello from Tachyon Mesh!")
-        .build()
+    wit_bindgen::generate!({
+        path: "../../wit/tachyon.wit",
+        world: "faas-guest",
+    });
+
+    export!(Component);
+}
+
+struct Component;
+
+impl bindings::exports::tachyon::mesh::handler::Guest for Component {
+    fn handle_request(
+        req: bindings::exports::tachyon::mesh::handler::Request,
+    ) -> bindings::exports::tachyon::mesh::handler::Response {
+        let body = if req.body.is_empty() {
+            b"Hello from Tachyon Mesh!".to_vec()
+        } else {
+            req.body
+        };
+        bindings::exports::tachyon::mesh::handler::Response {
+            status: 200,
+            headers: vec![],
+            body,
+            trailers: vec![],
+        }
+    }
 }
 ```
 

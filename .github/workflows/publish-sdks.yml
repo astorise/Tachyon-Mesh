@@ -140,10 +140,25 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
+      - name: Install Go toolchain
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.24.7"
+
       - name: Install SDK generators
+        # componentize-py and wit-bindgen-go (TACH-41, 2026-10-30 audit):
+        # real generators for the Python and Go SDKs' bindings, the same
+        # role jco/wit-bindgen already play for JavaScript/Rust above --
+        # before this, sdk/python and sdk/go shipped no generated bindings
+        # at all (sdk/python's __init__.py was a bare version string; Go
+        # had no generate step and wasn't even published).
         run: |
           npm install --global @bytecodealliance/jco@1.40.0
           pipx install poetry==2.5.1
+          pip install --user componentize-py==0.25.1
+          go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Verify SDK manifest versions match the resolved tag's SemVer
         # TACH-32 (2026-10-29 audit): catches a tag whose own checked-out
@@ -181,15 +196,69 @@ jobs:
           npm ci
           npm run build
 
+      - name: Generate Python SDK (drift check against committed bindings)
+        # TACH-41 (2026-10-30 audit): componentize-py's `bindings` command
+        # only emits typed, documented stubs (every method body raises
+        # NotImplementedError) -- componentize-py's own `componentize`
+        # step swaps in the real Component Model ABI calls when a guest
+        # app is actually bundled. That's real, by-design behavior (JS's
+        # jco types below works the same way), not a placeholder we forgot
+        # to finish -- what this check catches is sdk/wit/tachyon.wit
+        # drifting from the generated/committed bindings sdk/python ships.
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/py-bindgen-check
+          mkdir -p /tmp/py-bindgen-check
+          componentize-py -d sdk/wit -w kv-consumer bindings /tmp/py-bindgen-check
+          mismatch=0
+          for path in wit_world componentize_py_async_support componentize_py_types.py componentize_py_runtime.pyi poll_loop.py; do
+            if ! diff -rq "sdk/python/${path}" "/tmp/py-bindgen-check/${path}" >/dev/null; then
+              echo "::error file=sdk/python/${path}::drifted from what componentize-py generates for the kv-consumer world -- regenerate with 'componentize-py -d ../wit -w kv-consumer bindings .' from sdk/python and commit the result." >&2
+              diff -rq "sdk/python/${path}" "/tmp/py-bindgen-check/${path}" || true
+              mismatch=1
+            fi
+          done
+          if [ "$mismatch" -ne 0 ]; then
+            exit 1
+          fi
+          echo "sdk/python's generated bindings match componentize-py's current output."
+
       - name: Build Python SDK
         run: |
           cd sdk/python
           poetry build
 
-      - name: Check Go SDK
+      - name: Generate Go SDK (drift check against committed bindings)
+        # TACH-41 (2026-10-30 audit): wit-bindgen-go emits real, complete
+        # Component Model ABI glue (go:wasmimport declarations), unlike
+        # componentize-py's stubs above -- this is the same kind of real
+        # bindings Rust's wit_bindgen::generate! already produces. What
+        # this check catches is sdk/go/wit/tachyon.wit (vendored, kept in
+        # sync by scripts/check_wit_sdk_sync.sh) drifting from the
+        # committed sdk/go/gen tree.
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/go-bindgen-check
+          mkdir -p /tmp/go-bindgen-check
+          wit-bindgen-go generate -w kv-consumer -o /tmp/go-bindgen-check -p github.com/astorise/Tachyon-Mesh/sdk/go/gen sdk/go/wit
+          if ! diff -rq sdk/go/gen /tmp/go-bindgen-check >/dev/null; then
+            echo "::error file=sdk/go/gen::drifted from what wit-bindgen-go generates for the kv-consumer world -- regenerate with 'go generate ./...' from sdk/go and commit the result." >&2
+            diff -rq sdk/go/gen /tmp/go-bindgen-check || true
+            exit 1
+          fi
+          echo "sdk/go/gen matches wit-bindgen-go's current output."
+
+      - name: Build and vet Go SDK
+        # Mainline Go's gc compiler can typecheck this package (and does
+        # here, for CI coverage with no extra toolchain) but cannot link
+        # it for wasip1/wasip2 -- go:wasmimport only accepts flat scalar
+        # parameter types there; wit-bindgen-go's generated Result/List/
+        # Tuple-typed signatures require TinyGo's wasm backend instead
+        # (see sdk/go/generate.go and sdk/go/README.md).
         run: |
           cd sdk/go
-          go mod tidy
+          go build ./...
+          go vet ./...
 
       - name: cargo publish --dry-run (Rust SDK)
         run: cargo publish --manifest-path sdk/rust/Cargo.toml --dry-run
@@ -202,8 +271,14 @@ jobs:
         # <package-spec> argument is what actually selects sdk/js.
         run: npm publish ./sdk/js --access public --dry-run
 
-      - name: poetry build already validates the Python SDK's packaging
-        run: echo "poetry publish has no dry-run mode; the build step above is the packaging check."
+      - name: poetry publish --dry-run (Python SDK)
+        # TACH-40 (2026-10-30 audit): Poetry has supported `publish
+        # --dry-run` since well before the 2.5.1 pinned elsewhere in this
+        # file (confirmed via `poetry publish --help`: "Perform all
+        # actions except upload the package.", and it runs with no
+        # PYPI_TOKEN configured) -- the prior comment here claiming no
+        # dry-run mode exists was simply wrong.
+        run: poetry publish --directory sdk/python --dry-run
 
   publish-sdks:
     name: publish-sdks / real publish (manual only)
@@ -216,6 +291,8 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      contents: write # TACH-41 (2026-10-30 audit): needed to push the sdk/go/vX.Y.Z module tag below
     steps:
       # TACH-32 (2026-10-29 audit): checks out the exact commit
       # resolve-publish-target resolved from the required `tag` input --
@@ -231,10 +308,19 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
+      - name: Install Go toolchain
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.24.7"
+
       - name: Install SDK generators
         run: |
           npm install --global @bytecodealliance/jco@1.40.0
           pipx install poetry==2.5.1
+          pip install --user componentize-py==0.25.1
+          go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Generate Rust SDK
         run: |
@@ -246,10 +332,27 @@ jobs:
           npm ci
           npm run build
 
+      - name: Generate Python SDK
+        # componentize-py's `bindings` command asserts its output paths
+        # don't already exist -- harmless for a one-shot generate-into-a-
+        # temp-dir drift check (dry-run-publish-sdks), but this job
+        # regenerates in place over a tree already checked out with these
+        # same committed paths, so they're cleared first.
+        run: |
+          rm -rf sdk/python/wit_world sdk/python/componentize_py_async_support \
+            sdk/python/componentize_py_types.py sdk/python/componentize_py_runtime.pyi \
+            sdk/python/poll_loop.py
+          componentize-py -d sdk/wit -w kv-consumer bindings sdk/python
+
       - name: Build Python SDK
         run: |
           cd sdk/python
           poetry build
+
+      - name: Generate Go SDK
+        run: |
+          rm -rf sdk/go/gen
+          wit-bindgen-go generate -w kv-consumer -o sdk/go/gen -p github.com/astorise/Tachyon-Mesh/sdk/go/gen sdk/go/wit
 
       # "Credential-Gated Publish Steps Fail Closed" (Magnetar precedent):
       # assert each secret is present and non-empty, with an explicit
@@ -285,6 +388,33 @@ jobs:
           fi
       - name: Publish Python SDK (real)
         run: poetry publish --directory sdk/python --username __token__ --password "${{ secrets.PYPI_TOKEN }}"
+
+      - name: Publish Go SDK (real)
+        # TACH-41 (2026-10-30 audit): unlike cargo/npm/poetry, a Go module
+        # has no package-registry upload step -- the module proxy
+        # resolves versions directly from the module's own VCS tags, and
+        # for a module living in a monorepo subdirectory that means a
+        # "<subdir>/vX.Y.Z" tag, not the repo-root release tag this
+        # workflow already runs from. Without this, `go get
+        # github.com/astorise/Tachyon-Mesh/sdk/go@v<version>` could never
+        # resolve no matter how complete sdk/go's bindings are -- Go
+        # wasn't even in this job before this fix.
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.resolve-publish-target.outputs.version }}"
+          SHA="${{ needs.resolve-publish-target.outputs.sha }}"
+          TAG="sdk/go/v${VERSION}"
+          existing="$(git ls-remote origin "refs/tags/${TAG}" | cut -f1)"
+          if [ -n "$existing" ]; then
+            if [ "$existing" = "$SHA" ]; then
+              echo "${TAG} already points at ${SHA}; nothing to do."
+              exit 0
+            fi
+            echo "::error::${TAG} already exists on origin but points at ${existing}, not the resolved commit ${SHA}. Refusing to move an existing tag." >&2
+            exit 1
+          fi
+          git tag "${TAG}" "${SHA}"
+          git push origin "${TAG}"
 
   publish-wit-oci:
     name: Publish WIT contracts to GHCR (OCI)

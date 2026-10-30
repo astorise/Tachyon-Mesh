@@ -87,3 +87,22 @@ if ! diff -q "$sdk" "$rust_vendored" >/dev/null; then
 fi
 
 echo "sdk/rust/wit/tachyon.wit matches sdk/wit/tachyon.wit exactly."
+
+# TACH-41 (2026-10-30 audit): sdk/go/wit/tachyon.wit is the same kind of
+# real, tracked vendored copy as sdk/rust/wit/tachyon.wit above --
+# wit-bindgen-go generate (sdk/go/generate.go) needs a local WIT file to
+# read, and a copy that silently drifted from sdk/wit/tachyon.wit would mean
+# the published Go SDK's bindings no longer match the interface sdk/wit's
+# own curated world actually declares.
+go_vendored="sdk/go/wit/tachyon.wit"
+if [ ! -f "$go_vendored" ]; then
+  echo "::error file=$go_vendored::missing -- sdk/go's wit-bindgen-go generate needs its own vendored copy of $sdk (TACH-41)" >&2
+  exit 1
+fi
+if ! diff -q "$sdk" "$go_vendored" >/dev/null; then
+  echo "::error file=$go_vendored::has drifted from $sdk -- copy $sdk over $go_vendored (TACH-41)" >&2
+  diff "$sdk" "$go_vendored" || true
+  exit 1
+fi
+
+echo "sdk/go/wit/tachyon.wit matches sdk/wit/tachyon.wit exactly."

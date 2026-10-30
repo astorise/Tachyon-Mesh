@@ -1,32 +1,83 @@
 # Tachyon FaaS SDK
 
-This directory contains the FaaS SDK crate for building Rust guest functions that run on Tachyon Mesh.
+This directory contains `faas-sdk`, a small, optional, workspace-internal
+proc-macro crate exposing `#[faas_sdk::faas_handler]` -- applying it to a
+guest's `handle_request` wires up JSON-structured `tracing` output to
+stdout automatically. It is **not** published to crates.io and is not
+required to write a guest function.
+
+For the `kv-partition` interface's typed `Table` client, see the real,
+published `tachyon-faas-sdk` crate under [`sdk/rust/`](../sdk/rust/)
+instead -- despite the similar name, it is a different crate from this
+directory's `faas-sdk`.
 
 ## Quick Start
 
+A Tachyon Mesh guest implements the `handler` world's `Guest` trait,
+generated directly from the published WIT contract with
+[`wit-bindgen`](https://github.com/bytecodealliance/wit-bindgen) (see
+[`examples/guest-example`](../examples/guest-example/) for the full,
+CI-built reference):
+
 ```toml
 # Cargo.toml
+[lib]
+crate-type = ["cdylib"]
+
 [dependencies]
-tachyon-faas-sdk = "1.0.0"
+wit-bindgen = "0.46"
 ```
 
 ```rust
-use tachyon_sdk::prelude::*;
+mod bindings {
+    use super::Component;
 
-#[tachyon_function]
-fn handle_request(req: Request) -> Response {
-    Response::builder()
-        .status(200)
-        .body("Hello from Tachyon Mesh!")
-        .build()
+    wit_bindgen::generate!({
+        path: "wit/tachyon.wit", // a local copy of the WIT contract -- see the
+        world: "faas-guest",     // "WIT Contracts via OCI" section below for
+    });                          // fetching one without vendoring it by hand
+
+    export!(Component);
+}
+
+struct Component;
+
+impl bindings::exports::tachyon::mesh::handler::Guest for Component {
+    fn handle_request(
+        req: bindings::exports::tachyon::mesh::handler::Request,
+    ) -> bindings::exports::tachyon::mesh::handler::Response {
+        let body = if req.body.is_empty() {
+            b"Hello from Tachyon Mesh!".to_vec()
+        } else {
+            req.body
+        };
+        bindings::exports::tachyon::mesh::handler::Response {
+            status: 200,
+            headers: vec![],
+            body,
+            trailers: vec![],
+        }
+    }
 }
 ```
 
-Build targeting `wasm32-wasip2`:
+`Request`/`Response` are plain records generated from the `handler`
+interface in `wit/tachyon.wit` -- construct them as ordinary structs, no
+builder exists. Build targeting `wasm32-wasip2`:
 
 ```bash
 cargo build --target wasm32-wasip2 --release
 ```
+
+Need the `kv-partition` interface too (persistent key-value storage)?
+Add `tachyon-faas-sdk` from [`sdk/rust/`](../sdk/rust/) as a second
+dependency and import `tachyon_faas_sdk::ai::kv_partition::Table`
+alongside the `handler` bindings above.
+
+Want this directory's optional JSON-structured `tracing` output for free?
+Depend on `faas-sdk` from a workspace member (it is not published
+externally) and annotate `handle_request` with `#[faas_sdk::faas_handler]`
+-- see this crate's own `src/lib.rs` for exactly what it injects.
 
 ---
 

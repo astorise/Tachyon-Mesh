@@ -6,7 +6,7 @@
 
 > **Note (TACH-24, 2026-10-29 audit):** this section previously carried a placeholder date of `2026-05-15`, written before the release was actually cut — several of the fixes folded into the "Full Changelog" below (TACH-32/33/34, among others) landed as late as 2026-10-30, after that placeholder date had already passed. `2026-10-31` is the real GA date.
 
-Tachyon-Mesh v1.0.0 marks the transition to a production-ready, Enterprise-grade FaaS and AI orchestration mesh. This major release signals the stabilisation of our core API and MCP contracts. Following a rigorous multi-stage usability and security audit, it delivers robust supply-chain security, a hardened LLM agent interface, and full WCAG AAA accessibility.
+Tachyon-Mesh v1.0.0 marks the transition to a production-ready, Enterprise-grade FaaS and AI orchestration mesh. This major release signals the stabilisation of our core API and MCP contracts. Following a rigorous multi-stage usability and security audit, it delivers robust supply-chain security, a hardened LLM agent interface, and targeted accessibility improvements (focus management, screen-reader announcements, and component decomposition for assistive technology).
 
 ---
 
@@ -31,7 +31,7 @@ Tachyon-Mesh v1.0.0 marks the transition to a production-ready, Enterprise-grade
 
 ---
 
-### ♿ UI & Accessibility (WCAG AAA)
+### ♿ UI & Accessibility
 
 - **Focus Restoration (WCAG 2.4.3):** `trapFocus()` now captures `previousFocus` on entry and restores it in the cleanup function. Keyboard users are no longer dropped to `<body>` after closing a modal.
 - **Screen Reader Announcements:** `TachyonToastManager` container has `role="status" aria-live="polite" aria-atomic="false"`. All `sealAndApply` outcomes (success, conflict, error) are announced.
