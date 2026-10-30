@@ -12,6 +12,10 @@
 #
 # cargo-audit's schema doesn't support a `reason` field the way deny.toml's
 # does — ids only, so context goes in comments instead.
+#
+# TACH-49 (2026-10-30 audit): dated "added"/"review by" tracking for every
+# entry below lives in deny.toml's own ignore-list comment, not duplicated
+# here.
 [advisories]
 ignore = [
     # Also ignored in deny.toml — RSA Marvin timing side-channel targets
