@@ -5,13 +5,20 @@ Distributes Tachyon Mesh WIT interface contracts as OCI artifacts to GitHub Cont
 
 ## Requirements
 
-### Requirement: WIT contracts MUST be published to GHCR on every version tag
-`.github/workflows/publish-sdks.yml` SHALL contain a `publish-wit-oci` job that triggers on `v*` tags and `release: published` events. The job SHALL use `wkg publish` to push `./wit` as an OCI artifact to `ghcr.io/$OWNER/tachyon-mesh-wit:$VERSION`.
+### Requirement: WIT contracts MUST be published to GHCR on every version tag, atomically with the GitHub Release
+`.github/workflows/release.yml` SHALL contain a `publish-wit-oci` job that triggers on `v*` tags only (TACH-33: a `release: published` trigger double-fired this job alongside the tag push that creates the release, since removed). The job SHALL stage only `wit/tachyon.wit` (TACH-33: the `./wit` directory holds several independent WIT packages as siblings of `tachyon:mesh`; staging the whole directory fails WIT resolution) into an isolated temp directory and use `wkg publish --package "$OWNER:tachyon-mesh-wit@$VERSION"` (TACH-33: `wkg` 0.16.1 has no separate `--version` flag) to push it as an OCI artifact to `ghcr.io/$OWNER/tachyon-mesh-wit:$VERSION`.
+
+TACH-42: this job SHALL be one of `finalize-release`'s dependencies, so the GitHub Release is never published unless the WIT GHCR artifact was too (previously a separate job in `.github/workflows/publish-sdks.yml`, independently triggered by the same tag push with no coordination between the two outcomes).
 
 #### Scenario: Tag push triggers WIT publication
 - **GIVEN** a `v1.2.3` tag is pushed
 - **WHEN** the `publish-wit-oci` job runs
-- **THEN** `wkg publish` is called with `--version 1.2.3` (no `v` prefix) and the artifact is available at `ghcr.io/astorise/tachyon-mesh-wit:1.2.3`
+- **THEN** `wkg publish` is called with `--package "$OWNER:tachyon-mesh-wit@1.2.3"` (no `v` prefix on the version) and the artifact is available at `ghcr.io/astorise/tachyon-mesh-wit:1.2.3`
+
+#### Scenario: WIT publication failure blocks the GitHub Release
+- **GIVEN** a `v1.2.3` tag is pushed
+- **WHEN** the `publish-wit-oci` job fails
+- **THEN** `finalize-release` does not run, and the GitHub Release for `v1.2.3` stays a draft
 
 ### Requirement: GHCR authentication MUST use GITHUB_TOKEN with packages:write permission
 The `publish-wit-oci` job SHALL declare `permissions: packages: write` and authenticate via `docker/login-action` with `password: ${{ secrets.GITHUB_TOKEN }}`.
