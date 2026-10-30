@@ -29,8 +29,10 @@ yanked = "deny"
 # so every entry's owner is astorise; re-date an entry's "added" (and move
 # the clock forward) each time it's actually re-reviewed and still holds.
 #
-# - RUSTSEC-2023-0071: added 2026-07-19. Review by 2027-01-19 or the next
-#   Renovate PR touching `rsa`, whichever comes first.
+# - RUSTSEC-2023-0071: added 2026-06-02 (`eb98810f8`; 2026-07-19's
+#   `8bef101aa` only added an allowed git source, it didn't re-review this
+#   exception). Review by 2026-12-02 or the next Renovate PR touching
+#   `rsa`, whichever comes first.
 # - RUSTSEC-2026-0367/0368/0369: added 2026-10-17. Review by 2027-04-17 or
 #   the next Renovate PR touching `zip`/`libsodium-sys-stable`, whichever
 #   comes first.
