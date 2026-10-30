@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+## [v1.0.0] — General Availability (GA) · 2026-10-31
+
+> **Note (TACH-24, 2026-10-29 audit):** this section previously carried a placeholder date of `2026-05-15`, written before the release was actually cut — several of the fixes folded into the "Full Changelog" below (TACH-32/33/34, among others) landed as late as 2026-10-30, after that placeholder date had already passed. `2026-10-31` is the real GA date.
+
+Tachyon-Mesh v1.0.0 marks the transition to a production-ready, Enterprise-grade FaaS and AI orchestration mesh. This major release signals the stabilisation of our core API and MCP contracts. Following a rigorous multi-stage usability and security audit, it delivers robust supply-chain security, a hardened LLM agent interface, and full WCAG AAA accessibility.
+
+---
+
+### 🛡️ Security & Supply Chain
+
+- **Keyless Signing:** All Linux/macOS release artifacts are cryptographically signed using GitHub OIDC and Sigstore (`cosign sign-blob`). Rekor transparency-log bundles (`.bundle`) are attached to every release.
+- **SBOM Generation:** SPDX 2.3 Software Bill of Materials are generated via `cargo sbom` and attached to releases for vulnerability scanning (Trivy, Grype, etc.).
+- **Zero-Build Verification:** The `get-tachyon.sh` and `get-tachyon.ps1` installation scripts now enforce SHA-256 checksum validation before extraction, preventing MITM attacks.
+- **XSS Immunity:** The entire UI has been rewritten to use native DOM APIs (`el()` / `frag()` helpers). All `innerHTML` interpolation of user data has been eliminated. A strict Content Security Policy is compatible with the new architecture.
+- **GitHub Actions Hardening:** `publish-server-binaries` now requests `id-token: write` for keyless OIDC. Artifact names are resolved via `$GITHUB_OUTPUT` (step outputs) rather than `$GITHUB_ENV` for static linter correctness.
+
+---
+
+### 🤖 AI Agents & MCP (Claude Desktop / Cursor)
+
+- **Pre-auth Parameter Validation:** `missing_required_args()` now runs before authentication and network calls, ensuring malformed requests return `-32602 Invalid Params` rather than `-32001 Cluster Unreachable`. Agents can self-correct without a live cluster.
+- **Strict Rate Limiting:** All mutator tools are rate-limited before dispatch: `canary_split` at 2/min, `deploy/delete` at 5/min, KV mutators at 30/min. Rate limits fire even when the cluster is unreachable.
+- **Error Taxonomy:** Standardised error codes across all 35 MCP tools: `-32602` (invalid params), `-32001` (cluster unreachable), `-32002` (rate limited with `retry_after_ms`), `-32603` (internal error).
+- **E2E Test Coverage:** Full behavioural coverage for all lifecycle (`deploy_function`, `list_functions`, `function_logs`, `delete_function`) and KV (`kv_get`, `kv_put`, `kv_delete`) tools. All 12 tests pass without a live cluster.
+- **`tools/list` Warnings:** When the manifest schema is not yet fetched, `tools/list` appends a `data.warnings` array instead of returning degraded results silently.
+- **Rate-limit State Isolation:** Tests use unique per-process state paths to prevent inter-test contamination.
+
+---
+
+### ♿ UI & Accessibility (WCAG AAA)
+
+- **Focus Restoration (WCAG 2.4.3):** `trapFocus()` now captures `previousFocus` on entry and restores it in the cleanup function. Keyboard users are no longer dropped to `<body>` after closing a modal.
+- **Screen Reader Announcements:** `TachyonToastManager` container has `role="status" aria-live="polite" aria-atomic="false"`. All `sealAndApply` outcomes (success, conflict, error) are announced.
+- **`<dialog>` Safety Docs:** `trapFocus()` carries a JSDoc warning that it must not be combined with native `<dialog>` elements to prevent duplicate focus trapping.
+- **Global Apply Loader:** `aria-live="polite"`, `role="status"`, `.sr-only` descriptive text, and `aria-hidden` on the visual spinner. `aria-busy="true"` is set on `main-content` during apply.
+- **Component Decomposition:** `TachyonAppShell` split into `TachyonAppShellNav` and `TachyonAppShellModalRoot`. `TachyonIAM` split into `TachyonAuthStepCredentials`.
+
+---
+
+### ☸️ Kubernetes & Infrastructure
+
+- **Hardened Homelab Manifest:** `manifests/deploy-gpu-homelab-hardened.yaml` enforces Pod Security Standards (Restricted): dedicated `ServiceAccount`, `runAsNonRoot`, `readOnlyRootFilesystem`, `capabilities.drop: [ALL]`, `seccompProfile: RuntimeDefault`, `/tmp emptyDir` scratch volume.
+- **Zero-Trust NetworkPolicy:** Default-deny ingress/egress with explicit allowances for port 8080 (MCP/API), Prometheus scraping from the `monitoring` namespace, DNS (UDP+TCP/53), and HTTPS (TCP/443).
+- **Dynamic OpenAPI:** All 35 core-host routes are documented and served at `/admin/docs` (Swagger UI) and `/admin/schema/openapi.json`. The integrity.lock JSON Schema is served at `/admin/schema/integrity-lock`.
+- **IDE Schema Integration:** VS Code `json.schemas` and YAML modeline configs for `integrity.lock` validation. See `docs/ide-integration.md`.
+- **GPU Homelab:** `deploy-gpu-homelab.yaml` supports NVIDIA GPU nodeSelector, `tachyon-model-pvc` (50 Gi), `ServiceMonitor` for Prometheus, and `CUDA_VISIBLE_DEVICES` injection.
+
+---
+
+### 🔧 Developer Experience
+
+- **Setup Scripts:** `scripts/setup.sh` and `scripts/setup.ps1` bootstrap the full development environment (WASM targets, binaries, guest artifacts, npm install) with `--skip-guests` and `--skip-ui` flags.
+- **Zero-Build Installers:** `get-tachyon.sh` and `get-tachyon.ps1` download pre-built binaries, verify SHA-256, and print an MCP config banner.
+- **TROUBLESHOOTING.md:** 15 documented failure modes covering build, runtime, UI, MCP, and Kubernetes/GPU domains.
+- **`docs/ide-integration.md`:** VS Code, JetBrains, Neovim integration guides and offline schema snapshot procedure.
+
+### Full Changelog
+
+Every fix and feature landed on `main` in the run-up to this release, in the order they were merged (most recent first):
+
 - **Made the Zero-Build installer smoke tests required at the tag gate** (`.github/workflows/verify-tag-ci-green.yml`; TACH-35): `verify-tag-ci-green` (shared by `release.yml` and `publish-sdks.yml`) only required `quality`/`cuda-quality`/`security-audit`/`build-guests` to be green on the tagged commit's push-on-main CI run — `installer-contract-smoke-test-linux`/`-windows` (TACH-30), which catch exactly the archive-layout regression class TACH-27/TACH-31 fixed, weren't in that list. A future commit could have broken the Zero-Build installer contract again without ever blocking a tag from being cut. Added both job names to the `required` list. The audit also suggested adding them to the `main`-branch-protection ruleset's required status checks "ideally" — left out of scope here: that's a *different* technical ruleset than the one versioned at `.github/rulesets/main-branch-protection.json` (which only models PR/review rules, not required status checks), and this session has no API access to read or modify GitHub rulesets (the same pre-existing constraint tracked as TACH-12), so extending that JSON file would be guessing at structure I can't verify against the live ruleset. Bench-tested the gate's shell logic directly (mocked `gh api` responses for the run-resolution and jobs-listing calls, same method used when this gate was first built for TACH-17) against: both smoke jobs green (passes), the Linux smoke job failing (blocks, names it), and both jobs missing entirely — e.g. an old push-on-main run from before TACH-30 existed (blocks, names them as missing rather than silently skipping them). `actionlint`/`yaml.safe_load` — zero new findings beyond the pre-existing unrecognized `ubuntu-26.04` runner label.
 - **Removed the openspec `hygiene-plan` spec's stale pre-release version requirement** (`openspec/specs/hygiene-plan/spec.md`; TACH-36): this still-active spec mandated `1.1.0-alpha` across every workspace Cargo manifest and the frontend/Tauri files "while the v1.1 feature set is incomplete" — contradicted since `core-host`'s own workspace-wide bump to the real `1.0.0` baseline (TACH-28 aligned the last two stragglers, `tachyon-ui`'s `tauri.conf.json`/`package.json`). There is no `v1.1.x` branch left for this requirement to describe, and no CI step enforces it (confirmed: no workflow runs `openspec validate`), so it had quietly become permanently false documentation rather than a real, current rule. Removed it; left the unrelated "Telemetry Mutex Poison Visibility" requirement in the same file untouched.
 
@@ -90,61 +150,6 @@ A third bug flagged on the same PR: `publish-wit-oci` (a pre-existing job in thi
 - **NVFP4 (ModelOpt) checkpoints now execute, not just load** (`core-host/src/ai_inference/{modelopt_nvfp4,candle_llm_runtime,ai_inference}.rs`): ModelOpt/NVFP4 Llama checkpoints (previously detected and load-time-validated, but unconditionally rejected with an "unsupported execution" error at run time) now dequantize every NVFP4-quantized linear to dense F32 at load time and run the same tested `Llama::load`/decode engine the plain-safetensors path uses; everything ModelOpt left unquantized (norms, embeddings) is read through as-is. This is the documented fallback execution path — native FP4-kernel matmul without eager dequantization remains a follow-up. Verified by a new equivalence test (`modelopt_nvfp4_dequantized_forward_matches_a_dense_reference`) that quantizes a fixture's `down_proj` with exact NVFP4 E2M1 levels and asserts the dequantized forward pass matches a plain-dense reference checkpoint within tolerance, plus the full `ai_inference::` suite (105 tests, 0 regressions). See `openspec/changes/2026-06-19-gpu-accelerated-inference-execution`.
 - **Homelab K3S deployment**: provisioned two K3S instances (`tachyon-edge-1` and `tachyon-edge-2`) via WSL/MCP and deployed the latest `core-host` image from GHCR using hardened Kubernetes manifests with Pod Security Standards, NetworkPolicy, and GPU node-selector support.
 
-## [v1.0.0] — General Availability (GA) · 2026-05-15
-
-Tachyon-Mesh v1.0.0 marks the transition to a production-ready, Enterprise-grade FaaS and AI orchestration mesh. This major release signals the stabilisation of our core API and MCP contracts. Following a rigorous multi-stage usability and security audit, it delivers robust supply-chain security, a hardened LLM agent interface, and full WCAG AAA accessibility.
-
----
-
-### 🛡️ Security & Supply Chain
-
-- **Keyless Signing:** All Linux/macOS release artifacts are cryptographically signed using GitHub OIDC and Sigstore (`cosign sign-blob`). Rekor transparency-log bundles (`.bundle`) are attached to every release.
-- **SBOM Generation:** SPDX 2.3 Software Bill of Materials are generated via `cargo sbom` and attached to releases for vulnerability scanning (Trivy, Grype, etc.).
-- **Zero-Build Verification:** The `get-tachyon.sh` and `get-tachyon.ps1` installation scripts now enforce SHA-256 checksum validation before extraction, preventing MITM attacks.
-- **XSS Immunity:** The entire UI has been rewritten to use native DOM APIs (`el()` / `frag()` helpers). All `innerHTML` interpolation of user data has been eliminated. A strict Content Security Policy is compatible with the new architecture.
-- **GitHub Actions Hardening:** `publish-server-binaries` now requests `id-token: write` for keyless OIDC. Artifact names are resolved via `$GITHUB_OUTPUT` (step outputs) rather than `$GITHUB_ENV` for static linter correctness.
-
----
-
-### 🤖 AI Agents & MCP (Claude Desktop / Cursor)
-
-- **Pre-auth Parameter Validation:** `missing_required_args()` now runs before authentication and network calls, ensuring malformed requests return `-32602 Invalid Params` rather than `-32001 Cluster Unreachable`. Agents can self-correct without a live cluster.
-- **Strict Rate Limiting:** All mutator tools are rate-limited before dispatch: `canary_split` at 2/min, `deploy/delete` at 5/min, KV mutators at 30/min. Rate limits fire even when the cluster is unreachable.
-- **Error Taxonomy:** Standardised error codes across all 35 MCP tools: `-32602` (invalid params), `-32001` (cluster unreachable), `-32002` (rate limited with `retry_after_ms`), `-32603` (internal error).
-- **E2E Test Coverage:** Full behavioural coverage for all lifecycle (`deploy_function`, `list_functions`, `function_logs`, `delete_function`) and KV (`kv_get`, `kv_put`, `kv_delete`) tools. All 12 tests pass without a live cluster.
-- **`tools/list` Warnings:** When the manifest schema is not yet fetched, `tools/list` appends a `data.warnings` array instead of returning degraded results silently.
-- **Rate-limit State Isolation:** Tests use unique per-process state paths to prevent inter-test contamination.
-
----
-
-### ♿ UI & Accessibility (WCAG AAA)
-
-- **Focus Restoration (WCAG 2.4.3):** `trapFocus()` now captures `previousFocus` on entry and restores it in the cleanup function. Keyboard users are no longer dropped to `<body>` after closing a modal.
-- **Screen Reader Announcements:** `TachyonToastManager` container has `role="status" aria-live="polite" aria-atomic="false"`. All `sealAndApply` outcomes (success, conflict, error) are announced.
-- **`<dialog>` Safety Docs:** `trapFocus()` carries a JSDoc warning that it must not be combined with native `<dialog>` elements to prevent duplicate focus trapping.
-- **Global Apply Loader:** `aria-live="polite"`, `role="status"`, `.sr-only` descriptive text, and `aria-hidden` on the visual spinner. `aria-busy="true"` is set on `main-content` during apply.
-- **Component Decomposition:** `TachyonAppShell` split into `TachyonAppShellNav` and `TachyonAppShellModalRoot`. `TachyonIAM` split into `TachyonAuthStepCredentials`.
-
----
-
-### ☸️ Kubernetes & Infrastructure
-
-- **Hardened Homelab Manifest:** `manifests/deploy-gpu-homelab-hardened.yaml` enforces Pod Security Standards (Restricted): dedicated `ServiceAccount`, `runAsNonRoot`, `readOnlyRootFilesystem`, `capabilities.drop: [ALL]`, `seccompProfile: RuntimeDefault`, `/tmp emptyDir` scratch volume.
-- **Zero-Trust NetworkPolicy:** Default-deny ingress/egress with explicit allowances for port 8080 (MCP/API), Prometheus scraping from the `monitoring` namespace, DNS (UDP+TCP/53), and HTTPS (TCP/443).
-- **Dynamic OpenAPI:** All 35 core-host routes are documented and served at `/admin/docs` (Swagger UI) and `/admin/schema/openapi.json`. The integrity.lock JSON Schema is served at `/admin/schema/integrity-lock`.
-- **IDE Schema Integration:** VS Code `json.schemas` and YAML modeline configs for `integrity.lock` validation. See `docs/ide-integration.md`.
-- **GPU Homelab:** `deploy-gpu-homelab.yaml` supports NVIDIA GPU nodeSelector, `tachyon-model-pvc` (50 Gi), `ServiceMonitor` for Prometheus, and `CUDA_VISIBLE_DEVICES` injection.
-
----
-
-### 🔧 Developer Experience
-
-- **Setup Scripts:** `scripts/setup.sh` and `scripts/setup.ps1` bootstrap the full development environment (WASM targets, binaries, guest artifacts, npm install) with `--skip-guests` and `--skip-ui` flags.
-- **Zero-Build Installers:** `get-tachyon.sh` and `get-tachyon.ps1` download pre-built binaries, verify SHA-256, and print an MCP config banner.
-- **TROUBLESHOOTING.md:** 15 documented failure modes covering build, runtime, UI, MCP, and Kubernetes/GPU domains.
-- **`docs/ide-integration.md`:** VS Code, JetBrains, Neovim integration guides and offline schema snapshot procedure.
-
----
 
 ## [v0.x] — Pre-release development
 
