@@ -44,8 +44,40 @@ jobs:
       actions: read
     uses: ./.github/workflows/verify-tag-ci-green.yml
 
-  publish-integrity-schemas:
+  # TACH-34 (2026-10-29 audit): publish-integrity-schemas,
+  # publish-server-binaries' matrix, and publish-tauri's matrix all
+  # independently target the same GitHub Release for this tag --
+  # softprops/action-gh-release (the first two) and tauri-apps/tauri-action
+  # (the third, with releaseDraft: true) each decide for themselves whether
+  # to create a new release or reuse an existing one, and that decision is
+  # timing-dependent: whichever of the three build jobs finishes first
+  # determines whether the tag's release exists yet, and in what draft
+  # state, when the next one looks it up. The one real push/main run this
+  # repo has exercised end to end never took the tag path at all, so this
+  # has never actually been proven to resolve safely either way. This job
+  # removes the timing dependency entirely by creating the release as a
+  # draft before any of the three build jobs starts, so none of them ever
+  # has to decide whether to create one -- it already exists, in the exact
+  # draft state every one of their own calls now expects (see the `draft:
+  # true` added to publish-integrity-schemas'/publish-server-binaries' own
+  # upload steps below). finalize-release, after all three complete, is
+  # the one place that flips it to published.
+  create-draft-release:
+    name: Create the draft GitHub Release this tag's jobs upload into
     needs: verify-tag-ci-green
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create (or reuse) this tag's release as a draft, with no assets yet
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          draft: true
+          name: Tachyon Mesh ${{ github.ref_name }}
+
+  publish-integrity-schemas:
+    needs: [verify-tag-ci-green, create-draft-release]
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ubuntu-26.04
     permissions:
@@ -70,6 +102,12 @@ jobs:
       - name: Upload schema assets to GitHub release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
+          # TACH-34 (2026-10-29 audit): keep the release a draft while
+          # uploading -- create-draft-release owns creating and finalize-
+          # release owns publishing it. Omitting `draft` here (its default
+          # is false) would publish the release the instant this step's
+          # upload lands, racing every other job that also targets it.
+          draft: true
           files: |
             target/schemas/integrity-config.schema.json
             target/schemas/integrity-lock.schema.json
@@ -77,7 +115,7 @@ jobs:
   # ── Server-side binary tarballs (core-host + tachyon-mcp) ────────────────────
   # Published only on version tags; used by scripts/get-tachyon.sh.
   publish-server-binaries:
-    needs: verify-tag-ci-green
+    needs: [verify-tag-ci-green, create-draft-release]
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     permissions:
       contents: write
@@ -85,7 +123,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Two scalar dimensions that GitHub Actions cross-joins (5 × 6 = 30 jobs).
+        # Two scalar dimensions that GitHub Actions cross-joins (5 platforms
+        # x 7 features = 35 combinations before `exclude`, 29 after --
+        # stale "5 x 6 = 30" comment fixed per the 2026-10-29 audit; TACH-22
+        # added the 7th feature, `ai-cuda`, without updating this count).
         # The `include` blocks below inject derived properties into each cell.
         platform:
           - ubuntu-x86_64
@@ -302,6 +343,9 @@ jobs:
       - name: Upload archive and supply-chain artifacts to GitHub release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
+          # TACH-34 (2026-10-29 audit): see the matching comment on
+          # publish-integrity-schemas' own upload step -- same reasoning.
+          draft: true
           files: |
             ${{ steps.pkg.outputs.tarball }}
             ${{ steps.checksum.outputs.checksum_file }}
@@ -309,13 +353,14 @@ jobs:
             ${{ steps.sbom.outputs.sbom_file }}
 
   publish-tauri:
-    needs: verify-tag-ci-green
+    needs: [verify-tag-ci-green, create-draft-release]
     # always() bypasses the implicit needs-success gate: verify-tag-ci-green
-    # is itself skipped (not failed) on every ordinary push to main, and a
-    # skipped dependency would otherwise skip this job too. The condition
-    # below is the real gate -- block only the tag-triggered release path
-    # when verify-tag-ci-green actually ran and did not succeed.
-    if: ${{ always() && (!startsWith(github.ref, 'refs/tags/v') || needs.verify-tag-ci-green.result == 'success') }}
+    # and create-draft-release (TACH-34) are both themselves skipped (not
+    # failed) on every ordinary push to main, and a skipped dependency
+    # would otherwise skip this job too. The condition below is the real
+    # gate -- block only the tag-triggered release path, and only when
+    # either dependency actually ran and did not succeed.
+    if: ${{ always() && (!startsWith(github.ref, 'refs/tags/v') || (needs.verify-tag-ci-green.result == 'success' && needs.create-draft-release.result == 'success')) }}
     permissions:
       contents: write
     strategy:
@@ -396,7 +441,13 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: ./tachyon-ui
-        run: npm install
+        # TACH-38 (2026-10-29 audit): tachyon-ui has a committed
+        # package-lock.json, but this step used npm install anyway --
+        # ignoring the lock on exactly the reproducibility-sensitive path
+        # that builds the signed release bundle. npm ci (verified against
+        # the real lockfile: `npm ci --dry-run` succeeds cleanly) is what
+        # the SDK JS publish pipeline already uses for the same reason.
+        run: npm ci
 
       - name: Fetch Rust dependencies
         shell: bash
@@ -455,3 +506,41 @@ jobs:
           name: tachyon-mesh-sbom
           if-no-files-found: error
           path: tachyon-mesh.spdx.json
+
+  # TACH-34 (2026-10-29 audit): the one place that owns ending this tag's
+  # Release lifecycle. By the time this runs, create-draft-release already
+  # owns the start of it and every build job above has finished uploading
+  # into that same draft -- `needs:` below fails this job closed (default
+  # GitHub Actions behavior, no override) if any of them didn't succeed,
+  # so a partially-uploaded release is never published.
+  finalize-release:
+    name: Finalize and publish the GitHub Release
+    needs: [create-draft-release, publish-integrity-schemas, publish-server-binaries, publish-tauri]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Sanity-check the draft actually has assets before publishing it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          is_draft=$(gh release view "${TAG}" --repo "${REPO}" --json isDraft -q '.isDraft')
+          asset_count=$(gh release view "${TAG}" --repo "${REPO}" --json assets -q '.assets | length')
+          echo "Release ${TAG}: isDraft=${is_draft}, ${asset_count} asset(s) attached."
+          if [ "${is_draft}" != "true" ]; then
+            echo "::error::Release ${TAG} is not a draft (isDraft=${is_draft}) -- expected create-draft-release to have left it as one; refusing to publish, since this means something outside this job's own control already changed its state." >&2
+            exit 1
+          fi
+          if [ "${asset_count}" -lt 1 ]; then
+            echo "::error::Release ${TAG} has no assets attached -- refusing to publish what would be an empty release." >&2
+            exit 1
+          fi
+
+      - name: Publish the release (flip draft -> published)
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          draft: false
