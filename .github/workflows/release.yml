@@ -85,8 +85,9 @@ jobs:
   # silently in the other workflow, or the reverse. Folding it into this
   # file's own draft/finalize lifecycle (TACH-34) -- needed by
   # finalize-release below, same as every other build job -- makes the
-  # two outcomes atomic: finalize-release never flips the Release to
-  # published unless this job (among the others) already succeeded.
+  # publication ordered: finalize-release never flips the Release to
+  # published unless this job succeeded. This is not atomic: a successful
+  # GHCR push can remain visible if the later GitHub Release step fails.
   publish-wit-oci:
     name: Publish WIT contracts to GHCR (OCI)
     needs: [verify-tag-ci-green, create-draft-release]
@@ -179,11 +180,11 @@ jobs:
             --package "${OWNER}:tachyon-mesh-wit@${VERSION}" \
             "${STAGE_DIR}"
 
-      - name: Verify published artifact
+      - name: Report published artifact target
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           OWNER="${{ github.repository_owner }}"
-          echo "Published ghcr.io/${OWNER}/tachyon-mesh-wit:${VERSION}"
+          echo "wkg publish completed for ghcr.io/${OWNER}/tachyon-mesh-wit:${VERSION}; independent consumer resolution is still required."
 
   publish-integrity-schemas:
     needs: [verify-tag-ci-green, create-draft-release]
@@ -597,6 +598,9 @@ jobs:
           releaseBody: See the assets to download and install this version.
           releaseDraft: true
           prerelease: false
+          # There is no configured/signed updater. Avoid publishing an empty
+          # latest.json independently from the actual desktop bundles.
+          uploadUpdaterJson: false
           releaseAssetNamePattern: tachyon-studio_[version]_[arch][ext]
           args: ${{ matrix.args }}
 
@@ -625,8 +629,8 @@ jobs:
   #
   # TACH-42 (2026-10-30 audit): publish-wit-oci added to this list -- see
   # its own comment above. The GitHub Release and the WIT GHCR artifact
-  # are now one transaction: this job (and therefore the published
-  # Release) never succeeds unless the WIT publish did too.
+  # are ordered: this job never succeeds unless the WIT publish did too.
+  # A later failure cannot roll back the earlier GHCR push.
   finalize-release:
     name: Finalize and publish the GitHub Release
     needs: [create-draft-release, publish-integrity-schemas, publish-server-binaries, publish-tauri, publish-wit-oci]
@@ -635,24 +639,58 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Sanity-check the draft actually has assets before publishing it
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Inspect and verify every expected release asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          is_draft=$(gh release view "${TAG}" --repo "${REPO}" --json isDraft -q '.isDraft')
-          asset_count=$(gh release view "${TAG}" --repo "${REPO}" --json assets -q '.assets | length')
-          echo "Release ${TAG}: isDraft=${is_draft}, ${asset_count} asset(s) attached."
-          if [ "${is_draft}" != "true" ]; then
-            echo "::error::Release ${TAG} is not a draft (isDraft=${is_draft}) -- expected create-draft-release to have left it as one; refusing to publish, since this means something outside this job's own control already changed its state." >&2
-            exit 1
-          fi
-          if [ "${asset_count}" -lt 1 ]; then
-            echo "::error::Release ${TAG} has no assets attached -- refusing to publish what would be an empty release." >&2
-            exit 1
-          fi
+          gh api "repos/${REPO}/releases/tags/${TAG}" > "$RUNNER_TEMP/release.json"
+          release_id=$(jq -er '.id' "$RUNNER_TEMP/release.json")
+          gh api --paginate --slurp "repos/${REPO}/releases/${release_id}/assets?per_page=100" > "$RUNNER_TEMP/assets.json"
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          gh release download "$TAG" --repo "$REPO" --dir "$RUNNER_TEMP/release-assets" \
+            --pattern '*.sha256' --pattern 'integrity-*.schema.json' \
+            --pattern "tachyon-mesh-${TAG}-linux-x86_64.tar.gz" \
+            --pattern "tachyon-mesh-${TAG}-linux-x86_64.tar.gz.bundle"
+          ui_version=$(jq -er '.version' tachyon-ui/tauri.conf.json)
+          python3 scripts/verify-release-assets.py --tag "$TAG" --ui-version "$ui_version" \
+            --release "$RUNNER_TEMP/release.json" --assets "$RUNNER_TEMP/assets.json" \
+            --downloaded "$RUNNER_TEMP/release-assets" --commit "$(git rev-parse HEAD)" \
+            --output "$RUNNER_TEMP/release-manifest.json"
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Verify representative archive's release-workflow signature
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/release-assets/tachyon-mesh-${TAG}-linux-x86_64.tar.gz"
+          escaped_tag=${TAG//./\\.}
+          cosign verify-blob --bundle "${archive}.bundle" \
+            --certificate-identity-regexp "(?i)^https://github\\.com/${REPO}/\\.github/workflows/release\\.yml@refs/tags/${escaped_tag}$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" "$archive"
+
+      - name: Attach the verified digest inventory
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" --repo "$REPO" "$RUNNER_TEMP/release-manifest.json" --clobber
+          release_id=$(jq -er '.id' "$RUNNER_TEMP/release.json")
+          gh api --paginate --slurp "repos/${REPO}/releases/${release_id}/assets?per_page=100" > "$RUNNER_TEMP/assets-after.json"
+          expected="sha256:$(sha256sum "$RUNNER_TEMP/release-manifest.json" | cut -d ' ' -f 1)"
+          actual=$(jq -er '[.[][] | select(.name == "release-manifest.json" and .state == "uploaded") | .digest] | if length == 1 then .[0] else empty end' "$RUNNER_TEMP/assets-after.json")
+          test "$actual" = "$expected"
 
       - name: Publish the release (flip draft -> published)
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3

@@ -17,7 +17,9 @@
 // https://pkg.go.dev/cmd/compile for why `go build -target=wasip1` alone
 // rejects the generated gen/tachyon/mesh/kv-partition package):
 //
-//	tinygo build -o guest.wasm --target=wasip2 ./...
+// Compose a WIT world with wasi:cli/command, kv-partition and the Tachyon
+// handler, then pass it via -wit-package and -wit-world. The repository's
+// tests/sdk-wasm/build-and-test.sh demonstrates the complete working build.
 package tachyonsdk
 
 //go:generate go run go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0 generate -w kv-consumer -o gen -p github.com/astorise/Tachyon-Mesh/sdk/go/gen wit

@@ -19,9 +19,11 @@ Every ``Table`` method below only has a real implementation once this
 package is itself bundled into an actual guest component --
 componentize-py's own ``componentize`` step swaps the generated
 ``NotImplementedError`` stub bodies for real Component Model ABI calls
-when it detects which imports your guest app actually uses::
-
-    componentize-py -d wit -w kv-consumer componentize your_app -o guest.wasm
+when it detects which imports your guest app actually uses. The SDK's
+``kv-consumer`` world only describes imports: a deployable Tachyon guest
+must also export ``tachyon:mesh/handler@2.0.0``. The repository's
+``tests/sdk-wasm/build-and-test.sh`` composes that world, builds a Python
+guest with this SDK and runs a KV round-trip against core-host.
 
 Calling a ``Table`` method directly under plain CPython (i.e. without that
 ``componentize`` step) raises ``NotImplementedError`` by design -- the same

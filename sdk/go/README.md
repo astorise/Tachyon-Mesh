@@ -35,15 +35,22 @@ func main() {
 }
 ```
 
-Build a real guest component with [TinyGo](https://tinygo.org/) (mainline
-Go's `gc` compiler does not support the Component Model ABI that the
-generated bindings in `gen/` use -- `go build`/`go vet` work for local
-development and type-checking, but producing an actual `.wasm` guest
-requires TinyGo's `wasip2` target):
+Build a real guest component with [TinyGo](https://tinygo.org/) and
+`wasm-tools`. Mainline Go's `gc` compiler can type-check the SDK, but it
+cannot produce this Component Model ABI. TinyGo's default WASIp2 command
+world does not include Tachyon's KV import or handler export, so provide a
+WIT world containing both, as well as `wasi:cli/command@0.2.0`:
 
 ```bash
-tinygo build -o guest.wasm --target=wasip2 .
+tinygo build -o guest.wasm --target=wasip2 \
+  -wit-package /path/to/composed-wit -wit-world your-world .
 ```
+
+The component must export `tachyon:mesh/handler@2.0.0` and implement its
+request handler. The complete working example and WIT composition are in
+`tests/sdk-wasm/go_guest.go` and `tests/sdk-wasm/build-and-test.sh` at the
+repository root. The latter builds the guest and exercises SDK `set`/`get`
+against core-host with a scoped KV partition.
 
 ## Regenerating bindings
 

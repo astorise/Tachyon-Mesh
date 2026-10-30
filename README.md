@@ -54,7 +54,7 @@ irm https://raw.githubusercontent.com/astorise/tachyon-mesh/main/scripts/get-tac
 
 Optional: `-Version v1.2.3`, `-Dir C:\Tools\tachyon`, or `-Variant http3`.
 
-> **Security:** Binaries are automatically verified via SHA-256 upon download, plus a cosign signature check when `cosign` is on `PATH`. Cosign signatures (`.bundle`) and SBOMs (`.spdx.json`) are available in the [GitHub Releases](https://github.com/astorise/tachyon-mesh/releases) for each version tag.
+> **Security:** Binaries are automatically verified via SHA-256 upon download, plus a cosign signature check when `cosign` is on `PATH`. Server archives have cosign bundles; Linux server archives also have SBOMs. Release qualification and current limitations are described in [the release checklist](docs/release-qualification.md).
 
 **Which variant do I want?** Every release ships a platform-dependent set of pre-built binaries, each compiled with a different Cargo feature set — not every variant is built for every platform (see below). The plain installer command above always fetches `default` — the others are opt-in via `--variant`/`-Variant`:
 

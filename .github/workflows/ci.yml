@@ -14,10 +14,7 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   # Cancel superseded runs on PR/feature branches, but never on main:
-  # publish-docker-images pushes mutable latest* tags, and cancelling a run
-  # mid-publish could leave GHCR with latest* tags from mixed commits. The
-  # group still serializes main runs, so a new push waits instead of killing
-  # an in-flight publish.
+  # Never cancel a push/main validation run in progress.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 # ── Shared env snippets used across multiple jobs ─────────────────────────────
@@ -102,7 +99,7 @@ jobs:
   # Dockerfile.e2e (apt+rustup setup, cargo-chef `planner`/cook layers — see
   # the `chef`/`planner`/`*-builder` stages) and exports them with
   # `cache-to: type=gha,mode=max`. This warms the docker-default, docker-fips
-  # and docker-e2e-slim scopes BEFORE publish-docker-images' 5-way matrix and
+  # and docker-e2e-slim scopes before the separate image-publishing workflow and
   # the e2e-mesh/e2e-k8s/integration/e2e-zero-touch workflows read from them
   # (all triggered by this same push to main), so the shared ~16-package
   # dependency compile happens once instead of cold-starting in parallel
@@ -110,7 +107,7 @@ jobs:
   # `outputs: type=cacheonly` skips producing a loadable image — only the
   # layer cache is exported. `continue-on-error: true` makes this strictly
   # best-effort: a warm-up failure just leaves a scope cold (today's
-  # behavior), it never blocks publish-docker-images.
+  # behavior). It is best-effort and does not fail CI if cache warming fails.
   docker-base:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -188,6 +185,52 @@ jobs:
 
   # Offline manifest schemas must stay compatible with the latest published
   # release unless a PR intentionally carries the breaking-manifest label.
+  # Exercise actual Python and Go SDK components against the Tachyon host,
+  # including scoped KV imports; package builds alone cannot validate this.
+  sdk-wasm-runtime:
+    # Match the Renovate PR fast lane; every push to main runs this job.
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'renovate/')
+    runs-on: ubuntu-latest
+    env:
+      CARGO_BUILD_JOBS: 4
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: 1.24.7
+          cache: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: sdk-wasm-runtime
+      - name: Install verified TinyGo and wasm-tools archives
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSL https://github.com/tinygo-org/tinygo/releases/download/v0.40.1/tinygo0.40.1.linux-amd64.tar.gz -o "$RUNNER_TEMP/tinygo.tar.gz"
+          echo '064fc0c07f4d71f7369b168c337caa88ef32a6b00b16449cea44790ccadfc2b4  '"$RUNNER_TEMP/tinygo.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/tinygo"
+          tar -xzf "$RUNNER_TEMP/tinygo.tar.gz" -C "$RUNNER_TEMP/tinygo" --strip-components=1
+          echo "$RUNNER_TEMP/tinygo/bin" >> "$GITHUB_PATH"
+          curl --proto '=https' --tlsv1.2 -fsSL https://github.com/bytecodealliance/wasm-tools/releases/download/v1.239.0/wasm-tools-1.239.0-x86_64-linux.tar.gz -o "$RUNNER_TEMP/wasm-tools.tar.gz"
+          echo 'be1764c1718a2ed90cdd3e1ed2fe6e4c6b3e2b69fb6ba9a85bcafdca5146a3b9  '"$RUNNER_TEMP/wasm-tools.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wasm-tools"
+          tar -xzf "$RUNNER_TEMP/wasm-tools.tar.gz" -C "$RUNNER_TEMP/wasm-tools" --strip-components=1
+          echo "$RUNNER_TEMP/wasm-tools" >> "$GITHUB_PATH"
+      - name: Install component generators
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/sdk-python"
+          "$RUNNER_TEMP/sdk-python/bin/pip" install componentize-py==0.25.1
+          echo "$RUNNER_TEMP/sdk-python/bin" >> "$GITHUB_PATH"
+          go install go.bytecodealliance.org/cmd/wit-bindgen-go@v0.7.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Build SDK guests and run them in core-host
+        run: bash tests/sdk-wasm/build-and-test.sh
+
   manifest-schema-compatibility:
     runs-on: ubuntu-latest
     env:
@@ -256,6 +299,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
+
+      - name: Test Docker and release asset gates
+        run: python3 -m unittest discover -s tests/scripts -p 'test_release_gates.py' -v
 
       - name: Install Linux system dependencies for Tauri
         run: |
@@ -807,9 +853,8 @@ jobs:
 
   # ── 7b. Feature matrix release artifacts (decoupled from tests) ─────────────
   # Builds and uploads a per-variant release binary for manual download/
-  # debugging. Not consumed by any downstream job, so it is intentionally NOT
-  # a dependency of publish-docker-images (which builds its own images from
-  # source). Runs in parallel with feature-matrix-tests rather than after it.
+  # debugging. Runs in parallel with feature-matrix-tests rather than after it.
+  # The separate image workflow waits for the conclusion of this entire CI run.
   feature-matrix-artifacts:
     # Skipped on Renovate PRs — compile-only fast lane (see top of file).
     if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'renovate/')
@@ -939,9 +984,8 @@ jobs:
         run: cargo check -p core-host --features fips
 
   # ── 8b. FIPS release artifact (decoupled from tests) ────────────────────────
-  # Not consumed by any downstream job, so it is intentionally NOT a
-  # dependency of publish-docker-images (which builds its own FIPS image
-  # from source via Dockerfile.fips).
+  # Not consumed by downstream CI jobs; image publication still waits for the
+  # conclusion of the entire CI run.
   fips-artifacts:
     # Skipped on Renovate PRs — compile-only fast lane (see top of file).
     if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'renovate/')
@@ -1029,6 +1073,9 @@ jobs:
           sha256sum "${ARCHIVE}" | awk '{print $1}' > "${ARCHIVE}.sha256"
           echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
 
+      - name: Test Linux installer argument parsing and extraction
+        run: bash tests/scripts/get-tachyon-test.sh
+
       - name: Verify checksum and extraction exactly as get-tachyon.sh does
         run: |
           ARCHIVE="${{ steps.pkg.outputs.archive }}"
@@ -1094,135 +1141,3 @@ jobs:
             exit 1
           }
           Write-Host "Windows installer contract OK: core-host.exe and tachyon-mcp.exe land directly at the target directory root."
-
-  # ── 9. Publish Docker images (push to main, needs quality + test) ─────────
-  # Docker builds core-host from source inside the Dockerfile, so it doesn't
-  # consume the pre-built release artifact. It waits on the *test* jobs only
-  # (not the artifact-build jobs above, which are unused by this job and were
-  # previously on its critical path) so we don't publish an image that fails
-  # basic validation, while starting as early as possible. It also depends on
-  # docker-base purely for sequencing (so the matrix below sees a warm GHA
-  # cache); docker-base is best-effort (continue-on-error), so this never
-  # blocks on it.
-  publish-docker-images:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [docker-base, quality, manifest-schema-compatibility, test, cover, release, feature-matrix-tests, fips-tests]
-    runs-on: ubuntu-latest
-    env:
-      BUILDKIT_PROGRESS: plain
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # The 4 ./Dockerfile variants share a "docker-default" GHA cache
-          # scope: the FaaS/system wasm + legacy-mock layers (everything
-          # before the CARGO_FEATURES ARG) are feature-independent, so a
-          # cache populated by one variant (or by the E2E workflows, which
-          # build the same Dockerfile) is reused by the others.
-          - image_name: tachyon-mesh
-            dockerfile: ./Dockerfile
-            context: .
-            cargo_features: "s3-persistence"
-            feature_tag: ""
-            cache_scope: docker-default
-          - image_name: tachyon-mesh
-            dockerfile: ./Dockerfile.fips
-            context: .
-            cargo_features: ""
-            feature_tag: "-fips"
-            cache_scope: docker-fips
-          - image_name: tachyon-mesh
-            dockerfile: ./Dockerfile
-            context: .
-            cargo_features: "http3"
-            feature_tag: "-http3"
-            cache_scope: docker-default
-          - image_name: tachyon-mesh
-            dockerfile: ./Dockerfile
-            context: .
-            cargo_features: "rate-limit,resiliency,mtls,secrets-vault,websockets"
-            feature_tag: "-security"
-            cache_scope: docker-default
-          - image_name: tachyon-mesh
-            dockerfile: ./Dockerfile
-            context: .
-            # TACH-22 (2026-10-28 audit): added oci-artifacts, which this
-            # variant's own `ai-inference` was missing, same gap as
-            # release.yml's "-ai" binary variant. `magnetar-cuda` stays out
-            # for now: this image targets x86_64-unknown-linux-musl and
-            # hasn't been verified to build under musl's cross toolchain
-            # (ittapi-sys, a wasmtime profiling dependency, needs
-            # x86_64-linux-musl-gcc, unavailable to verify this with outside
-            # the Dockerfile's own build) -- left as a documented follow-up
-            # rather than shipped unverified.
-            cargo_features: "ai-inference,oci-artifacts,legacy-wasi-nn,ebpf-loader,experimental,http3,mtls,rate-limit,resiliency,s3-persistence,secrets-vault,websockets"
-            feature_tag: "-all-features"
-            cache_scope: docker-default
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          submodules: recursive
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
-
-      - name: Normalize image owner
-        id: owner
-        shell: bash
-        run: echo "value=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
-        with:
-          images: ghcr.io/${{ steps.owner.outputs.value }}/${{ matrix.image_name }}
-          tags: |
-            type=ref,event=branch,suffix=${{ matrix.feature_tag }}
-            type=sha,prefix=sha-,suffix=${{ matrix.feature_tag }}
-            type=raw,value=latest${{ matrix.feature_tag }},enable={{is_default_branch}}
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-
-      # GHCR intermittently returns "error writing layer blob: not_found" when
-      # the matrix variants push their shared base-layer blobs to the same repo
-      # concurrently (blob cross-mount race). The build itself is cached, so the
-      # first attempt is left as continue-on-error and a single retry rides out
-      # the transient push failure (re-pushing from the warm buildkit/gha cache).
-      - name: Build and publish Docker image
-        id: build
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
-        continue-on-error: true
-        with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            CARGO_FEATURES=${{ matrix.cargo_features }}
-          cache-from: type=gha,scope=${{ matrix.cache_scope }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
-
-      - name: Build and publish Docker image (retry)
-        if: steps.build.outcome == 'failure'
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
-        with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            CARGO_FEATURES=${{ matrix.cargo_features }}
-          cache-from: type=gha,scope=${{ matrix.cache_scope }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}

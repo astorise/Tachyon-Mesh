@@ -734,3 +734,61 @@ async fn router_buffers_ai_generation_and_exposes_job_status() {
     let status = status.expect("job should complete");
     assert_eq!(status["output"], "generated:hello model");
 }
+
+#[tokio::test]
+#[ignore = "requires a component built from the Python SDK audit guest"]
+async fn python_sdk_kv_component_round_trip() {
+    let mut route = IntegrityRoute::user("/api/sdk-python-audit");
+    route.scopes = Some(serde_json::json!({ "kv": ["audit-sdk-python"] }));
+    let mut config = IntegrityConfig::default_sealed();
+    config.routes = vec![route];
+    config.guest_memory_limit_bytes = 512 * 1024 * 1024;
+    config.guest_fuel_budget = 20_000_000_000;
+    let app = build_app(build_test_state(config, telemetry::init_test_telemetry()));
+    let response = app
+        .oneshot(
+            Request::post("/api/sdk-python-audit")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(body.as_ref(), b"tachyon-python-sdk");
+}
+
+#[tokio::test]
+#[ignore = "requires a component built from the Go SDK audit guest"]
+async fn go_sdk_kv_component_round_trip() {
+    let mut route = IntegrityRoute::user("/api/sdk-go-audit");
+    route.scopes = Some(serde_json::json!({ "kv": ["audit-sdk-go"] }));
+    let mut config = IntegrityConfig::default_sealed();
+    config.routes = vec![route];
+    config.guest_memory_limit_bytes = 512 * 1024 * 1024;
+    config.guest_fuel_budget = 20_000_000_000;
+    let app = build_app(build_test_state(config, telemetry::init_test_telemetry()));
+    let response = app
+        .oneshot(
+            Request::post("/api/sdk-go-audit")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(body.as_ref(), b"tachyon-go-sdk");
+}
