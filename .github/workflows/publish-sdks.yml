@@ -23,8 +23,6 @@ on:
   push:
     tags:
       - "v*.*.*"
-  release:
-    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -176,7 +174,18 @@ jobs:
     # jobs (ci.yml's publish-docker-images, release.yml's GitHub Release
     # uploads). It is now gated on verify-tag-ci-green regardless (TACH-18),
     # which it previously was not.
-    if: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'release' }}
+    #
+    # TACH-33 (2026-10-29 audit): this `if:` used to also accept
+    # `github.event_name == 'release'`, and the workflow's own `on:` block
+    # (above) listened for `release: types: [published]` as well as the tag
+    # push below. A single real tag push fires both: release.yml's own jobs
+    # publish the GitHub Release off that same push, which then re-fires
+    # this workflow a second time. That meant wkg publish could attempt the
+    # same package/version twice. Tag push alone is sufficient -- and is
+    # what verify-tag-ci-green's gate already checks against -- so it's now
+    # the only trigger for this job, and the `release` trigger was removed
+    # from `on:` entirely since nothing else in this file used it.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     permissions:
       contents: read
       packages: write
@@ -195,6 +204,51 @@ jobs:
       - name: Install wkg (Wasm Package Tools)
         run: cargo install wkg --version 0.16.1 --locked
 
+      - name: Stage tachyon:mesh's own file into an isolated package root
+        # TACH-33 (2026-10-29 audit): `./wit` is a flat directory holding
+        # MANY independent WIT packages as siblings of tachyon:mesh
+        # (tachyon:identity, tachyon:*-config, tachyon:accelerator,
+        # tachyon:storage, ...) -- confirmed by reproducing `wkg publish
+        # ./wit --dry-run` directly: it fails WIT resolution with "package
+        # identifier `tachyon:ai-config@1.1.0` does not match previous
+        # package name of `tachyon:identity@1.1.0`" before ever reaching
+        # GHCR, because wkg tries to build the whole directory as one
+        # package.
+        #
+        # An earlier version of this step staged all 10 files that
+        # `grep -rl "^package tachyon:mesh@" wit/` finds, including four
+        # subdirectories (wit/{mesh,ai,events,store}), preserving their
+        # relative paths. `wkg publish --dry-run` against that staged
+        # directory built and resolved without error, which looked like
+        # proof it worked -- but decoding the actual built package
+        # (`wasm-tools component wit <dir> --wasm -o out.wasm`, then
+        # `wasm-tools component wit out.wasm`) showed it silently dropped
+        # 9 of those 10 files: wit_parser's directory-based build only
+        # picks up *.wit files sitting directly in the given directory,
+        # never in subdirectories, so "no error" was never proof the
+        # subdirectory content was actually included in the package.
+        #
+        # wit/tachyon.wit alone is the correct, self-sufficient publish
+        # target: its own header names it "the single source of truth for
+        # all Tachyon Mesh WIT interfaces" and says not to fork worlds or
+        # create -with-X variants; it builds standalone with zero
+        # resolution errors (verified the same way: build, then decode,
+        # and compare against the file's own content); and
+        # sdk/wit/tachyon.wit (the consumer-facing SDK subset) never
+        # references any interface/world that only the four subdirectories
+        # declare. Those subdirectories' files remain referenced elsewhere
+        # in the repo by direct path (e.g.
+        # crates/parallel-topology/src/lib.rs,
+        # scripts/validate_ai_component_boundary.sh) -- they are not dead
+        # code, just not part of the externally-published GHCR artifact.
+        run: |
+          set -euo pipefail
+          STAGE_DIR="$(mktemp -d)"
+          echo "STAGE_DIR=${STAGE_DIR}" >> "$GITHUB_ENV"
+          cp wit/tachyon.wit "${STAGE_DIR}/"
+          echo "Staged tachyon:mesh file(s) into ${STAGE_DIR}:"
+          find "$STAGE_DIR" -name '*.wit' | sort
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
@@ -202,25 +256,36 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Package and publish WIT contracts
+      - name: Dry-run preflight (build and resolve, no push)
+        # TACH-33 (2026-10-29 audit): catches a broken build/resolve before
+        # attempting the real, one-shot publish below.
         run: |
-          # Strip the leading 'v' from the tag: v1.2.3 -> 1.2.3
+          set -euo pipefail
           VERSION="${GITHUB_REF#refs/tags/v}"
           OWNER="${{ github.repository_owner }}"
-          REGISTRY="ghcr.io"
-          PACKAGE="tachyon-mesh-wit"
-
-          echo "Publishing WIT contracts as ${REGISTRY}/${OWNER}/${PACKAGE}:${VERSION}"
-
-          # wkg publish uses the OCI distribution spec to push the ./wit directory
-          # as a wasm-component-package artifact. The --version flag must be a
-          # valid semver string (no 'v' prefix).
           wkg publish \
-            --registry "${REGISTRY}" \
-            --namespace "${OWNER}" \
-            --package  "${PACKAGE}" \
-            --version  "${VERSION}" \
-            ./wit
+            --registry ghcr.io \
+            --package "${OWNER}:tachyon-mesh-wit@${VERSION}" \
+            --dry-run \
+            "${STAGE_DIR}"
+
+      - name: Package and publish WIT contracts
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          OWNER="${{ github.repository_owner }}"
+
+          echo "Publishing WIT contracts as ghcr.io/${OWNER}/tachyon-mesh-wit:${VERSION}"
+
+          # wkg 0.16.1's `publish` has no separate --namespace/--version
+          # flags -- confirmed via `wkg publish --help`: it takes a single
+          # combined `<namespace>:<name>@<version>` via --package. The old
+          # --namespace/--version invocation would have failed at argument
+          # parsing before ever reaching GHCR.
+          wkg publish \
+            --registry ghcr.io \
+            --package "${OWNER}:tachyon-mesh-wit@${VERSION}" \
+            "${STAGE_DIR}"
 
       - name: Verify published artifact
         run: |
