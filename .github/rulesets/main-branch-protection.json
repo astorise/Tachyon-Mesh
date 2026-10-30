@@ -4,9 +4,9 @@
   "enforcement": "active",
   "bypass_actors": [
     {
-      "actor_id": 6298458,
-      "actor_type": "User",
-      "bypass_mode": "pull_request"
+      "actor_id": 5,
+      "actor_type": "RepositoryRole",
+      "bypass_mode": "always"
     }
   ],
   "conditions": {
@@ -27,7 +27,7 @@
       "parameters": {
         "required_approving_review_count": 1,
         "dismiss_stale_reviews_on_push": true,
-        "require_code_owner_review": true,
+        "require_code_owner_review": false,
         "require_last_push_approval": true,
         "required_review_thread_resolution": true
       }
