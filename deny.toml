@@ -16,6 +16,30 @@ yanked = "deny"
 # (crossbeam-epoch — already at 0.9.21, past the advisory's own >=0.9.20
 # fix) and the chacha20@0.10.0 yank (fixed by bumping to the non-yanked
 # 0.10.2, `cargo update -p chacha20@0.10.0 --precise 0.10.2`).
+# TACH-49 (2026-10-30 audit): dated review ledger for every ignore entry
+# below (and .cargo/audit.toml's, which this file's own comment above
+# explains can't live here) -- "added" dates are each entry's real first
+# commit (`git log -S"<id>" -- deny.toml .cargo/audit.toml`), not guessed.
+# "Review by" is the sooner of: 6 months after it was added or last
+# reviewed, or the next Renovate PR that bumps the dependency chain named
+# in its reason (Renovate already runs on a schedule and opens a PR for
+# any such bump on its own -- that PR is a real trigger to re-run `cargo
+# audit`/`cargo deny check advisories` against the new version, not a
+# second tracking mechanism to maintain by hand). Single-maintainer repo,
+# so every entry's owner is astorise; re-date an entry's "added" (and move
+# the clock forward) each time it's actually re-reviewed and still holds.
+#
+# - RUSTSEC-2023-0071: added 2026-07-19. Review by 2027-01-19 or the next
+#   Renovate PR touching `rsa`, whichever comes first.
+# - RUSTSEC-2026-0367/0368/0369: added 2026-10-17. Review by 2027-04-17 or
+#   the next Renovate PR touching `zip`/`libsodium-sys-stable`, whichever
+#   comes first.
+# - RUSTSEC-2026-0387: added 2026-10-25. Review by 2027-04-25 or the next
+#   Renovate PR touching `crypto-bigint`/`elliptic-curve`/`k256`/
+#   `iota-crypto`/`iota_stronghold`, whichever comes first.
+# - RUSTSEC-2024-0429 (.cargo/audit.toml): added 2026-09-18. Review by
+#   2027-03-18 or the next Renovate PR touching `glib`, whichever comes
+#   first.
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing side-channel applies to RSA private-key decryption; system-faas-node-registry uses rsa only for RS256 JWT signature VERIFICATION with public keys (no private-key ops), so it is not exploitable here. No fixed rsa release is available yet." },
     { id = "RUSTSEC-2026-0367", reason = "zip 8.6.0 is only a build-dependency of libsodium-sys-stable (via iota_stronghold -> tachyon-ui) used to unpack the pinned libsodium source archive at build time; no attacker-controlled archive is extracted and nothing runs at runtime. Blocked on libsodium-sys-stable moving to zip >=9." },
