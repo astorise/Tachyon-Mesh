@@ -399,7 +399,11 @@ jobs:
         # attempting the real, one-shot publish below.
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF#refs/tags/v}"
+          # TACH-32 follow-up (2026-10-29 audit): derived from
+          # resolve-publish-target's resolved output, not GITHUB_REF --
+          # see the checkout step above for why those can differ on a
+          # workflow_dispatch.
+          VERSION="${{ needs.resolve-publish-target.outputs.version }}"
           OWNER="${{ github.repository_owner }}"
           wkg publish \
             --registry ghcr.io \
@@ -409,13 +413,12 @@ jobs:
 
       - name: Package and publish WIT contracts
         run: |
+          set -euo pipefail
           # TACH-32 follow-up (2026-10-29 audit): derived from
           # resolve-publish-target's resolved output, not GITHUB_REF --
           # see the checkout step above for why those can differ on a
           # workflow_dispatch.
           VERSION="${{ needs.resolve-publish-target.outputs.version }}"
-          set -euo pipefail
-          VERSION="${GITHUB_REF#refs/tags/v}"
           OWNER="${{ github.repository_owner }}"
 
           echo "Publishing WIT contracts as ghcr.io/${OWNER}/tachyon-mesh-wit:${VERSION}"
