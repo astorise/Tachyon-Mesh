@@ -58,6 +58,28 @@ jobs:
             exit 1
           fi
 
+          # TACH-43 (2026-10-30 audit): the API query above filters on
+          # `status=completed` -- a run is "completed" the instant every
+          # job in it has finished, successfully or not. Nothing above
+          # this point ever looks at the run's own `conclusion`. Checking
+          # only the six named jobs below means a run where `test`, `ui`,
+          # a FIPS/feature-matrix job, or any job outside this list failed
+          # -- while these six happened to pass independently, since none
+          # of them depend on those others -- would satisfy every check
+          # below and authorize create-draft-release, the WIT/binary
+          # publishes, and finalize-release off a CI run that was actually
+          # red. Requiring the run's overall conclusion to be `success`
+          # first closes that gap; the six-job loop stays as defense in
+          # depth (TACH-35's own reasoning for why job names, not just an
+          # overall conclusion, matter: a run can conclude `success` while
+          # genuinely omitting a job that was never scheduled for this ref
+          # at all, e.g. if ci.yml's own triggers change in the future).
+          run_conclusion=$(gh api "repos/${REPO}/actions/runs/${run_id}" -q '.conclusion // empty')
+          if [ "$run_conclusion" != "success" ]; then
+            echo "::error::CI push run ${run_id} on main for ${SHA} concluded '${run_conclusion}', not 'success' -- refusing to treat this commit's CI as green even though the six required jobs below may individually show success." >&2
+            exit 1
+          fi
+
           missing=""
           failed=""
           for name in $required; do
