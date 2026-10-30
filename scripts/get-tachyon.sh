@@ -133,9 +133,19 @@ if command -v cosign >/dev/null 2>&1; then
   URL: ${BUNDLE_URL}
   Re-run without cosign on PATH to skip this check, or verify manually once the bundle is available."
   fi
+  # TACH-45 (2026-10-30 audit): REPO is lowercased ("astorise/tachyon-mesh")
+  # but the real repo is "astorise/Tachyon-Mesh" -- neither GitHub's nor
+  # Sigstore/Fulcio's docs state whether the OIDC `repository` claim (and
+  # thus the certificate identity Fulcio issues from it) preserves that
+  # case or lowercases it, and no signed artifact exists yet to check
+  # directly (no tag has been pushed). `(?i)` makes this match regardless
+  # of which one is true -- verified this still correctly rejects a
+  # same-named repo under a different owner (Go's regexp package, which
+  # cosign uses, treats `(?i)` as a flag on the whole pattern, not just
+  # the literal text immediately after it).
   cosign verify-blob \
     --bundle "${TMP}/${TARBALL}.bundle" \
-    --certificate-identity-regexp "^https://github\\.com/${REPO}/\\.github/workflows/release\\.yml@" \
+    --certificate-identity-regexp "(?i)^https://github\\.com/${REPO}/\\.github/workflows/release\\.yml@" \
     --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
     "${TMP}/${TARBALL}" \
     || die "cosign signature verification failed — the archive does not match a signature from this repo's release workflow."

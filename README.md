@@ -157,8 +157,8 @@ Deploy the resulting binary like any other node — it stays enrollable (`/admin
 
 Tachyon-Mesh is built for zero-trust environments.
 
-- **Verified Binaries:** Installation scripts (`get-tachyon.sh` / `get-tachyon.ps1`) automatically verify SHA-256 checksums before extraction — no silent MITM risk.
-- **Cryptographic Signatures:** Release artifacts are keylessly signed via [Sigstore/Cosign](https://docs.sigstore.dev/) using GitHub OIDC. Rekor transparency-log bundles are attached to every release.
+- **Verified Binaries:** Installation scripts (`get-tachyon.sh` / `get-tachyon.ps1`) automatically verify a SHA-256 checksum before extraction, protecting against a corrupted or tampered download. If [cosign](https://docs.sigstore.dev/cosign/installation/) is on `PATH`, they also verify the archive's Sigstore/cosign signature against this repo's release workflow, confirming where it was actually built rather than just that it matches a checksum served alongside it — this stronger check is skipped (not failed) when cosign isn't installed, so install it for the full guarantee. Desktop (Tauri) bundles are not currently cosign-signed; only the server binary archives are.
+- **Cryptographic Signatures:** Server binary archives are keylessly signed via [Sigstore/Cosign](https://docs.sigstore.dev/) using GitHub OIDC. Rekor transparency-log bundles are attached to every release.
 - **SBOM:** SPDX 2.3 Software Bill of Materials are generated per release for supply-chain vulnerability scanning (Trivy, Grype).
 - **Kubernetes:** `manifests/deploy-gpu-homelab-hardened.yaml` enforces Pod Security Standards (Restricted) with zero-root privileges, read-only root filesystem, and default-deny NetworkPolicy for highly-regulated clusters.
 - **XSS Immunity:** The operator UI uses exclusively native DOM APIs — no `innerHTML` interpolation of user data.
