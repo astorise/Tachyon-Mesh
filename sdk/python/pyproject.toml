@@ -1,9 +1,16 @@
 [tool.poetry]
-name = "tachyon-sdk"
+name = "tachyon-mesh-sdk"
 version = "1.0.0"
 description = "Official Python SDK bindings for Tachyon Mesh FaaS guests"
 authors = ["Tachyon Mesh Maintainers"]
-packages = [{ include = "tachyon_sdk" }]
+packages = [
+  { include = "tachyon_mesh_sdk" },
+  { include = "wit_world" },
+  { include = "componentize_py_async_support" },
+  { include = "componentize_py_types.py" },
+  { include = "poll_loop.py" },
+]
+include = ["componentize_py_runtime.pyi"]
 
 [tool.poetry.dependencies]
 python = "^3.11"
