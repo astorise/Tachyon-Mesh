@@ -52,11 +52,11 @@ In `core-host/src/host_core/` (where the AI/KV bindings are implemented), the im
 - **AND** `get-range` uses native B-Tree range iteration with limit and offset
 
 ### Requirement: Rust FaaS SDK MUST expose ergonomic KV partition resources
-In `faas-sdk/src/`, the API bindings SHALL let developers use the resource ergonomically.
+In `sdk/rust/src/` (the published `tachyon-faas-sdk` crate -- not the similarly-named but distinct, unpublished `faas-sdk/` proc-macro crate), the API bindings SHALL let developers use the resource ergonomically.
 
 **Target SDK Usage Example for Codex to ensure:**
 ```rust
-use tachyon_sdk::ai::kv_partition::Table;
+use tachyon_faas_sdk::ai::kv_partition::Table;
 
 pub fn execute_agent_logic() {
     // Constructor automatically maps to `open-table` resource creation
