@@ -7,7 +7,19 @@ name: Verify tag CI baseline
 # Factored out of release.yml (where this job originated) so both
 # workflows share one script instead of drifting apart.
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      target_sha:
+        description: >-
+          Commit SHA to verify CI for. Optional -- defaults to the caller's
+          own github.sha, which is already correct for a tag-push trigger
+          (the push itself IS the tagged commit). Pass this explicitly
+          (TACH-32, 2026-10-29 audit) when the caller can be dispatched from
+          an arbitrary ref -- e.g. a `workflow_dispatch` -- where
+          github.sha reflects whatever ref the run happened to be started
+          from, not necessarily the exact tag being acted on.
+        required: false
+        type: string
 
 jobs:
   verify-tag-ci-green:
@@ -20,7 +32,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
+          SHA: ${{ inputs.target_sha || github.sha }}
         run: |
           set -euo pipefail
           # TACH-35 (2026-10-29 audit): installer-contract-smoke-test-linux/
