@@ -228,7 +228,8 @@ class ReleaseInventoryTests(unittest.TestCase):
             self.verify(assets)
 
 
-@unittest.skipUnless(shutil.which("dpkg-deb") and shutil.which("dpkg"), "requires dpkg tools")
+@unittest.skipUnless(shutil.which("dpkg-deb") and shutil.which("dpkg") and shutil.which("ar"),
+                     "requires dpkg and ar tools")
 class DebianPrereleaseTests(unittest.TestCase):
     def test_real_deb_orders_rc_before_ga_and_preserves_contents(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -250,6 +251,9 @@ class DebianPrereleaseTests(unittest.TestCase):
             subprocess.run(cmd, check=True, capture_output=True)
             self.assertEqual(subprocess.check_output(["dpkg-deb", "-f", str(deb), "Version"],
                                                      text=True).strip(), "1.0.0~rc0")
+            members = subprocess.check_output(["ar", "t", str(deb)], text=True).splitlines()
+            self.assertIn("control.tar.gz", members)
+            self.assertIn("data.tar.gz", members)
             subprocess.run(["dpkg", "--compare-versions", "1.0.0~rc0", "lt", "1.0.0"], check=True)
             output = directory / "extracted"
             subprocess.run(["dpkg-deb", "--extract", str(deb), str(output)], check=True)
@@ -272,6 +276,24 @@ class DebianPrereleaseTests(unittest.TestCase):
                              {name for name in expected if name.endswith(("_amd64.deb", "_amd64.AppImage"))})
             stage_command[3] = "v1.0.0"
             self.assertNotEqual(subprocess.run(stage_command, capture_output=True).returncode, 0)
+
+    def test_reencodes_an_already_normalized_zstd_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            package = directory / "package"
+            (package / "DEBIAN").mkdir(parents=True)
+            (package / "DEBIAN").chmod(0o755)
+            (package / "DEBIAN/control").write_text(
+                "Package: tachyon-test\nVersion: 1.0.0~rc0\nArchitecture: all\n"
+                "Maintainer: Tachyon <test@example.invalid>\nDescription: test fixture\n")
+            deb = directory / "tachyon.deb"
+            subprocess.run(["dpkg-deb", "--build", "--root-owner-group", "-Zzstd",
+                            str(package), str(deb)], check=True, capture_output=True)
+            subprocess.run([sys.executable, str(ROOT / "scripts/normalize-deb-version.py"),
+                            "--version", "1.0.0-rc0", str(deb)], check=True, capture_output=True)
+            members = subprocess.check_output(["ar", "t", str(deb)], text=True).splitlines()
+            self.assertIn("control.tar.gz", members)
+            self.assertIn("data.tar.gz", members)
 
 
 class SdkReleaseGateTests(unittest.TestCase):

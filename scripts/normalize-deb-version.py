@@ -23,9 +23,10 @@ def normalize(package, app_version):
         raise ValueError("invalid application version")
     target = match.group(1) + ("~" + match.group(2) if match.group(2) else "")
     actual = package_version(package)
-    if actual == target:
+    members = set(subprocess.check_output(["ar", "t", str(package)], text=True).splitlines())
+    if actual == target and {"control.tar.gz", "data.tar.gz"}.issubset(members):
         return target
-    if actual != app_version:
+    if actual not in (app_version, target):
         raise ValueError(f"package version {actual} does not match {app_version}")
 
     # Extracting a package does not run its maintainer scripts. Rebuild the
@@ -41,8 +42,10 @@ def normalize(package, app_version):
         if count != 1:
             raise ValueError("package control must have exactly one Version field")
         control.write_text(content, encoding="utf-8")
-        subprocess.run(["dpkg-deb", "--build", "--root-owner-group", str(directory), str(rebuilt)],
-                       check=True)
+        # Tauri's original control and data archives use gzip; dpkg's default
+        # can be zstd, which older Debian-family installers cannot read.
+        subprocess.run(["dpkg-deb", "--build", "--root-owner-group", "-Zgzip",
+                        str(directory), str(rebuilt)], check=True)
         if package_version(rebuilt) != target:
             raise ValueError("rebuilt package has the wrong version")
         os.replace(rebuilt, package)

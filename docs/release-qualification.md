@@ -64,7 +64,8 @@ upgrades and potential downgrades on a clean Windows machine before release.
 
 Debian prereleases use `~` in the installed package version, so the RC package
 is `1.0.0~rc0` and sorts before `1.0.0`; its release asset still carries the
-`1.0.0-rc0` name. macOS requires numeric bundle version fields, which are
+`1.0.0-rc0` name. Rebuilt packages retain Tauri's gzip archive compression.
+macOS requires numeric bundle version fields, which are
 `1.0.0`; the bundle also records the full RC in `TachyonReleaseVersion`. Check
 installation and upgrades on both platforms before release.
 
