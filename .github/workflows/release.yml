@@ -489,11 +489,12 @@ jobs:
               target/release/bundle/deb/*.deb
           - platform: macos-latest
             rust_targets: aarch64-apple-darwin
-            args: --target aarch64-apple-darwin --bundles dmg
+            args: --target aarch64-apple-darwin --bundles app,dmg
             artifact_name: tachyon-desktop-macos
             artifact_path: |
               target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
               target/release/bundle/dmg/*.dmg
+              target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz
           - platform: windows-latest
             rust_targets: ""
             args: --bundles msi,nsis
@@ -580,8 +581,10 @@ jobs:
           cargo install cargo-sbom --version 0.10.0 --locked
           cargo sbom --output-format spdx_json_2_3 > tachyon-mesh.spdx.json
 
-      - name: Build Tauri bundles for push artifacts
-        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+      # Linux bundles need Debian's '~' prerelease ordering before upload.
+      # Build them without a release ID so the .deb can be corrected first.
+      - name: Build Tauri bundles without release upload
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') || matrix.platform == 'ubuntu-22.04' }}
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -589,8 +592,44 @@ jobs:
           projectPath: tachyon-ui
           args: ${{ matrix.args }}
 
+      - name: Normalize Debian package version
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(target/release/bundle/deb/*.deb)
+          test "${#packages[@]}" -eq 1
+          version=$(node -p 'require("./tachyon-ui/tauri.conf.json").version')
+          python3 scripts/normalize-deb-version.py --version "$version" "${packages[0]}"
+
+      - name: Stage Linux desktop release assets
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && matrix.platform == 'ubuntu-22.04' }}
+        id: stage-linux-desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(target/release/bundle/deb/*.deb)
+          images=(target/release/bundle/appimage/*.AppImage)
+          test "${#packages[@]}" -eq 1
+          test "${#images[@]}" -eq 1
+          version=$(node -p 'require("./tachyon-ui/tauri.conf.json").version')
+          bash scripts/stage-linux-desktop-release.sh "$version" "$GITHUB_REF_NAME" \
+            "${packages[0]}" "${images[0]}" "$RUNNER_TEMP" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Linux desktop release assets
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && matrix.platform == 'ubuntu-22.04' }}
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            ${{ steps.stage-linux-desktop.outputs.deb }}
+            ${{ steps.stage-linux-desktop.outputs.image }}
+
       - name: Publish Tauri bundles for version tags
-        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && matrix.platform != 'ubuntu-22.04' }}
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

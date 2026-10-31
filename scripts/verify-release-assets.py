@@ -33,7 +33,7 @@ def expected_assets(tag, ui_version):
         f"tachyon-studio_{ui_version}_amd64.AppImage",
         f"tachyon-studio_{ui_version}_amd64.deb",
         f"tachyon-studio_{ui_version}_aarch64.dmg",
-        # tauri-action also archives and uploads the .app produced for a DMG.
+        # The release build explicitly retains .app and tauri-action archives it.
         f"tachyon-studio_{ui_version}_aarch64.app.tar.gz",
         f"tachyon-studio_{ui_version}_x64.msi",
         f"tachyon-studio_{ui_version}_x64.exe",

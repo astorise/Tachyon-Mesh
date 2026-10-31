@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Free unused hosted-runner disk before Docker cache and publication builds
+  after a FIPS image build exhausted its runner.
 - Run real gRPC-Go unary and aioquic HTTP/3 interoperability tests on main and
   ordinary pull requests, and correct the example guest's protobuf response.
 - Harden benchmark validation, record run metadata and avoid reporting cold
@@ -9,7 +11,9 @@
   calibration on a representative environment; remove the unmeasured
   near-zero cold-start claim.
 - Mark prerelease tags such as `v1.0.0-rc0` as GitHub prereleases and verify
-  that flag before publication.
+  that flag before publication. Align desktop package versions with the
+  planned `1.0.0-rc0` release candidate, including platform-specific installer
+  version formats, Debian prerelease ordering and the required macOS app archive.
 - Gate Docker publication on the successful CI run for the exact commit, and
   promote image digests only after all variants are built.
 - Fix Linux installer argument parsing and verify the release asset inventory,
