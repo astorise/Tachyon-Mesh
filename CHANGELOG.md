@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Gate Docker publication on the successful CI run for the exact commit, and
+  promote image digests only after all variants are built.
+- Fix Linux installer argument parsing and verify the release asset inventory,
+  checksums and a representative signature before publishing a release.
+- Exercise Python and Go SDK KV guests in core-host CI and require the matching
+  published release before publishing SDK packages.
+
 ## [v1.0.0] — General Availability (GA) · 2026-10-31
 
 > **Note (TACH-24, 2026-10-29 audit):** this section previously carried a placeholder date of `2026-05-15`, written before the release was actually cut — several of the fixes folded into the "Full Changelog" below (TACH-32/33/34, among others) landed as late as 2026-10-30, after that placeholder date had already passed. `2026-10-31` is the real GA date.

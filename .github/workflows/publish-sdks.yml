@@ -127,6 +127,36 @@ jobs:
     with:
       target_sha: ${{ needs.resolve-publish-target.outputs.sha }}
 
+  # A real SDK publication follows the matching, already-published GitHub
+  # Release. The registries still cannot be committed or rolled back atomically.
+  verify-published-release:
+    needs: [resolve-publish-target, verify-tag-ci-green]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.resolve-publish-target.outputs.sha }}
+          persist-credentials: false
+      - name: Require the published release manifest for the exact commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.resolve-publish-target.outputs.version }}
+          SHA: ${{ needs.resolve-publish-target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          gh api "repos/${REPO}/releases/tags/${tag}" > "$RUNNER_TEMP/release.json"
+          release_id=$(jq -er '.id' "$RUNNER_TEMP/release.json")
+          gh api --paginate --slurp "repos/${REPO}/releases/${release_id}/assets?per_page=100" > "$RUNNER_TEMP/assets.json"
+          gh release download "$tag" --repo "$REPO" --dir "$RUNNER_TEMP" --pattern 'release-manifest.json'
+          python3 scripts/verify-sdk-release.py --tag "$tag" --commit "$SHA" \
+            --release "$RUNNER_TEMP/release.json" --assets "$RUNNER_TEMP/assets.json" \
+            --manifest "$RUNNER_TEMP/release-manifest.json"
+
   # TACH-40 (2026-10-30 audit): this used to be one job running cargo/npm/
   # poetry/go sequentially -- a transient failure on any one language (or
   # just an expired/misconfigured token) failed the whole job, and
@@ -139,9 +169,8 @@ jobs:
   # dry-run-rust-sdk/dry-run-js-sdk/dry-run-python-sdk/dry-run-go-sdk below,
   # publish-rust-sdk/publish-js-sdk/publish-python-sdk/publish-go-sdk
   # further down -- lets GitHub's own "re-run failed jobs" retry exactly
-  # the one that failed, each depending only on resolve-publish-target and
-  # verify-tag-ci-green (the shared preflight), never on a sibling
-  # language's job.
+  # the one that failed. Each uses the shared commit, CI and published-release
+  # preflight, never a sibling language's publish job.
   #
   # This lightweight check has no language-specific toolchain dependency
   # (plain grep/sed against each manifest) and gates all four per-language
@@ -350,7 +379,7 @@ jobs:
   # dry-run job passed end to end on this exact ref.
   publish-rust-sdk:
     name: publish-sdks / Rust SDK (real, manual only)
-    needs: [resolve-publish-target, verify-tag-ci-green, verify-sdk-manifest-versions, dry-run-rust-sdk]
+    needs: [resolve-publish-target, verify-tag-ci-green, verify-published-release, verify-sdk-manifest-versions, dry-run-rust-sdk]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: release
@@ -382,7 +411,7 @@ jobs:
 
   publish-js-sdk:
     name: publish-sdks / JavaScript SDK (real, manual only)
-    needs: [resolve-publish-target, verify-tag-ci-green, verify-sdk-manifest-versions, dry-run-js-sdk]
+    needs: [resolve-publish-target, verify-tag-ci-green, verify-published-release, verify-sdk-manifest-versions, dry-run-js-sdk]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: release
@@ -415,7 +444,7 @@ jobs:
 
   publish-python-sdk:
     name: publish-sdks / Python SDK (real, manual only)
-    needs: [resolve-publish-target, verify-tag-ci-green, verify-sdk-manifest-versions, dry-run-python-sdk]
+    needs: [resolve-publish-target, verify-tag-ci-green, verify-published-release, verify-sdk-manifest-versions, dry-run-python-sdk]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: release
@@ -459,7 +488,7 @@ jobs:
 
   publish-go-sdk:
     name: publish-sdks / Go SDK (real, manual only)
-    needs: [resolve-publish-target, verify-tag-ci-green, dry-run-go-sdk]
+    needs: [resolve-publish-target, verify-tag-ci-green, verify-published-release, dry-run-go-sdk]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: release

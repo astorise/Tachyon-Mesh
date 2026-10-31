@@ -27,17 +27,6 @@ TARGET_DIR="."
 VERSION=""
 VARIANT="default"
 
-for arg in "$@"; do
-  case "$arg" in
-    --version=*) VERSION="${arg#*=}" ;;
-    --version)   shift; VERSION="${1:-}" ;;
-    --dir=*)     TARGET_DIR="${arg#*=}" ;;
-    --dir)       shift; TARGET_DIR="${1:-}" ;;
-    --variant=*) VARIANT="${arg#*=}" ;;
-    --variant)   shift; VARIANT="${1:-}" ;;
-  esac
-done
-
 BOLD=$(tput bold 2>/dev/null || true)
 RESET=$(tput sgr0 2>/dev/null || true)
 CYAN=$(tput setaf 6 2>/dev/null || true)
@@ -47,6 +36,29 @@ RED=$(tput setaf 1 2>/dev/null || true)
 info() { echo "${CYAN}${BOLD}» $*${RESET}"; }
 ok()   { echo "${GREEN}✔  $*${RESET}"; }
 die()  { echo "${RED}${BOLD}✘  $*${RESET}" >&2; exit 1; }
+
+while (($#)); do
+  option=$1
+  case "$option" in
+    --version|--dir|--variant)
+      [[ $# -ge 2 && -n $2 && $2 != --* ]] || die "${option} requires a value."
+      value=$2
+      shift 2
+      ;;
+    --version=*|--dir=*|--variant=*)
+      value=${option#*=}
+      option=${option%%=*}
+      [[ -n $value ]] || die "${option} requires a value."
+      shift
+      ;;
+    *) die "Unknown option: ${option}" ;;
+  esac
+  case "$option" in
+    --version) VERSION=$value ;;
+    --dir) TARGET_DIR=$value ;;
+    --variant) VARIANT=$value ;;
+  esac
+done
 
 case "$VARIANT" in
   default)    VARIANT_SUFFIX="" ;;
