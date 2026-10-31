@@ -2,8 +2,8 @@
 
 ## Unreleased
 
-- Run real gRPC-Go unary and aioquic HTTP/3 interoperability tests and correct
-  the example gRPC guest's protobuf response format.
+- Run real gRPC-Go unary and aioquic HTTP/3 interoperability tests on main and
+  ordinary pull requests, and correct the example guest's protobuf response.
 - Harden benchmark validation, record run metadata and avoid reporting cold
   start p99 from fewer than 100 samples. Performance thresholds remain pending
   calibration on a representative environment.

@@ -191,7 +191,7 @@ jobs:
   # loopback. These jobs intentionally test the supported unary/H3 subset;
   # streaming RPCs, QUIC Retry and 0-RTT need separate conformance coverage.
   grpc-interop:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'renovate/')
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: 4
@@ -224,7 +224,7 @@ jobs:
           grep -Fx "test ${test_name} ... ok" "$RUNNER_TEMP/grpc-interop.log"
 
   quic-interop:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'renovate/')
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: 4

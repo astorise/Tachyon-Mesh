@@ -1,10 +1,12 @@
 # HTTP/3 interoperability
 
-The `quic-interop` job in the manually dispatched Integration workflow starts
-Tachyon's HTTP/3 listener on loopback and uses the independent, pinned aioquic
+The `quic-interop` job in the Integration workflow starts Tachyon's HTTP/3
+listener on loopback and uses the independent, pinned aioquic
 client. It verifies a TLS 1.3 handshake, ALPN `h3`, the server certificate,
 and three concurrent requests and responses on one QUIC connection. A second
 attempt must fail when the client trusts the wrong CA.
+The job runs on main, ordinary pull requests and manual dispatch; Renovate
+pull requests use the repository's compile-only fast lane.
 
 To run the same test locally with Python 3.12 and the Rust WASI target installed:
 
