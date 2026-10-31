@@ -187,6 +187,12 @@ class ReleaseInventoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "desktop version"):
             release_gate.expected_assets("v1.0.0-rc0", "1.0.0")
 
+    def test_macos_build_retains_the_app_archive_required_by_inventory(self):
+        for workflow in ("release.yml", "integration.yml"):
+            source = (ROOT / ".github/workflows" / workflow).read_text()
+            self.assertIn("--target aarch64-apple-darwin --bundles app,dmg", source)
+            self.assertIn("target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz", source)
+
     def test_desktop_metadata_versions_match(self):
         config = json.loads((ROOT / "tachyon-ui/tauri.conf.json").read_text())
         npm = json.loads((ROOT / "tachyon-ui/package.json").read_text())

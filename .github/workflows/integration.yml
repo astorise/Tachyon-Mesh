@@ -280,10 +280,11 @@ jobs:
               target/release/bundle/deb/*.deb
           - platform: macos-latest
             rust_targets: aarch64-apple-darwin
-            args: --target aarch64-apple-darwin --bundles dmg
+            args: --target aarch64-apple-darwin --bundles app,dmg
             artifact_path: |
               target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
               target/release/bundle/dmg/*.dmg
+              target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz
           - platform: windows-latest
             rust_targets: ''
             args: --bundles msi,nsis
@@ -367,6 +368,7 @@ jobs:
               ;;
             macOS)
               ls target/aarch64-apple-darwin/release/bundle/dmg/*.dmg >/dev/null
+              ls target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz >/dev/null
               ;;
             Windows)
               ls target/release/bundle/msi/*.msi >/dev/null
