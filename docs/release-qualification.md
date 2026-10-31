@@ -50,11 +50,23 @@ Do not treat skipped checks as passed or treat a release draft as published.
    a numeric SLO or comparison.
 
 The intended first release candidate is `v1.0.0-rc0`. Before creating that
-tag, align the desktop version and any packages being published with the RC
+tag, verify the desktop version and any packages being published match the RC
 version and their registry's version rules. The inventory check requires the
 desktop version to match the tag exactly. The release workflow marks tags with
 a prerelease suffix as GitHub prereleases; qualification and publication still
 require their own successful runs and authorization.
+
+Windows MSI ProductVersion is numeric and cannot encode `-rc0`. The desktop
+configuration therefore uses `1.0.0.0` for MSI while retaining
+`1.0.0-rc0` in the application and release asset names. MSI treats the RC and
+future `1.0.0` as the same product version for upgrade comparisons; test
+upgrades and potential downgrades on a clean Windows machine before release.
+
+To build the desktop installer matrix for a selected branch without publishing
+a release, dispatch `integration.yml` with `desktop_qualification=true`. Verify
+the run's head SHA and collect its Linux, macOS and Windows artifacts. This
+build check does not replace platform installation tests or the required
+`push/main` CI and integration runs for the final release SHA.
 
 Local regression checks for the release controls:
 
