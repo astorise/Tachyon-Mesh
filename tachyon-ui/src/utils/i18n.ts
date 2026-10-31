@@ -1,3 +1,5 @@
+import { version } from "../../package.json";
+
 export type SupportedLanguage = "en" | "fr";
 
 type Dictionary = Record<string, string>;
@@ -26,7 +28,7 @@ const dictionaries: Record<SupportedLanguage, Dictionary> = {
     "shell.subtitle": "Native Web Components shell",
     "shell.operator": "Operator",
     "shell.unknown": "unknown",
-    "shell.version": "v1.0.0-webcomponents",
+    "shell.version": `v${version}`,
     "shell.help": "Help / Tour",
     "shell.language": "Language",
     "shell.skip-nav": "Skip to main content",
@@ -521,7 +523,7 @@ const dictionaries: Record<SupportedLanguage, Dictionary> = {
     "shell.subtitle": "Shell natif Web Components",
     "shell.operator": "Opérateur",
     "shell.unknown": "inconnu",
-    "shell.version": "v1.0.0-webcomponents",
+    "shell.version": `v${version}`,
     "shell.help": "Aide / Tour",
     "shell.language": "Langue",
     "shell.skip-nav": "Aller au contenu principal",

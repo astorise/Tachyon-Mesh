@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
+import { version } from "../../package.json";
 import { getLanguage, setLanguage, t, translateBackendError, ErrorTranslator } from "./i18n";
 
 beforeEach(() => {
@@ -6,6 +7,13 @@ beforeEach(() => {
 });
 
 describe("t()", () => {
+  it("shows the package version in both languages", () => {
+    for (const language of ["en", "fr"] as const) {
+      setLanguage(language);
+      expect(t("shell.version")).toBe(`v${version}`);
+    }
+  });
+
   it("returns the English string for a known key", () => {
     expect(t("nav.dashboard")).toBe("Dashboard");
   });
