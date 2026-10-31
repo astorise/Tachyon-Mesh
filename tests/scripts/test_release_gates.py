@@ -3,6 +3,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import plistlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -207,12 +209,63 @@ class ReleaseInventoryTests(unittest.TestCase):
         if wix is not None:
             self.assertRegex(wix, r"^\d+\.\d+\.\d+(?:\.\d+)?$")
             self.assertEqual(wix.split(".")[:3], version.split("-", 1)[0].split("."))
+        plist = plistlib.loads((ROOT / "tachyon-ui/Info.plist").read_bytes())
+        numeric_version = version.split("-", 1)[0]
+        self.assertEqual(plist["CFBundleShortVersionString"], numeric_version)
+        self.assertEqual(plist["CFBundleVersion"], numeric_version)
+        self.assertEqual(plist["TachyonReleaseVersion"], version)
 
     def test_unuploaded_or_digestless_asset_blocks_release(self):
         assets = copy.deepcopy(self.assets)
         assets[0]["digest"] = None
         with self.assertRaisesRegex(ValueError, "SHA-256"):
             self.verify(assets)
+
+
+@unittest.skipUnless(shutil.which("dpkg-deb") and shutil.which("dpkg"), "requires dpkg tools")
+class DebianPrereleaseTests(unittest.TestCase):
+    def test_real_deb_orders_rc_before_ga_and_preserves_contents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            package = directory / "package"
+            (package / "DEBIAN").mkdir(parents=True)
+            (package / "DEBIAN").chmod(0o755)
+            (package / "DEBIAN/control").write_text(
+                "Package: tachyon-test\nVersion: 1.0.0-rc0\nArchitecture: all\n"
+                "Maintainer: Tachyon <test@example.invalid>\nDescription: test fixture\n")
+            payload = package / "usr/share/tachyon-test"
+            payload.mkdir(parents=True)
+            (payload / "payload.txt").write_text("fixture\n")
+            deb = directory / "tachyon.deb"
+            subprocess.run(["dpkg-deb", "--build", "--root-owner-group", str(package), str(deb)],
+                           check=True, capture_output=True)
+            cmd = [sys.executable, str(ROOT / "scripts/normalize-deb-version.py"),
+                   "--version", "1.0.0-rc0", str(deb)]
+            subprocess.run(cmd, check=True, capture_output=True)
+            self.assertEqual(subprocess.check_output(["dpkg-deb", "-f", str(deb), "Version"],
+                                                     text=True).strip(), "1.0.0~rc0")
+            subprocess.run(["dpkg", "--compare-versions", "1.0.0~rc0", "lt", "1.0.0"], check=True)
+            output = directory / "extracted"
+            subprocess.run(["dpkg-deb", "--extract", str(deb), str(output)], check=True)
+            self.assertEqual((output / "usr/share/tachyon-test/payload.txt").read_text(), "fixture\n")
+            before = hashlib.sha256(deb.read_bytes()).hexdigest()
+            subprocess.run(cmd, check=True, capture_output=True)
+            self.assertEqual(hashlib.sha256(deb.read_bytes()).hexdigest(), before)
+            mismatch = subprocess.run([sys.executable, str(ROOT / "scripts/normalize-deb-version.py"),
+                                       "--version", "1.0.1-rc0", str(deb)], capture_output=True)
+            self.assertNotEqual(mismatch.returncode, 0)
+            self.assertEqual(hashlib.sha256(deb.read_bytes()).hexdigest(), before)
+            image = directory / "tachyon.AppImage"
+            image.write_bytes(b"appimage fixture")
+            stage = directory / "stage"
+            stage_command = ["bash", str(ROOT / "scripts/stage-linux-desktop-release.sh"),
+                             "1.0.0-rc0", "v1.0.0-rc0", str(deb), str(image), str(stage)]
+            subprocess.run(stage_command, check=True, capture_output=True)
+            expected = release_gate.expected_assets("v1.0.0-rc0", "1.0.0-rc0")
+            self.assertEqual({p.name for p in stage.iterdir()},
+                             {name for name in expected if name.endswith(("_amd64.deb", "_amd64.AppImage"))})
+            stage_command[3] = "v1.0.0"
+            self.assertNotEqual(subprocess.run(stage_command, capture_output=True).returncode, 0)
 
 
 class SdkReleaseGateTests(unittest.TestCase):

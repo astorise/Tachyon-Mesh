@@ -339,6 +339,24 @@ jobs:
         with:
           projectPath: tachyon-ui
           args: ${{ matrix.args }}
+      - name: Normalize and verify the Debian prerelease version
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          packages=(target/release/bundle/deb/*.deb)
+          test "${#packages[@]}" -eq 1
+          version=$(node -p 'require("./tachyon-ui/tauri.conf.json").version')
+          python3 scripts/normalize-deb-version.py --version "$version" "${packages[0]}"
+          if [[ "$version" == *-* ]]; then
+            actual=$(dpkg-deb --field "${packages[0]}" Version)
+            dpkg --compare-versions "$actual" lt "${version%%-*}"
+          fi
+          images=(target/release/bundle/appimage/*.AppImage)
+          test "${#images[@]}" -eq 1
+          bash scripts/stage-linux-desktop-release.sh "$version" "v${version}" \
+            "${packages[0]}" "${images[0]}" "$RUNNER_TEMP/desktop-release-stage"
       - name: Require every expected installer type
         shell: bash
         run: |
@@ -356,6 +374,19 @@ jobs:
               ;;
             *) exit 1 ;;
           esac
+      - name: Verify macOS bundle versions
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=(target/aarch64-apple-darwin/release/bundle/macos/*.app)
+          test "${#apps[@]}" -eq 1
+          plist="${apps[0]}/Contents/Info.plist"
+          version=$(node -p 'require("./tachyon-ui/tauri.conf.json").version')
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "${version%%-*}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = "${version%%-*}"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :TachyonReleaseVersion' "$plist")" = "$version"
       - name: Verify the MSI ProductVersion
         if: runner.os == 'Windows'
         shell: pwsh

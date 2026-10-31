@@ -10,7 +10,8 @@
   near-zero cold-start claim.
 - Mark prerelease tags such as `v1.0.0-rc0` as GitHub prereleases and verify
   that flag before publication. Align desktop package versions with the
-  planned `1.0.0-rc0` release candidate.
+  planned `1.0.0-rc0` release candidate, including platform-specific installer
+  version formats and Debian prerelease ordering.
 - Gate Docker publication on the successful CI run for the exact commit, and
   promote image digests only after all variants are built.
 - Fix Linux installer argument parsing and verify the release asset inventory,

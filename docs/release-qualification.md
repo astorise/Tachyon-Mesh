@@ -62,6 +62,12 @@ configuration therefore uses `1.0.0.0` for MSI while retaining
 future `1.0.0` as the same product version for upgrade comparisons; test
 upgrades and potential downgrades on a clean Windows machine before release.
 
+Debian prereleases use `~` in the installed package version, so the RC package
+is `1.0.0~rc0` and sorts before `1.0.0`; its release asset still carries the
+`1.0.0-rc0` name. macOS requires numeric bundle version fields, which are
+`1.0.0`; the bundle also records the full RC in `TachyonReleaseVersion`. Check
+installation and upgrades on both platforms before release.
+
 To build the desktop installer matrix for a selected branch without publishing
 a release, dispatch `integration.yml` with `desktop_qualification=true`. Verify
 the run's head SHA and collect its Linux, macOS and Windows artifacts. This
