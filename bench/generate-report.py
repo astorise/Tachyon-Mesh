@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 import math
 from pathlib import Path
@@ -9,19 +10,27 @@ from pathlib import Path
 RAW_DIR = Path("bench/results/raw")
 REPORT = Path("bench/results/report.md")
 THRESHOLDS = Path("bench/results/thresholds.json")
+MIN_P99_SAMPLES = 100
 
 
 def percentile(data: dict, key: str) -> float | None:
     duration = data.get("DurationHistogram") or data.get("duration_histogram") or {}
     percentiles = duration.get("Percentiles") or duration.get("percentiles") or []
     for item in percentiles:
-        if str(item.get("Percentile") or item.get("percentile")) == key:
-            return float(item.get("Value") or item.get("value"))
+        percentile_key = item.get("Percentile", item.get("percentile"))
+        value = item.get("Value", item.get("value"))
+        if percentile_key is not None and float(percentile_key) == float(key) and value is not None:
+            result = float(value)
+            if not math.isfinite(result) or result < 0:
+                raise ValueError("Fortio percentile must be finite and non-negative")
+            return result
     return None
 
 
 def sample_percentile(samples: list[float], pct: float) -> float | None:
     if not samples:
+        return None
+    if pct >= 99 and len(samples) < MIN_P99_SAMPLES:
         return None
     ordered = sorted(samples)
     index = min(len(ordered) - 1, max(0, math.ceil(pct / 100 * len(ordered)) - 1))
@@ -37,7 +46,10 @@ def load_cold_start_samples(label: str) -> list[float]:
         line = line.strip()
         if not line:
             continue
-        samples.append(float(json.loads(line)["latency_s"]))
+        latency = float(json.loads(line)["latency_s"])
+        if not math.isfinite(latency) or latency < 0:
+            raise ValueError(f"invalid cold-start latency in {path}")
+        samples.append(latency)
     return samples
 
 
@@ -80,7 +92,7 @@ def check_threshold(
     minimum required in-process dispatch share)."""
     if observed is None:
         lines.append(f"- {label}: no data collected (n/a)")
-        return False
+        return threshold is not None
     if threshold is None:
         lines.append(
             f"- {label}: {observed:.2f}{unit} (provisional — not yet enforced, "
@@ -99,7 +111,42 @@ def check_threshold(
     return False
 
 
+def regression_data_errors(minimum_cold_samples: int) -> list[str]:
+    errors = []
+    for label in ("in-process", "forced-transport"):
+        path = RAW_DIR / f"faas-chain-{label}.json"
+        if not path.is_file():
+            errors.append(f"missing {path}")
+            continue
+        data = json.loads(path.read_text(encoding="utf-8"))
+        histogram = data.get("DurationHistogram") or data.get("duration_histogram") or {}
+        count = histogram.get("Count", histogram.get("count", 0))
+        codes = data.get("RetCodes") or data.get("retCodes") or {}
+        if not isinstance(count, (int, float)) or count <= 0 or percentile(data, "99") is None:
+            errors.append(f"{path} has no valid request count or p99")
+        if not isinstance(codes, dict) or not codes or any(
+            int(number) < 0 or (str(code) != "200" and int(number) > 0)
+            for code, number in codes.items()
+        ) or sum(int(number) for number in codes.values()) != count:
+            errors.append(f"{path} has missing or non-200 responses")
+    for label in ("with-instance-pre", "without-instance-pre"):
+        required = minimum_cold_samples if label == "with-instance-pre" else 5
+        samples = load_cold_start_samples(label)
+        if len(samples) < required:
+            errors.append(f"cold-start-{label}: expected at least {required} samples, got {len(samples)}")
+    counts = dispatch_mode_share("in-process")
+    if counts is None or counts[1] == 0:
+        errors.append("missing in-process dispatch log or zero dispatch decisions")
+    return errors
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--require-regression-data", action="store_true")
+    parser.add_argument("--min-cold-start-samples", type=int, default=5)
+    args = parser.parse_args()
+    if args.min_cold_start_samples < 1:
+        parser.error("--min-cold-start-samples must be positive")
     REPORT.parent.mkdir(parents=True, exist_ok=True)
     all_files = sorted(RAW_DIR.glob("*.json")) if RAW_DIR.exists() else []
     # faas-chain-*.json is handled by its own section below, not the generic
@@ -118,7 +165,7 @@ def main() -> int:
             ),
             encoding="utf-8",
         )
-        return 0
+        return 1 if args.require_regression_data else 0
 
     if files:
         rows = []
@@ -207,6 +254,7 @@ def main() -> int:
         samples = load_cold_start_samples(label)
         if samples:
             cold_start_variants[label] = (
+                len(samples),
                 sample_percentile(samples, 50),
                 sample_percentile(samples, 99),
             )
@@ -214,17 +262,19 @@ def main() -> int:
     if cold_start_variants:
         lines += ["", "## Cold Start (/api/guest-example after a cache-clearing restart)", ""]
         lines += [
-            "| Variant | p50 latency (s) | p99 latency (s) |",
-            "| --- | ---: | ---: |",
+            "| Variant | Samples | p50 latency (s) | p99 latency (s) |",
+            "| --- | ---: | ---: | ---: |",
         ]
-        for label, (p50, p99) in cold_start_variants.items():
+        for label, (count, p50, p99) in cold_start_variants.items():
             lines.append(
-                f"| {label} | {p50 if p50 is not None else 'n/a'} | "
+                f"| {label} | {count} | {p50 if p50 is not None else 'n/a'} | "
                 f"{p99 if p99 is not None else 'n/a'} |"
             )
+        lines += ["", f"Cold-start p99 requires at least {MIN_P99_SAMPLES} independent samples; "
+                  "the empirical percentile remains uncertain at low sample counts."]
 
         lines += ["", "### Thresholds", ""]
-        with_instance_pre_p99 = cold_start_variants.get("with-instance-pre", (None, None))[1]
+        with_instance_pre_p99 = cold_start_variants.get("with-instance-pre", (0, None, None))[2]
         observed_ms = (
             with_instance_pre_p99 * 1_000 if with_instance_pre_p99 is not None else None
         )
@@ -241,6 +291,13 @@ def main() -> int:
         lines.extend(["", "## Kubernetes Resource Snapshot", "", "```text"])
         lines.extend(resources.read_text(encoding="utf-8").splitlines())
         lines.append("```")
+
+    if args.require_regression_data:
+        errors = regression_data_errors(args.min_cold_start_samples)
+        if errors:
+            any_failure = True
+            lines += ["", "## Missing or invalid regression data", ""]
+            lines.extend(f"- {error}" for error in errors)
 
     REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return 1 if any_failure else 0

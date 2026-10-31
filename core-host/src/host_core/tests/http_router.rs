@@ -792,3 +792,56 @@ async fn go_sdk_kv_component_round_trip() {
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_eq!(body.as_ref(), b"tachyon-go-sdk");
 }
+
+/// Exercise Tachyon with the independent grpc-go interop client, not just a
+/// second Hyper connection. The harness sets the path to the pinned client.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires guest-grpc-interop.wasm and the grpc-go interop client"]
+async fn grpc_go_official_unary_interoperability() {
+    let client = std::env::var_os("TACHYON_GRPC_INTEROP_CLIENT")
+        .expect("TACHYON_GRPC_INTEROP_CLIENT must point to the grpc-go interop client");
+    let routes = [
+        "/grpc.testing.TestService/EmptyCall",
+        "/grpc.testing.TestService/UnaryCall",
+    ]
+    .into_iter()
+    .map(|path| targeted_route(path, vec![weighted_target("guest-grpc-interop", 100)]))
+    .collect();
+    let config = validate_integrity_config(IntegrityConfig {
+        routes,
+        ..IntegrityConfig::default_sealed()
+    })
+    .expect("gRPC interop routes should validate");
+    let app = build_app(build_test_state(config, telemetry::init_test_telemetry()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("gRPC interop listener should bind loopback");
+    let port = listener.local_addr().expect("listener address").port();
+    let server = tokio::spawn(async move {
+        serve_http_listener(listener, app)
+            .await
+            .expect("gRPC interop server")
+    });
+    for case in ["empty_unary", "large_unary"] {
+        let mut command = tokio::process::Command::new(&client);
+        command
+            .arg("--server_host=127.0.0.1")
+            .arg(format!("--server_port={port}"))
+            .arg("--use_tls=false")
+            .arg(format!("--test_case={case}"))
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(60), command.output())
+            .await
+            .expect("gRPC client timed out")
+            .expect("gRPC client should start");
+        assert!(
+            output.status.success(),
+            "grpc-go case {case} failed ({}):\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    server.abort();
+    let _ = server.await;
+}

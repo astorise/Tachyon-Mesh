@@ -841,3 +841,87 @@ async fn udp_layer4_listener_drops_when_safe_queue_is_full() {
         }
     }
 }
+
+/// An independent Python QUIC implementation must complete a validated TLS
+/// handshake and exchange concurrent HTTP/3 requests with Tachyon.
+#[cfg(feature = "http3")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires guest-example.wasm and the pinned aioquic client"]
+async fn aioquic_http3_interoperability() {
+    init_host_tracing();
+    let python = std::env::var_os("TACHYON_AIOQUIC_PYTHON")
+        .expect("TACHYON_AIOQUIC_PYTHON must identify the aioquic Python interpreter");
+    let domain = "localhost";
+    let mut route = IntegrityRoute::user("/api/guest-example");
+    route.domains = vec![domain.to_owned()];
+    let config = validate_integrity_config(IntegrityConfig {
+        host_address: "127.0.0.1:8080".to_owned(),
+        tls_address: Some("127.0.0.1:0".to_owned()),
+        routes: vec![route],
+        ..IntegrityConfig::default_sealed()
+    })
+    .expect("HTTP/3 config should validate");
+    let state = build_test_state(config, telemetry::init_test_telemetry());
+    let material = generate_mtls_test_material();
+    let cert = tls_runtime::CertificateMaterial {
+        domain: domain.to_owned(),
+        certificate_pem: format!("{}{}", material.server_cert_pem, material.ca_pem),
+        private_key_pem: material.server_key_pem,
+    };
+    state
+        .core_store
+        .put(
+            crate::store::CoreStoreBucket::TlsCerts,
+            domain,
+            &serde_json::to_vec(&cert).expect("test certificate should serialize"),
+        )
+        .expect("test certificate should be stored");
+    let ca_dir = tempfile::tempdir().expect("CA temp directory");
+    let ca_path = ca_dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &material.ca_pem).expect("write test CA");
+    let wrong_ca_path = ca_dir.path().join("wrong-ca.pem");
+    std::fs::write(&wrong_ca_path, generate_mtls_test_material().ca_pem).expect("write wrong CA");
+    let app = build_app(state.clone());
+    let listener = start_http3_listener(state, app)
+        .await
+        .expect("HTTP/3 listener should start")
+        .expect("HTTP/3 should be enabled");
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../tests/conformance/quic/aioquic_http3_client.py");
+    let expected =
+        expected_guest_example_body_without_secret_grant("FaaS received an empty payload");
+    for (ca, should_succeed) in [(&ca_path, true), (&wrong_ca_path, false)] {
+        let mut command = tokio::process::Command::new(&python);
+        command
+            .arg(&script)
+            .arg("--port")
+            .arg(listener.local_addr.port().to_string())
+            .arg("--ca")
+            .arg(ca)
+            .arg("--expected")
+            .arg(&expected)
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(60), command.output())
+            .await
+            .expect("aioquic client timed out")
+            .expect("aioquic client should start");
+        assert_eq!(
+            output.status.success(),
+            should_succeed,
+            "aioquic with trusted={should_succeed}:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if should_succeed {
+            assert!(String::from_utf8_lossy(&output.stdout).contains("three concurrent responses"));
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+            assert!(
+                stderr.contains("certificate") || stderr.contains("verify"),
+                "unexpected failure: {stderr}"
+            );
+        }
+    }
+    listener.join_handle.abort();
+    let _ = listener.join_handle.await;
+}

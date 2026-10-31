@@ -130,6 +130,9 @@ pub(super) fn generate_mtls_test_material() -> MtlsTestMaterial {
     let ca_key = KeyPair::generate().expect("CA key should generate");
     let mut ca_params =
         CertificateParams::new(vec!["tachyon-mtls-ca".to_owned()]).expect("CA params");
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Tachyon Test CA");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![
         KeyUsagePurpose::KeyCertSign,
@@ -145,6 +148,9 @@ pub(super) fn generate_mtls_test_material() -> MtlsTestMaterial {
     let mut server_params =
         CertificateParams::new(vec!["localhost".to_owned()]).expect("server params");
     server_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "localhost");
+    server_params
         .subject_alt_names
         .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
     server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
@@ -159,6 +165,9 @@ pub(super) fn generate_mtls_test_material() -> MtlsTestMaterial {
     let client_key = KeyPair::generate().expect("client key should generate");
     let mut client_params =
         CertificateParams::new(vec!["tachyon-client".to_owned()]).expect("client params");
+    client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Tachyon Test Client");
     client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     let client_cert = client_params

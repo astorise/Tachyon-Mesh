@@ -303,6 +303,9 @@ jobs:
       - name: Test Docker and release asset gates
         run: python3 -m unittest discover -s tests/scripts -p 'test_release_gates.py' -v
 
+      - name: Test benchmark reporting
+        run: python3 -m unittest discover -s tests/bench -v
+
       - name: Install Linux system dependencies for Tauri
         run: |
           sudo apt-get update
