@@ -17,14 +17,18 @@ def package_version(package):
     ).strip()
 
 
+def uses_gzip(package):
+    members = set(subprocess.check_output(["ar", "t", str(package)], text=True).splitlines())
+    return {"control.tar.gz", "data.tar.gz"}.issubset(members)
+
+
 def normalize(package, app_version):
     match = VERSION.fullmatch(app_version)
     if not match:
         raise ValueError("invalid application version")
     target = match.group(1) + ("~" + match.group(2) if match.group(2) else "")
     actual = package_version(package)
-    members = set(subprocess.check_output(["ar", "t", str(package)], text=True).splitlines())
-    if actual == target and {"control.tar.gz", "data.tar.gz"}.issubset(members):
+    if actual == target and uses_gzip(package):
         return target
     if actual not in (app_version, target):
         raise ValueError(f"package version {actual} does not match {app_version}")
@@ -48,6 +52,8 @@ def normalize(package, app_version):
                         str(directory), str(rebuilt)], check=True)
         if package_version(rebuilt) != target:
             raise ValueError("rebuilt package has the wrong version")
+        if not uses_gzip(rebuilt):
+            raise ValueError("rebuilt package must use gzip compression")
         os.replace(rebuilt, package)
     return target
 
