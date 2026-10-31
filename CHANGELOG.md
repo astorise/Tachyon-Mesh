@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Free unused hosted-runner disk before Docker cache and publication builds
+  after a FIPS image build exhausted its runner.
 - Run real gRPC-Go unary and aioquic HTTP/3 interoperability tests on main and
   ordinary pull requests, and correct the example guest's protobuf response.
 - Harden benchmark validation, record run metadata and avoid reporting cold
