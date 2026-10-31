@@ -49,6 +49,8 @@ def digest_file(path):
 def inventory(tag, ui_version, release, pages, downloaded, commit):
     if release.get("draft") is not True or release.get("tag_name") != tag:
         raise ValueError("release is not the expected draft")
+    if release.get("prerelease") is not ("-" in tag):
+        raise ValueError("release prerelease flag does not match the tag")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("invalid release commit SHA")
     assets = {}

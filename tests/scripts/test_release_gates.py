@@ -112,7 +112,7 @@ class ReleaseInventoryTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.directory = Path(self.tmp.name)
         self.tag = "v1.0.0"
-        self.release = {"tag_name": self.tag, "draft": True}
+        self.release = {"tag_name": self.tag, "draft": True, "prerelease": False}
         self.assets = []
         self.sample = f"tachyon-mesh-{self.tag}-linux-x86_64.tar.gz"
         expected = release_gate.expected_assets(self.tag, "1.0.0")
@@ -171,6 +171,18 @@ class ReleaseInventoryTests(unittest.TestCase):
             self.verify()
         with self.assertRaisesRegex(ValueError, "desktop version"):
             release_gate.expected_assets("v1.0.1", "1.0.0")
+
+    def test_release_candidate_is_marked_as_prerelease_and_version_matches(self):
+        self.release["prerelease"] = True
+        with self.assertRaisesRegex(ValueError, "prerelease flag"):
+            self.verify()
+        self.release.update(tag_name="v1.0.0-rc0", prerelease=False)
+        with self.assertRaisesRegex(ValueError, "prerelease flag"):
+            release_gate.inventory("v1.0.0-rc0", "1.0.0-rc0", self.release,
+                                   [], self.directory, "a" * 40)
+        self.assertTrue(release_gate.expected_assets("v1.0.0-rc0", "1.0.0-rc0"))
+        with self.assertRaisesRegex(ValueError, "desktop version"):
+            release_gate.expected_assets("v1.0.0-rc0", "1.0.0")
 
     def test_unuploaded_or_digestless_asset_blocks_release(self):
         assets = copy.deepcopy(self.assets)

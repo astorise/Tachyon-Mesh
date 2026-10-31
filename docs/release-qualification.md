@@ -49,6 +49,13 @@ Do not treat skipped checks as passed or treat a release draft as published.
    not evidence of a latency target. Publish calibrated results before citing
    a numeric SLO or comparison.
 
+The intended first release candidate is `v1.0.0-rc0`. Before creating that
+tag, align the desktop version and any packages being published with the RC
+version and their registry's version rules. The inventory check requires the
+desktop version to match the tag exactly. The release workflow marks tags with
+a prerelease suffix as GitHub prereleases; qualification and publication still
+require their own successful runs and authorization.
+
 Local regression checks for the release controls:
 
 ```sh

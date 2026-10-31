@@ -14,5 +14,8 @@ COLD_START_LABEL="${COLD_START_LABEL:-with-instance-pre}"
 mkdir -p "$RESULT_DIR"
 output="$RESULT_DIR/cold-start-${COLD_START_LABEL}.jsonl"
 
-latency_s=$(curl -s -o /dev/null -w '%{time_total}' "$COLD_START_URL")
+result=$(curl --fail --show-error --silent --max-time 30 \
+  -o /dev/null -w '%{time_total} %{http_code}' "$COLD_START_URL")
+read -r latency_s http_status <<< "$result"
+[[ "$http_status" == 2?? ]] || { echo "cold-start request returned HTTP ${http_status}" >&2; exit 1; }
 printf '{"latency_s":%s}\n' "$latency_s" >>"$output"

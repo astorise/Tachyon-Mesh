@@ -12,18 +12,38 @@ mod bindings {
 }
 
 #[derive(Clone, PartialEq, Message)]
+struct Payload {
+    #[prost(enumeration = "PayloadType", tag = "1")]
+    payload_type: i32,
+    #[prost(bytes, tag = "2")]
+    body: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+enum PayloadType {
+    Compressable = 0,
+}
+
+#[derive(Clone, PartialEq, Message)]
 struct SimpleRequest {
+    #[prost(enumeration = "PayloadType", tag = "1")]
+    response_type: i32,
     #[prost(int32, tag = "2")]
     response_size: i32,
-    #[prost(bytes, tag = "3")]
-    payload: Vec<u8>,
+    #[prost(message, optional, tag = "3")]
+    payload: Option<Payload>,
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct SimpleResponse {
-    #[prost(bytes, tag = "1")]
-    payload: Vec<u8>,
+    #[prost(message, optional, tag = "1")]
+    payload: Option<Payload>,
 }
+
+#[derive(Clone, PartialEq, Message)]
+struct Empty {}
+
+const MAX_RESPONSE_SIZE: i32 = 4 * 1024 * 1024;
 
 struct Component;
 
@@ -31,17 +51,33 @@ impl bindings::exports::tachyon::mesh::handler::Guest for Component {
     fn handle_request(
         req: bindings::exports::tachyon::mesh::handler::Request,
     ) -> bindings::exports::tachyon::mesh::handler::Response {
+        let path = req.uri.split('?').next().unwrap_or(&req.uri);
+        if path.ends_with("/EmptyCall") {
+            if let Err(message) = decode_grpc_message::<Empty>(&req.body) {
+                return grpc_error("3", &message);
+            }
+            return response(
+                200,
+                vec![0, 0, 0, 0, 0],
+                vec![("grpc-status".to_owned(), "0".to_owned())],
+            );
+        }
         let request = match decode_grpc_message::<SimpleRequest>(&req.body) {
             Ok(request) => request,
             Err(message) => return grpc_error("3", &message),
         };
-        let size = request.response_size.max(0) as usize;
-        let payload = if size == 0 {
-            request.payload
-        } else {
-            vec![0; size]
+        if !(0..=MAX_RESPONSE_SIZE).contains(&request.response_size)
+            || request.response_type != PayloadType::Compressable as i32
+        {
+            return grpc_error("3", "unsupported response type or size");
+        }
+        let payload = Payload {
+            payload_type: PayloadType::Compressable as i32,
+            body: vec![0; request.response_size as usize],
         };
-        let body = match encode_grpc_message(&SimpleResponse { payload }) {
+        let body = match encode_grpc_message(&SimpleResponse {
+            payload: Some(payload),
+        }) {
             Ok(body) => body,
             Err(message) => return grpc_error("13", &message),
         };
@@ -117,13 +153,17 @@ mod tests {
     #[test]
     fn interop_frame_round_trips_simple_request() {
         let body = encode_grpc_message(&SimpleRequest {
+            response_type: 0,
             response_size: 4,
-            payload: b"ping".to_vec(),
+            payload: Some(Payload {
+                payload_type: 0,
+                body: b"ping".to_vec(),
+            }),
         })
         .expect("frame should encode");
         let decoded = decode_grpc_message::<SimpleRequest>(&body).expect("frame should decode");
 
         assert_eq!(decoded.response_size, 4);
-        assert_eq!(decoded.payload, b"ping");
+        assert_eq!(decoded.payload.expect("payload").body, b"ping");
     }
 }

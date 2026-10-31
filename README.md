@@ -13,7 +13,7 @@ Tachyon is a next-generation, ultra-lightweight Service Mesh written in Rust. It
 
 ## ✨ Key Features
 
-* **⚡ Native WASM Runtime**: Execute polyglot functions (Rust, Go, JS, Python) via WebAssembly (WASIp2) with near-zero cold start latency.
+* **⚡ Native WASM Runtime**: Execute polyglot functions (Rust, Go, JS, Python) via WebAssembly (WASIp2), with support for caching prepared instances.
 * **🧠 AI-Centric Routing**: "VRAM-aware" intelligent routing capable of allocating AI models to the most optimal GPUs in real-time.
 * **🔐 Zero-Trust Security**: Native integration with **IOTA Stronghold** for secret storage, MFA step-up sessions, and PAT (Personal Access Token) authentication.
 * **📦 KV-Partition V2**: Distributed and partitioned Key-Value storage for ultra-fast state sharing between functions.

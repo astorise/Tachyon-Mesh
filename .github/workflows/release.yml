@@ -74,6 +74,7 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           name: Tachyon Mesh ${{ github.ref_name }}
 
   # TACH-42 (2026-10-30 audit): moved here from publish-sdks.yml, which
@@ -218,6 +219,7 @@ jobs:
           # is false) would publish the release the instant this step's
           # upload lands, racing every other job that also targets it.
           draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             target/schemas/integrity-config.schema.json
             target/schemas/integrity-lock.schema.json
@@ -456,6 +458,7 @@ jobs:
           # TACH-34 (2026-10-29 audit): see the matching comment on
           # publish-integrity-schemas' own upload step -- same reasoning.
           draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             ${{ steps.pkg.outputs.tarball }}
             ${{ steps.checksum.outputs.checksum_file }}
@@ -597,7 +600,7 @@ jobs:
           releaseName: Tachyon Desktop v__VERSION__
           releaseBody: See the assets to download and install this version.
           releaseDraft: true
-          prerelease: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
           # There is no configured/signed updater. Avoid publishing an empty
           # latest.json independently from the actual desktop bundles.
           uploadUpdaterJson: false
@@ -696,3 +699,4 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

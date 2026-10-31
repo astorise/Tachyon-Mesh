@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Run real gRPC-Go unary and aioquic HTTP/3 interoperability tests on main and
+  ordinary pull requests, and correct the example guest's protobuf response.
+- Harden benchmark validation, record run metadata and avoid reporting cold
+  start p99 from fewer than 100 samples. Performance thresholds remain pending
+  calibration on a representative environment; remove the unmeasured
+  near-zero cold-start claim.
+- Mark prerelease tags such as `v1.0.0-rc0` as GitHub prereleases and verify
+  that flag before publication.
 - Gate Docker publication on the successful CI run for the exact commit, and
   promote image digests only after all variants are built.
 - Fix Linux installer argument parsing and verify the release asset inventory,
@@ -9,11 +17,12 @@
 - Exercise Python and Go SDK KV guests in core-host CI and require the matching
   published release before publishing SDK packages.
 
-## [v1.0.0] — General Availability (GA) · 2026-10-31
+## [v1.0.0] — Planned scope
 
-> **Note (TACH-24, 2026-10-29 audit):** this section previously carried a placeholder date of `2026-05-15`, written before the release was actually cut — several of the fixes folded into the "Full Changelog" below (TACH-32/33/34, among others) landed as late as 2026-10-30, after that placeholder date had already passed. `2026-10-31` is the real GA date.
-
-Tachyon-Mesh v1.0.0 marks the transition to a production-ready, Enterprise-grade FaaS and AI orchestration mesh. This major release signals the stabilisation of our core API and MCP contracts. Following a rigorous multi-stage usability and security audit, it delivers robust supply-chain security, a hardened LLM agent interface, and targeted accessibility improvements (focus management, screen-reader announcements, and component decomposition for assistive technology).
+The entries below describe work intended for v1.0.0; they do not assert that a
+GA release has been published or that all capabilities have been qualified.
+The first intended release is `v1.0.0-rc0`; see `docs/release-qualification.md`
+for the evidence required before publication.
 
 ---
 

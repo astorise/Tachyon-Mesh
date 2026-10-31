@@ -6,6 +6,12 @@ name: Bench Regression
 # or to investigate a regression.
 on:
   workflow_dispatch:
+    inputs:
+      cold_start_samples:
+        description: Independent instance-pre cold starts (100 or more for an empirical p99)
+        required: false
+        type: string
+        default: '5'
   schedule:
     - cron: "30 4 * * 1"
 
@@ -19,15 +25,28 @@ concurrency:
 jobs:
   bench-regression:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Manual calibration with 100 cold starts takes longer than a smoke run.
+    timeout-minutes: 120
     env:
       CARGO_TERM_COLOR: always
+      COLD_START_SAMPLES: ${{ inputs.cold_start_samples || '5' }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           submodules: recursive
+
+      - name: Validate sample count
+        run: |
+          set -euo pipefail
+          [[ "$COLD_START_SAMPLES" =~ ^[1-9][0-9]{0,2}$ ]] && (( COLD_START_SAMPLES <= 200 )) || {
+            echo 'cold_start_samples must be an integer from 1 to 200' >&2
+            exit 1
+          }
+
+      - name: Test benchmark report validation
+        run: python3 -m unittest discover -s tests/bench -v
 
       # k3d + two Docker image builds is disk-heavy on the standard runner
       # (mirrors integration.yml's cleanup step).
@@ -93,6 +112,9 @@ jobs:
           sudo apt-get install -y ./fortio.deb
           fortio version
 
+      - name: Record actual runner and workload metadata
+        run: python3 bench/capture-profile.py
+
       - name: Create cluster and import local images
         run: |
           k3d cluster create tachyon-bench --wait
@@ -152,7 +174,7 @@ jobs:
           kill "$PF_PID" || true
           trap - EXIT
 
-          for i in $(seq 1 5); do
+          for i in $(seq 1 "$COLD_START_SAMPLES"); do
             kubectl rollout restart deployment/tachyon-host
             kubectl rollout status deployment/tachyon-host --timeout=300s
             kubectl port-forward service/tachyon-service 8080:8080 >/tmp/tachyon-port-forward.log 2>&1 &
@@ -223,7 +245,7 @@ jobs:
         run: bash bench/collect-resources.sh || true
 
       - name: Generate report and check thresholds
-        run: python3 bench/generate-report.py
+        run: python3 bench/generate-report.py --require-regression-data --min-cold-start-samples "$COLD_START_SAMPLES"
 
       - name: Upload bench results
         if: always()
