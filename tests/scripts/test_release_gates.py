@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -183,6 +184,29 @@ class ReleaseInventoryTests(unittest.TestCase):
         self.assertTrue(release_gate.expected_assets("v1.0.0-rc0", "1.0.0-rc0"))
         with self.assertRaisesRegex(ValueError, "desktop version"):
             release_gate.expected_assets("v1.0.0-rc0", "1.0.0")
+
+    def test_desktop_metadata_versions_match(self):
+        config = json.loads((ROOT / "tachyon-ui/tauri.conf.json").read_text())
+        npm = json.loads((ROOT / "tachyon-ui/package.json").read_text())
+        npm_lock = json.loads((ROOT / "tachyon-ui/package-lock.json").read_text())
+        manifest = tomllib.loads((ROOT / "tachyon-ui/Cargo.toml").read_text())
+        cargo_lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
+        packages = [p for p in cargo_lock["package"] if p["name"] == "tachyon-ui"]
+        self.assertEqual(len(packages), 1)
+        version = config["version"]
+        for actual in (npm["version"], npm_lock["version"],
+                       npm_lock["packages"][""]["version"],
+                       manifest["package"]["version"], packages[0]["version"]):
+            self.assertEqual(actual, version)
+        self.assertTrue(release_gate.expected_assets(f"v{version}", version))
+        # WiX needs a numeric ProductVersion for an alphabetic prerelease;
+        # an explicit override must track the app's major/minor/patch.
+        wix = config.get("bundle", {}).get("windows", {}).get("wix", {}).get("version")
+        if "-" in version:
+            self.assertIsNotNone(wix)
+        if wix is not None:
+            self.assertRegex(wix, r"^\d+\.\d+\.\d+(?:\.\d+)?$")
+            self.assertEqual(wix.split(".")[:3], version.split("-", 1)[0].split("."))
 
     def test_unuploaded_or_digestless_asset_blocks_release(self):
         assets = copy.deepcopy(self.assets)
