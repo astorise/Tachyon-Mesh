@@ -6,7 +6,8 @@
   ordinary pull requests, and correct the example guest's protobuf response.
 - Harden benchmark validation, record run metadata and avoid reporting cold
   start p99 from fewer than 100 samples. Performance thresholds remain pending
-  calibration on a representative environment.
+  calibration on a representative environment; remove the unmeasured
+  near-zero cold-start claim.
 - Mark prerelease tags such as `v1.0.0-rc0` as GitHub prereleases and verify
   that flag before publication.
 - Gate Docker publication on the successful CI run for the exact commit, and
