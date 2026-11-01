@@ -8309,7 +8309,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-ui"
-version = "1.0.0-rc0"
+version = "1.0.0-rc1"
 dependencies = [
  "iota_stronghold",
  "rand 0.10.3",

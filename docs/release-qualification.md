@@ -49,22 +49,22 @@ Do not treat skipped checks as passed or treat a release draft as published.
    not evidence of a latency target. Publish calibrated results before citing
    a numeric SLO or comparison.
 
-The intended first release candidate is `v1.0.0-rc0`. Before creating that
+The next release candidate is `v1.0.0-rc1`. Before creating that
 tag, verify the desktop version and any packages being published match the RC
 version and their registry's version rules. The inventory check requires the
 desktop version to match the tag exactly. The release workflow marks tags with
 a prerelease suffix as GitHub prereleases; qualification and publication still
 require their own successful runs and authorization.
 
-Windows MSI ProductVersion is numeric and cannot encode `-rc0`. The desktop
+Windows MSI ProductVersion is numeric and cannot encode `-rc1`. The desktop
 configuration therefore uses `1.0.0.0` for MSI while retaining
-`1.0.0-rc0` in the application and release asset names. MSI treats the RC and
+`1.0.0-rc1` in the application and release asset names. MSI treats the RC and
 future `1.0.0` as the same product version for upgrade comparisons; test
 upgrades and potential downgrades on a clean Windows machine before release.
 
 Debian prereleases use `~` in the installed package version, so the RC package
-is `1.0.0~rc0` and sorts before `1.0.0`; its release asset still carries the
-`1.0.0-rc0` name. Rebuilt packages retain Tauri's gzip archive compression.
+is `1.0.0~rc1` and sorts before `1.0.0`; its release asset still carries the
+`1.0.0-rc1` name. Rebuilt packages retain Tauri's gzip archive compression.
 macOS requires numeric bundle version fields, which are
 `1.0.0`; the bundle also records the full RC in `TachyonReleaseVersion`. Check
 installation and upgrades on both platforms before release.
