@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "core-host"
-version = "1.0.0"
+version = "1.0.0-rc1"
 dependencies = [
  "aes-gcm 0.11.1",
  "anyhow",
@@ -8309,7 +8309,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-ui"
-version = "1.0.0-rc0"
+version = "1.0.0-rc1"
 dependencies = [
  "iota_stronghold",
  "rand 0.10.3",

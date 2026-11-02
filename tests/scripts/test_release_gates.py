@@ -202,6 +202,10 @@ class ReleaseInventoryTests(unittest.TestCase):
         packages = [p for p in cargo_lock["package"] if p["name"] == "tachyon-ui"]
         self.assertEqual(len(packages), 1)
         version = config["version"]
+        core = tomllib.loads((ROOT / "core-host/Cargo.toml").read_text())
+        core_lock = [p for p in cargo_lock["package"] if p["name"] == "core-host"]
+        self.assertEqual(core["package"]["version"], version)
+        self.assertEqual([p["version"] for p in core_lock], [version])
         for actual in (npm["version"], npm_lock["version"],
                        npm_lock["packages"][""]["version"],
                        manifest["package"]["version"], packages[0]["version"]):
@@ -300,11 +304,40 @@ class SdkReleaseGateTests(unittest.TestCase):
     def setUp(self):
         self.tag = "v1.0.0"
         self.commit = "a" * 40
-        self.release = {"tag_name": self.tag, "draft": False}
+        self.release = {"tag_name": self.tag, "draft": False, "prerelease": False}
         self.manifest = json.dumps({"schema_version": 1, "tag": self.tag,
                                     "commit": self.commit}).encode()
         self.assets = [[{"name": "release-manifest.json", "state": "uploaded",
                          "digest": "sha256:" + hashlib.sha256(self.manifest).hexdigest()}]]
+
+    def test_prerelease_tags_never_authorize_sdk_publication(self):
+        for tag in ("v1.0.0-rc0", "v1.0.0-rc1", "v1.0.0-beta.2",
+                    "v1.0.0+build", "v01.0.0"):
+            with self.subTest(tag=tag), self.assertRaisesRegex(ValueError, "stable release"):
+                sdk_gate.validate(tag, self.commit, self.release, self.assets, self.manifest)
+
+    def test_prerelease_or_unknown_release_status_is_rejected(self):
+        for value in (True, None):
+            self.release["prerelease"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "non-prerelease"):
+                sdk_gate.validate(self.tag, self.commit, self.release, self.assets, self.manifest)
+
+    def test_manual_sdk_dispatch_rejects_rc_before_checkout(self):
+        workflow = (ROOT / ".github/workflows/publish-sdks.yml").read_text()
+        self.assertIn('      - "!v*-*"', workflow)
+        block = workflow.split("      - name: Validate the workflow_dispatch tag input", 1)[1]
+        block = block.split("      - name: Checkout the exact ref", 1)[0]
+        script = block.split("        run: |\n", 1)[1]
+        import textwrap
+        script = textwrap.dedent(script)
+        for tag, allowed in (("v1.0.0", True), ("v2.10.3", True),
+                             ("v1.0.0-rc1", False), ("v01.0.0", False),
+                             ("v1.0.0$(false)", False)):
+            result = subprocess.run(["bash", "-c", script],
+                                    env={**os.environ, "TAG_INPUT": tag},
+                                    capture_output=True, text=True)
+            with self.subTest(tag=tag):
+                self.assertEqual(result.returncode == 0, allowed, result.stderr)
 
     def test_matching_published_release_is_accepted(self):
         sdk_gate.validate(self.tag, self.commit, self.release, self.assets, self.manifest)
