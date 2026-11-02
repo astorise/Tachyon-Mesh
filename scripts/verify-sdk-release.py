@@ -8,12 +8,14 @@ from pathlib import Path
 
 
 def validate(tag, commit, release, pages, manifest_bytes):
-    if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", tag):
-        raise ValueError("invalid release tag")
+    if not re.fullmatch(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", tag):
+        raise ValueError("SDK publication requires a stable release tag; prereleases exclude SDKs")
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("invalid commit")
     if release.get("tag_name") != tag or release.get("draft") is not False:
         raise ValueError("the matching GitHub Release must already be published")
+    if release.get("prerelease") is not False:
+        raise ValueError("SDK publication requires a non-prerelease GitHub Release")
     found = [asset for page in pages for asset in page if asset.get("name") == "release-manifest.json"]
     digest = "sha256:" + hashlib.sha256(manifest_bytes).hexdigest()
     if len(found) != 1 or found[0].get("state") != "uploaded" or found[0].get("digest") != digest:
