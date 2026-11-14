@@ -25,6 +25,20 @@
   ],
   "packageRules": [
     {
+      "description": "Keep the SDK runtime's Go toolchain paired with pinned TinyGo 0.40.1; migrate and qualify both together.",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["go"],
+      "matchFileNames": [".github/workflows/ci.yml"],
+      "allowedVersions": "1.24.7"
+    },
+    {
+      "description": "The QUIC interop requirements contain Python 3.12 Linux wheel hashes; update the hashes and interpreter together.",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["python"],
+      "matchFileNames": [".github/workflows/integration.yml"],
+      "allowedVersions": "3.12"
+    },
+    {
       "description": "All GitHub Actions updates (majors included) in a single PR — action bumps are low-risk and reviewed together.",
       "matchManagers": ["github-actions"],
       "groupName": "github-actions"
