@@ -1,4 +1,4 @@
-FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS rust-base
+FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 AS rust-base
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -135,7 +135,7 @@ RUN set -eux; \
       cargo build -p core-host --target x86_64-unknown-linux-musl --release; \
     fi
 
-FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS tinygo-builder
+FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 AS tinygo-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TINYGO_VERSION=0.40.1
@@ -161,7 +161,7 @@ COPY examples/guest-go/main.go ./
 RUN mkdir -p /workspace/guest-modules \
     && tinygo build -o /workspace/guest-modules/guest_go.wasm -target=wasip1 .
 
-FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS javy-builder
+FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 AS javy-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG JAVY_VERSION=8.1.0
@@ -184,7 +184,7 @@ COPY examples/guest-js/index.js ./
 RUN mkdir -p /workspace/guest-modules \
     && javy build /workspace/examples/guest-js/index.js -o /workspace/guest-modules/guest_js.wasm
 
-FROM mcr.microsoft.com/dotnet/sdk:8.0@sha256:ff39a765f04619c8d146796fc09b38499ae5984f4a2a4c3a0a57d0022855daee AS dotnet-builder
+FROM mcr.microsoft.com/dotnet/sdk:8.0@sha256:1b955f179b02df4f0eb5fadedaa898cbe44d620a64aab52eec72c8e91d1355b5 AS dotnet-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG WASI_SDK_VERSION=20.0
@@ -225,7 +225,7 @@ RUN mkdir -p /workspace/guest-modules \
         exit 1; \
       fi
 
-FROM maven:3.10.0-eclipse-temurin-17@sha256:a6d08f0b65a5420d67425b9851283b6b6f7f49b4b3cdfb234a4203bc59784124 AS java-builder
+FROM maven:3.10.0-eclipse-temurin-17@sha256:b67db904974d04b9e6eba5b073ae227569ee1cae0d1f26be8993525291ef76dc AS java-builder
 
 WORKDIR /workspace/examples/guest-java
 

@@ -11,7 +11,7 @@
 # approuvées, avec assertion au démarrage via provider.fips().
 
 # ── WASM guest modules ────────────────────────────────────────────────────────
-FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS wasm-base
+FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 AS wasm-base
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -133,7 +133,7 @@ RUN cargo build -p core-host \
     --release
 
 # ── Guests polyglots (inchangés) ─────────────────────────────────────────────
-FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS tinygo-builder
+FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 AS tinygo-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TINYGO_VERSION=0.40.1
@@ -155,7 +155,7 @@ COPY examples/guest-go/main.go ./
 RUN mkdir -p /workspace/guest-modules \
     && tinygo build -o /workspace/guest-modules/guest_go.wasm -target=wasip1 .
 
-FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS javy-builder
+FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 AS javy-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG JAVY_VERSION=8.1.0
@@ -174,7 +174,7 @@ COPY examples/guest-js/index.js ./
 RUN mkdir -p /workspace/guest-modules \
     && javy build /workspace/examples/guest-js/index.js -o /workspace/guest-modules/guest_js.wasm
 
-FROM mcr.microsoft.com/dotnet/sdk:11.0@sha256:3a9175b6c54b2f076817af1360f691c9994447b192faa48a1a1f112a516844c7 AS dotnet-builder
+FROM mcr.microsoft.com/dotnet/sdk:11.0@sha256:65f3c7c6a25a239ab3e6719f2896147e7b68242ff2d8818dd70498bde6ef8bea AS dotnet-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG WASI_SDK_VERSION=20.0
@@ -215,7 +215,7 @@ RUN mkdir -p /workspace/guest-modules \
         echo "missing guest_csharp.wasm" >&2; exit 1; \
       fi
 
-FROM maven:3.10.0-eclipse-temurin-17@sha256:a6d08f0b65a5420d67425b9851283b6b6f7f49b4b3cdfb234a4203bc59784124 AS java-builder
+FROM maven:3.10.0-eclipse-temurin-17@sha256:b67db904974d04b9e6eba5b073ae227569ee1cae0d1f26be8993525291ef76dc AS java-builder
 
 WORKDIR /workspace/examples/guest-java
 COPY examples/guest-java/pom.xml ./

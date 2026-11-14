@@ -85,6 +85,15 @@ jobs:
           # Plain create (mirrors the passing k3d-integration workflow); the
           # deprecated `--no-deploy` k3s-arg can hang `--wait` on newer k3s.
           k3d cluster create tachyon-zt --wait
+          # k3d can return while the API server still reports ServiceUnavailable.
+          # Bound the readiness wait and fail before deploying if it never recovers.
+          for attempt in $(seq 1 36); do
+            if kubectl --request-timeout=5s get --raw=/readyz >/dev/null 2>&1; then
+              break
+            fi
+            sleep 5
+          done
+          kubectl --request-timeout=10s get --raw=/readyz
           kubectl create namespace tachyon
 
       - name: Import image into k3d
