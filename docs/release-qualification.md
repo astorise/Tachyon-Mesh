@@ -119,3 +119,20 @@ API requests return `Forbidden`. This prevents verifying Actions, releases,
 assets and rulesets, creating a PR through the API, and dispatching platform
 qualification workflows. Do not mark those checks passed until access is restored
 and their results are inspected.
+
+### Published desktop installer smoke tests
+
+After a release has actually been published, dispatch `Qualify published desktop
+installers` with its exact tag. The workflow resolves the tag commit, checks the
+published release state and manifest digest, and verifies each downloaded desktop
+asset against both GitHub metadata and the release manifest before testing it on
+hosted Linux, macOS and Windows runners. It installs/removes the Debian, MSI and
+NSIS packages, and mounts the DMG and copies/inspects its application. The
+AppImage and macOS application archive are digest-checked but not executed.
+Retain the run URL and asset hashes with the release evidence. This smoke test
+does not exercise application functionality, server installers, SDK consumers,
+macOS execution or RC-to-GA upgrades; qualify those separately. Run this on the
+final tagged commit with the workflow code reviewed for that release.
+
+The asset verifier's local regression suite runs with
+`python -m unittest discover -s tests/scripts -p 'test_desktop_release.py' -v`.
