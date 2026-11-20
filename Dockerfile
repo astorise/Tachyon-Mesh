@@ -225,7 +225,7 @@ RUN mkdir -p /workspace/guest-modules \
         exit 1; \
       fi
 
-FROM maven:3.10.0-eclipse-temurin-17@sha256:b67db904974d04b9e6eba5b073ae227569ee1cae0d1f26be8993525291ef76dc AS java-builder
+FROM maven:3.10.0-eclipse-temurin-17@sha256:0362bf77ae7b21e3e0a0f4b211e85eb973e2cf9a680b2d36210e580336bb2255 AS java-builder
 
 WORKDIR /workspace/examples/guest-java
 
