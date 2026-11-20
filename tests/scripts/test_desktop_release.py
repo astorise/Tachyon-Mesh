@@ -1,6 +1,8 @@
 import hashlib
 import importlib.util
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -56,6 +58,19 @@ class PublishedDesktopReleaseTests(unittest.TestCase):
         data = json.dumps(self.manifest).encode()
         with self.assertRaisesRegex(ValueError, "manifest digest"):
             checker.verify(self.tag, self.sha, self.release, [[self.asset]], data, self.directory, [self.name])
+
+
+class DebianVersionTests(unittest.TestCase):
+    def test_workflow_version_conversion_preserves_literal_tilde(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/qualify-published-desktop.yml").read_text(encoding="utf-8")
+        lines = [line.strip() for line in workflow.splitlines() if line.strip().startswith("expected=")]
+        self.assertEqual(len(lines), 1)
+        for version, expected in (("1.0.0-rc1", "1.0.0~rc1"), ("1.0.0", "1.0.0")):
+            with self.subTest(version=version):
+                result = subprocess.run(["bash", "-c", lines[0] + '\nprintf "%s" "$expected"'],
+                                        env={**os.environ, "version": version, "HOME": "/test-home"},
+                                        capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout, expected)
 
 
 if __name__ == "__main__":
