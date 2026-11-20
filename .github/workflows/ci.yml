@@ -310,7 +310,9 @@ jobs:
           submodules: recursive
 
       - name: Test Docker and release asset gates
-        run: python3 -m unittest discover -s tests/scripts -p 'test_release_gates.py' -v
+        run: |
+          python3 -m unittest discover -s tests/scripts -p 'test_release_gates.py' -v
+          python3 -m unittest discover -s tests/scripts -p 'test_desktop_release.py' -v
 
       - name: Test benchmark reporting
         run: python3 -m unittest discover -s tests/bench -v

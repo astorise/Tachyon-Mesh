@@ -1,0 +1,143 @@
+name: Qualify published desktop installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to qualify (for example v1.0.0-rc1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Download and verify published assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo 'Invalid release tag' >&2; exit 1
+          fi
+          version="${TAG#v}"
+          dir="$RUNNER_TEMP/release-assets"
+          mkdir -p "$dir"
+          gh api "repos/$REPO/releases/tags/$TAG" > "$dir/release.json"
+          id=$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["id"])' "$dir/release.json")
+          [[ "$id" =~ ^[0-9]+$ ]]
+          gh api --paginate --slurp "repos/$REPO/releases/$id/assets?per_page=100" > "$dir/assets.json"
+          sha=$(gh api "repos/$REPO/commits/refs/tags/$TAG" --jq .sha)
+          gh release download "$TAG" --repo "$REPO" --dir "$dir" --pattern release-manifest.json
+          case "$RUNNER_OS" in
+            Linux) names=("tachyon-studio_${version}_amd64.deb" "tachyon-studio_${version}_amd64.AppImage") ;;
+            macOS) names=("tachyon-studio_${version}_aarch64.dmg" "tachyon-studio_${version}_aarch64.app.tar.gz") ;;
+            Windows) names=("tachyon-studio_${version}_x64.msi" "tachyon-studio_${version}_x64.exe") ;;
+            *) exit 1 ;;
+          esac
+          for name in "${names[@]}"; do
+            gh release download "$TAG" --repo "$REPO" --dir "$dir" --pattern "$name"
+          done
+          python scripts/verify-desktop-release.py --tag "$TAG" --commit "$sha" \
+            --release "$dir/release.json" --assets "$dir/assets.json" \
+            --manifest "$dir/release-manifest.json" --directory "$dir" "${names[@]}"
+          echo "Release $TAG resolves to $sha"
+      - name: Install and remove Debian package
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          deb="$RUNNER_TEMP/release-assets/tachyon-studio_${version}_amd64.deb"
+          expected="${version/-/~}"
+          test "$(dpkg-deb -f "$deb" Version)" = "$expected"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends "$deb"
+          test "$(dpkg-query -W -f='${Version}' tachyon-ui)" = "$expected"
+          test -x /usr/bin/tachyon-ui
+          sudo apt-get remove -y tachyon-ui
+          test ! -e /usr/bin/tachyon-ui
+      - name: Mount and inspect macOS application
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          dmg="$RUNNER_TEMP/release-assets/tachyon-studio_${version}_aarch64.dmg"
+          mount="$RUNNER_TEMP/tachyon-dmg"
+          mkdir -p "$mount" "$RUNNER_TEMP/qualification-applications"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "$dmg"
+          trap 'hdiutil detach "$mount" -force' EXIT
+          shopt -s nullglob
+          apps=("$mount"/*.app)
+          test "${#apps[@]}" -eq 1
+          app="$RUNNER_TEMP/qualification-applications/tachyon-ui.app"
+          ditto "${apps[0]}" "$app"
+          test -x "$app/Contents/MacOS/tachyon-ui"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :TachyonReleaseVersion' "$app/Contents/Info.plist")" = "$version"
+      - name: Install and remove MSI and NSIS packages
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:TAG.Substring(1)
+          $base = $version.Split('-')[0]
+          $dir = Join-Path $env:RUNNER_TEMP 'release-assets'
+          $msi = Join-Path $dir "tachyon-studio_${version}_x64.msi"
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $db = $installer.OpenDatabase($msi, 0)
+          function Get-MsiProperty([string]$name) {
+            $view = $db.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$name'")
+            [void]$view.Execute()
+            $record = $view.Fetch()
+            if (!$record) { throw "Missing MSI property: $name" }
+            $value = $record.StringData(1)
+            [void]$view.Close()
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($record)
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($view)
+            return $value
+          }
+          $productVersion = Get-MsiProperty 'ProductVersion'
+          $productCode = Get-MsiProperty 'ProductCode'
+          if ($productVersion -notin @($base, "$base.0")) { throw "Unexpected MSI ProductVersion: $productVersion" }
+          [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
+          $log = Join-Path $env:RUNNER_TEMP 'tachyon-msi-install.log'
+          $process = Start-Process msiexec.exe -ArgumentList @('/i', ('"{0}"' -f $msi), '/qn', '/norestart', '/l*v', ('"{0}"' -f $log)) -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { Get-Content $log -Tail 80; throw "MSI install failed: $($process.ExitCode)" }
+          try {
+            if ($installer.ProductState($productCode) -ne 5) { throw 'MSI product is not installed' }
+          } finally {
+            $process = Start-Process msiexec.exe -ArgumentList @('/x', $productCode, '/qn', '/norestart') -WindowStyle Hidden -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "MSI uninstall failed: $($process.ExitCode)" }
+          }
+          if ($installer.ProductState($productCode) -eq 5) { throw 'MSI product remains installed' }
+          [void][Runtime.InteropServices.Marshal]::ReleaseComObject($installer)
+          $setup = Join-Path $dir "tachyon-studio_${version}_x64.exe"
+          $target = Join-Path $env:RUNNER_TEMP 'tachyon-nsis'
+          $process = Start-Process -FilePath $setup -ArgumentList @('/S', "/D=$target") -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "NSIS install failed: $($process.ExitCode)" }
+          $exe = @(Get-ChildItem $target -Recurse -File -Filter 'tachyon-ui.exe')
+          $uninstall = @(Get-ChildItem $target -Recurse -File | Where-Object { $_.Name -match '(?i)^uninstall.*\.exe$' })
+          if ($exe.Count -ne 1 -or $uninstall.Count -ne 1) { throw 'NSIS executable or uninstaller missing' }
+          $process = Start-Process -FilePath $uninstall[0].FullName -ArgumentList '/S' -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0 -or (Test-Path $exe[0].FullName)) { throw 'NSIS uninstall failed' }
