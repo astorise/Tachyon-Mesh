@@ -20,7 +20,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install wasm-tools
-        uses: taiki-e/install-action@b2813452daa6f58b893e0b6b79b6a0d2a37e7dba # wasm-tools
+        uses: taiki-e/install-action@745319f1cc9062cb0c2e6e30639b5180392b1951 # wasm-tools
 
       - name: Check sdk/wit/tachyon.wit has not drifted from wit/tachyon.wit
         shell: bash
