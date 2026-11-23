@@ -215,7 +215,7 @@ RUN mkdir -p /workspace/guest-modules \
         echo "missing guest_csharp.wasm" >&2; exit 1; \
       fi
 
-FROM maven:3.10.0-eclipse-temurin-17@sha256:0362bf77ae7b21e3e0a0f4b211e85eb973e2cf9a680b2d36210e580336bb2255 AS java-builder
+FROM maven:3.10.0-eclipse-temurin-17@sha256:7d92f4b97ceca94699c70dfe41e186115de1a9e34dd50413ab3f96ce32bc60ec AS java-builder
 
 WORKDIR /workspace/examples/guest-java
 COPY examples/guest-java/pom.xml ./
