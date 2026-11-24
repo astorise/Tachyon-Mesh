@@ -1,4 +1,4 @@
-FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 AS rust-base
+FROM ubuntu:24.04@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b AS rust-base
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -135,7 +135,7 @@ RUN set -eux; \
       cargo build -p core-host --target x86_64-unknown-linux-musl --release; \
     fi
 
-FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 AS tinygo-builder
+FROM ubuntu:24.04@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b AS tinygo-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TINYGO_VERSION=0.40.1
@@ -161,7 +161,7 @@ COPY examples/guest-go/main.go ./
 RUN mkdir -p /workspace/guest-modules \
     && tinygo build -o /workspace/guest-modules/guest_go.wasm -target=wasip1 .
 
-FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 AS javy-builder
+FROM ubuntu:24.04@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b AS javy-builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG JAVY_VERSION=8.1.0
